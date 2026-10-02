@@ -1,0 +1,33 @@
+{
+  "id": "gen-1748372401-ImAgEoUtPuT0000000001",
+  "object": "chat.completion",
+  "created": 1748372401,
+  "model": "google/gemini-3.1-flash-image",
+  "provider": "Google AI Studio",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Here is your image.",
+        "images": [
+          {
+            "image_url": {
+              "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 1290,
+    "total_tokens": 1302,
+    "cost": 0.0774,
+    "completion_tokens_details": {
+      "image_tokens": 1290
+    }
+  }
+}

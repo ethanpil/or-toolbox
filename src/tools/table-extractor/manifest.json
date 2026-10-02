@@ -1,0 +1,13 @@
+{
+  "id": "table-extractor",
+  "name": "Table extractor",
+  "description": "Find tables and charts in pages and export them as editable spreadsheets.",
+  "category": "documents",
+  "icon": "table",
+  "capabilities": ["vision"],
+  "accepts": ["image/png", "image/jpeg", "image/webp", "application/pdf"],
+  "produces": ["text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+  "usesJobs": false,
+  "lazyLibs": ["pdfjs-dist", "write-excel-file"],
+  "defaults": {}
+}

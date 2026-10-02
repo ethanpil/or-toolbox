@@ -1,0 +1,16 @@
+{
+  "id": "music-generation",
+  "name": "Music generation",
+  "description": "Compose songs and instrumentals from a prompt, lyrics or an image.",
+  "category": "audio",
+  "icon": "music-note-beamed",
+  "capabilities": ["music"],
+  "accepts": ["image/png", "image/jpeg", "image/webp"],
+  "produces": ["audio/mpeg", "audio/wav"],
+  "usesJobs": false,
+  "lazyLibs": [],
+  "defaults": {
+    "format": "mp3",
+    "instrumental": false
+  }
+}

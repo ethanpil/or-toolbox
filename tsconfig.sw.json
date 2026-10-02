@@ -1,0 +1,9 @@
+{
+  // The service worker: WebWorker globals only, no DOM.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "WebWorker"],
+    "types": []
+  },
+  "include": ["src/sw/**/*.ts"]
+}

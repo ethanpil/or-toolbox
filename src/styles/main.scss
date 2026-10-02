@@ -1,0 +1,40 @@
+// The site's one stylesheet: Bootstrap 5.3 with the overrides in
+// _variables.scss, the Bootstrap Icons font, and the few rules Bootstrap
+// lacks. Linked from every page by vite-plugins/html-head.ts.
+//
+// Light and dark come from Bootstrap's colour modes: `data-bs-theme` on
+// <html>, set before first paint by public/theme-init.js.
+
+@use 'variables' as v;
+
+@use 'bootstrap/scss/bootstrap' with (
+  $primary: v.$primary,
+  $font-family-sans-serif: v.$font-family-sans-serif,
+  $border-radius-sm: v.$border-radius-sm,
+  $border-radius: v.$border-radius,
+  $border-radius-lg: v.$border-radius-lg
+);
+
+// Self-hosted icon font. Vite bundles the font file next to the CSS; nothing
+// is loaded from a CDN. Usage: <i class="bi bi-gear" aria-hidden="true"></i>
+//
+// The font URL is spelled out here because the package builds its own from
+// Sass variables, which Vite cannot resolve to a file. WOFF2 only: every
+// supported browser has it.
+@use 'bootstrap-icons/font/bootstrap-icons' with (
+  $bootstrap-icons-font-src: url('bootstrap-icons/font/fonts/bootstrap-icons.woff2') format('woff2')
+);
+
+// Cross-page View Transitions: a short cross-fade between pages so the
+// multi-page site feels like one app. Browsers without support navigate
+// normally. Off for users who prefer reduced motion.
+@media (prefers-reduced-motion: no-preference) {
+  @view-transition {
+    navigation: auto;
+  }
+
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 200ms;
+  }
+}

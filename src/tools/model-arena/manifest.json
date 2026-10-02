@@ -1,0 +1,20 @@
+{
+  "id": "model-arena",
+  "name": "Model arena",
+  "description": "Send one input to several models and compare answers, cost and speed.",
+  "category": "reasoning",
+  "icon": "trophy",
+  "capabilities": ["text", "vision"],
+  "accepts": [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "application/pdf",
+    "text/plain",
+    "text/markdown"
+  ],
+  "produces": ["text/markdown", "application/json"],
+  "usesJobs": false,
+  "lazyLibs": ["marked", "dompurify"],
+  "defaults": {}
+}

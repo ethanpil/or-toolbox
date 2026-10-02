@@ -1,0 +1,35 @@
+{
+  "data": {
+    "label": "sk-or-v1-abc...123",
+    "is_management_key": false,
+    "is_provisioning_key": false,
+    "limit": 1,
+    "limit_reset": null,
+    "limit_remaining": 1,
+    "include_byok_in_limit": false,
+    "usage": 0,
+    "usage_daily": 0,
+    "usage_weekly": 0,
+    "usage_monthly": 0,
+    "byok_usage": 0,
+    "byok_usage_daily": 0,
+    "byok_usage_weekly": 0,
+    "byok_usage_monthly": 0,
+    "is_free_tier": false,
+    "expires_at": null,
+    "creator_user_id": "user_REDACTED",
+    "organization_id": null,
+    "workspace_id": "00000000-0000-0000-0000-000000000000",
+    "allowed_data_regions": ["global"],
+    "free_model_daily_requests": {
+      "used": 2,
+      "limit": 1000,
+      "remaining": 998
+    },
+    "rate_limit": {
+      "requests": -1,
+      "interval": "10s",
+      "note": "This field is deprecated and safe to ignore."
+    }
+  }
+}

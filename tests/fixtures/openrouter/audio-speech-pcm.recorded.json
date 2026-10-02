@@ -1,0 +1,20 @@
+{
+  "request": {
+    "model": "fish-audio/s2.1-pro-free:free",
+    "input": "Hello from the toolbox."
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "audio/pcm;rate=44100;channels=1",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-tts-1790981576-ChEwnOoDdKvbLJlNv8Nd",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "body_bytes": 126976,
+    "body_first_bytes_hex": "0a000d0035005200"
+  }
+}

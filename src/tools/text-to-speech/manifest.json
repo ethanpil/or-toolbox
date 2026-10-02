@@ -1,0 +1,15 @@
+{
+  "id": "text-to-speech",
+  "name": "Text-to-speech",
+  "description": "Read text aloud in a chosen voice, stitched into one audio file.",
+  "category": "audio",
+  "icon": "volume-up",
+  "capabilities": ["tts"],
+  "accepts": ["text/plain", "text/markdown"],
+  "produces": ["audio/mpeg", "audio/wav"],
+  "usesJobs": false,
+  "lazyLibs": [],
+  "defaults": {
+    "format": "mp3"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "image-editor",
+  "name": "Image editor",
+  "description": "Paint a mask to change, remove or extend parts of an image.",
+  "category": "images",
+  "icon": "brush",
+  "capabilities": ["image"],
+  "accepts": ["image/png", "image/jpeg", "image/webp"],
+  "produces": ["image/png"],
+  "usesJobs": false,
+  "lazyLibs": [],
+  "defaults": {}
+}

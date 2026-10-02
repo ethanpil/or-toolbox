@@ -1,0 +1,16 @@
+# Build and test output
+dist/
+coverage/
+test-results/
+playwright-report/
+blob-report/
+
+# Generated or third-party
+package-lock.json
+public/icons/
+
+# Prose is not formatted by Prettier (tables in PLAN.md / CLAUDE.md stay hand-aligned)
+*.md
+
+# Recorded / documented API responses are kept byte-for-byte
+tests/fixtures/

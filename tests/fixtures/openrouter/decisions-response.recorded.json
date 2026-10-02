@@ -1,0 +1,41 @@
+{
+  "model": "inception/mercury-decide-20260930",
+  "answers": {
+    "is_bug": {
+      "type": "noul",
+      "noul": 0.9999251537754908
+    },
+    "team": {
+      "type": "choice",
+      "choice": "payments",
+      "probabilities": {
+        "payments": 0.8927065432050946,
+        "frontend": 0.10661859145173662,
+        "account": 0.0006748653431688572
+      },
+      "confidence": 0.8390598148076417
+    },
+    "urgency": {
+      "type": "score",
+      "score": 1.9987874876411762,
+      "legend": {
+        "0": "Can wait for the next release",
+        "1": "Should be fixed this week",
+        "2": "Blocking revenue right now"
+      },
+      "probabilities": {
+        "0": 0.00009018720829220385,
+        "1": 0.0010321379422391713,
+        "2": 0.9988776748494685
+      },
+      "confidence": 0.9981812314617646
+    }
+  },
+  "usage": {
+    "input_tokens": 253,
+    "output_tokens": 6,
+    "cost": 0
+  },
+  "id": "gen-dec-1790981559-GRhKn6gDF9X1SiIrh2AN",
+  "provider": "Inception"
+}

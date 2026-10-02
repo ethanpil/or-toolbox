@@ -1,0 +1,13 @@
+{
+  "id": "image-generation",
+  "name": "Image generation",
+  "description": "Create images from a prompt, with variations and reference images.",
+  "category": "images",
+  "icon": "image",
+  "capabilities": ["image"],
+  "accepts": ["image/png", "image/jpeg", "image/webp"],
+  "produces": ["image/png", "image/jpeg"],
+  "usesJobs": false,
+  "lazyLibs": [],
+  "defaults": {}
+}

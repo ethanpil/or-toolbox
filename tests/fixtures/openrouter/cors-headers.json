@@ -1,0 +1,35 @@
+{
+  "_note": "Recorded 2026-10-02 against https://openrouter.ai from Origin https://ethanpil.github.io. Identical for every endpoint tested (see docs/openrouter-api.md CORS table). set-cookie, date, cf-ray, permissions-policy, referrer-policy and server headers removed.",
+  "preflight_POST_api_alpha_decisions": {
+    "status": 204,
+    "headers": {
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Access-Control-Request-Headers",
+      "Access-Control-Allow-Headers": "Authorization,User-Agent,X-Api-Key,X-CSRF-Token,X-Requested-With,Accept,Accept-Version,Content-Length,Content-MD5,Content-Type,Date,X-Api-Version,HTTP-Referer,X-Windowai-Title,X-Openrouter-Title,X-Title,X-Openrouter-Categories,X-Openrouter-App-Visibility,X-Session-Id,X-Stainless-Lang,X-Stainless-Package-Version,X-Stainless-OS,X-Stainless-Arch,X-Stainless-Runtime,X-Stainless-Runtime-Version,X-Stainless-Retry-Count,X-Stainless-Timeout,X-Stainless-Helper-Method,Protection-Key,Idempotency-Key,traceparent,tracestate,b3",
+      "Access-Control-Allow-Methods": "GET,OPTIONS,PATCH,DELETE,POST,PUT",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "unauthenticated_POST_chat_completions_401": {
+    "status": 401,
+    "headers": {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "GET_models_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=120, stale-while-revalidate=3600, stale-if-error=3600",
+      "Vary": "Host",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Content-Type-Options": "nosniff"
+    }
+  }
+}

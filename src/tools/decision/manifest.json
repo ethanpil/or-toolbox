@@ -1,0 +1,13 @@
+{
+  "id": "decision",
+  "name": "Decision",
+  "description": "Ask yes/no, choice and score questions and get answers with probabilities.",
+  "category": "reasoning",
+  "icon": "signpost-split",
+  "capabilities": ["decisions"],
+  "accepts": ["text/plain"],
+  "produces": ["application/json"],
+  "usesJobs": false,
+  "lazyLibs": [],
+  "defaults": {}
+}

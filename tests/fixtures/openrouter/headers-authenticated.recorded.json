@@ -1,0 +1,101 @@
+{
+  "GET_key_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "private, no-store",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "POST_chat_completions_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-1790981403-wrnRYGs8VBhCEKopNY1F",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "POST_chat_completions_stream_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/event-stream",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-cache",
+      "X-Generation-Id": "gen-1790981416-f0MwbDBlx1LOFOgfDoxv",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "POST_chat_completions_429_upstream_a": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Generation-Id": "gen-1790981483-CfbqS740cQWDBUp3PVIg",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "POST_chat_completions_429_upstream_b": {
+    "status": 429,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Retry-After": "1",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Generation-Id": "gen-1790981588-XEekNwTl6dEafC7ayB9v",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "POST_chat_completions_400_invalid_model": {
+    "status": 400,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Generation-Id": "gen-1790981512-Sdqa9k7eY3nyeqcJDXlc",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "POST_audio_speech_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "audio/mpeg",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-tts-1790981524-maN3oVpk1dbskK9tgd5y",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  },
+  "POST_api_alpha_decisions_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Generation-Id": "gen-dec-1790981559-GRhKn6gDF9X1SiIrh2AN",
+      "X-Provider-Name": "Inception",
+      "Referrer-Policy": "no-referrer, strict-origin-when-cross-origin",
+      "X-Content-Type-Options": "nosniff"
+    }
+  }
+}

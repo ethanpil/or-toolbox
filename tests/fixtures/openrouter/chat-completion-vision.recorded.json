@@ -1,0 +1,54 @@
+{
+  "id": "gen-1790981500-l5h7VODZTF86JTVhf4Of",
+  "object": "chat.completion",
+  "created": 1790981500,
+  "model": "dots-studio/dots-3-note-preview:free",
+  "provider": "AtlasCloud",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "\n\nRed",
+        "refusal": null,
+        "reasoning": "Thinking Process:\n\n1.  **Analyze the Request:** \"What single color fills this image? Answer with one word.\"\n2.  **Examine the image:** The image is a solid, uniform color.\n3.  **Identify the color:**\n    *   Looking at the RGB values of the image (conceptually, based on visual appearance): It is a bright red, specifically pure red or close to `#ff0000` or similar vibrant red.\n    *   Let's check the exact visual color: it looks like a bright, solid red (specifically, standard red, hex `#FF0000` or similar).\n    *   The color name in English is \"red\".\n4.  **Format the output:** \"Answer with one word.\" -> \"Red\" or \"red\".",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "Thinking Process:\n\n1.  **Analyze the Request:** \"What single color fills this image? Answer with one word.\"\n2.  **Examine the image:** The image is a solid, uniform color.\n3.  **Identify the color:**\n    *   Looking at the RGB values of the image (conceptually, based on visual appearance): It is a bright red, specifically pure red or close to `#ff0000` or similar vibrant red.\n    *   Let's check the exact visual color: it looks like a bright, solid red (specifically, standard red, hex `#FF0000` or similar).\n    *   The color name in English is \"red\".\n4.  **Format the output:** \"Answer with one word.\" -> \"Red\" or \"red\".",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 31,
+    "completion_tokens": 174,
+    "total_tokens": 205,
+    "cost": 0,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0,
+      "upstream_inference_completions_cost": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 159,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

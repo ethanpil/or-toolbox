@@ -1,0 +1,8 @@
+{
+  "status": 200,
+  "headers": {
+    "Content-Type": "audio/mpeg",
+    "X-Generation-Id": "gen-1748372406-SpEeCh000000000001"
+  },
+  "body": "<raw mp3 bytes; not JSON>"
+}

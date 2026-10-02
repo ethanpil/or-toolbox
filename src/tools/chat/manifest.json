@@ -1,0 +1,20 @@
+{
+  "id": "chat",
+  "name": "Chat",
+  "description": "Chat with any model, attach files and images, branch and switch models mid-chat.",
+  "category": "documents",
+  "icon": "chat-dots",
+  "capabilities": ["text", "vision"],
+  "accepts": [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "application/pdf",
+    "text/plain",
+    "text/markdown"
+  ],
+  "produces": ["text/markdown"],
+  "usesJobs": false,
+  "lazyLibs": ["marked", "dompurify"],
+  "defaults": {}
+}

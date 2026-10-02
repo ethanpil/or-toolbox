@@ -1,0 +1,93 @@
+# ORtoolbox — developer and agent guide
+
+Browser-only toolbox of 14 AI tools on top of OpenRouter. No server, no accounts. The product spec is [PLAN.md](PLAN.md); the OpenRouter API facts we code against are in [docs/openrouter-api.md](docs/openrouter-api.md). Read both before changing behaviour. This file records the architecture rules and the non-obvious decisions.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `npm run dev` | Vite dev server on :5273 under `/or-toolbox/` (no service worker, no CSP meta) |
+| `npm run build` | Typecheck + production build to `dist/` (also emits `sw.js` and copies the ffmpeg cores) |
+| `npm run preview` | Serve `dist/` on :4273 (service worker and CSP active) |
+| `npm run check` | Typecheck + lint + unit tests — run before reporting any work done |
+| `npm run typecheck` / `lint` / `format` | `tsc` on the three projects / ESLint + Prettier check / Prettier write |
+| `npm run test` | Vitest unit tests |
+| `npm run e2e:dev -- <spec>` | Playwright against the dev server (reuses a running one) — use this while developing |
+| `npm run e2e` | Build, then Playwright against `preview` — the gate run; do not run it while other agents are working (it rewrites `dist/`) |
+| `npm run icons` | Regenerate `public/icons/*.png` and `favicon.ico` from `public/icons/logo.svg` (outputs are committed) |
+
+## Layout
+
+```
+index.html, settings/, models/, history/, stats/, privacy/, diagnostics/,  platform pages (tiny HTML entry each:
+auth/callback/                                                             <title>, <div id="app">, one module script)
+tools/<id>/index.html                                                     one page per tool
+src/core/        api, settings, keys, models, budgets, history, prompts, jobs, stats, media, backup, bus
+                 (today: boot.ts, paths.ts, sw-register.ts, media/ffmpeg.ts)
+src/ui/          dom helpers, shell (navbar, theme, palette, toasts, modals), shared components, tool-page
+                 (today: dom.ts, markdown.ts, stub.ts — the Stage 0 placeholder frame, delete in Stage 2)
+src/tools/<id>/  manifest.json + main.ts (+ tool-local modules and tests); registry.ts + types.ts beside them
+src/pages/       code for the platform pages
+src/styles/      main.scss (Bootstrap + Bootstrap Icons + the few variable overrides in _variables.scss)
+src/sw/          the single service worker (sw.ts) and its message protocol with pages (protocol.ts)
+public/          theme-init.js, manifest.webmanifest, icons/, .nojekyll — copied to dist/ as-is
+vite-plugins/    page discovery, shared <head> + CSP, ffmpeg core copying, service worker build, ports/base
+scripts/         one-off generators (icons)
+tests/e2e/       Playwright specs (sw/ = service-worker specs)   tests/mock/  mocked OpenRouter   tests/fixtures/  recorded/documented responses
+```
+
+Adding a page = adding a folder with an `index.html`; the build, dev server and route tests all discover it (`vite-plugins/pages.ts`). The shared `<head>` (charset, CSP, viewport, theme colour, manifest, icons, `theme-init.js`, the stylesheet) is injected by `vite-plugins/html-head.ts`; HTML entries must not repeat it.
+
+TypeScript is three projects behind a solution-style `tsconfig.json`: `tsconfig.app.json` (src/, DOM), `tsconfig.sw.json` (src/sw/, WebWorker), `tsconfig.node.json` (configs, vite-plugins/, tests/e2e, tests/mock; imports use `.ts` extensions).
+
+Tool ids (also the URL segment): `chat`, `ocr`, `data-extractor`, `table-extractor`, `speech-to-text`, `text-to-speech`, `music-generation`, `image-generation`, `image-editor`, `isolated-image`, `video-studio`, `decision`, `bot-to-bot`, `model-arena`.
+
+Capabilities (keys for default models): `text`, `vision`, `image`, `tts`, `stt`, `video`, `music`, `decisions`.
+
+## Architecture rules
+
+1. **Pages never call OpenRouter or storage directly.** Tools and pages go through `src/core`. Only `src/core/api` may `fetch` openrouter.ai; only `src/core` may touch `localStorage`, `sessionStorage` or IndexedDB. This is what keeps keys, budgets, cost tracking and history consistent.
+2. **Every model call belongs to a run.** A tool starts a run through the context (`ctx.runs`), which applies free-only mode and budgets before the request, captures usage/cost from every response, writes text-only history and feeds stats. Never call the API outside a run except for catalog/key/status reads.
+3. **History is text only.** Images, audio, video and uploaded files stay in memory and are registered with the leave-page guard until downloaded. Never write binaries to IndexedDB or localStorage.
+4. **Tool contract.** `src/tools/<id>/manifest.json` describes the tool; the shape is `ToolManifest` in `src/tools/types.ts` (PLAN.md's example plus a one-line `description`, minus `entry`, which the folder convention makes redundant; `capabilities` use the list above). `src/tools/registry.ts` collects and validates the manifests. `main.ts` calls `mountTool(manifest, mount)` and receives one context object (Stage 0 stubs call `renderToolStub()` instead). Tools use the shared components (drop zone, model picker, key chip, cost estimate, prompts panel, output panel, players, exporters) instead of rebuilding them. A tool folder may not import from another tool folder; shared code moves to `src/core` or `src/ui`.
+5. **Three-zone tool layout:** input left, output right, settings in an offcanvas drawer; advanced options in an accordion. Stacks on narrow screens.
+6. **Plain Bootstrap 5.3.** Stock components and Bootstrap Icons. Customisation is limited to the Sass variables in `src/styles/_variables.scss`. No UI framework, no CSS-in-JS, no custom component library. Small utility CSS for things Bootstrap lacks is fine.
+7. **No third-party origin at runtime.** Everything is bundled and self-hosted. The only network destinations are the static host and `https://openrouter.ai`.
+8. **Heavy libraries are lazy.** pdf.js, ffmpeg.wasm, docx/xlsx writers, the chart library and the markdown renderer load with dynamic `import()` only when used. Budgets: shell ≤ 150 KB gzipped JS, each tool ≤ 80 KB more.
+
+## Conventions
+
+- TypeScript strict; ES modules; no `any` without a comment explaining why.
+- Build DOM with the `h()` helper in `src/ui/dom.ts`. Never put model output, file names or any other untrusted string into `innerHTML`. Markdown from models goes through `renderMarkdown()` (marked + DOMPurify).
+- No inline scripts or inline event-handler attributes (CSP is `script-src 'self'`). No inline `style=""` attributes in HTML strings; set styles through CSSOM or classes.
+- Internal links and asset URLs go through `url()` in `src/core/paths.ts`, because the site is served from `/or-toolbox/` on GitHub Pages.
+- API keys are never logged, never placed in URLs, never written to history, and are masked in the UI (`sk-or-…a1b2`).
+- Accessibility is part of done: labelled controls, keyboard reachable, visible focus, `aria-live` for streaming/status, contrast checked in light and dark.
+- Motion is 150–250 ms, transform/opacity only, and off under `prefers-reduced-motion` or the Reduced motion setting.
+- Unit tests live next to the code as `*.test.ts` (Vitest, jsdom; tests needing IndexedDB `import 'fake-indexeddb/auto'`). E2E specs live in `tests/e2e/`, import `test`/`expect` from `tests/mock/index.ts` (never from `@playwright/test` directly) and only talk to the mocked OpenRouter; no test may reach the real API. Use `watchForProblems()` from `tests/e2e/support.ts` to assert a page has no console errors, failed requests or CSP violations.
+- ESLint enforces two of these rules: no `innerHTML`/`outerHTML`/`insertAdjacentHTML`, and no `localStorage`/`sessionStorage`/`indexedDB` outside `src/core`.
+- Dependencies: assume your knowledge of every library is outdated. Check the installed version's docs or types before using an API. Do not add a dependency if one already in `package.json` does the job.
+- Changelog: `CHANGELOG.md` in Keep a Changelog format, short entries, with the commit hash when known.
+
+## Non-obvious decisions
+
+- **Service worker = offline shell + cross-origin isolation.** GitHub Pages cannot send headers, so the one service worker (`src/sw/sw.ts`) adds COOP `same-origin`, COEP and CORP `same-origin` to every same-origin response it serves (needed for multi-threaded ffmpeg.wasm). It never calls `respondWith` for cross-origin requests: OpenRouter calls go straight from the page. Code checks `crossOriginIsolated` to choose the ffmpeg core; the single-threaded core is the fallback.
+  - **COEP mode:** `credentialless` first. WebKit ignores it, so `sw-register.ts` asks the worker to switch to `require-corp`; the choice is persisted in the `ortoolbox-meta` cache (the worker is killed when idle, so memory is not enough). First visit therefore reloads once in Chromium/Firefox and twice in WebKit, once per profile.
+  - **Reload guard:** at most 2 automatic reloads per tab (sessionStorage `ortoolbox:sw-reloads`, cleared once isolated); no reload if sessionStorage is unusable or the user has already clicked/typed (the next page they open is isolated anyway).
+  - **Updates:** a new worker `skipWaiting()`s and claims open pages without reloading them; the next page load gets the new shell. Activation keeps the previous build's precache so pages opened before the update can still load their lazy chunks.
+  - **Caches:** all names start with `ortoolbox-` because every project site on `ethanpil.github.io` shares one origin and one CacheStorage. `precache-<build hash>` = the shell (HTML/JS/CSS/woff2/icons from the build output list, see `vite-plugins/service-worker.ts`); `vendor-<hash>` = ffmpeg cores, cached on first request only. Offline navigations to unknown URLs fall back to Home.
+- **Shared origin.** For the same reason, localStorage, IndexedDB and sessionStorage are readable by any other page under `https://ethanpil.github.io/`. Keys at rest there are only as safe as every other project site on that origin; a custom domain removes the risk.
+- **ffmpeg loading (`src/core/media/ffmpeg.ts`).** `@ffmpeg/ffmpeg` always starts a *module* worker, so we ship the cores' ESM builds, self-hosted under `vendor/ffmpeg/core[-mt]-<version>/` (copied from node_modules by `vite-plugins/ffmpeg-assets.ts`, served by middleware in dev; versioned URLs are immutable). The page downloads the wasm itself (progress against the size recorded at build time, because Content-Length is the gzipped size on Pages) and hands it over as a `blob:` URL; core JS and workers load from same-origin URLs, so no `blob:` worker or script is needed. `optimizeDeps.exclude: ['@ffmpeg/ffmpeg']` is required for its worker URL to survive the dev server.
+- **CSP** (`vite-plugins/csp.ts`, the single source, with a reason per directive): `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://openrouter.ai blob: data:; img-src 'self' blob: data: https:; media-src 'self' blob: data: https:; style-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'self'`. Tighter than PLAN.md: no `blob:` workers, no frames, no form posts to OpenRouter (sign-in is a navigation). `'wasm-unsafe-eval'` is measured as *not* needed by ffmpeg in Chromium/WebKit (wasm compiles inside network-loaded workers, which do not inherit a meta CSP) but is kept for Firefox (unverified) and main-thread wasm (pdf.js fallbacks); it allows wasm compilation, not JS eval. No `'unsafe-inline'` for styles: Bootstrap/Popper set styles through the CSSOM, which CSP does not restrict. `build.assetsInlineLimit: 0` stops Vite inlining fonts as `data:` URLs (would violate `font-src`).
+- **CSP is a meta tag injected at build time only** (the dev server needs inline styles for HMR). Anything that only breaks under CSP shows up in `npm run e2e`, not in `e2e:dev`.
+- **Theme before first paint:** `public/theme-init.js`, a classic render-blocking script (inline scripts are forbidden), reads `appearance.theme` (`light`/`dark`/`system`) from localStorage `ortoolbox:settings` and sets `data-bs-theme`. It is the one sanctioned storage read outside `src/core`; keep its contract in sync with the settings schema. The View Transitions opt-in is CSS (`@view-transition` in main.scss), not a meta tag.
+- **Sass:** Bootstrap and Bootstrap Icons are loaded with `@use … with (…)`, not `@import`, so our own code has no deprecation warnings; `quietDeps` hides the ones inside Bootstrap (import, global-builtin, color-functions, if-function). The icon font URL is overridden in main.scss because the package builds it from variables, which Vite cannot resolve.
+- **TypeScript 7 + typescript-eslint.** TS 7 has no JS compiler API, which typescript-eslint needs, so `package.json` maps `typescript` → `@typescript/typescript6` (API for ESLint, binary `tsc6`) and `@typescript/native` → `typescript@7` (binary `tsc`, used by `npm run typecheck`). Do not "fix" this until typescript-eslint supports TS 7.
+- **Remote media is fetched, not hot-linked.** Under COEP `require-corp` (Safari), cross-origin `<img>`/`<video>` without CORS are blocked. Load remote results with `fetch` → Blob → object URL. Note that `connect-src` currently allows only openrouter.ai: if results live on provider CDNs, the CSP must grow (decide in Stage 4–6).
+- **OpenRouter CORS** (checked 2026-10-02): `Access-Control-Expose-Headers` is only `X-Generation-Id,X-Provider-Name,request-id,cf-ray`, so browser code cannot read `Retry-After`; back off without it. The mock reproduces these headers.
+- **E2E runs with service workers blocked by default**; only the `sw-*` Playwright projects allow them and run `tests/e2e/sw/` only. The app must work fully without the worker.
+  - In WebKit, requests from a page controlled by a service worker bypass Playwright's `context.route`, so they would reach the real network. Specs in `tests/e2e/sw/` must not call OpenRouter. As a backstop, every project sends non-localhost traffic to a dead proxy.
+  - Playwright's `setOffline()` in WebKit also fails requests the worker would answer from cache; offline specs use `serveBuild()` (a private static server they shut down) instead.
+  - Playwright's Firefox build does not start on some Windows 10 machines ("side-by-side configuration is incorrect", `mozglue`); `playwright.config.ts` then leaves the Firefox projects out with a warning. CI never skips. Firefox has not been verified locally for isolation or multi-threaded ffmpeg.
+  - The mock serves SSE bodies in one piece (`route.fulfill` cannot stream), so event parsing is tested but pacing is not.
+- **Fixtures named `*.documented.json` were written from the docs, not recorded**, because development had no API key. Replace them with recordings when a key is available.

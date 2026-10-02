@@ -1,0 +1,10 @@
+{
+  "lines": [
+    "data: {\"type\":\"image_generation.partial_image\",\"partial_image_index\":0,\"b64_json\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\"}",
+    "",
+    "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\",\"media_type\":\"image/png\",\"created\":1748372400,\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":272,\"total_tokens\":288,\"cost\":0.011}}",
+    "",
+    "data: [DONE]",
+    ""
+  ]
+}

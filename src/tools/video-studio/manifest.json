@@ -1,0 +1,20 @@
+{
+  "id": "video-studio",
+  "name": "Video studio",
+  "description": "Generate, continue and extend video clips, then join them into one MP4.",
+  "category": "video",
+  "icon": "film",
+  "capabilities": ["video"],
+  "accepts": [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "video/mp4",
+    "video/quicktime",
+    "video/webm"
+  ],
+  "produces": ["video/mp4", "image/png"],
+  "usesJobs": true,
+  "lazyLibs": ["@ffmpeg/ffmpeg"],
+  "defaults": {}
+}

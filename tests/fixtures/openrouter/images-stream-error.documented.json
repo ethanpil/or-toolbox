@@ -1,0 +1,8 @@
+{
+  "lines": [
+    "data: {\"type\":\"error\",\"error\":{\"message\":\"Generation failed\",\"code\":\"server_error\"}}",
+    "",
+    "data: [DONE]",
+    ""
+  ]
+}

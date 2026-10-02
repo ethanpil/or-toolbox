@@ -1,0 +1,16 @@
+{
+  "lines": [
+    ": OPENROUTER PROCESSING",
+    "",
+    "data: {\"id\":\"gen-1748372405-AuDiO0000000000001\",\"object\":\"chat.completion.chunk\",\"created\":1748372405,\"model\":\"openai/gpt-audio\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"data\":\"UklGRiQAAABXQVZF\",\"transcript\":\"Hello\"}},\"finish_reason\":null}]}",
+    "",
+    "data: {\"id\":\"gen-1748372405-AuDiO0000000000001\",\"object\":\"chat.completion.chunk\",\"created\":1748372405,\"model\":\"openai/gpt-audio\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"data\":\"Zm10IBAAAAABAAEA\",\"transcript\":\" there\"}},\"finish_reason\":null}]}",
+    "",
+    "data: {\"id\":\"gen-1748372405-AuDiO0000000000001\",\"object\":\"chat.completion.chunk\",\"created\":1748372405,\"model\":\"openai/gpt-audio\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"data\":\"QB8AAIA+AAACABAA\"}},\"finish_reason\":null}]}",
+    "",
+    "data: {\"id\":\"gen-1748372405-AuDiO0000000000001\",\"object\":\"chat.completion.chunk\",\"created\":1748372405,\"model\":\"openai/gpt-audio\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":60,\"total_tokens\":74,\"cost\":0.00025,\"completion_tokens_details\":{\"audio_tokens\":50}}}",
+    "",
+    "data: [DONE]",
+    ""
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "ocr",
+  "name": "OCR",
+  "description": "Turn images and PDFs into text, including handwriting and math.",
+  "category": "documents",
+  "icon": "file-earmark-text",
+  "capabilities": ["vision"],
+  "accepts": ["image/png", "image/jpeg", "image/webp", "application/pdf"],
+  "produces": [
+    "text/markdown",
+    "text/plain",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  ],
+  "usesJobs": false,
+  "lazyLibs": ["pdfjs-dist", "docx"],
+  "defaults": {
+    "mode": "standard"
+  }
+}

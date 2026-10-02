@@ -1,0 +1,13 @@
+{
+  // Browser code: everything under src/ except the service worker, which runs
+  // in a different global scope and has its own project (tsconfig.sw.json).
+  // src/sw/protocol.ts is still checked here, through the import in
+  // src/core/sw-register.ts.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.json"],
+  "exclude": ["src/sw/**"]
+}

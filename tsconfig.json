@@ -1,0 +1,10 @@
+{
+  // Solution file: no code of its own. It tells editors and ESLint which
+  // project a file belongs to. `npm run typecheck` checks each project in turn.
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.sw.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}

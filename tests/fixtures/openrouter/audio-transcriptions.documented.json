@@ -1,0 +1,10 @@
+{
+  "text": "Hello, this is a test of speech-to-text transcription.",
+  "usage": {
+    "seconds": 9.2,
+    "total_tokens": 113,
+    "input_tokens": 83,
+    "output_tokens": 30,
+    "cost": 0.000508
+  }
+}

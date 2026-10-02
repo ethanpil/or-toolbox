@@ -1,0 +1,7 @@
+{
+  "success": false,
+  "error": {
+    "name": "ZodError",
+    "message": "[\n  {\n    \"code\": \"custom\",\n    \"message\": \"Invalid output_modalities value: \\\"file\\\". Valid values are: text, image, embeddings, audio, video, rerank, decisions, speech, transcription, all\",\n    \"path\": [\n      \"output_modalities\"\n    ]\n  }\n]"
+  }
+}

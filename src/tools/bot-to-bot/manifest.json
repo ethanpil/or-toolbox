@@ -1,0 +1,18 @@
+{
+  "id": "bot-to-bot",
+  "name": "Bot-to-bot chat",
+  "description": "Let two models talk to each other while you moderate, with hard limits.",
+  "category": "reasoning",
+  "icon": "robot",
+  "capabilities": ["text"],
+  "accepts": [],
+  "produces": ["text/markdown", "application/json"],
+  "usesJobs": false,
+  "lazyLibs": ["marked", "dompurify"],
+  "defaults": {
+    "turnLimit": 20,
+    "timeLimitMinutes": 5,
+    "costCapUsd": 0.25,
+    "stopPhrase": "[END]"
+  }
+}

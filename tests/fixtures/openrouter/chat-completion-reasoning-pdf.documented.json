@@ -1,0 +1,52 @@
+{
+  "id": "gen-1748372402-PdFrEaSoNiNg00000001",
+  "object": "chat.completion",
+  "created": 1748372402,
+  "model": "google/gemma-3-27b-it",
+  "provider": "DeepInfra",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "The document describes a peer-to-peer electronic cash system.",
+        "reasoning": "The user asks for the main points; the parsed PDF text describes a peer-to-peer payment system...",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "The user asks for the main points; the parsed PDF text describes a peer-to-peer payment system...",
+            "signature": null,
+            "id": "reasoning-text-1",
+            "format": "unknown",
+            "index": 0
+          }
+        ],
+        "annotations": [
+          {
+            "type": "file",
+            "file": {
+              "hash": "3f2a9c1e7b5d4a60",
+              "name": "document.pdf",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Bitcoin: A Peer-to-Peer Electronic Cash System ..."
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 100,
+    "total_tokens": 1100,
+    "cost": 0.0004,
+    "completion_tokens_details": {
+      "reasoning_tokens": 40
+    }
+  }
+}

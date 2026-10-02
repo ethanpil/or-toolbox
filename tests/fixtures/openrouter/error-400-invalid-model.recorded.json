@@ -1,0 +1,7 @@
+{
+  "error": {
+    "message": "nonexistent/not-a-model:free is not a valid model ID",
+    "code": 400
+  },
+  "user_id": "user_REDACTED"
+}

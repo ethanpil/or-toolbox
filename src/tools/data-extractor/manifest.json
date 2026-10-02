@@ -1,0 +1,19 @@
+{
+  "id": "data-extractor",
+  "name": "Data extractor",
+  "description": "Pull structured fields out of invoices, receipts and other documents in bulk.",
+  "category": "documents",
+  "icon": "braces",
+  "capabilities": ["vision"],
+  "accepts": ["image/png", "image/jpeg", "image/webp", "application/pdf"],
+  "produces": [
+    "application/json",
+    "text/csv",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  ],
+  "usesJobs": false,
+  "lazyLibs": ["pdfjs-dist", "write-excel-file"],
+  "defaults": {
+    "preset": "invoice"
+  }
+}

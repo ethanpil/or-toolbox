@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check, build, e2e (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - run: npm ci
+
+      # Typecheck + lint + unit tests.
+      - run: npm run check
+
+      - run: npm run build
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      # The default suite (service workers blocked) and the service-worker
+      # suite (isolation, offline shell, multi-threaded ffmpeg) on Chromium,
+      # against `vite preview` of the build above.
+      - name: E2E (Chromium)
+        run: npx playwright test --project=chromium --project=sw-chromium
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7

@@ -1,0 +1,19 @@
+{
+  "id": "isolated-image",
+  "name": "Isolated image",
+  "description": "Put product photos on a pure white square, checked and ready for a shop.",
+  "category": "images",
+  "icon": "bounding-box",
+  "capabilities": ["image"],
+  "accepts": ["image/png", "image/jpeg", "image/webp"],
+  "produces": ["image/jpeg", "image/png", "application/zip"],
+  "usesJobs": false,
+  "lazyLibs": ["fflate"],
+  "defaults": {
+    "size": 2000,
+    "margin": 0.08,
+    "whiteThreshold": 245,
+    "format": "jpg",
+    "jpegQuality": 92
+  }
+}

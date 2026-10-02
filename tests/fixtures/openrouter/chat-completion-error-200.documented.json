@@ -1,0 +1,10 @@
+{
+  "id": "gen-1748372404-ErRoR000000000000001",
+  "error": {
+    "code": 502,
+    "message": "Provider disconnected mid-stream",
+    "metadata": {
+      "error_type": "provider_unavailable"
+    }
+  }
+}

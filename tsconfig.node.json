@@ -1,0 +1,14 @@
+{
+  // Node-side code: build config, Vite plugins, Playwright config, e2e specs
+  // and the OpenRouter mock. DOM lib is included because Playwright specs pass
+  // callbacks that run in the page (page.evaluate).
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    // Node-side files import each other with the .ts extension, which is what
+    // Node itself and Vite's native config loader expect.
+    "allowImportingTsExtensions": true
+  },
+  "include": ["*.config.ts", "vite-plugins/**/*.ts", "tests/e2e/**/*.ts", "tests/mock/**/*.ts"]
+}
