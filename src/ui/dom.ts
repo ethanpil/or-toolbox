@@ -268,6 +268,19 @@ export function focusKey(root: ParentNode, key: string): boolean {
  * ids. Removal hooks run for the dropped children (Bootstrap instances are disposed).
  */
 export function replace(el: Element, ...children: Child[]): void {
+  replaceWith(el, children);
+}
+
+export interface ReplaceOptions {
+  /**
+   * Where focus goes when the focused control's successor is gone or disabled (gets its `data-focus-key`).
+   * Return null or undefined for the default: the nearest keyed control, then the first focusable element.
+   */
+  fallback?: (lostKey: string) => HTMLElement | null | undefined;
+}
+
+/** `replace()` with options: a page that knows a better landing place (a section heading) passes `fallback`. */
+export function replaceWith(el: Element, children: Child, options: ReplaceOptions = {}): void {
   const key = focusedKey(el);
   const oldKeys =
     key === null
@@ -277,9 +290,14 @@ export function replace(el: Element, ...children: Child[]): void {
     for (const child of el.children) for (const hook of removalHooks) hook(child);
   }
   el.replaceChildren();
-  appendChildren(el, children);
+  appendChildren(el, [children]);
   if (key === null) return;
   if (focusKey(el, key)) return;
+  const chosen = options.fallback?.(key);
+  if (chosen && canFocus(chosen)) {
+    chosen.focus();
+    if (document.activeElement === chosen) return;
+  }
 
   // The same control is gone or disabled: the nearest one that is left, following ones first.
   const at = oldKeys.indexOf(key);

@@ -9,6 +9,7 @@ import {
   on,
   onReplaceRemove,
   replace,
+  replaceWith,
   type Props,
 } from './dom';
 
@@ -295,6 +296,31 @@ describe('replace', () => {
     expect(document.activeElement?.getAttribute('data-focus-key')).toBe('b');
     replace(el, h('p', null, 'Empty'), h('a', { href: '#x' }, 'Add one')); // no keys: the first focusable
     expect(document.activeElement?.textContent).toBe('Add one');
+    el.remove();
+  });
+
+  it('lets the caller choose where focus goes when the successor is gone', () => {
+    const heading = h('h2', { tabIndex: -1 }, 'Keys');
+    const el = h('div', null, [
+      h('button', { type: 'button', 'data-focus-key': 'key:a:remove' }, 'Remove A'),
+      h('button', { type: 'button', 'data-focus-key': 'key:b:remove' }, 'Remove B'),
+    ]);
+    document.body.append(heading, el);
+    (el.firstElementChild as HTMLElement).focus();
+    const lost: string[] = [];
+    replaceWith(
+      el,
+      [h('button', { type: 'button', 'data-focus-key': 'key:b:remove' }, 'Remove B')],
+      {
+        fallback: (key) => {
+          lost.push(key);
+          return heading;
+        },
+      },
+    );
+    expect(lost).toEqual(['key:a:remove']);
+    expect(document.activeElement).toBe(heading);
+    heading.remove();
     el.remove();
   });
 
