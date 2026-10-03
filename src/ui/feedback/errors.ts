@@ -98,7 +98,6 @@ export async function presentError(
         title: 'Blocked by your budget',
         message: userMessage(error),
         action: { label: 'Budgets', href: settingsUrl('budgets') },
-        timeoutMs: 12_000,
         testId: 'error-toast',
       });
       return;
@@ -127,7 +126,6 @@ export async function presentError(
         title: 'Browser storage is full',
         message: userMessage(error),
         action: { label: 'Free up space', href: settingsUrl('data') },
-        timeoutMs: 12_000,
         testId: 'error-toast',
       });
       return;

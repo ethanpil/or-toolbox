@@ -146,6 +146,18 @@ export function openModal(options: ModalOptions): ModalHandle {
   let hideRequested = false;
   let dropped = false;
 
+  // Bootstrap also ignores its own dismissals (a data-bs-dismiss button, Escape, the backdrop) while the dialog
+  // is still opening; remember them so the dialog closes once shown instead of staying open.
+  element.addEventListener('click', (event) => {
+    if (shown) return;
+    const target = event.target instanceof Element ? event.target : null;
+    const onBackdrop = target === element && !options.staticBackdrop;
+    if (onBackdrop || target?.closest('[data-bs-dismiss="modal"]')) hideRequested = true;
+  });
+  element.addEventListener('keydown', (event) => {
+    if (!shown && event.key === 'Escape' && options.keyboard !== false) hideRequested = true;
+  });
+
   const start = (): void => {
     current = { closed };
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;

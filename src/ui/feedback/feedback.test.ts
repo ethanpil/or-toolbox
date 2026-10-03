@@ -130,6 +130,18 @@ describe('openModal queue', () => {
     modal.hide();
     await modal.closed;
   });
+  it('honours Cancel or Escape pressed while the dialog is still opening', async () => {
+    const cancelled = confirmDialog({ title: 'Delete?', message: 'Sure?' });
+    $('dialog-cancel')!.click(); // Bootstrap ignores hide() during the show transition
+    await expect(cancelled).resolves.toBe(false);
+
+    const escaped = confirmDialog({ title: 'Delete?', message: 'Sure?' });
+    $('confirm-dialog')!.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+    );
+    await expect(escaped).resolves.toBe(false);
+    expect(modalOpen()).toBe(false);
+  });
 });
 
 describe('setFieldError', () => {
