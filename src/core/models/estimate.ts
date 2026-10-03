@@ -1,0 +1,213 @@
+/**
+ * Pre-run cost estimates in USD. Pure functions over catalog data; null when the price cannot be derived.
+ * Units differ per model family and are not machine-readable (docs/openrouter-api.md §4.3, §5.4, §7.5), so the
+ * heuristics below err on the high side. The real cost always arrives later as `usage.cost`.
+ */
+
+import type { RawModelEndpoint, RawVideoModel } from '../api/types';
+import type { ModelInfo } from '../types';
+import { priceNumber } from './normalize';
+
+/** Gemini TTS produced 63 audio tokens for 20 characters; rounded up. */
+const AUDIO_TOKENS_PER_CHARACTER = 3.5;
+/** Slow speech (real speech is ~15 characters/s), so per-second TTS prices are not underestimated. */
+const SPEECH_CHARACTERS_PER_SECOND = 10;
+/** A TTS completion price at or above this is per second of output (Seed Audio $0.0025/s), not per token. */
+const PER_SECOND_COMPLETION_THRESHOLD = 0.0005;
+/** Token-priced STT: Gemini bills 32 audio tokens per second; transcript tokens are a few per second. */
+const STT_AUDIO_TOKENS_PER_SECOND = 32;
+const STT_TEXT_TOKENS_PER_SECOND = 5;
+/** An STT prompt price at or above this is per hour (MAI-Transcribe 0.1 and 0.36), billed in whole seconds. */
+const PER_HOUR_THRESHOLD = 0.01;
+/** One image token covers 16x16 pixels (1024x1024 = 4096 tokens), and per-image models bill a flat 4175. */
+const PIXELS_PER_IMAGE_TOKEN = 256;
+const MIN_IMAGE_TOKENS = 4175;
+/** Tokens counted for one 1024x1024 reference image. */
+const REFERENCE_IMAGE_TOKENS = 4096;
+/** An input-image price at or above this is per image; below it is per token. */
+const PER_IMAGE_THRESHOLD = 0.0005;
+/** Seedance-style video tokens: width x height x seconds x 24 / 1024 (§7.3). */
+const VIDEO_TOKEN_FRAMES = 24;
+
+/** Flat prices for music models whose catalog price is "0" and whose description does not parse. */
+const MUSIC_FLAT_PRICES: Readonly<Record<string, number>> = {
+  'google/lyria-3-clip-preview': 0.04,
+  'google/lyria-3-pro-preview': 0.08,
+};
+
+function price(raw: Record<string, unknown>, key: string): number {
+  return priceNumber(raw[key]) ?? 0;
+}
+
+export function estimateTokens(
+  model: ModelInfo,
+  promptTokens: number,
+  completionTokens: number,
+): number | null {
+  const { prompt, completion } = model.pricing;
+  if (prompt === null || completion === null) return null;
+  return promptTokens * prompt + completionTokens * completion;
+}
+
+export function estimateDecision(model: ModelInfo, inputTokens: number): number | null {
+  // Billing is input tokens only (§8.2).
+  return model.pricing.prompt === null ? null : inputTokens * model.pricing.prompt;
+}
+
+/**
+ * TTS: the catalog shows only the cheapest endpoint and routing is not controllable, so the most expensive
+ * endpoint is used (§0). `prompt` is per character (per UTF-8 byte for Fish, per token for Gemini: both
+ * overestimate safely); `completion` is per audio token, or per second of output when large.
+ */
+export function estimateSpeech(
+  characters: number,
+  endpoints: RawModelEndpoint[],
+  catalogPricing: Record<string, unknown>,
+): number | null {
+  const sources = endpoints.length > 0 ? endpoints.map((e) => e.pricing ?? {}) : [catalogPricing];
+  const prompt = Math.max(...sources.map((p) => price(p, 'prompt')));
+  const completion = Math.max(...sources.map((p) => price(p, 'completion')));
+  if (!sources.some((p) => priceNumber(p['prompt']) !== null)) return null;
+  const output =
+    completion >= PER_SECOND_COMPLETION_THRESHOLD
+      ? completion * (characters / SPEECH_CHARACTERS_PER_SECOND)
+      : completion * characters * AUDIO_TOKENS_PER_CHARACTER;
+  return characters * prompt + output;
+}
+
+export function estimateTranscription(
+  seconds: number,
+  pricing: Record<string, unknown>,
+): number | null {
+  const prompt = priceNumber(pricing['prompt']);
+  if (prompt === null) return null;
+  const completion = price(pricing, 'completion');
+  if (completion > 0) {
+    return (
+      seconds * STT_AUDIO_TOKENS_PER_SECOND * prompt +
+      seconds * STT_TEXT_TOKENS_PER_SECOND * completion
+    );
+  }
+  const billed = Math.ceil(seconds);
+  return prompt >= PER_HOUR_THRESHOLD ? (billed / 3600) * prompt : billed * prompt;
+}
+
+/**
+ * Images: `image_output` is USD per output image token. Per-megapixel models bill width x height / 256 tokens,
+ * per-image models a flat 4175 (so 1 MP is the floor). References add the input-image price.
+ */
+export function estimateImage(
+  model: ModelInfo,
+  input: { images: number; width?: number; height?: number; references?: number },
+): number | null {
+  const raw = model.pricing.raw;
+  const perToken = priceNumber(raw['image_output']) ?? priceNumber(raw['image_token']);
+  if (perToken === null) return null;
+  const pixels = input.width && input.height ? input.width * input.height : 0;
+  const tokens = Math.max(MIN_IMAGE_TOKENS, Math.ceil(pixels / PIXELS_PER_IMAGE_TOKEN));
+  let total = input.images * tokens * perToken;
+  const references = input.references ?? 0;
+  if (references > 0) {
+    const imagePrice = price(raw, 'image');
+    const perReference =
+      (imagePrice >= PER_IMAGE_THRESHOLD ? imagePrice : imagePrice * REFERENCE_IMAGE_TOKENS) +
+      (model.pricing.prompt ?? 0) * REFERENCE_IMAGE_TOKENS;
+    total += references * perReference;
+  }
+  return total;
+}
+
+/** Flat per-song price: from the description ("$0.08 per song"), else the known table. */
+export function estimateMusic(model: Pick<ModelInfo, 'id' | 'description'>): number | null {
+  const match = /\$\s?(\d+(?:\.\d+)?)\s*(?:per|\/)\s*(?:song|clip)/i.exec(model.description);
+  if (match?.[1]) return Number(match[1]);
+  return MUSIC_FLAT_PRICES[model.id] ?? null;
+}
+
+// --- video ----------------------------------------------------------------------------------------
+
+type VideoUnit = 'usd-per-second' | 'cents-per-second' | 'usd-per-token' | 'min-cents';
+
+interface VideoSku {
+  unit: VideoUnit;
+  value: number;
+  resolution: string | null;
+  audio: 'with' | 'without' | null;
+}
+
+/** Interprets one `pricing_skus` key; null for SKUs that do not apply to plain generation. */
+function parseSku(key: string, rawValue: string): VideoSku | null {
+  const value = priceNumber(rawValue);
+  if (value === null) return null;
+  const k = key.toLowerCase();
+  // Reference, continuation and video-input surcharges, and per-image input prices, are out of scope.
+  if (/reference|continuation|with_video_input|image_input|megapixel/.test(k)) return null;
+  let unit: VideoUnit;
+  if (k === 'minimum_cents_per_generation') unit = 'min-cents';
+  else if (k.startsWith('cents_per_') && k.includes('second')) unit = 'cents-per-second';
+  else if (k.startsWith('video_tokens')) unit = 'usd-per-token';
+  else if (k.includes('duration_seconds')) unit = 'usd-per-second';
+  else return null;
+  const resolution = /(?:^|_)(\d{3,4}p|\dk)(?=_|$)/.exec(k)?.[1] ?? null;
+  const audio = k.includes('without_audio') ? 'without' : k.includes('with_audio') ? 'with' : null;
+  return { unit, value, resolution, audio };
+}
+
+/** Short side in pixels for a resolution label. */
+function shortSide(resolution: string): number | null {
+  const r = resolution.toLowerCase();
+  const p = /^(\d{3,4})p$/.exec(r);
+  if (p?.[1]) return Number(p[1]);
+  if (r === '4k') return 2160;
+  if (r === '2k') return 1440;
+  if (r === '1k') return 1024;
+  return null;
+}
+
+/**
+ * Video from `/videos/models` pricing SKUs. Picks the most specific SKU for the resolution and audio choice; when
+ * either is unknown, the most expensive matching SKU. Token-priced models (Seedance) use an area-preserving frame
+ * size: a 480p clip is about 480 x 853 pixels whatever the aspect ratio (1:1 at 480p is 640 x 640).
+ */
+export function estimateVideo(
+  model: RawVideoModel,
+  input: { seconds: number; resolution?: string; withAudio?: boolean },
+): number | null {
+  const skus = Object.entries(model.pricing_skus ?? {})
+    .map(([key, value]) => parseSku(key, value))
+    .filter((sku): sku is VideoSku => sku !== null);
+  const wantRes = input.resolution?.toLowerCase();
+  const wantAudio =
+    input.withAudio === undefined ? null : input.withAudio ? 'with' : ('without' as const);
+
+  const applicable = skus.filter(
+    (sku) =>
+      sku.unit !== 'min-cents' &&
+      (!wantRes || !sku.resolution || sku.resolution === wantRes) &&
+      (!wantAudio || !sku.audio || sku.audio === wantAudio),
+  );
+  if (applicable.length === 0) return null;
+  const specificity = (sku: VideoSku): number =>
+    (wantRes && sku.resolution === wantRes ? 1 : 0) +
+    (wantAudio && sku.audio === wantAudio ? 1 : 0);
+  const best = Math.max(...applicable.map(specificity));
+
+  // Without a chosen resolution, assume the largest the model offers (1080p when it lists none).
+  const sides = (model.supported_resolutions ?? [])
+    .map((r) => shortSide(r) ?? 0)
+    .filter((side) => side > 0);
+  const maxSide = sides.length > 0 ? Math.max(...sides) : 1080;
+  const costs = applicable
+    .filter((sku) => specificity(sku) === best)
+    .map((sku) => {
+      if (sku.unit === 'usd-per-second') return sku.value * input.seconds;
+      if (sku.unit === 'cents-per-second') return (sku.value / 100) * input.seconds;
+      const side = shortSide(sku.resolution ?? wantRes ?? '') ?? maxSide;
+      const tokens = ((side * side * 16) / 9) * input.seconds * (VIDEO_TOKEN_FRAMES / 1024);
+      return sku.value * tokens;
+    });
+  let total = Math.max(...costs);
+  const minimum = skus.find((sku) => sku.unit === 'min-cents');
+  if (minimum) total = Math.max(total, minimum.value / 100);
+  return total;
+}
