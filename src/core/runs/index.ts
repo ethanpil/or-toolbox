@@ -24,7 +24,7 @@ import type {
   ModelUsageTotals,
   RunHandle,
   RunRecord,
-  RunResult,
+  RunCheckpoint,
   RunsService,
   RunStatus,
   Usage,
@@ -45,6 +45,7 @@ import { RECENT_MODELS_CAP } from '../settings/schema';
 import { addRunToStats } from '../stats';
 import { isFinalState, webLocks } from '../jobs';
 import { MINUTE_MS, abortError, isFiniteNumber } from '../util';
+import { paidAddons, withAddons } from './addons';
 import { getTool } from '../../tools/registry';
 
 export const OUTPUT_CAP = 500_000;
@@ -242,7 +243,18 @@ export function createRunsService(core: CoreServices): RunsService {
     const controller = new AbortController();
     const totals: UsageTotals = { ...emptyTotals(), ...structuredClone(initial.usage) };
     const usageListeners = new Set<(totals: UsageTotals) => void>();
-    let output: string | null = initial.output;
+    // A checkpoint may pass a function (long text built only when a write happens); read it through `outputNow`.
+    let output: string | null | (() => string) = initial.output;
+    let lastOutput: string | null = initial.output;
+    const outputNow = (): string | null => {
+      if (typeof output !== 'function') return output;
+      try {
+        lastOutput = output();
+      } catch (error) {
+        console.warn('A checkpoint output function failed; keeping the last text.', error);
+      }
+      return lastOutput;
+    };
     let meta: Record<string, unknown> = { ...initial.meta };
     let jobId: string | null = initial.jobId ?? null;
     let abortReason: string | null = null;
@@ -281,7 +293,7 @@ export function createRunsService(core: CoreServices): RunsService {
       });
 
     const runningFields = (): Partial<RunRecord> => {
-      const capped = capOutput(output);
+      const capped = capOutput(outputNow());
       return {
         output: capped.output,
         usage: structuredClone(totals),
@@ -415,7 +427,7 @@ export function createRunsService(core: CoreServices): RunsService {
           usageListeners.delete(fn);
         };
       },
-      checkpoint(partial: RunResult) {
+      checkpoint(partial: RunCheckpoint) {
         if (finalRecord) return Promise.resolve();
         if (partial.output !== undefined) output = partial.output;
         const copied = partial.meta ? copyMeta(partial.meta) : null;
@@ -492,12 +504,19 @@ export function createRunsService(core: CoreServices): RunsService {
       if (!core.keys.lock.unlocked()) throw new KeyLockedError();
 
       const models = unique([spec.model, ...(spec.models ?? [])]);
+      const addons = spec.addons ?? [];
+      const paidExtras = paidAddons(addons);
       if (core.settings.get().freeOnly) {
         const paid = models.filter((m) => !core.models.isFree(m));
-        if (paid.length > 0) throw new FreeOnlyError(paid);
+        if (paid.length > 0 || paidExtras.length > 0) {
+          throw new FreeOnlyError(
+            paid,
+            paidExtras.map((addon) => addon.label),
+          );
+        }
       }
 
-      const estimate = spec.estimateUsd ?? null;
+      const estimate = withAddons(spec.estimateUsd ?? null, addons);
       // Strictly increasing within this page, so `before` pagination never splits parallel runs.
       const startedAt = Math.max(Date.now(), lastStartedAt + 1);
       lastStartedAt = startedAt;
@@ -527,7 +546,10 @@ export function createRunsService(core: CoreServices): RunsService {
       };
 
       // A run on free models only costs nothing: budgets never block or question it.
-      const free = (estimate === null || estimate === 0) && models.every((m) => isFree(m));
+      const free =
+        (estimate === null || estimate === 0) &&
+        paidExtras.length === 0 &&
+        models.every((m) => isFree(m));
 
       // Own the run before it becomes visible, so no sweep can mistake it for an orphan.
       const releaseLock = await holdRunLock(record.id);

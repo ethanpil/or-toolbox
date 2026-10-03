@@ -137,13 +137,17 @@ export class InvalidKeyError extends OrError {
 export class FreeOnlyError extends OrError {
   override readonly name = 'FreeOnlyError';
   readonly models: string[];
+  /** Labels of the paid add-ons (`RunSpec.addons`) that were refused. */
+  readonly addons: string[];
 
-  constructor(models: string[]) {
+  constructor(models: string[], addons: string[] = []) {
+    const names = [...models, ...addons];
     super(
       'free-only',
-      `Free-only mode is on, and ${models.join(', ')} ${models.length === 1 ? 'is' : 'are'} not free.`,
+      `Free-only mode is on, and ${names.join(', ')} ${names.length === 1 ? 'is' : 'are'} not free.`,
     );
     this.models = models;
+    this.addons = addons;
   }
 }
 

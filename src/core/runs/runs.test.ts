@@ -97,6 +97,31 @@ describe('begin: gatekeeping order', () => {
     ).resolves.toBeDefined();
   });
 
+  it('refuses a paid add-on in free-only mode, naming it; free add-ons pass', async () => {
+    core.settings.update((d) => {
+      d.freeOnly = true;
+    });
+    const parser = { id: 'pdf-engine:mistral-ocr', label: 'Mistral OCR', estimateUsd: 0.004 };
+    const error = (await core.runs
+      .begin({ ...spec, model: 'a/free:free', addons: [parser] })
+      .catch((e: unknown) => e)) as FreeOnlyError;
+    expect(error).toBeInstanceOf(FreeOnlyError);
+    expect(error.models).toEqual([]);
+    expect(error.addons).toEqual(['Mistral OCR']);
+    expect(error.message).toBe('Free-only mode is on, and Mistral OCR is not free.');
+    // An add-on of unknown price is not free either.
+    await expect(
+      core.runs.begin({
+        ...spec,
+        model: 'a/free:free',
+        addons: [{ ...parser, estimateUsd: null }],
+      }),
+    ).rejects.toBeInstanceOf(FreeOnlyError);
+    await expect(
+      core.runs.begin({ ...spec, model: 'a/free:free', addons: [{ ...parser, estimateUsd: 0 }] }),
+    ).resolves.toBeDefined();
+  });
+
   it('does not write anything when a check fails', async () => {
     keyState.locked = true;
     await expect(core.runs.begin(spec)).rejects.toThrow();
@@ -272,6 +297,31 @@ describe('handle: checkpoints', () => {
     await vi.advanceTimersByTimeAsync(CHECKPOINT_INTERVAL_MS * 2);
     await settle();
     expect((await stored(run.id))?.output).toBe('done');
+  });
+
+  it('reads a checkpoint thunk only when the throttled write happens, and at the end', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const run = await core.runs.begin(spec);
+    let text = 'a';
+    const output = vi.fn(() => text);
+    await run.checkpoint({ output });
+    expect(output).toHaveBeenCalledTimes(1);
+    expect((await stored(run.id))?.output).toBe('a');
+
+    text = 'ab';
+    void run.checkpoint({ output });
+    text = 'abc';
+    const later = run.checkpoint({ output });
+    await settle();
+    expect(output).toHaveBeenCalledTimes(1); // nothing built while the write waits
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_INTERVAL_MS);
+    await later;
+    expect(output).toHaveBeenCalledTimes(2);
+    expect((await stored(run.id))?.output).toBe('abc');
+
+    text = 'abcd';
+    const record = await run.finish();
+    expect(record.output).toBe('abcd');
   });
 
   it('keeps checkpointed output when finish has none', async () => {

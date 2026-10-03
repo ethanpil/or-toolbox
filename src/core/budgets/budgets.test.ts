@@ -293,6 +293,41 @@ describe('free runs', () => {
   });
 });
 
+describe('paid add-ons', () => {
+  const parser = { id: 'pdf-engine:mistral-ocr', label: 'Mistral OCR', estimateUsd: 0.06 };
+
+  it('count towards the estimate the budgets check and the run reserves', async () => {
+    setBudgets({ mode: 'warn', perRunUsd: 0.1 });
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    const run = await core.runs.begin({
+      tool: 'ocr',
+      model: 'm/paid',
+      estimateUsd: 0.05,
+      addons: [parser],
+    });
+    const [check] = confirm.mock.calls[0] as [
+      { reasons: { kind: string; projectedUsd: number }[] },
+    ];
+    expect(check.reasons[0]?.kind).toBe('per-run');
+    expect(check.reasons[0]?.projectedUsd).toBeCloseTo(0.11);
+    expect((await (await getDb()).get('runs', run.id))?.reservedUsd).toBeCloseTo(0.11);
+    await run.finish();
+  });
+
+  it('make a run on a free model go through the budgets', async () => {
+    setBudgets({ mode: 'hard', monthlyUsd: 1, perRunUsd: 0 });
+    await spend('k1', 5);
+    const free = { tool: 'ocr', model: 'a/b:free', estimateUsd: 0 } as const;
+    await expect(core.runs.begin({ ...free, addons: [parser] })).rejects.toThrow(
+      BudgetBlockedError,
+    );
+    await expect(
+      core.runs.begin({ ...free, addons: [{ ...parser, estimateUsd: 0 }] }),
+    ).resolves.toBeDefined();
+  });
+});
+
 describe('spend reads', () => {
   it('reads the month of stats once per check', async () => {
     setBudgets({ monthlyUsd: 5, perKeyMonthlyUsd: { k1: 1 } });

@@ -374,6 +374,20 @@ export interface UsageTotals extends ModelUsageTotals {
 
 export type RunStatus = 'running' | 'ok' | 'error' | 'aborted';
 
+/**
+ * Something a run pays for besides its models' tokens, e.g. OpenRouter's Mistral OCR PDF parser (billed per page,
+ * even on a free model). Free-only mode refuses a run with a paid add-on, budgets add its estimate, and a run on
+ * free models stops counting as free. `estimateUsd` 0 means free; null means the price is unknown (treated as
+ * paid). `pdfEngineAddon()` (src/core/models/pdf-engines.ts) builds the PDF parser's.
+ */
+export interface RunAddon {
+  /** Stable id, e.g. `pdf-engine:mistral-ocr`. */
+  id: string;
+  /** Named in messages, e.g. "Mistral OCR PDF parser (12 pages)". */
+  label: string;
+  estimateUsd: number | null;
+}
+
 export interface RunSpec {
   tool: ToolId;
   /** Primary model (shown in history). */
@@ -382,8 +396,13 @@ export interface RunSpec {
   models?: string[];
   /** Overrides the key resolved from the tool binding / default key. */
   keyId?: string;
-  /** Pre-run estimate for budget checks; null/undefined = unknown (per-run threshold is then not applied). */
+  /**
+   * Pre-run estimate of the models' cost for budget checks; null/undefined = unknown (per-run threshold is then
+   * not applied). Add-on estimates are added to it (never include them here).
+   */
   estimateUsd?: number | null;
+  /** Paid extras the run incurs (see `RunAddon`). */
+  addons?: readonly RunAddon[];
   /** The user's main input text. Feeds Recent prompts (when recording is on) and history. */
   prompt?: string;
   /** JSON-safe snapshot of the tool's settings; restoring it must reproduce the form exactly. */
@@ -392,6 +411,12 @@ export interface RunSpec {
   title?: string;
   /** Links parallel runs of one action (e.g. arena contenders). */
   groupId?: string;
+}
+
+/** `RunHandle.checkpoint`'s input: `output` may be a function, called only when the throttled write happens. */
+export interface RunCheckpoint {
+  output?: string | (() => string);
+  meta?: Record<string, unknown>;
 }
 
 export interface RunResult {
@@ -416,7 +441,12 @@ export interface RunHandle {
   readonly jobId: string | null;
   onUsage(fn: (totals: UsageTotals) => void): () => void;
   /** Persist partial text output during long runs (bot transcripts, batches). */
-  checkpoint(partial: RunResult): Promise<void>;
+  /**
+   * Persists partial output (throttled: at most one write per interval, the latest wins). Pass `output` as a
+   * function to build long text only when a write actually happens; it is also read once more by `finish()`
+   * when the result has no output of its own.
+   */
+  checkpoint(partial: RunCheckpoint): Promise<void>;
   finish(result?: RunResult): Promise<RunRecord>;
   /** AbortError → status 'aborted'; anything else → 'error' with a user-safe message. */
   fail(error: unknown): Promise<RunRecord>;
