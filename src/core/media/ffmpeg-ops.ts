@@ -326,6 +326,13 @@ export interface TrimOptions extends FfmpegOpOptions {
    * says "video") means audio, and a file that has a video stream is video.
    */
   kind?: 'audio' | 'video';
+  /**
+   * Audio only, and only with an `end`: fades the last this-many seconds of the cut out to silence (music cut
+   * short ends softly instead of mid-note). Default none.
+   */
+  fadeOut?: number;
+  /** MP3 bit rate in kbit/s, for audio that stays MP3. Default 128. */
+  bitrate?: number;
 }
 
 /** Even width and height: H.264 in yuv420p cannot carry odd sizes. Adds at most one black pixel row and column. */
@@ -336,8 +343,9 @@ const EVEN_SIZE_FILTER = 'pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black';
  * end), frame-accurately. Video becomes an H.264/AAC MP4 (odd dimensions are
  * padded to even ones, as in `concatVideos`); audio stays MP3 as MP3 and
  * anything else becomes WAV. Which of the two a file is comes from
- * `options.kind` or from its streams (see `TrimOptions`). Always re-encodes,
- * so it takes about as long as the clip is.
+ * `options.kind` or from its streams (see `TrimOptions`). Audio can end in a
+ * fade-out (`fadeOut`). Always re-encodes, so it takes about as long as the
+ * clip is.
  */
 export function trimMedia(
   blob: Blob,
@@ -382,8 +390,14 @@ export function trimMedia(
           '+faststart',
         ]
       : format === 'mp3'
-        ? ['-c:a', 'libmp3lame', '-b:a', '128k']
+        ? ['-c:a', 'libmp3lame', '-b:a', `${options.bitrate ?? 128}k`]
         : ['-c:a', 'pcm_s16le'];
+    // Input seeking (-ss before -i) starts the output at 0, so the fade sits at the end of the cut's own length.
+    const length = end === undefined ? 0 : end - start;
+    const fade =
+      isVideo || !(options.fadeOut && options.fadeOut > 0) ? 0 : Math.min(options.fadeOut, length);
+    const fadeFilter =
+      fade > 0 ? ['-af', `afade=t=out:st=${seconds(length - fade)}:d=${seconds(fade)}`] : [];
     await job.run(
       [
         ...(isVideo ? job.threads.filter : []),
@@ -393,6 +407,7 @@ export function trimMedia(
         '-i',
         input,
         ...(isVideo ? [] : ['-vn']),
+        ...fadeFilter,
         ...codec,
         ...(isVideo ? job.threads.encode : []),
         output,
