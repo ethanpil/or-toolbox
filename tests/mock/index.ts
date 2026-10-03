@@ -14,8 +14,13 @@ import { test as base, expect, type BrowserContext } from '@playwright/test';
 import { OpenRouterMock } from './openrouter.ts';
 
 export { expect };
-export { MEDIA_FIXTURES_DIR, OpenRouterMock, OPENROUTER_ORIGIN } from './openrouter.ts';
-export type { RecordedCall } from './openrouter.ts';
+export {
+  MEDIA_FIXTURES_DIR,
+  OpenRouterMock,
+  OPENROUTER_ORIGIN,
+  sseResponse,
+} from './openrouter.ts';
+export type { RecordedCall, SequenceResponse } from './openrouter.ts';
 
 /** A syntactically plausible key that is obviously not real. */
 export const TEST_API_KEY =
