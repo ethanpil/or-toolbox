@@ -111,13 +111,19 @@ test('two tables on a page: edit, export XLSX, a ZIP of CSVs, one CSV, and copy 
   await first.getByLabel('Header of column 1, Quarterly revenue').press('Tab');
   await first.getByTestId('te-add-row').click();
   await expect(first.getByTestId('te-row')).toHaveCount(3);
-  // Focus moved into the new row's first cell.
+  // Focus moved into the new row's first cell; the grid is one Tab stop, the arrow keys move between cells.
   await page.keyboard.type('South');
-  await page.keyboard.press('Tab');
+  await page.keyboard.press('ArrowRight');
   await page.keyboard.type('75');
-  await page.keyboard.press('Tab');
+  await page.keyboard.press('ArrowRight');
   await page.keyboard.type('80');
+  await expect(first.getByLabel('Q2, row 3, Quarterly revenue', { exact: true })).toBeFocused();
+  // Tab leaves the grid for the buttons under it.
   await page.keyboard.press('Tab');
+  await expect(first.getByTestId('te-add-row')).toBeFocused();
+  await expect(first.getByTestId('te-add-row')).toHaveAccessibleName(
+    'Add row to Quarterly revenue',
+  );
   const second = tables.nth(1);
   await second.getByTestId('te-add-column').click();
   await expect(second.getByTestId('te-header')).toHaveCount(3);

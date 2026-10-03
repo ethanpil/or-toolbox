@@ -132,6 +132,82 @@ describe('parseTables', () => {
     expect(parseTables('{"x":1}')).toEqual({ problem: 'The answer had no "tables" list.' });
   });
 
+  it('maps rows given as objects to the headers by key, adding columns for keys without one', () => {
+    const parsed = parseTables(
+      JSON.stringify({
+        tables: [
+          {
+            title: 'Keyed',
+            headers: ['Region', 'Q1'],
+            rows: [
+              { Q1: '120', Region: 'North' },
+              { region: 'South', ' q1 ': 98, Q2: '101' },
+            ],
+          },
+          {
+            title: 'No headers',
+            rows: [
+              { Year: '2025', Sales: '10' },
+              { Sales: '12', Year: '2026' },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(parsed).toMatchObject({
+      tables: [
+        {
+          headers: ['Region', 'Q1', 'Q2'],
+          rows: [
+            ['North', '120', ''],
+            ['South', '98', '101'],
+          ],
+        },
+        {
+          headers: ['Year', 'Sales'],
+          rows: [
+            ['2025', '10'],
+            ['2026', '12'],
+          ],
+        },
+      ],
+    });
+  });
+
+  it('keeps the complete rows of an answer cut off at the length limit', () => {
+    const full = JSON.stringify({
+      tables: [
+        { title: 'A', kind: 'table', headers: ['x'], rows: [['1'], ['2']], notes: '' },
+        {
+          title: 'B',
+          kind: 'table',
+          headers: ['y', 'z'],
+          rows: [
+            ['3', '4'],
+            ['5', '6'],
+          ],
+          notes: '',
+        },
+      ],
+    });
+    const cut = full.slice(0, full.indexOf('["5"') + 6); // inside B's second row
+    expect(parseTables(cut)).toEqual({ problem: 'The answer was not valid JSON.' });
+    const parsed = parseTables(cut, { partial: true });
+    expect(parsed).toMatchObject({
+      salvaged: true,
+      tables: [
+        { title: 'A', rows: [['1'], ['2']] },
+        { title: 'B', headers: ['y', 'z'], rows: [['3', '4']] },
+      ],
+    });
+    // Strings with brackets do not confuse it, nor does a fence before the JSON.
+    const tricky = '```json\n{"tables":[{"title":"a ] } [","headers":["h"],"rows":[["1"],["2';
+    expect(parseTables(tricky, { partial: true })).toMatchObject({
+      tables: [{ title: 'a ] } [', rows: [['1']] }],
+    });
+    expect(parseTables('{"tables":[{"tit', { partial: true })).toMatchObject({ tables: [] });
+  });
+
   it('squares off ragged tables and names missing headers', () => {
     expect(rectangular(['a', ''], [['1'], ['1', '2', '3']])).toEqual({
       headers: ['a', 'Column 2', 'Column 3'],
@@ -158,8 +234,23 @@ describe('grid edits', () => {
     expect(t.headers[0]).toBe('Area');
     renameHeader(t, 1, '   ');
     expect(t.headers[1]).toBe('Column 2');
+    // Blanking a column that already has its generated name keeps that name (no "Column 2 (2)").
+    renameHeader(t, 1, '');
+    expect(t.headers[1]).toBe('Column 2');
     setCell(t, 9, 0, 'ignored');
     expect(t.rows).toHaveLength(2);
+  });
+
+  it('keeps the headers the model gave, column by column, through column edits', () => {
+    const made = toTable(
+      { title: 'T', kind: 'table', headers: ['Region', 'Q1'], rows: [['North', '1']], notes: '' },
+      { id: 'x', fileId: 'f', fileName: 'p.pdf', pageNumber: 1, pageCount: 2, index: 1 },
+    );
+    expect(made.sourceHeaders).toEqual(['Region', 'Q1']);
+    renameHeader(made, 0, 'Area');
+    expect(made.sourceHeaders).toEqual(['Region', 'Q1']);
+    expect(addColumn(made, 1).sourceHeaders).toEqual(['Region', '', 'Q1']);
+    expect(removeColumn(made, 0).sourceHeaders).toEqual(['Q1']);
   });
 
   it('adds and removes rows and columns without touching the original', () => {
@@ -228,6 +319,51 @@ describe('grid edits', () => {
       rows: [['X', '1', '2']],
     });
     expect(mergeTables(first, unnamed).rows).toHaveLength(3);
+  });
+
+  const next = (extra: Partial<ExtractedTable>): ExtractedTable =>
+    table({ id: 'n', firstPage: 3, lastPage: 3, rows: [['East', '75', '80']], ...extra });
+
+  it('drops a repeated header row however it is cased or spaced', () => {
+    const merged = mergeTables(table(), next({ headers: ['  REGION ', 'q1', 'Q2\n'] }));
+    expect(merged.rows.map((row) => row[0])).toEqual(['North', 'South', 'East']);
+    expect(merged.headers).toEqual(['Region', 'Q1', 'Q2']);
+  });
+
+  it('drops a repeated header row after the first table’s headers were renamed', () => {
+    const first = table({ sourceHeaders: ['Region', 'Q1', 'Q2'] });
+    renameHeader(first, 0, 'Area');
+    const merged = mergeTables(first, next({ headers: ['Region', 'Q1', 'Q2'] }));
+    expect(merged.rows.map((row) => row[0])).toEqual(['North', 'South', 'East']);
+    expect(merged.headers[0]).toBe('Area');
+  });
+
+  it('treats generated or empty headers as no header row', () => {
+    const merged = mergeTables(table(), next({ headers: ['', 'Column 2', ''] }));
+    expect(merged.rows).toEqual([
+      ['North', '120', '135'],
+      ['South', '98', '101'],
+      ['East', '75', '80'],
+    ]);
+  });
+
+  it('aligns columns by header name when the counts differ', () => {
+    // The continuation lacks Q1, and its columns come in another order.
+    const fewer = mergeTables(table(), next({ headers: ['Q2', 'Region'], rows: [['80', 'East']] }));
+    expect(fewer.headers).toEqual(['Region', 'Q1', 'Q2']);
+    expect(fewer.rows.at(-1)).toEqual(['East', '', '80']);
+    // The continuation has one more column: it is added, empty in the earlier rows.
+    const more = mergeTables(
+      table(),
+      next({ headers: ['Region', 'Q1', 'Q2', 'Q3'], rows: [['East', '75', '80', '91']] }),
+    );
+    expect(more.headers).toEqual(['Region', 'Q1', 'Q2', 'Q3']);
+    expect(more.rows).toEqual([
+      ['North', '120', '135', ''],
+      ['South', '98', '101', ''],
+      ['East', '75', '80', '91'],
+    ]);
+    expect(more.sourceHeaders).toEqual(['Region', 'Q1', 'Q2', 'Q3']);
   });
 });
 

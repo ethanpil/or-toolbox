@@ -19,16 +19,52 @@ function columns(table: ExtractedTable): ExportColumn[] {
   return table.headers.map((header, c) => ({ key: `c${c}`, header }));
 }
 
+/** Excel keeps 15 significant digits; a longer number would be silently rounded. */
+const MAX_SIGNIFICANT_DIGITS = 15;
+
+/**
+ * A cell of a numeric column as it goes to the workbook. Plain digits (`42`, `007`, `1.50`, a 20-digit id) stay
+ * text: the core writer's canonical check turns into numbers only those that lose nothing. A formatted number
+ * (`1,200`, `$12`, `(4)`) becomes a number only when nothing written is lost either: no sign but a minus, no
+ * leading zero, no trailing zero after the decimal mark, at most 15 significant digits. Phone numbers (`+1555…`)
+ * and codes stay as written.
+ */
+export function workbookValue(text: string): string | number {
+  const value = text.trim();
+  if (/^-?\d+(?:\.\d+)?$/.test(value) || /^\+/.test(value.replace(/^\(/, ''))) return text;
+  const number = cellNumber(value);
+  if (number === null) return text;
+  const digits = value.replace(/[^\d.]/g, '');
+  const [whole = '', fraction = ''] = digits.split('.');
+  const significant = `${whole}${fraction}`.replace(/^0+/, '');
+  if (/^0\d/.test(whole) || /0$/.test(fraction) || significant.length > MAX_SIGNIFICANT_DIGITS)
+    return text;
+  return number;
+}
+
 function rows(table: ExtractedTable, numbers = false): ExportRow[] {
   const numeric = numbers ? numericColumns(table) : [];
   return table.rows.map((row) =>
     Object.fromEntries(
       table.headers.map((_, c) => {
         const text = row[c] ?? '';
-        return [`c${c}`, numeric[c] ? (cellNumber(text) ?? text) : text];
+        return [`c${c}`, numeric[c] ? workbookValue(text) : text];
       }),
     ),
   );
+}
+
+/** Text safe inside a Markdown line: one line, with the characters Markdown reads as syntax escaped. */
+function inlineMarkdown(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[\\`*_[\]#|<>~]/g, '\\$&');
+}
+
+/** A table's title, or `Table N` when it has none. */
+export function tableTitle(table: ExtractedTable, position: number): string {
+  return table.title.trim() || `Table ${position}`;
 }
 
 export function tableCsv(table: ExtractedTable): string {
@@ -40,16 +76,18 @@ export function tableTsv(table: ExtractedTable): string {
   return toTsv(rows(table), columns(table));
 }
 
+/** The tables as Markdown (export and run output): titles, file names and notes escaped so they stay text. */
 export function tablesMarkdown(tables: readonly ExtractedTable[]): string {
   return tables
-    .map((table) => {
+    .map((table, index) => {
       const where = [table.fileName, pagesLabel(table)].filter(Boolean).join(', ');
       const parts = [
-        `## ${table.title}`,
-        `*${where}*`,
+        `## ${inlineMarkdown(tableTitle(table, index + 1))}`,
+        `*${inlineMarkdown(where)}*`,
         toMarkdownTable(rows(table), columns(table)),
       ];
-      if (table.notes.trim()) parts.push(table.notes.trim());
+      const notes = table.notes.split(/\r?\n/).map(inlineMarkdown).filter(Boolean).join('\n');
+      if (notes) parts.push(notes);
       return parts.join('\n\n');
     })
     .join('\n\n');
@@ -79,7 +117,7 @@ export function xlsxSheets(tables: readonly ExtractedTable[]): XlsxSheet[] {
     const numeric = numericColumns(table);
     return {
       // toXlsx makes the name valid and unique (31 characters, no []:*?/\).
-      name: table.title || `Table ${index + 1}`,
+      name: tableTitle(table, index + 1),
       columns: table.headers.map((header, c) => ({
         key: `c${c}`,
         header,
