@@ -23,7 +23,7 @@ import { createTestCore, type KeyState } from '../../core/testing/state-fakes';
 import type { ApiClient, CoreServices, ToolManifest } from '../../core/types';
 import { h } from '../dom';
 import { createToolContext } from './context';
-import { createEstimateTracker } from './estimate';
+import { badgeValue, createEstimateTracker } from './estimate';
 import { resultHandle } from './results';
 import { createRunner, type RunnerInternals } from './runner';
 import type { SendItem, ToolContext, ToolInstance, ToolSetup, ToolUi } from './types';
@@ -110,7 +110,7 @@ export function createToolTestContext(
     compute: (model) => instance?.estimate?.(model) ?? null,
     model: () => ctx.model().model,
     show: (usd) => {
-      shownEstimate = usd;
+      shownEstimate = badgeValue(usd, instance?.addons?.() ?? []);
     },
   });
 

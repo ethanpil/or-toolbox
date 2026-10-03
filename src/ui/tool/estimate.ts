@@ -8,6 +8,17 @@
  * estimate if it was computed for this model and nothing changed since, else a fresh one.
  */
 
+import { withAddons } from '../../core/runs/addons';
+import type { RunAddon } from '../../core/types';
+
+/**
+ * What the header badge shows: the models' estimate plus the tool's add-ons (`ToolInstance.addons`). Unknown stays
+ * unknown: a known add-on price does not make an unknown model cost known.
+ */
+export function badgeValue(usd: number | null, addons: readonly RunAddon[]): number | null {
+  return usd === null ? null : withAddons(usd, addons);
+}
+
 export interface EstimateTrackerOptions {
   /** The tool's own estimate for `model`; null when the tool has none (unknown). */
   compute: (model: string) => Promise<number | null> | null;

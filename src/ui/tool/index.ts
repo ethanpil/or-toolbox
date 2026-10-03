@@ -36,7 +36,7 @@ import { setToolBinding } from '../settings-actions';
 import { mountPage } from '../shell/index';
 import { historyUrl, settingsUrl } from '../shell/links';
 import { createToolContext, resolveFor } from './context';
-import { createEstimateTracker } from './estimate';
+import { badgeValue, createEstimateTracker } from './estimate';
 import { installFileDrop } from './file-drop';
 import { resultHandle } from './results';
 import { createRunner, type RunnerInternals } from './runner';
@@ -147,7 +147,7 @@ async function buildTool(
   const estimates = createEstimateTracker({
     compute: (model) => instance?.estimate?.(model) ?? null,
     model: () => resolveModel().model,
-    show: (usd, note) => estimate.set(usd, note),
+    show: (usd, note) => estimate.set(badgeValue(usd, instance?.addons?.() ?? []), note),
   });
   const chips = h('div', {
     class: 'd-flex flex-wrap align-items-center gap-2 mt-3',

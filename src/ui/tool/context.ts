@@ -81,8 +81,10 @@ export function createToolContext(parts: ContextParts): ToolContext {
           : chosen === resolved.model
             ? await estimates.current()
             : null;
+      const addons = spec.addons ?? parts.instance()?.addons?.() ?? [];
       const handle = await core.runs.begin({
         ...spec,
+        addons,
         tool: spec.tool ?? manifest.id,
         model: chosen,
         estimateUsd,
