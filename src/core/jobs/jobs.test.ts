@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_POLL_MS } from '.';
+import { DEFAULT_POLL_MS, MAX_POLL_FAILURES, MAX_POLL_MS } from '.';
 import type { CoreServices, JobPollResult, JobRecord } from '../types';
+import { ApiError, InvalidInputError, KeyLockedError, NetworkError, type OrError } from '../errors';
 import { getDb } from '../storage/db';
 import {
   FakeLockManager,
@@ -223,7 +224,7 @@ describe('resume, cancel and changes', () => {
     );
     await core.jobs.remove(a.id);
     expect(await core.jobs.get(a.id)).toBeUndefined();
-    await expect(core.jobs.update(a.id, {})).rejects.toThrow('not found');
+    await expect(core.jobs.update(a.id, {})).rejects.toThrow('no longer exists');
   });
 
   it('notifies subscribers with the job on every change, from any tab', async () => {
@@ -330,5 +331,75 @@ describe('completion notification', () => {
     await complete();
     expect(NotificationSpy).not.toHaveBeenCalled();
     expect(requestPermission).not.toHaveBeenCalled();
+  });
+});
+
+describe('poll failures', () => {
+  it('keeps polling after a storage error', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const handler = scripted();
+    core.jobs.register('video', handler);
+    const added = await core.jobs.add(input);
+    await until(() => handler.poll.mock.calls.length === 1);
+    await settle();
+
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- re-applied with the right `this` below
+    const original = IDBObjectStore.prototype.get;
+    let failures = 1;
+    vi.spyOn(IDBObjectStore.prototype, 'get').mockImplementation(function (
+      this: IDBObjectStore,
+      ...args: Parameters<IDBObjectStore['get']>
+    ) {
+      if (this.name === 'jobs' && failures-- > 0) throw new DOMException('io', 'UnknownError');
+      return original.apply(this, args);
+    });
+    await advance(DEFAULT_POLL_MS); // the read fails: back off
+    expect(handler.poll).toHaveBeenCalledTimes(1);
+    await advance(2 * DEFAULT_POLL_MS);
+    expect(handler.poll).toHaveBeenCalledTimes(2);
+    expect((await job(added.id))?.state).toBe('running');
+  });
+
+  it('fails the job on a non-retryable API error', async () => {
+    core.jobs.register('video', scripted([new ApiError('Video not found', 404)]));
+    const added = await core.jobs.add(input);
+    await until(async () => (await job(added.id))?.state === 'failed');
+    expect((await job(added.id))?.error).toBe('Video not found');
+  });
+
+  it('fails the job after 20 failed polls in a row', async () => {
+    const handler = scripted(Array.from({ length: 30 }, () => new NetworkError()));
+    core.jobs.register('video', handler);
+    const added = await core.jobs.add(input);
+    for (let i = 0; i < 25 && (await job(added.id))?.state !== 'failed'; i++) {
+      await settle();
+      await advance(MAX_POLL_MS);
+    }
+    expect(handler.poll).toHaveBeenCalledTimes(MAX_POLL_FAILURES);
+    expect(await job(added.id)).toMatchObject({
+      state: 'failed',
+      attempts: MAX_POLL_FAILURES,
+      error: 'Network error. Check your connection and try again.',
+    });
+  });
+
+  it('pauses while the keys are locked and resumes when they change', async () => {
+    const handler = scripted([new KeyLockedError(), { state: 'succeeded', result: 'ok' }]);
+    core.jobs.register('video', handler);
+    const added = await core.jobs.add(input);
+    await until(() => handler.poll.mock.calls.length === 1);
+    await advance(10 * MAX_POLL_MS);
+    expect(handler.poll).toHaveBeenCalledTimes(1);
+    expect((await job(added.id))?.state).toBe('queued');
+
+    core.bus.emit({ type: 'keys-changed' }); // unlocked
+    await until(async () => (await job(added.id))?.state === 'succeeded');
+  });
+
+  it('reports a missing job with an OrError', async () => {
+    const error = (await core.jobs.update('missing', {}).catch((e: unknown) => e)) as OrError;
+    expect(error).toBeInstanceOf(InvalidInputError);
+    expect(error.code).toBe('invalid-input');
   });
 });

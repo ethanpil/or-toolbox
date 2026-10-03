@@ -4,6 +4,7 @@
  */
 
 import type { CoreServices, PromptEntry, PromptsService, ToolId } from '../types';
+import { InvalidInputError } from '../errors';
 import { getDb } from '../storage/db';
 import { jsonCopy } from '../settings/merge';
 
@@ -86,7 +87,7 @@ export function createPromptsService(core: CoreServices): PromptsService {
 
     async saveFromRecent(recentId, name) {
       const source = await (await getDb()).get('prompts', recentId);
-      if (!source) throw new Error('That prompt no longer exists.');
+      if (!source) throw new InvalidInputError('That prompt no longer exists.');
       return save({
         tool: source.tool,
         text: source.text,

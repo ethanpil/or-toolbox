@@ -94,12 +94,38 @@ describe('object URLs and downloads', () => {
     expect(revoked).toEqual(['blob:test/1']); // temporary URL freed later
   });
 
-  it('reuses the display URL for a download and keeps it alive', () => {
+  it('keeps the display URL alive when downloading', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
     const a = add('image', 'a.png');
     const url = results.objectUrl(a.id);
     results.download(a.id);
-    expect(clicks).toEqual([{ href: url, download: 'a.png' }]);
-    expect(created).toHaveLength(1);
+    vi.advanceTimersByTime(60_000);
+    expect(revoked).not.toContain(url);
+    expect(results.objectUrl(a.id)).toBe(url);
+  });
+
+  it('marks the object that add() returned as downloaded', () => {
+    const a = add('image', 'a.png');
+    const b = add('image', 'b.png');
+    results.download(a.id);
+    results.markDownloaded(b.id);
+    expect(a.downloaded).toBe(true);
+    expect(b.downloaded).toBe(true);
+  });
+
+  it('downloads under a safe file name', () => {
+    const a = add('image', 'cats/dogs: "best"?.png');
+    results.download(a.id);
+    expect(clicks[0]?.download).toBe('cats_dogs_ _best__.png');
+  });
+
+  it('names the ZIP after the UTC day', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.UTC(2026, 9, 2, 23, 30));
+    add('image', 'a.png');
+    add('image', 'b.png');
+    await results.downloadAll();
+    expect(clicks[0]?.download).toBe('ortoolbox-results-2026-10-02.zip');
   });
 
   it('downloadAll downloads a single result directly', async () => {

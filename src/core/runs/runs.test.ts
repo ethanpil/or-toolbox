@@ -5,6 +5,7 @@ import type { BusEvent, CoreServices, RunHandle, RunRecord, RunSpec, Usage } fro
 import { ApiError, FreeOnlyError, KeyLockedError, NoKeyError } from '../errors';
 import { getDb } from '../storage/db';
 import {
+  FakeLockManager,
   createTestCore,
   isolateChannels,
   resetDb,
@@ -140,8 +141,11 @@ describe('begin: bookkeeping', () => {
         costUsd: 0,
         latencyMsTotal: 0,
         costEstimated: false,
+        costUnknown: false,
         byModel: {},
       },
+      reservedUsd: 0,
+      jobId: null,
       meta: {},
       starred: false,
       groupId: 'g1',
@@ -208,6 +212,7 @@ describe('handle: usage', () => {
       costUsd: expect.closeTo(0.014) as number,
       latencyMsTotal: 1200,
       costEstimated: true,
+      costUnknown: false,
       byModel: {
         'openai/gpt-x': {
           requests: 2,
@@ -370,27 +375,30 @@ describe('handle: finish and fail', () => {
 });
 
 describe('page unload and reattach', () => {
-  it('aborts active runs on pagehide and records them as aborted', async () => {
+  it('only aborts active runs on pagehide: no IndexedDB work while the page goes away', async () => {
     const run = await core.runs.begin(spec);
+    await settle(); // let begin's own writes (heartbeat) finish
+    const transaction = vi.spyOn(IDBDatabase.prototype, 'transaction');
     window.dispatchEvent(new Event('pagehide'));
     expect(run.signal.aborted).toBe(true);
-    await until(async () => (await stored(run.id))?.status === 'aborted');
-    expect((await stored(run.id))?.error).toBe('The page was closed.');
+    await settle(100);
+    expect(transaction).not.toHaveBeenCalled();
+    expect((await stored(run.id))?.status).toBe('running');
   });
 
-  it('leaves a run with an open job running so it can be reattached', async () => {
+  it('after handOff, aborts and AbortError failures are no-ops and the job id is kept', async () => {
     const run = await core.runs.begin({ ...spec, tool: 'video-studio' });
-    await core.jobs.add({
-      tool: 'video-studio',
-      type: 'video',
-      payload: {},
-      keyId: 'k1',
-      runId: run.id,
-    });
+    run.handOff('job-1');
+    await until(async () => (await stored(run.id))?.jobId === 'job-1');
+    run.abort();
     window.dispatchEvent(new Event('pagehide'));
-    expect(run.signal.aborted).toBe(true);
-    await settle(200);
-    expect((await stored(run.id))?.status).toBe('running');
+    expect(run.signal.aborted).toBe(false);
+    const still = await run.fail(new DOMException('gone', 'AbortError'));
+    expect(still).toMatchObject({ status: 'running', jobId: 'job-1' });
+
+    const page = createTestCore().core; // the job completes in another page
+    const handle = (await page.runs.reattach(run.id))!;
+    expect((await handle.finish({ output: 'video ready' })).status).toBe('ok');
   });
 
   it('reattaches a running record in a new page and finishes it', async () => {
@@ -421,5 +429,178 @@ describe('page unload and reattach', () => {
     const run = await core.runs.begin(spec);
     await run.finish();
     expect(await createTestCore().core.runs.reattach(run.id)).toBeNull();
+  });
+});
+
+describe('cost booking', () => {
+  it('holds the estimate as a reservation while running, then books the actual cost', async () => {
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.08 });
+    expect((await stored(run.id))?.reservedUsd).toBe(0.08);
+    run.addUsage(usage({ costUsd: 0.01 }));
+    const record = await run.finish();
+    expect(record.reservedUsd).toBe(0.08);
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.01);
+  });
+
+  it('books max(actual, reservation) when the cost is unknown', async () => {
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.08 });
+    run.addUsage(usage({ costUsd: 0, costUnknown: true }));
+    expect(run.totals.costUnknown).toBe(true);
+    await run.finish();
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.08);
+  });
+
+  it('persists usage without checkpoints, throttled', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const run = await core.runs.begin(spec);
+    run.addUsage(usage());
+    await until(async () => (await stored(run.id))?.usage.requests === 1);
+    run.addUsage(usage());
+    run.addUsage(usage());
+    await settle();
+    expect((await stored(run.id))?.usage.requests).toBe(1);
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_INTERVAL_MS);
+    await until(async () => (await stored(run.id))?.usage.requests === 3);
+  });
+});
+
+describe('atomic, retryable finalize', () => {
+  it('a second handle for the same run never books its stats twice', async () => {
+    const run = await core.runs.begin(spec);
+    run.addUsage(usage({ costUsd: 0.01 }));
+    await run.checkpoint({});
+    const other = (await createTestCore().core.runs.reattach(run.id))!;
+    const [a, b] = await Promise.all([run.finish(), other.finish()]);
+    expect(a.status).toBe('ok');
+    expect(b.status).toBe('ok');
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.01);
+    expect(await core.stats.modelSummary('openai/gpt-x')).toMatchObject({ runs: 1 });
+  });
+
+  it('can be retried after a transient storage failure', async () => {
+    const run = await core.runs.begin(spec);
+    run.addUsage(usage({ costUsd: 0.01 }));
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- re-applied with the right `this` below
+    const original = IDBDatabase.prototype.transaction;
+    let failNext = true;
+    vi.spyOn(IDBDatabase.prototype, 'transaction').mockImplementation(function (
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase['transaction']>
+    ) {
+      if (failNext && [args[0]].flat().includes('stats')) {
+        failNext = false;
+        throw new DOMException('transient', 'UnknownError');
+      }
+      return original.apply(this, args);
+    });
+    await expect(run.finish()).rejects.toThrow('transient');
+    expect((await stored(run.id))?.status).toBe('running');
+    expect((await run.finish()).status).toBe('ok');
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.01);
+  });
+
+  it('finishes even when the result meta cannot be copied', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const run = await core.runs.begin(spec);
+    const record = await run.finish({ output: 'ok', meta: { big: 1n } });
+    expect(record).toMatchObject({ status: 'ok', output: 'ok' });
+    expect((await stored(run.id))?.status).toBe('ok');
+  });
+});
+
+describe('storage failures do not block a run', () => {
+  it('runs without a history record when the write fails, and still books the spend', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- re-applied with the right `this` below
+    const original = IDBObjectStore.prototype.put;
+    vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+      this: IDBObjectStore,
+      ...args: Parameters<IDBObjectStore['put']>
+    ) {
+      if (this.name === 'runs') throw new DOMException('full', 'QuotaExceededError');
+      return original.apply(this, args);
+    });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('full', 'QuotaExceededError');
+    });
+
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.01 });
+    run.addUsage(usage({ costUsd: 0.02 }));
+    const second = await core.runs.begin(spec);
+    const record = await run.finish({ output: 'done' });
+    await second.finish();
+
+    expect(record).toMatchObject({ status: 'ok', output: 'done' });
+    expect(await stored(run.id)).toBeUndefined();
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.02);
+    expect(error).toHaveBeenCalledTimes(1); // logged once, not per write
+  });
+});
+
+describe('sweep', () => {
+  let locks: FakeLockManager;
+  const setLocks = (value: FakeLockManager | undefined): void => {
+    Object.defineProperty(navigator, 'locks', { value, configurable: true });
+  };
+  beforeEach(() => {
+    locks = new FakeLockManager();
+    setLocks(locks);
+  });
+  afterEach(() => setLocks(undefined));
+
+  it('finalizes a run whose page is gone, booking max(checkpointed usage, reservation)', async () => {
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    run.addUsage(usage({ costUsd: 0.01 }));
+    await run.checkpoint({ output: 'partial' });
+    expect(await createTestCore().core.runs.sweep()).toBe(0); // owner still alive
+
+    locks.release(`ortoolbox:run:${run.id}`); // the owning tab closes
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect(await stored(run.id)).toMatchObject({ status: 'aborted', output: 'partial' });
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.05);
+  });
+
+  it('is idempotent across tabs', async () => {
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    locks.release(`ortoolbox:run:${run.id}`);
+    const counts = await Promise.all([1, 2, 3].map(() => createTestCore().core.runs.sweep()));
+    expect(counts.reduce((a, b) => a + b, 0)).toBe(1);
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.05);
+    expect(await core.stats.modelSummary('openai/gpt-x')).toMatchObject({ runs: 1 });
+  });
+
+  it('leaves handed-off runs to their job until the job is final', async () => {
+    const run = await core.runs.begin({ ...spec, tool: 'video-studio' });
+    const job = await core.jobs.add({
+      tool: 'video-studio',
+      type: 'video',
+      payload: {},
+      keyId: 'k1',
+      runId: run.id,
+    });
+    run.handOff(job.id);
+    await until(async () => (await stored(run.id))?.jobId === job.id);
+    locks.release(`ortoolbox:run:${run.id}`);
+    expect(await createTestCore().core.runs.sweep()).toBe(0);
+
+    await core.jobs.update(job.id, { state: 'failed', error: 'x' });
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect((await stored(run.id))?.status).toBe('aborted');
+  });
+
+  it('uses a heartbeat when Web Locks are unavailable', async () => {
+    setLocks(undefined);
+    const live = await core.runs.begin(spec);
+    const orphan: RunRecord = {
+      ...(await stored(live.id))!,
+      id: 'orphan',
+      startedAt: Date.now() - 10 * 60_000,
+    };
+    await (await getDb()).put('runs', orphan);
+    await settle();
+
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect((await stored('orphan'))?.status).toBe('aborted');
+    expect((await stored(live.id))?.status).toBe('running');
   });
 });

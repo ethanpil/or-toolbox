@@ -6,11 +6,18 @@
 
 import { CAPABILITIES, TOOL_IDS, type Capability, type ToolId } from '../../tools/types';
 import type { BudgetMode, Settings, ThemeMode, ToolBinding } from '../types';
-import { isPlainObject, jsonCopy } from './merge';
+import { isFiniteNumber, isPlainObject, isUnsafeKey, stripUnsafeKeys } from '../util';
+import { jsonCopy } from './merge';
 
 export const SETTINGS_VERSION = 1;
 
 export const RECENT_MODELS_CAP = 20;
+
+/** Upper bounds for numeric settings; values outside a range are clamped into it. */
+export const MAX_PER_RUN_USD = 1000;
+export const MAX_MONTHLY_USD = 100_000;
+export const MAX_RETENTION_DAYS = 3650;
+export const MAX_AUTO_LOCK_MINUTES = 1440;
 
 export function defaultSettings(): Settings {
   return {
@@ -42,9 +49,9 @@ const MIGRATIONS: Record<number, (settings: Raw) => Raw> = {
   0: (settings) => settings,
 };
 
-/** Runs every migration from the stored version up to SETTINGS_VERSION. */
+/** Runs every migration from the stored version up to SETTINGS_VERSION. Unsafe keys are dropped first. */
 export function migrateSettings(raw: unknown): Raw {
-  let settings: Raw = isPlainObject(raw) ? { ...raw } : {};
+  let settings: Raw = isPlainObject(raw) ? stripUnsafeKeys(raw) : {};
   const stored = settings['version'];
   let version = typeof stored === 'number' && Number.isInteger(stored) && stored >= 0 ? stored : 0;
   while (version < SETTINGS_VERSION) {
@@ -67,15 +74,12 @@ const oneOf = <T extends string>(value: unknown, allowed: readonly T[], fallback
     ? (value as T)
     : fallback;
 
-const nonNegative = (value: unknown, fallback: number): number =>
-  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+/** A finite number clamped into [min, max]; anything else is the fallback. */
+const clamped = (value: unknown, min: number, max: number, fallback: number): number =>
+  isFiniteNumber(value) ? Math.min(Math.max(value, min), max) : fallback;
 
-const nonNegativeOrNull = (value: unknown, fallback: number | null): number | null =>
-  value === null
-    ? null
-    : typeof value === 'number' && Number.isFinite(value) && value >= 0
-      ? value
-      : fallback;
+const usdOrNull = (value: unknown, fallback: number | null): number | null =>
+  value === null ? null : isFiniteNumber(value) ? clamped(value, 0, MAX_MONTHLY_USD, 0) : fallback;
 
 const nonEmptyString = (value: unknown): value is string =>
   typeof value === 'string' && value.trim() !== '';
@@ -92,11 +96,11 @@ const isToolId = (value: unknown): value is ToolId =>
 const isCapability = (value: unknown): value is Capability =>
   typeof value === 'string' && (CAPABILITIES as readonly string[]).includes(value);
 
-/** A JSON-safe plain object, or an empty one. */
+/** A JSON-safe plain object without unsafe keys, or an empty one. */
 const jsonObject = (value: unknown): Record<string, unknown> => {
   if (!isPlainObject(value)) return {};
   try {
-    const copy = jsonCopy(value);
+    const copy = stripUnsafeKeys(jsonCopy(value));
     return isPlainObject(copy) ? copy : {};
   } catch {
     return {}; // cycles or BigInt
@@ -119,7 +123,8 @@ function normalizeBinding(value: unknown): ToolBinding | null {
 
 /**
  * Migrates and validates anything (parsed JSON, a mutated draft, an imported backup) into a complete,
- * valid `Settings`. Each field that is missing or wrong falls back to its shipped default; nothing throws.
+ * valid `Settings`. Each field that is missing or wrong falls back to its shipped default, numbers are
+ * clamped to sane ranges, and nothing throws.
  */
 export function normalizeSettings(input: unknown): Settings {
   const raw = migrateSettings(input);
@@ -145,14 +150,11 @@ export function normalizeSettings(input: unknown): Settings {
 
   const perKeyMonthlyUsd: Record<string, number | null> = {};
   for (const [keyId, limit] of Object.entries(section(budgets, 'perKeyMonthlyUsd'))) {
-    if (limit === null || (typeof limit === 'number' && Number.isFinite(limit) && limit >= 0)) {
-      perKeyMonthlyUsd[keyId] = limit;
-    }
+    if (isUnsafeKey(keyId) || (limit !== null && !isFiniteNumber(limit))) continue;
+    perKeyMonthlyUsd[keyId] = usdOrNull(limit, null);
   }
 
   const accent = appearance['accent'];
-  const retention = data['retentionDays'];
-  const autoLock = security['autoLockMinutes'];
 
   return {
     version: SETTINGS_VERSION,
@@ -166,8 +168,8 @@ export function normalizeSettings(input: unknown): Settings {
     tools,
     budgets: {
       mode: oneOf(budgets['mode'], BUDGET_MODES, d.budgets.mode),
-      perRunUsd: nonNegative(budgets['perRunUsd'], d.budgets.perRunUsd),
-      monthlyUsd: nonNegativeOrNull(budgets['monthlyUsd'], d.budgets.monthlyUsd),
+      perRunUsd: clamped(budgets['perRunUsd'], 0, MAX_PER_RUN_USD, d.budgets.perRunUsd),
+      monthlyUsd: usdOrNull(budgets['monthlyUsd'], d.budgets.monthlyUsd),
       perKeyMonthlyUsd,
     },
     appearance: {
@@ -180,17 +182,15 @@ export function normalizeSettings(input: unknown): Settings {
       reducedMotion: bool(appearance['reducedMotion'], d.appearance.reducedMotion),
     },
     data: {
-      retentionDays:
-        typeof retention === 'number' && Number.isFinite(retention) && retention >= 1
-          ? Math.min(Math.round(retention), 36_500)
-          : d.data.retentionDays,
+      retentionDays: Math.round(
+        clamped(data['retentionDays'], 1, MAX_RETENTION_DAYS, d.data.retentionDays),
+      ),
       recordRecentPrompts: bool(data['recordRecentPrompts'], d.data.recordRecentPrompts),
     },
     security: {
-      autoLockMinutes:
-        typeof autoLock === 'number' && Number.isFinite(autoLock) && autoLock >= 0
-          ? Math.round(autoLock)
-          : d.security.autoLockMinutes,
+      autoLockMinutes: Math.round(
+        clamped(security['autoLockMinutes'], 1, MAX_AUTO_LOCK_MINUTES, d.security.autoLockMinutes),
+      ),
     },
     models: {
       favourites: uniqueStrings(models['favourites']),

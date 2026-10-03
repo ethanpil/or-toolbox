@@ -1,10 +1,10 @@
 import 'fake-indexeddb/auto';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { BusEvent, CoreServices } from '../types';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { BusEvent, CoreServices, JobRecord } from '../types';
 import { getDb } from '../storage/db';
 import { LS_KEYS, SS_KEYS } from '../storage/local';
 import { defaultSettings } from '../settings';
-import { createTestCore, isolateChannels, resetDb } from '../testing/state-fakes';
+import { createTestCore, isolateChannels, resetDb, until } from '../testing/state-fakes';
 
 let core: CoreServices;
 let events: BusEvent['type'][];
@@ -98,19 +98,66 @@ describe('deletion', () => {
   });
 
   it('resets everything, including keys, settings and session secrets', async () => {
-    sessionStorage.setItem(SS_KEYS.unlocked, 'material');
-    sessionStorage.setItem(SS_KEYS.oauth, 'verifier');
-    sessionStorage.setItem('ortoolbox:isolation-reload', '1');
+    for (const key of Object.values(LS_KEYS)) localStorage.setItem(key, '"x"');
+    for (const key of Object.values(SS_KEYS)) sessionStorage.setItem(key, 'x');
+    localStorage.setItem('unrelated-site-key', 'kept');
+    const clearKeys = vi.spyOn(core.keys, 'clear');
 
     await core.data.resetEverything();
 
+    expect(clearKeys).toHaveBeenCalledOnce();
     expect(await counts()).toEqual({ runs: 0, prompts: 0, jobs: 0, stats: 0, kv: [] });
-    expect(localStorage.getItem(LS_KEYS.settings)).toBeNull();
-    expect(localStorage.getItem(LS_KEYS.keys)).toBeNull();
+    for (const key of Object.values(LS_KEYS)) expect(localStorage.getItem(key)).toBeNull();
     expect(sessionStorage.getItem(SS_KEYS.unlocked)).toBeNull();
     expect(sessionStorage.getItem(SS_KEYS.oauth)).toBeNull();
-    expect(sessionStorage.getItem('ortoolbox:isolation-reload')).toBe('1');
+    expect(sessionStorage.getItem(SS_KEYS.isolationReload)).toBe('x'); // the reload-loop guard stays
+    expect(localStorage.getItem('unrelated-site-key')).toBe('kept');
     expect(core.settings.get()).toEqual(defaultSettings());
-    expect(events).toEqual(['settings-changed', 'keys-changed', 'data-reset']);
+    expect(events).toEqual(['keys-changed', 'settings-changed', 'jobs-changed', 'data-reset']);
+  });
+
+  it('stops live work: running runs abort without booking, polling stops, jobs report removal', async () => {
+    core.settings.update((d) => {
+      d.freeOnly = false;
+    });
+    const run = await core.runs.begin({ tool: 'chat', model: 'm/x', prompt: 'still going' });
+    run.addUsage({
+      model: 'm/x',
+      promptTokens: 1,
+      completionTokens: 1,
+      costUsd: 0.5,
+      costEstimated: false,
+      latencyMs: 1,
+    });
+    const poll = vi.fn(() => Promise.resolve({ state: 'running' as const }));
+    core.jobs.register('video', { poll, intervalMs: 50 });
+    const [job] = await core.jobs.list();
+    const seen: JobRecord[] = [];
+    core.jobs.subscribe((j) => seen.push(j));
+    core.jobs.resume();
+    await until(() => poll.mock.calls.length > 0);
+
+    await core.data.resetEverything();
+    expect(run.signal.aborted).toBe(true);
+    await run.finish({ output: 'late' }); // the tool did not notice the reset
+    const calls = poll.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(poll.mock.calls.length).toBe(calls);
+    expect(await counts()).toEqual({ runs: 0, prompts: 0, jobs: 0, stats: 0, kv: [] });
+    expect(core.runs.active()).toEqual([]);
+    await until(() => seen.some((j) => j.removed));
+    expect(seen.filter((j) => j.removed)).toEqual([
+      expect.objectContaining({ id: job!.id, state: 'cancelled', removed: true }),
+    ]);
+  });
+
+  it('reports a removed job to subscribers', async () => {
+    const [job] = await core.jobs.list();
+    const seen: JobRecord[] = [];
+    core.jobs.subscribe((j) => seen.push(j));
+    await core.jobs.remove(job!.id);
+    await until(() => seen.length > 0);
+    expect(seen).toEqual([{ ...job, state: 'cancelled', removed: true }]);
   });
 });

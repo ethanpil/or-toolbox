@@ -4,18 +4,17 @@
  */
 
 import type { ToolId, ToolStateStore } from '../types';
+import { NotJsonSafeError } from '../errors';
 import { getDb } from '../storage/db';
-import { isPlainObject } from '../settings/merge';
+import { isPlainObject } from '../util';
+
+export { NotJsonSafeError };
 
 export const TOOL_STATE_PREFIX = 'tool:';
 
 /** Every string key that starts with `prefix`. */
 export function prefixRange(prefix: string): IDBKeyRange {
   return IDBKeyRange.bound(prefix, prefix + String.fromCharCode(0xffff));
-}
-
-export class NotJsonSafeError extends Error {
-  override readonly name = 'NotJsonSafeError';
 }
 
 function describe(value: unknown): string {

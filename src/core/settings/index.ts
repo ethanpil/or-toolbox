@@ -1,11 +1,14 @@
 /**
  * Settings service: localStorage `ortoolbox:settings`, read synchronously when the service is created
  * (page start), validated and repaired on every read and write, and kept in step with other tabs through
- * the `storage` event and the bus.
+ * the `storage` event and the bus. `update()` re-reads storage before applying its mutator, so a change
+ * another tab made a moment ago is never overwritten; a page restored from the back/forward cache or
+ * brought back to the foreground re-syncs too (it may have missed events while frozen).
  */
 
 import type { Bus, CoreServices, Settings, SettingsService } from '../types';
-import { LS_KEYS, local, writeJson } from '../storage/local';
+import { LS_KEYS, local, readRaw as readStored, writeJson } from '../storage/local';
+import { parseJsonSafe } from '../util';
 import { deepFreeze, deepMerge, jsonCopy } from './merge';
 import { SETTINGS_VERSION, defaultSettings, normalizeSettings } from './schema';
 
@@ -13,18 +16,12 @@ export { defaultSettings, normalizeSettings, SETTINGS_VERSION } from './schema';
 
 type Subscriber = (next: Readonly<Settings>, prev: Readonly<Settings>) => void;
 
-function readRaw(): string | null {
-  try {
-    return local()?.getItem(LS_KEYS.settings) ?? null;
-  } catch {
-    return null;
-  }
-}
+const readRaw = (): string | null => readStored(local(), LS_KEYS.settings);
 
 function parse(raw: string | null): unknown {
   if (raw == null) return null;
   try {
-    return JSON.parse(raw) as unknown;
+    return parseJsonSafe(raw);
   } catch {
     return null; // corrupt: the validator falls back to defaults
   }
@@ -74,6 +71,12 @@ export function createSettingsService(core: CoreServices): SettingsService {
       // key === null: the other tab cleared the whole storage.
       if (event.key === LS_KEYS.settings || event.key === null) reload();
     });
+    window.addEventListener('pageshow', (event) => {
+      if (event.persisted) reload();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'hidden') reload();
+    });
   }
 
   let wired = false;
@@ -100,6 +103,7 @@ export function createSettingsService(core: CoreServices): SettingsService {
 
   const update = (mutate: (draft: Settings) => void): Readonly<Settings> => {
     ensureWired();
+    reload(); // start from what is stored now, not from what this tab saw last
     const draft = structuredClone(current) as Settings;
     mutate(draft);
     return commit(normalizeSettings(draft));
@@ -113,6 +117,7 @@ export function createSettingsService(core: CoreServices): SettingsService {
     update,
     reset() {
       ensureWired();
+      reload();
       // Keys are not affected, and the default key is part of the keys setup.
       commit(normalizeSettings({ ...defaultSettings(), defaultKeyId: current.defaultKeyId }));
     },

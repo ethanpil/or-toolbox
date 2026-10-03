@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatUsd } from '.';
 import type { BudgetMode, BudgetSettings, CoreServices, RunRecord } from '../types';
 import { BudgetBlockedError, RunCancelledError } from '../errors';
@@ -43,6 +43,7 @@ beforeEach(async () => {
     keys: [fakeKey({ id: 'k1', name: 'Work' }), fakeKey({ id: 'k2', name: 'Sandbox' })],
   }).core;
 });
+afterEach(() => vi.restoreAllMocks());
 
 describe('formatUsd', () => {
   it('shows cents, and two significant digits below a cent', () => {
@@ -217,5 +218,108 @@ describe('runs.begin applies the verdict', () => {
     await expect(core.runs.begin({ ...spec, estimateUsd: 0.05, keyId: 'k2' })).rejects.toThrow(
       BudgetBlockedError,
     );
+  });
+});
+
+describe('reservations of running runs', () => {
+  const arena = { tool: 'model-arena', model: 'm/paid', prompt: 'which is best?' } as const;
+
+  it('parallel runs each see the others', async () => {
+    setBudgets({ mode: 'hard', monthlyUsd: 0.25 });
+    const results = await Promise.allSettled(
+      [1, 2, 3, 4].map(() => core.runs.begin({ ...arena, estimateUsd: 0.08 })),
+    );
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(3);
+    const [rejected] = results.filter((r) => r.status === 'rejected');
+    expect(rejected?.reason).toBeInstanceOf(BudgetBlockedError);
+  });
+
+  it('counts runs that are still running in another tab', async () => {
+    setBudgets({ mode: 'hard', monthlyUsd: 0.25 });
+    const otherTab = createTestCore({ keys: [fakeKey({ id: 'k1' })] }).core;
+    await otherTab.runs.begin({ ...arena, estimateUsd: 0.09 });
+    await otherTab.runs.begin({ ...arena, estimateUsd: 0.09 });
+    await expect(core.runs.begin({ ...arena, estimateUsd: 0.09 })).rejects.toThrow(
+      BudgetBlockedError,
+    );
+    expect(await core.budgets.check({ keyId: 'k1', estimateUsd: 0.08 })).toMatchObject({
+      verdict: 'block',
+      reasons: [{ kind: 'monthly', projectedUsd: expect.closeTo(0.26) as number }],
+    });
+  });
+
+  it('reserves before asking, and releases the reservation when declined', async () => {
+    let reservedWhileAsking = 0;
+    core.runs.setConfirmHandler(async () => {
+      const running = await (await getDb()).getAllFromIndex('runs', 'status', 'running');
+      reservedWhileAsking = running.reduce((sum, r) => sum + r.reservedUsd, 0);
+      return false;
+    });
+    await expect(core.runs.begin({ ...arena, estimateUsd: 0.5 })).rejects.toBeInstanceOf(
+      RunCancelledError,
+    );
+    expect(reservedWhileAsking).toBe(0.5);
+    expect(await (await getDb()).count('runs')).toBe(0);
+    expect(core.runs.active()).toEqual([]);
+  });
+
+  it('frees the reservation when the run finishes with its actual cost', async () => {
+    setBudgets({ mode: 'hard', monthlyUsd: 0.25 });
+    const first = await core.runs.begin({ ...arena, estimateUsd: 0.09 });
+    await core.runs.begin({ ...arena, estimateUsd: 0.09 });
+    await first.finish(); // cost 0: the 0.09 reservation goes away
+    await expect(core.runs.begin({ ...arena, estimateUsd: 0.09 })).resolves.toBeDefined();
+  });
+});
+
+describe('free runs', () => {
+  it('are never blocked or questioned, whatever the spend', async () => {
+    setBudgets({ mode: 'hard', monthlyUsd: 1, perRunUsd: 0 });
+    await spend('k1', 5);
+    const confirm = vi.fn().mockResolvedValue(false);
+    core.runs.setConfirmHandler(confirm);
+    const free = { tool: 'chat', model: 'a/b:free' } as const;
+
+    await expect(core.runs.begin({ ...free, estimateUsd: 0 })).resolves.toBeDefined();
+    await expect(core.runs.begin({ ...free, models: ['openrouter/free'] })).resolves.toBeDefined();
+    expect(confirm).not.toHaveBeenCalled();
+
+    await expect(core.runs.begin({ ...free, model: 'm/paid', estimateUsd: 0 })).rejects.toThrow(
+      BudgetBlockedError,
+    );
+    await expect(core.runs.begin({ ...free, models: ['m/paid'], estimateUsd: 0 })).rejects.toThrow(
+      BudgetBlockedError,
+    );
+  });
+});
+
+describe('spend reads', () => {
+  it('reads the month of stats once per check', async () => {
+    setBudgets({ monthlyUsd: 5, perKeyMonthlyUsd: { k1: 1 } });
+    await spend('k1', 0.5);
+    const rows = vi.spyOn(core.stats, 'rows');
+    const monthSpend = vi.spyOn(core.stats, 'monthSpend');
+    await core.budgets.check({ keyId: 'k1', estimateUsd: 0.01 });
+    expect(rows).toHaveBeenCalledOnce();
+    expect(monthSpend).not.toHaveBeenCalled();
+  });
+
+  it.each(['warn', 'hard'] as const)(
+    'asks for confirmation in %s mode when the spend cannot be read',
+    async (mode) => {
+      setBudgets({ mode, monthlyUsd: 5 });
+      vi.spyOn(core.stats, 'rows').mockRejectedValue(new Error('IndexedDB is broken'));
+      const check = await core.budgets.check({ keyId: 'k1', estimateUsd: 0.01 });
+      expect(check.verdict).toBe('confirm');
+      expect(check.reasons[0]?.message).toBe(
+        "This month's spend could not be read, so your monthly limits cannot be checked.",
+      );
+    },
+  );
+
+  it('does not read spend at all without monthly limits', async () => {
+    const rows = vi.spyOn(core.stats, 'rows').mockRejectedValue(new Error('broken'));
+    expect((await core.budgets.check({ keyId: 'k1', estimateUsd: 0.01 })).verdict).toBe('ok');
+    expect(rows).not.toHaveBeenCalled();
   });
 });

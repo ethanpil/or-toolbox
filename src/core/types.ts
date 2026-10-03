@@ -652,6 +652,8 @@ export interface JobRecord<P = unknown, R = unknown> {
   createdAt: number;
   updatedAt: number;
   attempts: number;
+  /** Only on tombstones passed to `JobsService.subscribe` for removed jobs; never stored. */
+  removed?: true;
 }
 
 export type JobPollResult<R> =
@@ -688,7 +690,12 @@ export interface JobsService {
   remove(id: string): Promise<void>;
   /** Start polling every non-final job of a registered type. Only one tab polls a given job at a time. */
   resume(): void;
-  /** Fires on every change, local or from another tab. Shows a browser notification on completion when the page is hidden and permission was granted. */
+  /**
+   * Fires on every change, local or from another tab. Shows a browser notification on completion when the page
+   * is hidden and permission was granted. A removed job (`remove()`, data deletion or reset) is reported once as
+   * a tombstone: the last record this tab saw with `state: 'cancelled'` and `removed: true` (only `id`, `state`
+   * and `removed` are guaranteed when the tab never saw the job).
+   */
   subscribe(fn: (job: JobRecord) => void): () => void;
 }
 

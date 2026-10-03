@@ -5,8 +5,8 @@
 
 import type { CoreServices, HistoryQuery, HistoryService, RunRecord } from '../types';
 import { getDb } from '../storage/db';
+import { DAY_MS } from '../util';
 
-const DAY_MS = 86_400_000;
 const PRUNE_KEY = 'meta:lastPrune';
 const DEFAULT_LIMIT = 50;
 
