@@ -131,7 +131,7 @@ test('a 20-page PDF: 20 page results in order, exports, a failed page retried', 
   await addPdf(page);
   await page.getByTestId('run-button').click();
 
-  await expect(page.getByTestId('output-status')).toHaveText('Done · 19 of 20 pages; 1 not read');
+  await expect(page.getByTestId('output-status')).toHaveText('Done · 19 of 20 pages; 1 failed');
   expect(mock.calls('/api/v1/chat/completions')).toHaveLength(20);
   // Every page was sent as an image, with the PDF's own text as a hint.
   const third = mock.calls('/api/v1/chat/completions').find((call) => pageOf(call) === 3)!;
@@ -236,7 +236,11 @@ test('Stop ends the remaining pages and keeps what was read', async ({ page, con
   );
 });
 
-test('free-only mode blocks the paid PDF parser and says why', async ({ page, context }) => {
+test('free-only mode refuses the paid PDF parser and says why; the free one reads', async ({
+  page,
+  context,
+  mock,
+}) => {
   await seedApp(context, {
     key: true,
     settings: {
@@ -244,22 +248,33 @@ test('free-only mode blocks the paid PDF parser and says why', async ({ page, co
       tools: { ocr: { options: { pdfParser: true, engine: 'mistral-ocr' } } },
     },
   });
+  mock.respond('POST', '/api/v1/chat/completions', (call) => pageStream(pageOf(call)));
   const problems = await watchForProblems(page);
+  const withoutStreamCancels = acceptStreamCancels(page);
   await page.goto('tools/ocr/');
   // Free-only swaps in the free vision model, and says so.
   await expect(page.getByTestId('model-note')).toContainText('Free-only mode: using');
   await addPdf(page);
-  await expect(page.getByTestId('ocr-engine-notice')).toBeVisible();
-  await expect(page.getByTestId('run-button')).toHaveAttribute('aria-disabled', 'true');
-  await expect(page.getByTestId('run-hint')).toHaveText(
-    'Mistral OCR is not free; free-only mode is on.',
-  );
+  // The parser is a paid add-on: the run is refused before anything is sent, naming it.
+  await page.getByTestId('run-button').click();
+  const refusal = page.getByTestId('error-toast').filter({ hasText: 'Free-only mode is on' });
+  await expect(refusal).toContainText('Mistral OCR (PDF parser) is not free');
+  expect(mock.calls('/api/v1/chat/completions')).toHaveLength(0);
+  await expect(page.getByTestId('ocr-page')).toHaveCount(0);
   await expectNoSeriousA11yViolations(page);
 
-  // The free parser is fine.
+  // The free parser reads the whole PDF in one request.
   await page.getByTestId('drawer-button').click();
   await page.getByTestId('ocr-engine').selectOption('cloudflare-ai');
-  await expect(page.getByTestId('ocr-engine-notice')).toBeHidden();
-  await expect(page.getByTestId('run-button')).toHaveAttribute('aria-disabled', 'false');
-  expect(problems).toEqual([]);
+  const drawer = page.locator('.or-drawer');
+  await drawer.locator('.btn-close').click();
+  await expect(drawer).toBeHidden();
+  await page.getByTestId('run-button').click();
+  await expect(page.getByTestId('output-status')).toHaveText('Done · 1 page');
+  const calls = mock.calls('/api/v1/chat/completions');
+  expect(calls).toHaveLength(1);
+  expect((calls[0]!.body as { plugins?: unknown }).plugins).toEqual([
+    { id: 'file-parser', pdf: { engine: 'cloudflare-ai' } },
+  ]);
+  expect(withoutStreamCancels(problems)).toEqual([]);
 });

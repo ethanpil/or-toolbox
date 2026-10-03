@@ -6,7 +6,7 @@
  * Rows are redrawn one at a time (a document finishing never disturbs a cell being edited in another row), and
  * text typed but not yet committed survives a redraw of its own row.
  */
-import { h } from '../../ui/dom';
+import { focusedKey, focusKey, h } from '../../ui/dom';
 import { setFieldError } from '../../ui/feedback/field-error';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
@@ -497,26 +497,17 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
     return [mainRow(doc, fields), ...detailRows(doc, fields)];
   };
 
-  function update(doc: DocResult, focusKey?: string): void {
+  function update(doc: DocResult, wantedKey?: string): void {
     const main = body.querySelector<HTMLElement>(`tr[data-doc-key="${doc.key}"]`);
     if (!main) return;
     const old = [main, ...body.querySelectorAll<HTMLElement>(`tr[data-detail-for="${doc.key}"]`)];
-    const active = document.activeElement;
-    const keyed = old.some((row) => row.contains(active))
-      ? (active?.closest('[data-focus-key]')?.getAttribute('data-focus-key') ?? null)
-      : null;
+    const keyed = old.map((row) => focusedKey(row)).find((key) => key !== null) ?? null;
     const fresh = rowsOf(doc);
     main.before(...fresh);
     for (const row of old) row.remove();
-    const wanted = focusKey ?? keyed;
-    if (wanted) {
-      const find = (key: string): HTMLElement | undefined =>
-        [...body.querySelectorAll<HTMLElement>('[data-focus-key]')].find(
-          (candidate) => candidate.getAttribute('data-focus-key') === key,
-        );
-      // The control that had focus may be gone (a Retry that started): stay in the row, on its source button.
-      (find(wanted) ?? (keyed ? find(`source:${doc.key}`) : undefined))?.focus();
-    }
+    const wanted = wantedKey ?? keyed;
+    // The control that had focus may be gone (a Retry that started): stay in the row, on its source button.
+    if (wanted && !focusKey(body, wanted) && keyed) focusKey(body, `source:${doc.key}`);
   }
 
   return {

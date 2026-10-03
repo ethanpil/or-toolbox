@@ -5,22 +5,21 @@
  * an Excel workbook with a sheet per table, Markdown, and TSV for pasting into a spreadsheet. One run per
  * Run press; its output is the tables as Markdown.
  */
-import { ApiError, errorCode, InvalidInputError, userMessage } from '../../core/errors';
-import { runPool } from '../../core/pool';
-import { abortError } from '../../core/util';
+import { InvalidInputError, userMessage } from '../../core/errors';
 import type { RunHandle } from '../../core/types';
 import { copyText } from '../../ui/clipboard';
 import { documentInput, type PageRef, textImage } from '../../ui/components/document-input';
 import { emptyState } from '../../ui/components/empty-state';
 import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
-import { h, replace } from '../../ui/dom';
+import { focusedKey, focusKey, h, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
+import { isStop } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import type { Runner, ToolContext, ToolInstance } from '../../ui/tool/index';
+import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
+import type { RunnerState, ToolContext, ToolInstance } from '../../ui/tool/index';
 import {
   csvZip,
   tableCsv,
@@ -54,13 +53,6 @@ interface PageState {
 
 const IMAGE_SIZES = [1024, 1600, 2048] as const;
 const CONCURRENCY = [1, 2, 3] as const;
-
-function isFatal(error: unknown): boolean {
-  if (needsAction(error)) return true;
-  const code = errorCode(error);
-  if (code === 'invalid-key' || code === 'no-key' || code === 'locked') return true;
-  return error instanceof ApiError && (error.status === 401 || error.status === 402);
-}
 
 export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
@@ -252,16 +244,16 @@ export function setup(ctx: ToolContext): ToolInstance {
     return first ? `${first.replace(/\.[^.]+$/, '')}-tables` : 'tables';
   };
 
-  const formats = (): ExportFormat[] => {
-    const single = tables.length === 1 ? tables[0] : undefined;
+  /** The download formats; they read the tables when chosen, so only one table versus several changes them. */
+  const formats = (single: boolean): ExportFormat[] => {
     return [
       single
         ? {
             label: 'CSV',
             extension: 'csv',
             icon: 'filetype-csv',
-            filename: () => tableStem(single, 1),
-            build: () => new Blob([tableCsv(single)], { type: 'text/csv' }),
+            filename: () => tableStem(tables[0]!, 1),
+            build: () => new Blob([tableCsv(tables[0]!)], { type: 'text/csv' }),
           }
         : {
             label: 'CSV files (ZIP, one per table)',
@@ -285,6 +277,15 @@ export function setup(ctx: ToolContext): ToolInstance {
     ];
   };
 
+  const menu = exportMenu({
+    formats: formats(false),
+    filename: stem,
+    disabled: true,
+    testId: 'te-export',
+  });
+  exportSlot.append(menu);
+  let menuShape = 'none';
+
   const pageName = (page: PageState): string =>
     page.ref.pageCount > 1 ? `${page.ref.fileName} p. ${page.ref.pageNumber}` : page.ref.fileName;
 
@@ -303,9 +304,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     progressBar.style.width = pages.length
       ? `${Math.round(((done + failed.length) / pages.length) * 100)}%`
       : '0%';
-    const retryHadFocus = failedBox.contains(document.activeElement);
     failedBox.hidden = reading || failed.length === 0;
-    replace(
+    replaceWith(
       failedBox,
       failed.length === 0
         ? null
@@ -323,11 +323,11 @@ export function setup(ctx: ToolContext): ToolInstance {
             ),
             retryButton(failed.map((page) => page.key)),
           ),
+      // "Retry" hides while reading: keep keyboard focus nearby, on the summary line.
+      { fallback: () => summary },
     );
-    // "Retry" hides while reading: keep keyboard focus nearby.
-    if (retryHadFocus && failedBox.hidden) summary.focus();
     truncatedBox.hidden = cut.length === 0;
-    replace(
+    replaceWith(
       truncatedBox,
       cut.length === 0
         ? null
@@ -342,22 +342,12 @@ export function setup(ctx: ToolContext): ToolInstance {
             ),
           ),
     );
-    replace(
-      exportSlot,
-      exportMenu({
-        formats: formats(),
-        filename: stem,
-        disabled: tables.length === 0,
-        testId: 'te-export',
-      }),
-    );
-  };
-
-  const focusKey = (key: string | undefined): void => {
-    if (!key) return;
-    [...list.querySelectorAll<HTMLElement>('[data-focus-key]')]
-      .find((candidate) => candidate.getAttribute('data-focus-key') === key)
-      ?.focus();
+    // In place, and only when it changes: an open menu stays open while pages finish and cells are edited.
+    const shape = tables.length === 0 ? 'none' : tables.length === 1 ? 'one' : 'many';
+    if (shape !== menuShape) {
+      menuShape = shape;
+      menu.update({ formats: formats(shape === 'one'), disabled: shape === 'none' });
+    }
   };
 
   /** The card drawn for each table, reused for as long as the table object stays the same. */
@@ -398,11 +388,7 @@ export function setup(ctx: ToolContext): ToolInstance {
    * never redraws, refocuses or resets the cards around it; only new or replaced tables get new cards.
    */
   const renderTables = (focus?: string): void => {
-    const active = document.activeElement;
-    const activeKey =
-      active && list.contains(active)
-        ? (active.closest('[data-focus-key]')?.getAttribute('data-focus-key') ?? null)
-        : null;
+    const activeKey = focusedKey(list);
     const wanted = tables.map((table, index) => {
       const mergeable = canMerge(table, tables[index + 1]);
       const cached = cards.get(table.id);
@@ -423,8 +409,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       if (at !== element) list.insertBefore(element, at ?? null);
     });
     while (list.children.length > wanted.length) list.lastElementChild!.remove();
-    if (focus) focusKey(focus);
-    else if (activeKey && !list.contains(document.activeElement)) focusKey(activeKey);
+    if (focus) focusKey(list, focus);
+    else if (activeKey && !list.contains(document.activeElement)) focusKey(list, activeKey);
   };
 
   /** Deletes a table; Undo puts it back next to the neighbours it had, unless a run replaced the tables since. */
@@ -439,7 +425,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     renderTables();
     renderSummary();
     const neighbour = tables[Math.min(at, tables.length - 1)];
-    focusKey(neighbour ? `${neighbour.id}:title` : undefined);
+    if (neighbour) focusKey(list, `${neighbour.id}:title`);
     toast({
       message: `Deleted “${name}”.`,
       action: {
@@ -480,38 +466,25 @@ export function setup(ctx: ToolContext): ToolInstance {
           completionTokens: count * 2500,
         });
 
-  /** The pages a Retry asks for; `run` takes them the moment the runner starts it (see `retry`). */
-  let pendingRetry: string[] | null = null;
-
-  /** Why Run cannot start now (busy, or disabled with a reason); null when it can. */
-  function runBlocked(): string | null {
-    if (runner.busy) return 'Wait until the current run ends.';
-    if (runner.button.getAttribute('aria-disabled') !== 'true') return null;
-    return (
-      runner.element.querySelector('[data-testid="run-hint"]')?.textContent?.trim() ||
-      'Reading is not possible right now.'
-    );
-  }
-
-  /** Brings every Retry button in line with the runner (Run disabled or busy disables them, with the reason). */
-  const syncRetryButtons = (): void => {
-    const reason = runBlocked();
-    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]')) {
-      button.setAttribute('aria-disabled', String(reason !== null));
-      button.classList.toggle('disabled', reason !== null);
-      button.title = reason ?? '';
-    }
+  /** The runner's state, kept by `runner.subscribe`: the Retry button follows it. */
+  let runnerState: RunnerState = { busy: false, disabledReason: null };
+  /** Why a Retry cannot start now (Run busy or disabled), or null. */
+  const retryBlocked = (): string | null =>
+    runnerState.busy ? 'Wait until the current run ends.' : runnerState.disabledReason;
+  /** Shows a Retry button as available or not, with the reason; it stays focusable (aria-disabled). */
+  const setRetryState = (button: HTMLElement): void => {
+    const reason = retryBlocked();
+    button.setAttribute('aria-disabled', String(reason !== null));
+    button.classList.toggle('disabled', reason !== null);
+    button.title = reason ?? '';
   };
 
   function retryButton(keys: string[]): HTMLButtonElement {
-    const reason = runBlocked();
-    return h(
+    const button = h(
       'button',
       {
         type: 'button',
-        class: ['btn btn-sm btn-warning', reason !== null && 'disabled'],
-        'aria-disabled': String(reason !== null),
-        title: reason ?? '',
+        class: 'btn btn-sm btn-warning',
         'data-retry': '',
         'data-focus-key': 'retry-failed',
         'data-testid': 'te-retry-failed',
@@ -519,20 +492,14 @@ export function setup(ctx: ToolContext): ToolInstance {
       },
       'Retry',
     );
+    setRetryState(button);
+    return button;
   }
 
+  /** Reads `keys` again (a Retry); the runner's own Retry after a refusal repeats the same pages. */
   function retry(keys: string[]): void {
-    const blocked = runBlocked();
-    if (blocked) {
-      announce(blocked);
-      return;
-    }
     if (keys.length === 0) return;
-    pendingRetry = keys;
-    void runner.trigger();
-    // The runner calls `run` synchronously when it starts; if it did not start, these keys must not wait around to
-    // turn a later Run press into a retry.
-    pendingRetry = null;
+    if (!runner.trigger(keys).started) announce(retryBlocked() ?? 'Reading cannot start now.');
   }
 
   const CUT_OFF_NOTE =
@@ -583,9 +550,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     ].sort((a, b) => rank(a) - rank(b));
   };
 
-  const run = async (signal: AbortSignal): Promise<void> => {
-    const keys = pendingRetry;
-    pendingRetry = null;
+  const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
     const refs = keys ? [] : docs.selection();
     if (!keys && refs.length === 0) {
       ui.status(docs.files().length ? 'Choose at least one page.' : 'Add an image or a PDF first.');
@@ -599,23 +564,18 @@ export function setup(ctx: ToolContext): ToolInstance {
     const model = ctx.model().model;
     const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
     const mode = outputMode(info?.supportedParameters ?? []);
-    const first = planned[0]!.fileName;
-    const files = new Set(planned.map((ref) => ref.fileName));
-    let handle: RunHandle;
-    try {
-      handle = await ctx.beginRun(
-        {
-          title: `${keys ? 'Retry: ' : ''}${first}${files.size > 1 ? ` and ${plural(files.size - 1, 'more file')}` : ''}`,
-          ...(keys && model ? { estimateUsd: await estimateFor(planned.length, model) } : {}),
-        },
-        signal,
-      );
-    } catch (error) {
-      // Refused before anything was sent (no key, locked, free-only, budget, Cancel): the tables, their edits and
-      // the list of failed pages stay exactly as they were. A refused retry offers to retry the same pages.
-      if (keys && !isStop(error)) void presentError(error, { retry: () => retry(keys) });
-      throw error;
-    }
+    // Refused before anything was sent (no key, locked, free-only, budget, Cancel): the tables, their edits and
+    // the list of failed pages stay exactly as they were.
+    const handle = await ctx.beginRun(
+      {
+        title: batchTitle(
+          planned.map((ref) => ref.fileName),
+          { retry: keys !== undefined },
+        ),
+        ...(keys && model ? { estimateUsd: await estimateFor(planned.length, model) } : {}),
+      },
+      signal,
+    );
 
     // The run is on: only now replace (or reset) what it reads.
     extraction += 1;
@@ -642,52 +602,26 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     reading = true;
     renderSummary();
-    let lastError = null as Error | null; // assigned inside the pool callbacks
     try {
-      try {
-        await runPool(
-          batch,
-          Number(concurrency.value) || 3,
-          async (page) => {
-            page.status = 'running';
-            try {
-              await readPage(handle, page, mode);
-              page.status = 'done';
-            } catch (error) {
-              if (isStop(error) || handle.signal.aborted) {
-                page.status = 'stopped';
-                throw error;
-              }
-              page.status = 'failed';
-              page.error = userMessage(error);
-              lastError =
-                error instanceof Error ? error : new InvalidInputError(userMessage(error));
-              if (isFatal(error)) throw error;
-            } finally {
-              renderTables();
-              renderSummary();
-              const done = pages.filter((item) => item.status === 'done').length;
-              ui.status(`Read ${done} of ${plural(pages.length, 'page')}`);
-              void handle.checkpoint({ output: tablesMarkdown(tables) }).catch(() => undefined);
-            }
-          },
-          handle.signal,
-        );
-      } finally {
-        for (const page of batch)
-          if (page.status === 'queued' || page.status === 'running') page.status = 'stopped';
-      }
-      if (handle.signal.aborted) {
-        const reason: unknown = handle.signal.reason;
-        throw reason instanceof Error ? reason : abortError('Stopped.');
-      }
-      // Only this run's pages decide whether it failed: a retry whose pages all fail again fails.
-      const done = batch.filter((page) => page.status === 'done').length;
-      if (done === 0 && lastError) {
-        if (!needsAction(lastError)) markPresented(lastError);
-        throw lastError;
-      }
-      ui.status(tables.length ? describeTables(tables) : 'No tables found');
+      const outcome = await runItems({
+        items: batch,
+        concurrency: Number(concurrency.value) || 3,
+        signal: handle.signal,
+        work: (page) => readPage(handle, page, mode),
+        onItem: ({ item: page, status, error }) => {
+          page.status = status;
+          if (status === 'failed') page.error = userMessage(error);
+          if (status === 'running' || status === 'queued') return;
+          renderTables();
+          renderSummary();
+          const done = pages.filter((item) => item.status === 'done').length;
+          ui.status(`Read ${done} of ${plural(pages.length, 'page')}`);
+          void handle.checkpoint({ output: () => tablesMarkdown(tables) }).catch(() => undefined);
+        },
+      });
+      ui.status(
+        `${batchSummary(outcome, 'page')} · ${tables.length ? describeTables(tables) : 'no tables found'}`,
+      );
       if (tables.length === 0) announce('No tables found on these pages.');
       await handle.finish({
         output: tablesMarkdown(tables),
@@ -709,14 +643,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner: Runner = ui.runner({ label: 'Find tables', icon: 'table', run });
-  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry buttons.
-  new MutationObserver(syncRetryButtons).observe(runner.element, {
-    subtree: true,
-    childList: true,
-    characterData: true,
-    attributes: true,
-    attributeFilter: ['aria-disabled'],
+  const runner = ui.runner<string[]>({ label: 'Find tables', icon: 'table', run });
+  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry button.
+  runner.subscribe((state) => {
+    runnerState = state;
+    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]'))
+      setRetryState(button);
   });
   renderSummary();
 
