@@ -9,6 +9,13 @@ describe('fileMime', () => {
     expect(fileMime({ type: '', name: 'unknown.xyz' })).toBe('');
     expect(fileMime({ type: '' })).toBe('');
   });
+
+  it('types untyped source files so `text/*` takes them and `text/plain` does not', () => {
+    expect(fileMime({ type: '', name: 'main.py' })).toBe('text/x-python');
+    expect(fileMime({ type: '', name: 'config.yml' })).toBe('text/yaml');
+    expect(acceptsFile({ type: '', name: 'main.py' }, ['text/*'])).toBe(true);
+    expect(acceptsFile({ type: '', name: 'main.py' }, ['text/plain'])).toBe(false);
+  });
 });
 
 describe('mimeMatches', () => {
@@ -43,6 +50,7 @@ describe('describeAccept', () => {
     );
     expect(describeAccept(['audio/*', 'video/*'])).toBe('audio or video');
     expect(describeAccept(['text/plain'])).toBe('text');
+    expect(describeAccept(['application/pdf', 'text/*'])).toBe('PDF or text and code');
     expect(describeAccept([])).toBe('');
   });
 });
