@@ -45,28 +45,67 @@ describe('tokens and decisions', () => {
   it('bills decisions on input tokens only (matches the recorded Jev cost)', () => {
     expect(estimateDecision(model('typesafe/jev-1.13'), 476)).toBeCloseTo(0.000019992, 12);
   });
+
+  it('applies long-context overrides above their threshold', () => {
+    const sol = model('openai/gpt-6.1-sol'); // above 272k prompt tokens: $4 / $15 per M
+    expect(estimateTokens(sol, 271_999, 0)).toBeCloseTo(271_999 * 0.000002, 8);
+    expect(estimateTokens(sol, 300_000, 1000)).toBeCloseTo(300_000 * 0.000004 + 1000 * 0.000015, 8);
+  });
+
+  it('assumes surcharge windows without a threshold apply', () => {
+    const base = model('openai/gpt-6.1-sol');
+    const windowed = {
+      ...base,
+      pricing: {
+        ...base.pricing,
+        raw: { ...base.pricing.raw, overrides: [{ prompt: '0.000003' }, { prompt: '0.000001' }] },
+      },
+    };
+    expect(estimateTokens(windowed, 1000, 0)).toBeCloseTo(1000 * 0.000003, 10);
+  });
 });
 
 describe('speech', () => {
   it('uses the most expensive endpoint (matches the billed Kokoro request)', () => {
     const endpoints = [endpoint('0.00000062'), endpoint('0.000004')];
-    expect(estimateSpeech(44, endpoints, {})).toBeCloseTo(0.000176, 10);
+    expect(estimateSpeech({ model: 'hexgrad/kokoro-82m', characters: 44 }, endpoints)).toBeCloseTo(
+      0.000176,
+      10,
+    );
   });
 
   it('adds audio-token output for token-priced models (Gemini TTS, billed $0.00057)', () => {
-    const pricing = model('google/gemini-3.8-flash-tts').pricing.raw;
-    const estimate = estimateSpeech(20, [], pricing) ?? 0;
+    const raw = model('google/gemini-3.8-flash-tts').pricing.raw;
+    const endpoints = [endpoint(String(raw['prompt']), String(raw['completion']))];
+    const estimate =
+      estimateSpeech({ model: 'google/gemini-3.8-flash-tts', characters: 20 }, endpoints) ?? 0;
     expect(estimate).toBeGreaterThanOrEqual(0.00057);
     expect(estimate).toBeLessThan(0.001);
   });
 
-  it('treats a large completion price as per second of output (Seed Audio)', () => {
-    const pricing = model('bytedance-seed/seed-audio-1-0').pricing.raw;
-    expect(estimateSpeech(100, [], pricing)).toBeCloseTo(0.025, 10);
+  it('assumes slow speech for per-second output prices (Seed Audio)', () => {
+    const endpoints = [endpoint('0', '0.0025')];
+    // 100 characters at 4 per second = 25 s at $0.0025/s.
+    expect(
+      estimateSpeech({ model: 'bytedance-seed/seed-audio-1-0', characters: 100 }, endpoints),
+    ).toBeCloseTo(0.0625, 10);
   });
 
-  it('returns null without any price', () => {
-    expect(estimateSpeech(10, [], {})).toBeNull();
+  it('counts UTF-8 bytes for byte-priced providers (Fish Audio)', () => {
+    const endpoints = [endpoint('0.000015')];
+    const fish = { model: 'fish-audio/s2.1-pro', characters: 7 };
+    expect(estimateSpeech({ ...fish, bytes: 12 }, endpoints)).toBeCloseTo(12 * 0.000015, 10);
+    // Without the byte count, the worst case of 4 bytes per character.
+    expect(estimateSpeech(fish, endpoints)).toBeCloseTo(28 * 0.000015, 10);
+  });
+
+  it('returns null without endpoint prices, never the cheapest catalog price', () => {
+    expect(estimateSpeech({ model: 'hexgrad/kokoro-82m', characters: 10 }, [])).toBeNull();
+    expect(
+      estimateSpeech({ model: 'hexgrad/kokoro-82m', characters: 10 }, [
+        { name: 'e', provider_name: 'p', pricing: {} },
+      ]),
+    ).toBeNull();
   });
 });
 
@@ -148,6 +187,19 @@ describe('video', () => {
     );
     // Unknown audio choice: the dearer option.
     expect(estimateVideo(veo, { seconds: 8, resolution: '720p' })).toBeCloseTo(0.8, 6);
+  });
+
+  it('counts the with-audio price when the audio choice is unknown (Kling)', () => {
+    const kling = video('kwaivgi/kling-v3.0-pro');
+    expect(estimateVideo(kling, { seconds: 5, resolution: '720p', withAudio: false })).toBeCloseTo(
+      0.56,
+      6,
+    );
+    expect(estimateVideo(kling, { seconds: 5, resolution: '720p', withAudio: true })).toBeCloseTo(
+      0.84,
+      6,
+    );
+    expect(estimateVideo(kling, { seconds: 5, resolution: '720p' })).toBeCloseTo(0.84, 6);
   });
 
   it('is conservative without a resolution and applies minimum charges', () => {

@@ -1,8 +1,10 @@
 /**
  * Model catalog service. The catalog (`GET /models?output_modalities=all`, ~1 MB), the image and video model
  * lists and per-model endpoint lists are cached in IndexedDB `kv` as `{fetchedAt, models}` (endpoints:
- * `{fetchedAt, endpoints}`), refreshed when older than 24 h or on demand, and served from cache when offline.
- * A refresh emits `models-refreshed`; other tabs drop their in-memory copy and reload from IndexedDB.
+ * `{fetchedAt, endpoints}`). Stale-while-revalidate: a copy older than 24 h is returned at once and refreshed in
+ * the background (one attempt; a failure is remembered for 5 minutes so an offline page does not keep trying).
+ * Only `refresh: true` or an empty cache waits for the network. A stored refresh emits `models-refreshed`; other
+ * tabs drop their in-memory copy and reload from IndexedDB.
  */
 
 import type { RawImageModel, RawModel, RawModelEndpoint, RawVideoModel } from '../api/types';
@@ -22,6 +24,8 @@ import { isFreeModelId } from './free';
 import { normalizeModel } from './normalize';
 
 export const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** After a failed refresh, the next automatic attempt waits this long. */
+export const REFRESH_FAILURE_BACKOFF_MS = 5 * 60 * 1000;
 export const KV_CATALOG = 'models:catalog';
 export const KV_IMAGE_MODELS = 'models:images';
 export const KV_VIDEO_MODELS = 'models:videos';
@@ -30,16 +34,22 @@ export const kvEndpoints = (modelId: string): string => `models:endpoints:${mode
 interface CacheOptions<T> {
   key: string;
   field: 'models' | 'endpoints';
-  fetch: () => Promise<T[]>;
+  /** `retry: false` for background refreshes. */
+  fetch: (opts: { retry: boolean }) => Promise<T[]>;
   now: () => number;
   maxAgeMs: number;
+  /** Runs once a refreshed list is stored in IndexedDB (other tabs then read the new copy). */
   onRefreshed?: () => void;
 }
 
-/** One cached list: memory → IndexedDB → network, with offline fallback to whatever is cached. */
+/** One cached list: memory → IndexedDB → network, stale-while-revalidate, offline-tolerant. */
 class ListCache<T> {
   private memory: { fetchedAt: number; items: T[] } | null = null;
-  private inflight: Promise<T[]> | null = null;
+  private loading: Promise<void> | null = null;
+  private loaded = false;
+  private foreground: Promise<T[]> | null = null;
+  private background: Promise<void> | null = null;
+  private failure: { at: number; error: unknown } | null = null;
   private readonly options: CacheOptions<T>;
 
   constructor(options: CacheOptions<T>) {
@@ -52,16 +62,26 @@ class ListCache<T> {
 
   invalidate(): void {
     this.memory = null;
+    this.loaded = false;
   }
 
-  get(refresh = false): Promise<T[]> {
-    if (!refresh && this.memory && this.fresh(this.memory.fetchedAt)) {
-      return Promise.resolve(this.memory.items);
+  async get(refresh = false): Promise<T[]> {
+    if (refresh) return this.fetchNow();
+    if (!this.memory && !this.loaded) {
+      this.loading ??= this.read().then((entry) => {
+        this.memory ??= entry;
+        this.loaded = true;
+        this.loading = null;
+      });
+      await this.loading;
     }
-    this.inflight ??= this.load(refresh).finally(() => {
-      this.inflight = null;
-    });
-    return this.inflight;
+    if (this.memory) {
+      if (!this.fresh(this.memory.fetchedAt)) this.revalidate();
+      return this.memory.items;
+    }
+    // Nothing cached: wait for the network, unless it just failed (then fail fast until the backoff ends).
+    if (this.failure && !this.backoffOver()) throw this.failure.error;
+    return this.fetchNow();
   }
 
   private fresh(fetchedAt: number): boolean {
@@ -69,20 +89,52 @@ class ListCache<T> {
     return age >= 0 && age < this.options.maxAgeMs;
   }
 
-  private async load(refresh: boolean): Promise<T[]> {
-    this.memory ??= await this.read();
-    if (!refresh && this.memory && this.fresh(this.memory.fetchedAt)) return this.memory.items;
-    try {
-      const items = await this.options.fetch();
-      this.memory = { fetchedAt: this.options.now(), items };
-      await this.write(this.memory);
-      this.options.onRefreshed?.();
-      return items;
-    } catch (error) {
-      // Offline or OpenRouter down: a stale copy beats nothing.
-      if (this.memory) return this.memory.items;
-      throw error;
-    }
+  private backoffOver(): boolean {
+    return !this.failure || this.options.now() - this.failure.at >= REFRESH_FAILURE_BACKOFF_MS;
+  }
+
+  private fetchNow(): Promise<T[]> {
+    this.foreground ??= this.options
+      .fetch({ retry: true })
+      .then(
+        (items) => this.store(items),
+        (error: unknown) => {
+          this.failure = { at: this.options.now(), error };
+          // Offline or OpenRouter down: a stale copy beats nothing.
+          if (this.memory) return this.memory.items;
+          throw error;
+        },
+      )
+      .finally(() => {
+        this.foreground = null;
+      });
+    return this.foreground;
+  }
+
+  /** Background refresh: one attempt, not while another runs or a recent one failed. */
+  private revalidate(): void {
+    if (this.background || this.foreground || !this.backoffOver()) return;
+    this.background = this.options
+      .fetch({ retry: false })
+      .then(
+        (items) => {
+          this.store(items);
+        },
+        (error: unknown) => {
+          this.failure = { at: this.options.now(), error };
+        },
+      )
+      .finally(() => {
+        this.background = null;
+      });
+  }
+
+  /** Keeps a fresh list; the IndexedDB write is not awaited, and other tabs are told once it is stored. */
+  private store(items: T[]): T[] {
+    this.memory = { fetchedAt: this.options.now(), items };
+    this.failure = null;
+    void this.write(this.memory).then(() => this.options.onRefreshed?.());
+    return items;
   }
 
   private async read(): Promise<{ fetchedAt: number; items: T[] } | null> {
@@ -138,23 +190,31 @@ export function createModelsService(
     }
   }
 
-  /** Another tab refreshed: drop memory copies so the next read loads its result from IndexedDB. */
+  function dropMemory(): void {
+    catalog.invalidate();
+    images.invalidate();
+    videos.invalidate();
+    endpointCaches.clear();
+    normalized = null;
+  }
+
+  /**
+   * Another tab refreshed: drop memory copies so the next read loads its result from IndexedDB. Data reset (any
+   * tab): drop them too, so nothing deleted from IndexedDB lives on here and `lastRefreshed()` is null.
+   */
   function listen(): void {
     if (listening) return;
     listening = true;
     core.bus.on('models-refreshed', () => {
-      if (emitting) return;
-      catalog.invalidate();
-      images.invalidate();
-      videos.invalidate();
-      normalized = null;
+      if (!emitting) dropMemory();
     });
+    core.bus.on('data-reset', dropMemory);
   }
 
   const catalog = new ListCache<RawModel>({
     key: KV_CATALOG,
     field: 'models',
-    fetch: () => core.api.catalog.models({ output_modalities: 'all' }),
+    fetch: (opts) => core.api.catalog.models({ output_modalities: 'all' }, opts),
     now,
     maxAgeMs,
     onRefreshed: announce,
@@ -162,7 +222,7 @@ export function createModelsService(
   const images = new ListCache<RawImageModel>({
     key: KV_IMAGE_MODELS,
     field: 'models',
-    fetch: () => core.api.catalog.imageModels(),
+    fetch: (opts) => core.api.catalog.imageModels(opts),
     now,
     maxAgeMs,
     onRefreshed: announce,
@@ -170,7 +230,7 @@ export function createModelsService(
   const videos = new ListCache<RawVideoModel>({
     key: KV_VIDEO_MODELS,
     field: 'models',
-    fetch: () => core.api.catalog.videoModels(),
+    fetch: (opts) => core.api.catalog.videoModels(opts),
     now,
     maxAgeMs,
     onRefreshed: announce,
@@ -201,7 +261,7 @@ export function createModelsService(
       cache = new ListCache<RawModelEndpoint>({
         key: kvEndpoints(modelId),
         field: 'endpoints',
-        fetch: () => core.api.catalog.modelEndpoints(modelId),
+        fetch: (opts) => core.api.catalog.modelEndpoints(modelId, opts),
         now,
         maxAgeMs,
       });
@@ -223,12 +283,16 @@ export function createModelsService(
         return model ? estimateDecision(model, input.inputTokens) : null;
       }
       case 'speech': {
-        const model = await get(input.model).catch(() => undefined);
+        // Endpoint prices only: the catalog shows the cheapest endpoint, which would underestimate (§0).
         const endpoints = await endpointsCache(input.model)
           .get()
-          .catch(() => []);
-        if (!model && endpoints.length === 0) return null;
-        return estimateSpeech(input.characters, endpoints, model?.pricing.raw ?? {});
+          .catch((): RawModelEndpoint[] => []);
+        const speech: { model: string; characters: number; bytes?: number } = {
+          model: input.model,
+          characters: input.characters,
+        };
+        if (input.bytes !== undefined) speech.bytes = input.bytes;
+        return estimateSpeech(speech, endpoints);
       }
       case 'transcription': {
         const model = await get(input.model);
@@ -320,10 +384,12 @@ export function createModelsService(
     },
 
     endpoints(modelId) {
+      listen();
       return endpointsCache(modelId).get();
     },
 
     async estimate(input) {
+      listen();
       if (isFreeModelId(input.model)) return 0;
       try {
         const value = await estimateOrNull(input);
@@ -335,6 +401,7 @@ export function createModelsService(
     },
 
     lastRefreshed() {
+      listen();
       return catalog.fetchedAt;
     },
   };
