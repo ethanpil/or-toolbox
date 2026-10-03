@@ -51,6 +51,7 @@ declare module 'bootstrap/js/src/toast.js' {
     hide(): void;
     dispose(): void;
     isShown(): boolean;
+    static getInstance(element: Element): Toast | null;
     static getOrCreateInstance(element: Element, options?: ToastOptions): Toast;
   }
 }
@@ -85,5 +86,17 @@ declare module 'bootstrap/js/src/collapse.js' {
     dispose(): void;
     static getInstance(element: Element): Collapse | null;
     static getOrCreateInstance(element: Element, options?: CollapseOptions): Collapse;
+  }
+}
+
+declare module 'bootstrap/js/src/util/focustrap.js' {
+  export interface FocusTrapOptions {
+    trapElement: Element;
+    autofocus?: boolean;
+  }
+  export default class FocusTrap {
+    constructor(options: FocusTrapOptions);
+    activate(): void;
+    deactivate(): void;
   }
 }

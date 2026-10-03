@@ -10,7 +10,7 @@
  * ```
  */
 import type { JobRecord, JobsService, JobState, ToolId } from '../../core/types';
-import { h } from '../dom';
+import { h, replace } from '../dom';
 import { formatRelativeTime } from '../format';
 import { icon } from '../icon';
 import { emptyState } from './empty-state';
@@ -64,6 +64,7 @@ export function jobList(options: JobListOptions = {}): JobList {
                 type: 'button',
                 class: 'btn btn-sm btn-outline-secondary',
                 'aria-label': `Cancel ${name}`,
+                'data-focus-key': `cancel:${job.id}`,
                 onclick: () => options.onCancel?.(job),
               },
               icon('x-lg'),
@@ -106,7 +107,8 @@ export function jobList(options: JobListOptions = {}): JobList {
 
   const update = (jobs: readonly JobRecord[]): void => {
     if (jobs.length === 0) {
-      element.replaceChildren(
+      replace(
+        element,
         emptyState({
           icon: 'hourglass',
           title: 'No jobs',
@@ -116,7 +118,7 @@ export function jobList(options: JobListOptions = {}): JobList {
       );
       return;
     }
-    element.replaceChildren(h('ul', { class: 'list-group' }, jobs.map(row)));
+    replace(element, h('ul', { class: 'list-group' }, jobs.map(row)));
   };
   update([]);
   return { element, update };

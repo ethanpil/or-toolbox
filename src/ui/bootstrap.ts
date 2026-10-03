@@ -9,8 +9,36 @@ import Dropdown from 'bootstrap/js/src/dropdown.js';
 import Modal from 'bootstrap/js/src/modal.js';
 import Offcanvas from 'bootstrap/js/src/offcanvas.js';
 import Toast from 'bootstrap/js/src/toast.js';
+import FocusTrap from 'bootstrap/js/src/util/focustrap.js';
+import { onReplaceRemove } from './dom';
 
 export { Collapse, Dropdown, Modal, Offcanvas, Toast };
+
+/** Disposes every Bootstrap instance in a subtree (its data, listeners and Popper), e.g. before it is dropped. */
+export function disposeBootstrap(root: Element): void {
+  const nodes = [root, ...root.querySelectorAll('*')];
+  for (const node of nodes) {
+    Dropdown.getInstance(node)?.dispose();
+    Collapse.getInstance(node)?.dispose();
+    Toast.getInstance(node)?.dispose();
+    Offcanvas.getInstance(node)?.dispose();
+    Modal.getInstance(node)?.dispose();
+  }
+}
+
+// Re-rendering with replace() must not leak plugin instances (an open dropdown keeps its Popper otherwise).
+onReplaceRemove(disposeBootstrap);
+
+/**
+ * After a modal closes over an open offcanvas (a confirmation from the Prompts panel, the palette over the
+ * drawer), the offcanvas has lost its focus trap: Bootstrap keeps one trap active at a time and does not give the
+ * previous one back. Re-arm it, so Tab stays inside the offcanvas. Bootstrap's own deactivation on close clears
+ * this trap too (one event namespace).
+ */
+export function restoreOffcanvasTrap(): void {
+  const open = document.querySelector('.offcanvas.show');
+  if (open) new FocusTrap({ trapElement: open, autofocus: false }).activate();
+}
 
 /**
  * Shows an offcanvas and, once it closes, returns focus to whatever had it. Bootstrap restores focus only for

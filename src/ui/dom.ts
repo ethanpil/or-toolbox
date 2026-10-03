@@ -207,10 +207,43 @@ export function clear(el: Element): void {
   el.replaceChildren();
 }
 
-/** Replaces every child of `el` with `children`; same rules as `h()` (rule 1), so `null`/`false` are skipped. */
+/** Attribute that names a control across re-renders, so `replace()` can give focus back to its successor. */
+export const FOCUS_KEY = 'data-focus-key';
+
+/** Called with every element `replace()` is about to drop (src/ui/bootstrap.ts disposes plugin instances). */
+type RemovalHook = (removed: Element) => void;
+const removalHooks = new Set<RemovalHook>();
+
+/** Registers a hook `replace()` calls for each element subtree it removes; returns an unregister function. */
+export function onReplaceRemove(hook: RemovalHook): () => void {
+  removalHooks.add(hook);
+  return () => {
+    removalHooks.delete(hook);
+  };
+}
+
+/**
+ * Replaces every child of `el` with `children`; same rules as `h()` (rule 1), so `null`/`false` are skipped.
+ *
+ * Re-rendering is focus-safe: when focus is inside `el` on (or within) an element with `data-focus-key`, the new
+ * element with the same key gets focus back, so a keyboard user does not drop to `<body>` when a list or menu
+ * re-renders. Give re-rendered controls a stable key (`h('button', { 'data-focus-key': `star-${id}` })`); never
+ * rely on test ids. Removal hooks run for the dropped children (Bootstrap instances are disposed).
+ */
 export function replace(el: Element, ...children: Child[]): void {
+  const active = document.activeElement;
+  const keyed = active && el.contains(active) ? active.closest(`[${FOCUS_KEY}]`) : null;
+  const key = keyed && el.contains(keyed) ? keyed.getAttribute(FOCUS_KEY) : null;
+  if (removalHooks.size > 0) {
+    for (const child of el.children) for (const hook of removalHooks) hook(child);
+  }
   el.replaceChildren();
   appendChildren(el, children);
+  if (key === null) return;
+  const successor = [...el.querySelectorAll<HTMLElement>(`[${FOCUS_KEY}]`)].find(
+    (candidate) => candidate.getAttribute(FOCUS_KEY) === key,
+  );
+  successor?.focus();
 }
 
 /**

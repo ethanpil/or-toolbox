@@ -20,6 +20,8 @@ export interface KeyPickerOptions {
   /** The pinned key id; undefined = the default key. */
   value: string | undefined;
   onChange: (keyId: string | undefined) => void;
+  /** `data-focus-key` of the toggle and its items (give several pickers on one page distinct keys). */
+  focusKey?: string;
   testId?: string;
 }
 
@@ -27,6 +29,7 @@ export function keyPicker(options: KeyPickerOptions): HTMLElement {
   const defaultKey = options.keys.find((key) => key.isDefault) ?? options.keys[0];
   const pinned = options.keys.find((key) => key.id === options.value);
   const shown = pinned ?? defaultKey;
+  const focusKey = options.focusKey ?? 'key-picker';
 
   const item = (
     label: HTMLElement[],
@@ -43,6 +46,8 @@ export function keyPicker(options: KeyPickerOptions): HTMLElement {
           type: 'button',
           class: ['dropdown-item d-flex align-items-center gap-2', selected && 'active'],
           'aria-current': selected ? 'true' : null,
+          // Same key as the toggle: after a choice re-renders the picker, focus lands on the new toggle.
+          'data-focus-key': focusKey,
           'data-testid': testId,
           onclick: onClick,
         },
@@ -63,6 +68,7 @@ export function keyPicker(options: KeyPickerOptions): HTMLElement {
         'data-bs-toggle': 'dropdown',
         'aria-expanded': 'false',
         'aria-label': `Key: ${shown?.name ?? 'none'}${pinned ? '' : ' (default)'}`,
+        'data-focus-key': focusKey,
         'data-testid': options.testId ?? 'key-picker',
       },
       shown ? keyDot(shown) : icon('key'),
