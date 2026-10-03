@@ -17,7 +17,14 @@ import type { Page } from '@playwright/test';
 import type { StatsRow } from '../../src/core/types';
 import { expect, test } from '../mock/index.ts';
 import { seedApp } from './app.ts';
-import { makeStats, seedDb, utcDayAgo } from './seed.ts';
+import {
+  clearIndexReads,
+  indexReads,
+  makeStats,
+  recordIndexReads,
+  seedDb,
+  utcDayAgo,
+} from './seed.ts';
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 
 const ROWS: StatsRow[] = [
@@ -272,7 +279,7 @@ test.describe('charts', () => {
       page
         .getByTestId('chart-spend-legend-item')
         .filter({ hasText: name })
-        .locator('.or-swatch')
+        .locator('.or-legend-swatch')
         .getAttribute('data-slot');
     // OCR spent the most over all time ($2.05), so it holds slot 1; chat is second.
     const chat30 = await slotOf('Chat');
@@ -369,7 +376,7 @@ test.describe('charts', () => {
       page
         .getByTestId('chart-spend-legend-item')
         .first()
-        .locator('.or-swatch')
+        .locator('.or-legend-swatch')
         .evaluate((node) => getComputedStyle(node).backgroundColor);
     // The bars grow for a moment; wait until the picture stops changing.
     const settled = async (): Promise<string> => {
@@ -593,5 +600,210 @@ test.describe('accessibility', () => {
     await page.keyboard.press('Enter');
     await expect(page.getByTestId('chart-spend-table')).toBeVisible();
     await expect(toggle).toBeFocused();
+  });
+});
+
+test.describe('hidden series', () => {
+  test('a hidden series is shown again when the legend goes away', async ({ page }) => {
+    await openStats(page);
+    const canvas = page.getByTestId('chart-spend-canvas');
+    await expect(canvas).toHaveAttribute('data-hidden', '0');
+    await page.getByTestId('chart-spend-legend-item').first().click();
+    await expect(canvas).toHaveAttribute('data-hidden', '1');
+
+    // Only chat spent 20 days ago: one series needs no legend, so nothing may stay hidden.
+    await page.getByTestId('stats-range-custom').click();
+    await page.getByTestId('stats-from').fill(utcDayAgo(21));
+    await page.getByTestId('stats-to').fill(utcDayAgo(19));
+    await page.getByTestId('stats-apply').click();
+    await expect(kpi(page, 'spend')).toHaveText('$1.00');
+    await expect(page.getByTestId('chart-spend-legend-item')).toHaveCount(0);
+    await expect(canvas).toHaveAttribute('data-hidden', '0');
+
+    // Widen again: the legend is back with every series on.
+    await page.getByTestId('stats-range-7d').click();
+    const items = page.getByTestId('chart-spend-legend-item');
+    await expect(items).toHaveCount(3);
+    for (const item of await items.all())
+      await expect(item).toHaveAttribute('aria-pressed', 'true');
+    await expect(canvas).toHaveAttribute('data-hidden', '0');
+  });
+
+  test('a series that left the chart is forgotten, one that stays keeps its choice', async ({
+    page,
+  }) => {
+    await openStats(page);
+    const canvas = page.getByTestId('chart-spend-canvas');
+    await page.getByTestId('chart-spend-legend-item').filter({ hasText: 'OCR' }).click();
+    await expect(canvas).toHaveAttribute('data-hidden', '1');
+    // Stacking by model: the ids are different, so the hidden tool is forgotten.
+    await page.getByTestId('stats-stack-model').click();
+    await expect(canvas).toHaveAttribute('data-hidden', '0');
+    await page
+      .getByTestId('chart-spend-legend-item')
+      .filter({ hasText: 'test/text-model' })
+      .click();
+    await expect(canvas).toHaveAttribute('data-hidden', '1');
+    // A wider range keeps the series, so it stays hidden.
+    await page.getByTestId('stats-range-90d').click();
+    await expect(kpi(page, 'spend')).toHaveText('$3.65');
+    await expect(canvas).toHaveAttribute('data-hidden', '1');
+    await expect(
+      page.getByTestId('chart-spend-legend-item').filter({ hasText: 'test/text-model' }),
+    ).toHaveAttribute('aria-pressed', 'false');
+  });
+});
+
+test.describe('estimated spend', () => {
+  const ESTIMATED: StatsRow[] = [
+    makeStats(utcDayAgo(0), {
+      tool: 'chat',
+      model: 'test/text-model',
+      costUsd: 0.3,
+      estimatedUsd: 0.3,
+    }),
+    makeStats(utcDayAgo(0), { tool: 'ocr', model: 'test/ocr', costUsd: 0.1, estimatedUsd: 0 }),
+    makeStats(utcDayAgo(1), { tool: 'chat', model: 'test/text-model', costUsd: 0.2 }),
+  ];
+
+  test('KPIs, tables, the table view and the month are marked with ≈', async ({ page }) => {
+    await openStats(page, ESTIMATED);
+    await expect(kpi(page, 'spend')).toHaveText('≈ $0.60');
+    await expect(page.getByTestId('kpi-spend-estimated')).toHaveText('Includes $0.30 estimated');
+    await expect(page.getByTestId('stats-dashboard')).toContainText(
+      'A figure marked ≈ includes estimates',
+    );
+
+    // By tool: chat includes the estimate, OCR is exact.
+    const tools = page.getByTestId('breakdown-tools-row');
+    await expect(
+      tools.filter({ hasText: 'Chat' }).locator('[data-estimated="true"]'),
+    ).toContainText('≈ $0.50');
+    await expect(tools.filter({ hasText: 'OCR' }).locator('[data-estimated]')).toHaveCount(0);
+    await expect(tools.filter({ hasText: 'OCR' })).toContainText('$0.10');
+    await expect(
+      page
+        .getByTestId('breakdown-models-row')
+        .filter({ hasText: 'test/text-model' })
+        .locator('[data-estimated="true"]'),
+    ).toContainText('≈ $0.50');
+
+    // The table view of the chart marks the cells and totals that include it.
+    await page.getByTestId('chart-spend-table-toggle').click();
+    const table = page.getByTestId('chart-spend-table');
+    await expect(table.getByRole('columnheader')).toHaveText(['Day', 'Chat', 'OCR', 'Total']);
+    const body = table.locator('tbody tr');
+    await expect(body).toHaveCount(2);
+    await expect(body.first().getByRole('cell')).toHaveText(['$0.20', '$0.00', '$0.20']);
+    await expect(body.last().getByRole('cell')).toHaveText(['≈ $0.30', '$0.10', '≈ $0.40']);
+    await expect(page.getByTestId('chart-spend-canvas')).toHaveAttribute(
+      'aria-label',
+      /Includes estimated costs\./,
+    );
+
+    // Today's row is in this month, so the budget figure includes the estimate too.
+    await expect(page.getByTestId('budget-month-spend')).toHaveText(/^≈ \$/);
+  });
+
+  test('exact spend is not marked', async ({ page }) => {
+    await openStats(page);
+    await expect(kpi(page, 'spend')).toHaveText('$1.65');
+    await expect(page.getByTestId('kpi-spend-estimated')).toHaveCount(0);
+    await expect(page.locator('[data-estimated="true"]')).toHaveCount(0);
+  });
+});
+
+test.describe('the ledger', () => {
+  test('is read once per load; changing the range reads nothing', async ({ page, context }) => {
+    await recordIndexReads(context);
+    await openStats(page);
+    await expect(kpi(page, 'spend')).toHaveText('$1.65');
+    expect((await indexReads(page)).filter((index) => index === 'stats.day')).toHaveLength(1);
+
+    await clearIndexReads(page);
+    await page.getByTestId('stats-range-7d').click();
+    await expect(kpi(page, 'spend')).toHaveText('$0.55');
+    await page.getByTestId('stats-range-month').click();
+    await page.getByTestId('stats-range-90d').click();
+    await expect(kpi(page, 'spend')).toHaveText('$3.65');
+    await page.getByTestId('stats-stack-model').click();
+    expect(await indexReads(page)).toEqual([]);
+
+    // A change of the ledger is one read again (the budget and key sections use the rows already read).
+    await seedDb(page, { stats: [makeStats(utcDayAgo(0), { costUsd: 1, model: 'x/new' })] });
+    await expect(kpi(page, 'spend')).toHaveText('$4.65');
+    expect((await indexReads(page)).filter((index) => index === 'stats.day')).toHaveLength(1);
+  });
+});
+
+test.describe('relative ranges', () => {
+  test('roll over at UTC midnight, and "This month" starts over with the new month', async ({
+    page,
+  }) => {
+    await page.clock.install({ time: new Date('2026-05-31T23:59:50Z') });
+    await page.goto('privacy/');
+    await expect(page.getByTestId('page-title')).toHaveText('Privacy');
+    await seedDb(page, {
+      stats: [
+        makeStats('2026-05-31', { costUsd: 1, requests: 1 }),
+        makeStats('2026-06-01', { costUsd: 2, requests: 2 }),
+      ],
+    });
+    await page.goto('stats/');
+    await expect(page.getByTestId('page-title')).toHaveText('Stats');
+    await page.getByTestId('stats-range-month').click();
+    await expect(page.getByTestId('stats-range-label')).toContainText('May 1 to May 31, 2026');
+    await expect(kpi(page, 'spend')).toHaveText('$1.00');
+    await expect(kpi(page, 'requests')).toHaveText('1');
+
+    // Midnight passes with the page open.
+    await page.clock.runFor(20_000);
+    await expect(page.getByTestId('stats-range-label')).toContainText('Jun 1, 2026 · 1 day, UTC');
+    await expect(kpi(page, 'spend')).toHaveText('$2.00');
+    await expect(kpi(page, 'requests')).toHaveText('2');
+    // The range before it is the day before, so the change is against May 31.
+    await expect(page.getByTestId('kpi-spend')).toContainText('+100% vs the 1 day before');
+  });
+
+  test('a custom range stays as it was chosen', async ({ page }) => {
+    await page.clock.install({ time: new Date('2026-05-31T23:59:50Z') });
+    await page.goto('privacy/');
+    await seedDb(page, { stats: [makeStats('2026-05-30', { costUsd: 3 })] });
+    await page.goto('stats/');
+    await page.getByTestId('stats-range-custom').click();
+    await page.getByTestId('stats-from').fill('2026-05-30');
+    await page.getByTestId('stats-to').fill('2026-05-30');
+    await page.getByTestId('stats-apply').click();
+    await expect(kpi(page, 'spend')).toHaveText('$3.00');
+    await page.clock.runFor(20_000);
+    await expect(page.getByTestId('stats-range-label')).toContainText('May 30, 2026');
+    await expect(kpi(page, 'spend')).toHaveText('$3.00');
+  });
+});
+
+test.describe('phones', () => {
+  test('tables, the table views and the legend do not make the page scroll sideways', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openStats(page);
+    await expect(page.getByTestId('chart-tokens-canvas')).toHaveAttribute('data-rendered', 'true');
+    const overflow = () =>
+      page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+    expect(await overflow()).toBeLessThanOrEqual(0);
+    for (const id of ['chart-spend', 'chart-requests', 'chart-tokens']) {
+      await page.getByTestId(`${id}-table-toggle`).click();
+    }
+    await expect(page.getByTestId('chart-spend-table')).toBeVisible();
+    expect(await overflow()).toBeLessThanOrEqual(0);
+    // The legend items are at least 24 px tall (WCAG 2.5.8).
+    await page.getByTestId('chart-spend-table-toggle').click();
+    const height = await page
+      .getByTestId('chart-spend-legend-item')
+      .first()
+      .evaluate((node) => node.getBoundingClientRect().height);
+    expect(height).toBeGreaterThanOrEqual(24);
   });
 });

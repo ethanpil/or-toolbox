@@ -25,6 +25,8 @@ export interface BarSeries {
   /** 0-based colour slot of the categorical palette, or null for the neutral "Other" grey. */
   slot: number | null;
   values: number[];
+  /** Per category, the part of the value that is an estimate (spend charts); the tooltip marks it with ≈. */
+  estimated?: number[];
 }
 
 export interface BarChartInput {
@@ -45,6 +47,8 @@ export interface BarChart {
   update(input: BarChartInput): void;
   /** Shows or hides one series (the legend's toggle); the choice survives `update`. */
   setVisible(id: string, visible: boolean): void;
+  /** Replaces the set of hidden series (everything else is shown). */
+  setHidden(ids: readonly string[]): void;
   destroy(): void;
 }
 
@@ -138,6 +142,11 @@ export function createBarChart(canvas: HTMLCanvasElement, initial: BarChartInput
   const valueOf = (item: TooltipItem<'bar'>): number =>
     (input.horizontal ? item.parsed.x : item.parsed.y) ?? 0;
 
+  /** The estimated part of one bar segment (0 when the series carries none). */
+  const estimatedOf = (item: TooltipItem<'bar'>): number =>
+    input.series[item.datasetIndex]?.estimated?.[item.dataIndex] ?? 0;
+  const approx = (item: TooltipItem<'bar'>): string => (estimatedOf(item) > 0 ? '≈ ' : '');
+
   const config: ChartConfiguration<'bar'> = {
     type: 'bar',
     data: { labels: input.labels, datasets: datasets() },
@@ -172,12 +181,15 @@ export function createBarChart(canvas: HTMLCanvasElement, initial: BarChartInput
           itemSort: (a, b) => valueOf(b) - valueOf(a),
           filter: (item) => valueOf(item) !== 0,
           callbacks: {
-            title: (items) => {
-              const index = items[0]?.dataIndex ?? 0;
+            // The hovered category, even when every item of it was filtered out (a day with nothing in it).
+            title(items) {
+              const index = this.getActiveElements()[0]?.index ?? items[0]?.dataIndex ?? 0;
               return input.titles?.[index] ?? input.labels[index] ?? '';
             },
-            // The value leads, the series name follows.
-            label: (item) => `${input.format(valueOf(item))}  ${item.dataset.label ?? ''}`,
+            beforeBody: (items) => (items.length === 0 ? 'Nothing recorded' : []),
+            // The value leads, the series name follows; a value that includes estimates reads ≈.
+            label: (item) =>
+              `${approx(item)}${input.format(valueOf(item))}  ${item.dataset.label ?? ''}`,
             labelColor: (item) => {
               const fill = item.dataset.backgroundColor;
               const colour = typeof fill === 'string' ? fill : theme.other;
@@ -186,7 +198,7 @@ export function createBarChart(canvas: HTMLCanvasElement, initial: BarChartInput
             footer: (items) => {
               if (items.length < 2 || input.series.length < 2) return '';
               const total = items.reduce((sum, item) => sum + valueOf(item), 0);
-              return `Total ${input.format(total)}`;
+              return `Total ${items.some((item) => estimatedOf(item) > 0) ? '≈ ' : ''}${input.format(total)}`;
             },
           },
         },
@@ -278,6 +290,12 @@ export function createBarChart(canvas: HTMLCanvasElement, initial: BarChartInput
     setVisible(id, visible) {
       if (visible) hidden.delete(id);
       else hidden.add(id);
+      applyVisibility();
+      chart.update();
+    },
+    setHidden(ids) {
+      hidden.clear();
+      for (const id of ids) hidden.add(id);
       applyVisibility();
       chart.update();
     },

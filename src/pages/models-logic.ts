@@ -2,14 +2,11 @@
  * The Models page without a DOM: filtering, sorting, price display and the comparison table. Pure functions over
  * `ModelInfo`, so the rules are unit-tested (models-logic.test.ts) and the page only draws the result.
  */
-import type { Capability, ModelInfo } from '../core/types';
+import type { Capability, ModelInfo, StatsRow } from '../core/types';
 import { CAPABILITIES } from '../tools/types';
 import { formatContext, formatMs, formatUsd, plural } from '../ui/format';
+import { comparablePrice, describePrice, modelPrice } from '../ui/model-price';
 import { rank } from '../ui/shell/palette-search';
-
-const PER_MILLION = 1_000_000;
-/** USD per token → USD per 1M tokens, without float noise (0.000002 * 1e6 is not exactly 2). */
-const perMillion = (price: number): number => Number((price * PER_MILLION).toPrecision(12));
 
 export type ModelSort = 'relevance' | 'name' | 'newest' | 'price' | 'context';
 export const MODEL_SORTS: readonly { id: ModelSort; label: string }[] = [
@@ -90,53 +87,41 @@ export const CONTEXT_STEPS: readonly { tokens: number; label: string }[] = [
 ];
 
 // --- prices ----------------------------------------------------------------------------------------------
+// The unit rules (tokens, images, characters, hours of audio, requests…) live in src/ui/model-price.ts, shared with
+// the model picker, the tool header and Settings.
 
-export type PriceInfo =
-  | { kind: 'free' }
-  | { kind: 'tokens'; inputPer1M: number; outputPer1M: number }
-  | { kind: 'unit'; text: string };
-
-/** What non-token models bill by (docs/openrouter-api.md §4.3, §5.4, §6.3, §7.5); the catalog has no unit field. */
-const UNIT_NOTES: Partial<Record<Capability, string>> = {
-  tts: 'Billed by the provider per character or second',
-  stt: 'Billed per second of audio',
-  video: 'Billed per second of video',
-  music: 'Billed per song or clip',
-  image: 'Billed per image',
-};
-
-export function priceInfo(model: ModelInfo): PriceInfo {
-  if (model.isFree) return { kind: 'free' };
-  const { prompt, completion, request, image } = model.pricing;
-  if (prompt !== null && completion !== null && (prompt > 0 || completion > 0)) {
-    return {
-      kind: 'tokens',
-      inputPer1M: perMillion(prompt),
-      outputPer1M: perMillion(completion),
-    };
-  }
-  if (request) return { kind: 'unit', text: `${formatUsd(request)} per request` };
-  if (image && prompt === null) return { kind: 'unit', text: `${formatUsd(image)} per image` };
-  for (const capability of model.capabilities) {
-    const note = UNIT_NOTES[capability];
-    if (note) return { kind: 'unit', text: note };
-  }
-  return { kind: 'unit', text: 'Price varies' };
+/** One line for the price in the model's own unit, and further lines (audio tokens, image output). */
+export function priceLines(model: ModelInfo): { text: string; extras: string[] } {
+  return describePrice(modelPrice(model), formatUsd);
 }
 
-/** Input plus output USD per 1M tokens; 0 for free models; null when the price is not per token. */
-export function priceKey(model: ModelInfo): number | null {
-  const price = priceInfo(model);
-  if (price.kind === 'free') return 0;
-  return price.kind === 'tokens' ? price.inputPer1M + price.outputPer1M : null;
+export const priceText = (model: ModelInfo): string => priceLines(model).text;
+
+const micro = (usd: number): number => Math.round(usd * 1_000_000);
+
+/**
+ * "Max price" is USD per 1M tokens, input plus output, compared in micro-dollars. Free models always pass; models
+ * billed in another unit (images, hours of audio, requests…) or without a number never do: a price per image is
+ * not comparable with a price per token (the page says how many that hides).
+ */
+function withinPriceLimit(model: ModelInfo, maxPrice: number): boolean {
+  const price = comparablePrice(modelPrice(model));
+  if (price === null) return false;
+  if (price.group === 0) return true;
+  return price.group === 1 && micro(price.amount) <= micro(maxPrice);
 }
 
-/** `$0.10 in · $0.50 out per 1M tokens`, `Free`, or the model's own unit. */
-export function priceText(model: ModelInfo): string {
-  const price = priceInfo(model);
-  if (price.kind === 'free') return 'Free';
-  if (price.kind === 'unit') return price.text;
-  return `${formatUsd(price.inputPer1M)} in · ${formatUsd(price.outputPer1M)} out per 1M tokens`;
+/** How many models the price limit hides only because they are not billed per token (0 without a limit). */
+export function hiddenByPriceLimit(
+  models: readonly ModelInfo[],
+  filters: ModelFilters,
+  favourites: ReadonlySet<string>,
+): number {
+  if (filters.maxPrice === null) return 0;
+  return queryModels(models, { ...filters, maxPrice: null }, 'name', favourites).filter((model) => {
+    const price = comparablePrice(modelPrice(model));
+    return price === null || price.group > 1;
+  }).length;
 }
 
 // --- expiry ----------------------------------------------------------------------------------------------
@@ -204,11 +189,7 @@ function passes(model: ModelInfo, filters: ModelFilters, favourites: ReadonlySet
   if (filters.provider && model.author !== filters.provider) return false;
   if (filters.freeOnly && !model.isFree) return false;
   if (filters.favouritesOnly && !favourites.has(model.id)) return false;
-  if (filters.maxPrice !== null) {
-    // A price that is not per token cannot be compared, so such models do not pass a price limit.
-    const key = priceKey(model);
-    if (key === null || key > filters.maxPrice) return false;
-  }
+  if (filters.maxPrice !== null && !withinPriceLimit(model, filters.maxPrice)) return false;
   if (filters.minContext > 0 && (model.contextLength ?? 0) < filters.minContext) return false;
   return true;
 }
@@ -229,6 +210,22 @@ function sortByKey(
     if (x === null) return 1;
     if (y === null) return -1;
     return (ascending ? x - y : y - x) || byName(a, b);
+  });
+}
+
+/**
+ * Free first, then each billing unit on its own (tokens, images, characters, hours of audio…), cheapest first
+ * within it, models without a number last; ties by name. Units are never compared with each other.
+ */
+function sortByPrice(list: ModelInfo[]): ModelInfo[] {
+  const keys = new Map(list.map((model) => [model, comparablePrice(modelPrice(model))]));
+  return list.sort((a, b) => {
+    const x = keys.get(a) ?? null;
+    const y = keys.get(b) ?? null;
+    if (x === null && y === null) return byName(a, b);
+    if (x === null) return 1;
+    if (y === null) return -1;
+    return x.group - y.group || x.amount - y.amount || byName(a, b);
   });
 }
 
@@ -266,7 +263,7 @@ export function queryModels(
     case 'newest':
       return sortByKey(list, (model) => model.created || null, false);
     case 'price':
-      return sortByKey(list, priceKey, true);
+      return sortByPrice(list);
     case 'context':
       return sortByKey(list, (model) => model.contextLength, false);
   }
@@ -277,19 +274,60 @@ export function parseQuery(search: string): string {
   return (new URLSearchParams(search).get('q') ?? '').trim().slice(0, 200);
 }
 
-/** `12 runs · avg 1.2 s · $0.034` or "Not used yet". */
+/** Your own use of one model, from the daily ledger. */
 export interface ModelUsage {
+  /** Runs whose primary model this is. */
   runs: number;
+  requests: number;
   avgLatencyMs: number | null;
   costUsd: number;
+  /** The part of `costUsd` that is an estimate. */
+  estimatedUsd: number;
 }
 
+/** Every model's totals from ledger rows: one read of the ledger serves every card. */
+export function usageByModel(rows: readonly StatsRow[]): Map<string, ModelUsage> {
+  const totals = new Map<string, ModelUsage & { latencyMsTotal: number }>();
+  for (const row of rows) {
+    let total = totals.get(row.model);
+    if (!total) {
+      total = {
+        runs: 0,
+        requests: 0,
+        avgLatencyMs: null,
+        costUsd: 0,
+        estimatedUsd: 0,
+        latencyMsTotal: 0,
+      };
+      totals.set(row.model, total);
+    }
+    total.runs += row.runs;
+    total.requests += row.requests;
+    total.costUsd += row.costUsd;
+    total.estimatedUsd += row.estimatedUsd ?? 0;
+    total.latencyMsTotal += row.latencyMsTotal;
+  }
+  const usage = new Map<string, ModelUsage>();
+  for (const [model, total] of totals) {
+    const { latencyMsTotal, ...rest } = total;
+    usage.set(model, {
+      ...rest,
+      avgLatencyMs: total.requests > 0 ? latencyMsTotal / total.requests : null,
+    });
+  }
+  return usage;
+}
+
+/**
+ * `12 runs · avg 1.2 s · $0.034`, "Not used yet", or requests instead of runs for a model that was only ever a
+ * second model of a run. Spend that includes estimates reads `≈ $0.034`.
+ */
 export function usageText(usage: ModelUsage | undefined): string {
-  if (!usage || usage.runs === 0) return 'Not used yet';
+  if (!usage || (usage.runs === 0 && usage.requests === 0)) return 'Not used yet';
   return [
-    plural(usage.runs, 'run'),
+    usage.runs > 0 ? plural(usage.runs, 'run') : plural(usage.requests, 'request'),
     usage.avgLatencyMs === null ? null : `avg ${formatMs(usage.avgLatencyMs)}`,
-    formatUsd(usage.costUsd),
+    `${usage.estimatedUsd > 0 ? '≈ ' : ''}${formatUsd(usage.costUsd)}`,
   ]
     .filter(Boolean)
     .join(' · ');
@@ -331,32 +369,24 @@ export function compareSections(
     values: models.map(value),
     kind: 'text',
   });
-  const sidePrice = (model: ModelInfo, side: 'inputPer1M' | 'outputPer1M'): string => {
-    const price = priceInfo(model);
+  const tokenPrice = (model: ModelInfo, side: 'inputPerM' | 'outputPerM'): string => {
+    const price = modelPrice(model);
     if (price.kind === 'free') return 'Free';
     return price.kind === 'tokens' ? formatUsd(price[side]) : '—';
   };
 
   const pricing: CompareRow[] = [
-    text('Input, per 1M tokens', (model) => sidePrice(model, 'inputPer1M')),
-    text('Output, per 1M tokens', (model) => sidePrice(model, 'outputPer1M')),
-    text('Billing', (model) => {
-      const price = priceInfo(model);
-      return price.kind === 'unit' ? price.text : price.kind === 'free' ? 'Free' : 'Per token';
-    }),
+    text('Input, per 1M tokens', (model) => tokenPrice(model, 'inputPerM')),
+    text('Output, per 1M tokens', (model) => tokenPrice(model, 'outputPerM')),
+    // The model's own unit: per image, per hour of audio, per 1M characters, per request…
+    text('Price', priceText),
   ];
-  if (models.some((model) => model.pricing.request)) {
+  if (models.some((model) => priceLines(model).extras.length > 0)) {
     pricing.push(
-      text('Per request', (model) =>
-        model.pricing.request ? formatUsd(model.pricing.request) : '—',
-      ),
-    );
-  }
-  if (models.some((model) => model.pricing.image)) {
-    pricing.push(
-      text('Per input image', (model) =>
-        model.pricing.image ? formatUsd(model.pricing.image) : '—',
-      ),
+      text('Also billed', (model) => {
+        const { extras } = priceLines(model);
+        return extras.length > 0 ? extras.join('; ') : '—';
+      }),
     );
   }
 

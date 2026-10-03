@@ -23,7 +23,8 @@ export function statsKey(row: Pick<StatsRow, 'day' | 'tool' | 'model' | 'keyId'>
 function stripKey(stored: StoredStatsRow): StatsRow {
   const row: Partial<StoredStatsRow> = { ...stored };
   delete row.key;
-  return row as StatsRow;
+  // Rows written before the estimated part existed have none: all of their cost counts as reported.
+  return { ...(row as StatsRow), estimatedUsd: stored.estimatedUsd ?? 0 };
 }
 
 /**
@@ -50,10 +51,15 @@ const zero = (): ModelUsageTotals => ({
 });
 
 /**
- * Adds a finished run to the rollups inside the caller's transaction. The run counts once for every model
- * in `usage.byModel`; a failed run also counts as an error on its primary model, and a run without any
- * usage still counts on its primary model. Booked cost above the reported cost (unknown cost) goes to the
- * primary model. The day is the run's finish day (UTC).
+ * Adds a finished run to the rollups inside the caller's transaction.
+ *
+ * - **Runs and errors** are counted once, on the primary model (`run.model`), so a run that called several models
+ *   is one run and a failed one is one error; the other models only gain requests, tokens and cost. The primary
+ *   model always gets a row, even when it reported no usage (an error, or only other models were billed).
+ * - **Cost:** booked cost above the reported cost (an unknown cost books its reservation) goes to the primary
+ *   model. `estimatedUsd` holds what is not OpenRouter's own number: when `usage.costEstimated` the whole run's
+ *   cost (the flag is per run, so every model's share counts), plus the booked reservation.
+ * - The day is the run's finish day (UTC).
  */
 export async function addRunToStats(
   store: StatsStore,
@@ -63,13 +69,20 @@ export async function addRunToStats(
   const day = utcDay(run.finishedAt ?? Date.now());
   const byModel: Record<string, ModelUsageTotals> = {};
   for (const [model, totals] of Object.entries(run.usage.byModel)) byModel[model] = { ...totals };
-  if (Object.keys(byModel).length === 0 || (run.status === 'error' && !(run.model in byModel))) {
-    byModel[run.model] = zero();
+  byModel[run.model] ??= zero();
+
+  const estimated: Record<string, number> = {};
+  for (const [model, totals] of Object.entries(byModel)) {
+    estimated[model] = run.usage.costEstimated ? totals.costUsd : 0;
   }
   const extra = bookedCost(run) - run.usage.costUsd;
-  if (extra > 0) (byModel[run.model] ??= zero()).costUsd += extra;
+  if (extra > 0) {
+    byModel[run.model]!.costUsd += extra;
+    estimated[run.model] = (estimated[run.model] ?? 0) + extra;
+  }
 
   for (const [model, totals] of Object.entries(byModel)) {
+    const primary = model === run.model;
     const key = statsKey({ day, tool: run.tool, model, keyId: run.keyId });
     const row: StoredStatsRow = (await store.get(key)) ?? {
       key,
@@ -84,14 +97,18 @@ export async function addRunToStats(
       promptTokens: 0,
       completionTokens: 0,
       costUsd: 0,
+      estimatedUsd: 0,
       latencyMsTotal: 0,
     };
-    row.runs += 1;
-    if (run.status === 'error' && model === run.model) row.errors += 1;
+    if (primary) {
+      row.runs += 1;
+      if (run.status === 'error') row.errors += 1;
+    }
     row.requests += totals.requests;
     row.promptTokens += totals.promptTokens;
     row.completionTokens += totals.completionTokens;
     row.costUsd += totals.costUsd;
+    row.estimatedUsd = (row.estimatedUsd ?? 0) + (estimated[model] ?? 0);
     row.latencyMsTotal += totals.latencyMsTotal;
     await store.put(row);
   }

@@ -5,10 +5,10 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 import { expect, test } from '../mock/index.ts';
 import { seedApp } from './app.ts';
-import { makeStats, seedDb, utcDayAgo } from './seed.ts';
+import { indexReads, makeStats, recordIndexReads, seedDb, utcDayAgo } from './seed.ts';
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 
 const catalog = JSON.parse(
@@ -87,6 +87,28 @@ test('only :free models get the Free badge, and media models show their unit', a
   const veo = card(page, 'google/veo-3.1');
   await expect(veo.getByTestId('free-badge')).toHaveCount(0);
   await expect(veo.getByTestId('model-price')).toHaveText('Billed per second of video');
+});
+
+test('the price is shown in the unit each model is billed in', async ({ page }) => {
+  await open(page, 'models/?q=flux.2-pro');
+  await expect(card(page, 'black-forest-labs/flux.2-pro').getByTestId('model-price')).toHaveText(
+    '≈ $0.031 per image',
+  );
+  await open(page, 'models/?q=kokoro');
+  await expect(card(page, 'hexgrad/kokoro-82m').getByTestId('model-price')).toHaveText(
+    '$0.62 per 1M characters',
+  );
+  // A chat model with audio tokens: the token price, then the audio price on a line of its own.
+  await open(page, 'models/?q=openai/gpt-audio');
+  const audio = card(page, 'openai/gpt-audio');
+  await expect(audio.getByTestId('model-price')).toHaveText('$2.50 in · $10.00 out per 1M tokens');
+  await expect(audio.getByTestId('model-price-extra')).toHaveText(
+    'Audio: $32.00 in · $64.00 out per 1M tokens',
+  );
+  await open(page, 'models/?q=gemini-3.1-flash-image');
+  await expect(
+    card(page, 'google/gemini-3.1-flash-image').getByTestId('model-price-extra'),
+  ).toHaveText('Image output: ≈ $0.25 per image');
 });
 
 test('?q= pre-fills the search, and typing keeps the address in step', async ({ page }) => {
@@ -176,6 +198,43 @@ test('sorts by name, price and context', async ({ page }) => {
   );
 });
 
+test('a price limit says how many models it hides because they are not billed per token', async ({
+  page,
+}) => {
+  await open(page);
+  const note = page.getByTestId('models-price-note');
+  await expect(note).toBeHidden();
+  await page.getByTestId('models-max-price').fill('1');
+  await expect(note).toBeVisible();
+  await expect(note).toContainText('compares per-token prices');
+  await expect(note).toContainText('billed per image, hour of audio, character or request');
+  // Only video models: all 5 are billed per second, so all 5 are hidden.
+  await page.getByTestId('models-capability').selectOption('video');
+  await expect(note).toContainText('5 models');
+  await expect(page.getByTestId('models-empty')).toBeVisible();
+  await page.getByTestId('models-max-price').fill('');
+  await expect(note).toBeHidden();
+});
+
+test('sorting by price keeps the units apart: free, then per token, then the other units', async ({
+  page,
+}) => {
+  await open(page);
+  await page.getByTestId('models-sort').selectOption('price');
+  await page.getByTestId('models-more').scrollIntoViewIfNeeded();
+  await expect(cards(page)).toHaveCount(TOTAL);
+  const prices = await cards(page).evaluateAll((nodes) =>
+    nodes.map((node) => node.querySelector('[data-testid="model-price"]')?.textContent ?? ''),
+  );
+  const tokens = (text: string) => text.endsWith('per 1M tokens');
+  const lastToken = prices.map(tokens).lastIndexOf(true);
+  const firstOther = prices.findIndex((text) => text !== 'Free' && !tokens(text));
+  expect(prices[0]).toBe('Free');
+  expect(lastToken).toBeGreaterThan(0);
+  // Every per-token price comes before the first price in another unit.
+  expect(lastToken).toBeLessThan(firstOther);
+});
+
 test('expiring models carry a warning badge', async ({ page }) => {
   await open(page, 'models/?q=laguna');
   const badge = card(page, 'poolside/laguna-s-2.1:free').getByTestId('expiry-badge');
@@ -249,12 +308,58 @@ test('table view lists the same models, and the choice is remembered', async ({ 
   await expect(page.getByTestId('model-row')).toHaveCount(1);
   const row = page.getByTestId('model-row');
   await expect(row).toContainText('openai/whisper-1');
-  await expect(row.getByTestId('model-price')).toHaveText('Billed per second of audio');
+  await expect(row.getByTestId('model-price')).toHaveText('$0.36 per hour of audio');
 
   await open(page);
   await expect(page.getByTestId('models-table')).toBeVisible();
   await page.getByTestId('models-view-cards').click();
   await expect(page.getByTestId('models-grid')).toBeVisible();
+});
+
+test('one read of the ledger serves every card: no card asks for its own model', async ({
+  page,
+  context,
+}) => {
+  await recordIndexReads(context);
+  await open(page);
+  await expect(cards(page).first().getByTestId('model-usage')).toHaveText('Not used yet');
+  const reads = await indexReads(page);
+  expect(reads.filter((index) => index === 'stats.model')).toEqual([]);
+  expect(reads.filter((index) => index === 'stats.day').length).toBeLessThanOrEqual(2);
+});
+
+test('your own stats count requests for a model that was only a second model, and mark estimates', async ({
+  page,
+}) => {
+  await open(page, 'models/?q=kokoro');
+  await seedDb(page, {
+    stats: [
+      makeStats(utcDayAgo(1), {
+        model: 'hexgrad/kokoro-82m',
+        tool: 'bot-to-bot',
+        runs: 0,
+        requests: 3,
+        costUsd: 0.03,
+        latencyMsTotal: 1500,
+      }),
+    ],
+  });
+  const usage = card(page, 'hexgrad/kokoro-82m').getByTestId('model-usage');
+  await expect(usage).toHaveText('3 requests · avg 500 ms · $0.03');
+  await seedDb(page, {
+    stats: [
+      makeStats(utcDayAgo(2), {
+        model: 'hexgrad/kokoro-82m',
+        tool: 'text-to-speech',
+        runs: 1,
+        requests: 1,
+        costUsd: 0.01,
+        estimatedUsd: 0.01,
+        latencyMsTotal: 500,
+      }),
+    ],
+  });
+  await expect(usage).toHaveText('1 run · avg 500 ms · ≈ $0.04');
 });
 
 test('your own stats appear on the cards of models you used', async ({ page }) => {
@@ -417,5 +522,50 @@ test.describe('accessibility', () => {
     await page.keyboard.press('Space');
     await expect(box).toBeChecked();
     await expect(page.getByTestId('compare-chip')).toHaveCount(1);
+  });
+});
+
+test.describe('target sizes and phones', () => {
+  const size = (locator: Locator) =>
+    locator.evaluate((node) => {
+      const box = node.getBoundingClientRect();
+      return { width: box.width, height: box.height };
+    });
+  const overflow = (page: Page) =>
+    page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+
+  test('the copy button and the comparison chip button are at least 24 × 24 px', async ({
+    page,
+  }) => {
+    await open(page, 'models/?q=kokoro');
+    const copy = await size(card(page, 'hexgrad/kokoro-82m').getByTestId('model-copy'));
+    expect(copy.width).toBeGreaterThanOrEqual(24);
+    expect(copy.height).toBeGreaterThanOrEqual(24);
+    await card(page, 'hexgrad/kokoro-82m').getByTestId('model-compare').check();
+    const close = await size(page.getByTestId('compare-chip').getByRole('button'));
+    expect(close.width).toBeGreaterThanOrEqual(24);
+    expect(close.height).toBeGreaterThanOrEqual(24);
+    // The table view's copy button too.
+    await page.getByTestId('models-view-table').click();
+    const rowCopy = await size(page.getByTestId('model-row').getByTestId('model-copy'));
+    expect(rowCopy.width).toBeGreaterThanOrEqual(24);
+    expect(rowCopy.height).toBeGreaterThanOrEqual(24);
+  });
+
+  test('nothing makes the page scroll sideways on a phone', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await open(page);
+    expect(await overflow(page)).toBeLessThanOrEqual(0);
+    await page.getByTestId('models-view-table').click();
+    await expect(page.getByTestId('models-table')).toBeVisible();
+    expect(await overflow(page)).toBeLessThanOrEqual(0);
+    await page.getByTestId('model-row').nth(0).getByTestId('model-compare').check();
+    await page.getByTestId('model-row').nth(1).getByTestId('model-compare').check();
+    expect(await overflow(page)).toBeLessThanOrEqual(0);
+    await page.getByTestId('compare-open').click();
+    await expect(page.getByTestId('compare-table')).toBeVisible();
+    expect(await overflow(page)).toBeLessThanOrEqual(0);
   });
 });

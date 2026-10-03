@@ -97,12 +97,13 @@ describe('recordRunStats', () => {
         promptTokens: 20,
         completionTokens: 40,
         costUsd: 0.02,
+        estimatedUsd: 0,
         latencyMsTotal: 200,
       },
     ]);
   });
 
-  it('counts a run once per model used and flags free models', async () => {
+  it('counts a run once, on its primary model, and flags free models', async () => {
     await recordRunStats(
       run({
         model: 'a/one',
@@ -115,10 +116,126 @@ describe('recordRunStats', () => {
       isFree,
     );
     const rows = await core.stats.rows({ from: '2026-10-15', to: '2026-10-15' });
+    // The other model gains requests, tokens and cost, but is not another run.
     expect(rows.map((r) => [r.model, r.runs, r.requests, r.free])).toEqual([
       ['a/one', 1, 3, false],
-      ['b/two:free', 1, 1, true],
+      ['b/two:free', 0, 1, true],
     ]);
+    expect(rows.reduce((sum, r) => sum + r.runs, 0)).toBe(1);
+  });
+
+  it('a failed run that called several models is one run and one error', async () => {
+    await recordRunStats(
+      run({
+        status: 'error',
+        model: 'a/one',
+        models: ['a/one', 'b/two'],
+        usage: { ...run().usage, byModel: { 'a/one': totals(), 'b/two': totals() } },
+      }),
+      isFree,
+    );
+    const rows = await core.stats.rows({ from: '2026-10-15', to: '2026-10-15' });
+    expect(rows.reduce((sum, r) => sum + r.runs, 0)).toBe(1);
+    expect(rows.reduce((sum, r) => sum + r.errors, 0)).toBe(1);
+    expect(rows.map((r) => [r.model, r.runs, r.errors])).toEqual([
+      ['a/one', 1, 1],
+      ['b/two', 0, 0],
+    ]);
+  });
+
+  it('counts the primary run even when only other models reported usage', async () => {
+    await recordRunStats(
+      run({ model: 'p/primary', usage: { ...run().usage, byModel: { 'o/other': totals() } } }),
+      isFree,
+    );
+    const rows = await core.stats.rows({ from: '2026-10-15', to: '2026-10-15' });
+    expect(rows.map((r) => [r.model, r.runs, r.requests])).toEqual([
+      ['o/other', 0, 1],
+      ['p/primary', 1, 0],
+    ]);
+  });
+
+  it('marks costs estimated from catalog prices, and reservations booked for unknown costs', async () => {
+    // Exact cost: nothing is estimated.
+    await recordRunStats(
+      run({ model: 'e/exact', usage: { ...run().usage, byModel: { 'e/exact': totals() } } }),
+      isFree,
+    );
+    // The response carried no cost (TTS): the whole run's cost is an estimate, across its models.
+    await recordRunStats(
+      run({
+        model: 'e/estimated',
+        models: ['e/estimated', 'e/second'],
+        usage: {
+          ...run().usage,
+          costEstimated: true,
+          byModel: {
+            'e/estimated': totals({ costUsd: 0.03 }),
+            'e/second': totals({ costUsd: 0.02 }),
+          },
+        },
+      }),
+      isFree,
+    );
+    // Unknown cost: the reservation is booked, and all of it is an estimate.
+    await recordRunStats(
+      run({
+        model: 'e/unknown',
+        reservedUsd: 0.5,
+        usage: {
+          ...run().usage,
+          costUnknown: true,
+          byModel: { 'e/unknown': totals({ costUsd: 0 }) },
+        },
+      }),
+      isFree,
+    );
+    // Part known, part unknown: the known part stays exact, the rest of the reservation is estimated.
+    await recordRunStats(
+      run({
+        model: 'e/mixed',
+        reservedUsd: 0.5,
+        usage: {
+          ...run().usage,
+          costUnknown: true,
+          costUsd: 0.1,
+          byModel: { 'e/mixed': totals({ costUsd: 0.1 }) },
+        },
+      }),
+      isFree,
+    );
+    const rows = await core.stats.rows({ from: '2026-10-15', to: '2026-10-15' });
+    const by = Object.fromEntries(rows.map((r) => [r.model, [r.costUsd, r.estimatedUsd]]));
+    expect(by['e/exact']).toEqual([0.01, 0]);
+    expect(by['e/estimated']).toEqual([0.03, 0.03]);
+    expect(by['e/second']).toEqual([0.02, 0.02]);
+    expect(by['e/unknown']).toEqual([0.5, 0.5]);
+    expect(by['e/mixed']![0]).toBeCloseTo(0.5);
+    expect(by['e/mixed']![1]).toBeCloseTo(0.4);
+    for (const r of rows) expect(r.estimatedUsd).toBeLessThanOrEqual(r.costUsd + 1e-12);
+  });
+
+  it('accumulates the estimated part over runs', async () => {
+    const estimated = run({
+      model: 'e/estimated',
+      usage: {
+        ...run().usage,
+        costEstimated: true,
+        byModel: { 'e/estimated': totals({ costUsd: 0.03 }) },
+      },
+    });
+    await recordRunStats(estimated, isFree);
+    await recordRunStats({ ...estimated, id: 'other' }, isFree);
+    await recordRunStats(
+      run({
+        model: 'e/estimated',
+        usage: { ...run().usage, byModel: { 'e/estimated': totals({ costUsd: 0.01 }) } },
+      }),
+      isFree,
+    );
+    const [row] = await core.stats.rows({ from: '2026-10-15', to: '2026-10-15' });
+    expect(row?.costUsd).toBeCloseTo(0.07);
+    expect(row?.estimatedUsd).toBeCloseTo(0.06);
   });
 
   it('counts an error on the primary model even without usage', async () => {
@@ -133,7 +250,7 @@ describe('recordRunStats', () => {
     );
     const rows = await core.stats.rows({ from: '2026-10-15', to: '2026-10-15' });
     expect(rows.map((r) => [r.model, r.runs, r.errors, r.requests])).toEqual([
-      ['o/other', 1, 0, 1],
+      ['o/other', 0, 0, 1],
       ['openai/gpt-x', 1, 1, 0],
       ['p/primary', 1, 1, 0],
     ]);

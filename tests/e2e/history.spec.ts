@@ -187,24 +187,58 @@ test.describe('search and filters', () => {
     await expect(rows(page)).toHaveCount(RUNS.length);
   });
 
-  test('filter by model: every model that ever ran is a choice', async ({ page }) => {
-    await openHistory(page);
-    await seedDb(page, {
-      stats: [
-        makeStats(utcDayAgo(0), { model: 'test/ocr', tool: 'ocr' }),
-        makeStats(utcDayAgo(0), { model: 'test/text-model' }),
-      ],
-    });
-    await page.reload();
-    await expect(rows(page)).toHaveCount(RUNS.length);
-    await expect(page.getByTestId('history-model').locator('option')).toHaveText([
+  const routed = makeRun('run-routed', 15, {
+    model: 'openrouter/free',
+    models: ['openrouter/free', 'acme/routed-model:free'],
+    title: 'Routed run',
+  });
+
+  test('filter by model: the models of the runs, including the ones behind a router', async ({
+    page,
+  }) => {
+    await openHistory(page, [...RUNS, routed]);
+    const options = page.getByTestId('history-model').locator('option');
+    await expect(options).toHaveText([
       'Any model',
+      'acme/routed-model:free',
+      'black-forest-labs/flux.2-klein-4b',
+      'hexgrad/kokoro-82m',
+      'openrouter/free',
       'test/ocr',
       'test/text-model',
     ]);
+    await page.getByTestId('history-model').selectOption('openrouter/free');
+    await expect(rows(page)).toHaveCount(1);
+    await expect(row(page, 'run-routed')).toBeVisible();
+    // A model the run used besides its primary one finds it too.
+    await page.getByTestId('history-model').selectOption('acme/routed-model:free');
+    await expect(row(page, 'run-routed')).toBeVisible();
     await page.getByTestId('history-model').selectOption('test/ocr');
     await expect(rows(page)).toHaveCount(1);
     await expect(row(page, 'run-ocr-json')).toBeVisible();
+  });
+
+  test('the model filter comes from the runs, not from the spending ledger, and follows deletes', async ({
+    page,
+  }) => {
+    await openHistory(page, [...RUNS, routed]);
+    // A model that only the ledger knows (its runs are gone) is not offered.
+    await seedDb(page, { stats: [makeStats(utcDayAgo(0), { model: 'ledger/only', runs: 1 })] });
+    await page.reload();
+    const options = page.getByTestId('history-model').locator('option');
+    await expect(options).toHaveCount(7);
+    await expect(options.filter({ hasText: 'ledger/only' })).toHaveCount(0);
+
+    // Deleting the routed run takes the models only it used out of the list.
+    await row(page, 'run-routed').getByTestId('run-open').click();
+    await page.getByTestId('run-delete').click();
+    await page.getByTestId('delete-run-dialog').getByTestId('dialog-confirm').click();
+    await expect(row(page, 'run-routed')).toHaveCount(0);
+    await expect(options.filter({ hasText: 'acme/routed-model:free' })).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    await expect(options.filter({ hasText: 'openrouter/free' })).toHaveCount(0);
+    await expect(options).toHaveCount(5);
   });
 
   test('filter by status, starred and date range', async ({ page }) => {
@@ -594,5 +628,154 @@ test.describe('accessibility', () => {
     await page.emulateMedia({ colorScheme: 'light' });
     await expect(page.locator('html')).toHaveAttribute('data-bs-theme', 'light');
     await expectNoSeriousA11yViolations(page);
+  });
+});
+
+test.describe('runs in progress', () => {
+  const live = makeRun('run-live', 1, {
+    status: 'running',
+    finishedAt: null,
+    latencyMs: null,
+    title: 'Still going',
+  });
+
+  /** The stored status of a run, read straight from IndexedDB. */
+  const storedStatus = (page: Page, id: string): Promise<string | undefined> =>
+    page.evaluate(async (runId) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('ortoolbox');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error ?? new Error('open failed'));
+      });
+      const record = await new Promise<{ status?: string } | undefined>((resolve, reject) => {
+        const request = db.transaction('runs').objectStore('runs').get(runId);
+        request.onsuccess = () => resolve(request.result as { status?: string } | undefined);
+        request.onerror = () => reject(request.error ?? new Error('read failed'));
+      });
+      db.close();
+      return record?.status;
+    }, id);
+
+  // Written after the page started: at page start, the sweep finalizes runs that no live page owns.
+  test.beforeEach(async ({ page }) => {
+    await openHistory(page);
+    await seedDb(page, { runs: [live] });
+    await expect(row(page, 'run-live').getByTestId('run-status')).toHaveText('Running');
+  });
+
+  test('cannot be deleted one by one', async ({ page }) => {
+    await row(page, 'run-live').getByTestId('run-open').click();
+    await expect(page.getByTestId('run-delete')).toBeDisabled();
+    await expect(page.getByTestId('run-delete-note')).toContainText('still in progress');
+    // Other runs can.
+    await closeDrawer(page);
+    await row(page, 'run-old').getByTestId('run-open').click();
+    await expect(page.getByTestId('run-delete')).toBeEnabled();
+    await expect(page.getByTestId('run-delete-note')).toHaveCount(0);
+  });
+
+  test('are kept by "Delete filtered", and Undo never brings one back or changes it', async ({
+    page,
+  }) => {
+    await page.getByTestId('history-menu').click();
+    await page.getByTestId('history-delete-filtered').click();
+    const dialog = page.getByTestId('delete-filtered-dialog');
+    await expect(dialog).toContainText(`${RUNS.length} runs`);
+    await expect(dialog).toContainText('1 run in progress is kept');
+    await dialog.getByTestId('typed-confirm-input').fill('delete');
+    await dialog.getByTestId('dialog-confirm').click();
+
+    await expect(rows(page)).toHaveCount(1);
+    await expect(row(page, 'run-live')).toBeVisible();
+    expect(await storedStatus(page, 'run-live')).toBe('running');
+
+    await page
+      .getByTestId('toast')
+      .filter({ hasText: `Deleted ${RUNS.length} runs` })
+      .getByTestId('toast-undo')
+      .click();
+    await expect(rows(page)).toHaveCount(RUNS.length + 1);
+    await expect(row(page, 'run-live').getByTestId('run-status')).toHaveText('Running');
+    expect(await storedStatus(page, 'run-live')).toBe('running');
+  });
+
+  test('a filter that matches only runs in progress has nothing to delete', async ({ page }) => {
+    await page.getByTestId('history-status').selectOption('running');
+    await expect(rows(page)).toHaveCount(1);
+    await page.getByTestId('history-menu').click();
+    await page.getByTestId('history-delete-filtered').click();
+    await expect(
+      page.getByTestId('toast').filter({ hasText: 'only runs in progress' }),
+    ).toBeVisible();
+    await expect(page.getByTestId('delete-filtered-dialog')).toHaveCount(0);
+  });
+});
+
+test.describe('output as stored', () => {
+  test('JSON output keeps big integers, overflowing exponents and trailing zeros', async ({
+    page,
+  }) => {
+    const output = '{"id": 12345678901234567890, "big": 1e999, "price": 1.50, "dup": 1, "dup": 2}';
+    await openHistory(
+      page,
+      [makeRun('run-json', 1, { title: 'Exact', output })],
+      'history/?run=run-json',
+    );
+    const json = page.getByTestId('run-output');
+    await expect(json).toContainText('"id": 12345678901234567890');
+    await expect(json).toContainText('"big": 1e999');
+    await expect(json).toContainText('"price": 1.50');
+    // Duplicate keys survive too: nothing was parsed and written back.
+    await expect(json).toContainText('"dup": 1');
+    await expect(json).toContainText('"dup": 2');
+    expect(await json.evaluate((node) => node.tagName)).toBe('PRE');
+  });
+});
+
+test.describe('paging builds only the new rows', () => {
+  test('Show more leaves the rows on screen as they are', async ({ page, context }) => {
+    await context.addInitScript(() => {
+      (window as { IntersectionObserver?: unknown }).IntersectionObserver = undefined;
+    });
+    const base = Date.now() - 3600_000;
+    const bulk = Array.from({ length: 90 }, (_, index) =>
+      makeRun(`more-${String(index).padStart(3, '0')}`, 0, {
+        title: `More ${index}`,
+        startedAt: base - index * 1000,
+      }),
+    );
+    await openHistory(page, bulk);
+    await expect(rows(page)).toHaveCount(40);
+    // Tag the first row and its day section: a rebuild would drop the tags.
+    await rows(page)
+      .first()
+      .evaluate((node) => {
+        node.setAttribute('data-mark', 'row');
+        node.closest('section')?.setAttribute('data-mark', 'section');
+      });
+    await page.getByTestId('history-more').click();
+    await expect(rows(page)).toHaveCount(80);
+    await expect(rows(page).first()).toHaveAttribute('data-mark', 'row');
+    await expect(page.getByTestId('history-day').first()).toHaveAttribute('data-mark', 'section');
+    // The new rows joined the same day (all 90 runs are within the last hour), not a new section.
+    await expect(page.getByTestId('history-day')).toHaveCount(1);
+    await expect(page.getByTestId('history-count')).toHaveText('80 runs of 90');
+  });
+});
+
+test.describe('phones', () => {
+  test('the list and the drawer with its usage table do not make the page scroll sideways', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openHistory(page, RUNS, 'history/?run=run-chat-ok');
+    await expect(page.getByTestId('run-usage')).toBeVisible();
+    const overflow = () =>
+      page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+    expect(await overflow()).toBeLessThanOrEqual(0);
+    await closeDrawer(page);
+    expect(await overflow()).toBeLessThanOrEqual(0);
   });
 });

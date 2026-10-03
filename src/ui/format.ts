@@ -4,7 +4,7 @@
  * from src/core/files (re-exported here so UI code has one import).
  */
 
-import type { ModelInfo } from '../core/types';
+import { describePrice, modelPrice, type PriceModel } from './model-price';
 
 export { formatBytes, formatDuration } from '../core/files';
 
@@ -76,26 +76,13 @@ export function formatContext(tokens: number | null): string | null {
   return `${formatCount(tokens)} context`;
 }
 
-const PER_MILLION = 1_000_000;
-
 /**
  * One line describing what a model costs, for pickers and chips: `Free`, `$0.10 in · $0.50 out per 1M tokens`,
- * `$0.04 per request`, `$0.03 per image`, or `Price varies` when the catalog's unit is model-specific
- * (speech, transcription, video and music prices are not per token; see docs/openrouter-api.md §9.3).
+ * `≈ $0.03 per image`, `$0.36 per hour of audio`, `$0.04 per request`, or `Price varies`. The unit is the model's
+ * own billing unit; the rules live in model-price.ts, shared with the Models page (see docs/openrouter-api.md §9.3).
  */
-export function formatModelPrice(model: Pick<ModelInfo, 'isFree' | 'pricing'>): string {
-  if (model.isFree) return 'Free';
-  const { prompt, completion, request, image } = model.pricing;
-  if (prompt !== null && completion !== null) {
-    if (prompt === 0 && completion === 0) {
-      if (request) return `${formatUsd(request)} per request`;
-      return 'Price varies';
-    }
-    return `${formatUsd(prompt * PER_MILLION)} in · ${formatUsd(completion * PER_MILLION)} out per 1M tokens`;
-  }
-  if (request) return `${formatUsd(request)} per request`;
-  if (image) return `${formatUsd(image)} per image`;
-  return 'Price varies';
+export function formatModelPrice(model: PriceModel): string {
+  return describePrice(modelPrice(model), formatUsd).text;
 }
 
 const RELATIVE = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
