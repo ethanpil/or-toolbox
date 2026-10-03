@@ -15,7 +15,7 @@
  */
 import type { Page } from '@playwright/test';
 import type { StatsRow } from '../../src/core/types';
-import { expect, test } from '../mock/index.ts';
+import { expect, TEST_API_KEY, test } from '../mock/index.ts';
 import { seedApp } from './app.ts';
 import {
   clearIndexReads,
@@ -497,6 +497,67 @@ test.describe('budget and balances', () => {
       'href',
       /settings\/#budgets$/,
     );
+  });
+
+  test('re-renders ask OpenRouter for no balance again; the free counter comes from the default key', async ({
+    page,
+    mock,
+  }) => {
+    // The default (test) key answers; a second key of the same account is rejected, which the core does not cache.
+    mock.respond('GET', '/api/v1/key', (call) =>
+      call.headers.authorization === `Bearer ${TEST_API_KEY}`
+        ? {
+            body: {
+              data: {
+                label: 'sk-or-v1-tes...000',
+                limit: 5,
+                limit_remaining: 4.5,
+                usage: 0.5,
+                is_free_tier: false,
+                free_model_daily_requests: { used: 12, limit: 50, remaining: 38 },
+              },
+            },
+          }
+        : { status: 401, body: { error: { code: 401, message: 'No auth' } } },
+    );
+    await page.goto('privacy/');
+    await page.evaluate(
+      (secret) => {
+        const file = JSON.parse(localStorage.getItem('ortoolbox:keys') ?? '{}') as {
+          keys: Record<string, unknown>[];
+        };
+        file.keys.push({
+          ...file.keys[0],
+          id: 'key-work',
+          name: 'Work',
+          masked: 'sk-or-…1111',
+          secret,
+        });
+        localStorage.setItem('ortoolbox:keys', JSON.stringify(file));
+      },
+      `${TEST_API_KEY.slice(0, -4)}1111`,
+    );
+    await openStats(page);
+    const work = page.getByTestId('budget-key-row').filter({ hasText: 'Work' });
+    await expect(work.getByTestId('balance-error')).toHaveText('Unavailable');
+    await expect(page.getByTestId('free-remote')).toContainText('12 of 50');
+    const rejected = () =>
+      mock
+        .calls('/api/v1/key')
+        .filter((call) => call.headers.authorization !== `Bearer ${TEST_API_KEY}`);
+    expect(rejected()).toHaveLength(1);
+
+    const asked = page
+      .waitForRequest((request) => request.url().endsWith('/api/v1/key'), { timeout: 1000 })
+      .then(
+        () => true,
+        () => false,
+      );
+    await page.getByTestId('stats-range-7d').click();
+    await expect(page.getByTestId('stats-range-7d')).toHaveAttribute('aria-pressed', 'true');
+    expect(await asked).toBe(false);
+    await expect(work.getByTestId('balance-error')).toHaveText('Unavailable');
+    expect(rejected()).toHaveLength(1);
   });
 
   test('a key whose balance cannot be read still shows its spend', async ({ page, mock }) => {

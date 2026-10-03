@@ -199,8 +199,7 @@ export function securitySection(core: CoreServices): SectionView {
           onsubmit: (event: Event) => {
             event.preventDefault();
             if (!current.input.value) {
-              current.invalid('Enter your current passphrase.');
-              current.input.focus();
+              current.invalid('Enter your current passphrase.', { focus: true });
               return;
             }
             if (!validNewPassphrase(next, confirm)) return;
@@ -211,7 +210,7 @@ export function securitySection(core: CoreServices): SectionView {
                 for (const field of [current, next, confirm]) field.clear();
               } catch (error) {
                 if (errorCode(error) === 'wrong-passphrase') {
-                  current.invalid('Wrong passphrase.');
+                  current.invalid('Wrong passphrase.', { focus: true });
                   current.input.select();
                 } else {
                   await presentError(error);
@@ -254,8 +253,7 @@ export function securitySection(core: CoreServices): SectionView {
           onsubmit: (event: Event) => {
             event.preventDefault();
             if (!current.input.value) {
-              current.invalid('Enter your passphrase.');
-              current.input.focus();
+              current.invalid('Enter your passphrase.', { focus: true });
               return;
             }
             void busy(submit, async () => {
@@ -267,7 +265,7 @@ export function securitySection(core: CoreServices): SectionView {
                 toast({ message: 'Passphrase lock is off.', variant: 'success' });
               } catch (error) {
                 if (errorCode(error) === 'wrong-passphrase') {
-                  current.invalid('Wrong passphrase.');
+                  current.invalid('Wrong passphrase.', { focus: true });
                   current.input.select();
                 } else {
                   await presentError(error);

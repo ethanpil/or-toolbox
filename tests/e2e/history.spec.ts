@@ -525,6 +525,43 @@ test.describe('paging and live updates', () => {
     await expect(page.getByTestId('run-drawer-title')).toHaveText('Still going');
     await expect(drawer(page).getByTestId('run-status')).toHaveText('Done');
   });
+
+  test('a live update of the open run keeps the focus on its Output or Prompt', async ({
+    page,
+  }) => {
+    const run = RUNS[0]!;
+    await openHistory(page, RUNS, `history/?run=${run.id}`);
+    await expectDrawerOpen(page);
+    let starred = run.starred;
+    for (const testId of ['run-output', 'run-prompt']) {
+      await page.getByTestId(testId).focus();
+      // Starred in another tab: the drawer is rebuilt.
+      starred = !starred;
+      await seedDb(page, { runs: [{ ...run, starred }] });
+      await expect(page.getByTestId('run-detail-star')).toHaveAttribute(
+        'aria-pressed',
+        String(starred),
+      );
+      await expect(page.getByTestId(testId)).toBeFocused();
+    }
+  });
+
+  test('a search that cannot read storage shows the error state, not the old list', async ({
+    page,
+  }) => {
+    await openHistory(page);
+    await expect(rows(page)).toHaveCount(RUNS.length);
+    // Every IndexedDB read fails from now on.
+    await page.evaluate(() => {
+      IDBDatabase.prototype.transaction = () => {
+        throw new DOMException('Storage is gone', 'UnknownError');
+      };
+    });
+    await page.getByTestId('history-search').fill('invoice');
+    await expect(page.getByTestId('history-error')).toBeVisible();
+    await expect(rows(page)).toHaveCount(0);
+    await expect(page.getByTestId('history-count')).toHaveText('History could not be loaded.');
+  });
 });
 
 test.describe('export and delete in bulk', () => {

@@ -5,41 +5,10 @@
  * hook ships in the bundles. Run: `npm run e2e:dev -- tests/e2e/dev --project=chromium`.
  */
 import type { Page } from '@playwright/test';
-import type { CoreServices } from '../../../src/core/types';
-import { basePath } from '../../../vite-plugins/site.ts';
 import { expect, test } from '../../mock/index.ts';
 import { seedApp, TEST_KEY_ID } from '../app.ts';
 import { watchForProblems } from '../support.ts';
-
-declare global {
-  interface Window {
-    __core?: CoreServices;
-  }
-}
-
-// A page the dev server has not served yet makes Vite transform its modules, which on a busy machine takes far
-// longer than Playwright's 30 s default. The waits below name what they wait for; the test budget just has to
-// be large enough for a cold first visit.
-test.describe.configure({ timeout: 120_000 });
-
-/**
- * Opens a tool page and waits until the shell has mounted it. Waiting for the page title (not for the `load`
- * event, which also waits for every subresource) is the signal that the app is ready for the test to act.
- */
-async function openTool(page: Page, path: string, title: string): Promise<void> {
-  await page.goto(path, { waitUntil: 'domcontentloaded' });
-  await expect(page.getByTestId('page-title')).toHaveText(title, { timeout: 90_000 });
-}
-
-/** Puts the page's own core (the module instance the app uses) on `window.__core`. */
-async function exposeCore(page: Page): Promise<void> {
-  await page.evaluate(async (base) => {
-    const module = (await import(/* @vite-ignore */ `${base}src/core/index.ts`)) as {
-      getCore: () => CoreServices;
-    };
-    window.__core = module.getCore();
-  }, basePath());
-}
+import { openWithCore } from './page-core.ts';
 
 async function addResults(page: Page, kinds: ('image' | 'video')[]): Promise<void> {
   await page.evaluate((list) => {
@@ -61,8 +30,7 @@ test.describe('leave guard', () => {
 
   test('asks before leaving with results that were not downloaded', async ({ page }) => {
     const problems = await watchForProblems(page);
-    await openTool(page, 'tools/image-generation/', 'Image generation');
-    await exposeCore(page);
+    await openWithCore(page, 'tools/image-generation/', 'Image generation');
     await addResults(page, ['image', 'video']);
 
     await page.getByRole('link', { name: 'Models', exact: true }).click();
@@ -78,13 +46,12 @@ test.describe('leave guard', () => {
 
     await page.getByRole('link', { name: 'Models', exact: true }).click();
     await page.getByTestId('leave-guard-leave').click();
-    await expect(page).toHaveURL(/\/models\/$/, { timeout: 30_000 });
+    await expect(page).toHaveURL(/\/models\/$/);
     expect(problems).toEqual([]);
   });
 
   test('Download all saves everything, then the way is clear', async ({ page }) => {
-    await openTool(page, 'tools/image-generation/', 'Image generation');
-    await exposeCore(page);
+    await openWithCore(page, 'tools/image-generation/', 'Image generation');
     await addResults(page, ['image']);
     await page.getByRole('link', { name: 'History', exact: true }).click();
     const download = page.waitForEvent('download');
@@ -92,12 +59,11 @@ test.describe('leave guard', () => {
     expect((await download).suggestedFilename()).toBe('cat.png');
     await expect(page.getByTestId('leave-guard')).toContainText('Nothing will be lost');
     await page.getByTestId('leave-guard-leave').click();
-    await expect(page).toHaveURL(/\/history\/$/, { timeout: 30_000 });
+    await expect(page).toHaveURL(/\/history\/$/);
   });
 
   test('guards palette navigation too, and counts runs in progress', async ({ page }) => {
-    await openTool(page, 'tools/chat/', 'Chat');
-    await exposeCore(page);
+    await openWithCore(page, 'tools/chat/', 'Chat');
     // A run that has begun and not finished (no request is made).
     await page.evaluate(async () => {
       await window.__core!.runs.begin({ tool: 'chat', model: 'test/text-model', estimateUsd: 0 });
@@ -134,8 +100,7 @@ test.describe('budget confirmation', () => {
     });
 
   test('Cancel stops the run before anything is sent or recorded', async ({ page, mock }) => {
-    await openTool(page, 'tools/chat/', 'Chat');
-    await exposeCore(page);
+    await openWithCore(page, 'tools/chat/', 'Chat');
     const result = begin(page);
     const dialog = page.getByTestId('budget-dialog');
     await expect(dialog).toBeVisible();
@@ -154,8 +119,7 @@ test.describe('budget confirmation', () => {
   });
 
   test('Run anyway lets the run start', async ({ page }) => {
-    await openTool(page, 'tools/chat/', 'Chat');
-    await exposeCore(page);
+    await openWithCore(page, 'tools/chat/', 'Chat');
     const result = begin(page);
     await page.getByTestId('budget-confirm').click();
     expect(await result).toEqual({ ok: true, code: null });

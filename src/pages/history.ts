@@ -495,8 +495,9 @@ class HistoryPage {
 
   /**
    * Loads the first page of the current filters, or with `keep` as many rows as are shown now (a live update:
-   * the list keeps its length and the keyboard focus). Content on screen stays while a reload runs, and when
-   * it fails (the toast says so); only a list that never loaded gets the skeleton and the error state.
+   * the list keeps its length and the keyboard focus). A live update leaves the rows on screen while it runs,
+   * and when it fails (the toast says so). A load the user asked for (search, filters, reset, Try again) shows
+   * the skeleton, and the error state when it fails: the rows on screen no longer match what was asked.
    */
   private reload(options: { keep?: boolean } = {}): Promise<boolean> {
     const mine = ++this.generation;
@@ -526,7 +527,7 @@ class HistoryPage {
           testId: 'history-error',
         },
         retry: () => void this.reload(),
-        keepOnLiveFailure: true,
+        keepOnLiveFailure: options.keep === true,
         toast: true,
       },
     );
@@ -929,6 +930,7 @@ class HistoryPage {
           tabIndex: 0,
           role: 'region',
           'aria-label': 'Output',
+          'data-focus-key': 'run-output',
           'data-testid': 'run-output',
         },
         h('code', null, view.text),
@@ -942,6 +944,7 @@ class HistoryPage {
         tabIndex: 0,
         role: 'region',
         'aria-label': 'Output',
+        'data-focus-key': 'run-output',
         'data-testid': 'run-output',
       },
       view.text,
@@ -1100,6 +1103,7 @@ class HistoryPage {
                 tabIndex: 0,
                 role: 'region',
                 'aria-label': 'Prompt',
+                'data-focus-key': 'run-prompt',
                 'data-testid': 'run-prompt',
               },
               run.prompt,

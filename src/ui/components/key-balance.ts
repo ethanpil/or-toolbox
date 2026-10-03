@@ -11,7 +11,10 @@
  * balance.load();
  * ```
  *
- * The view keeps what it last knew, so a page can repaint it (the lock changed) without asking again.
+ * The view keeps what it last knew, so a page can repaint it (the lock changed) without asking again: a page
+ * that re-renders on every keys or settings change calls `loadMissing()`, which asks only when nothing is known,
+ * and every request goes through `keys.status()`, whose short cache answers repeats. A refresh that fails keeps
+ * a balance already on show (with a line saying the refresh failed).
  */
 import { ApiError, errorCode, userMessage } from '../../core/errors';
 import type { CoreServices, KeyInfo, KeyStatus } from '../../core/types';
@@ -24,7 +27,10 @@ import { icon } from '../icon';
 import { meter } from './meter';
 
 type State =
-  { kind: 'loading' } | { kind: 'ok'; status: KeyStatus } | { kind: 'error'; error: unknown };
+  | { kind: 'loading' }
+  /** `refreshFailed`: the last refresh failed, so `status` is the balance from before it. */
+  | { kind: 'ok'; status: KeyStatus; refreshFailed?: unknown }
+  | { kind: 'error'; error: unknown };
 
 export interface KeyBalanceOptions {
   /** One line instead of the figures, the meter and Refresh. */
@@ -37,6 +43,11 @@ export interface KeyBalanceView {
   element: HTMLElement;
   /** Asks for the balance (the core's short cache answers, or the network with `force`) and repaints. */
   load(force?: boolean): void;
+  /**
+   * Loads only when no balance is known (never loaded, or the lock was in the way), else repaints what is known:
+   * for pages that re-render on every keys or settings change.
+   */
+  loadMissing(): void;
   /** Repaints from what is known now, e.g. after the lock changed. */
   paint(): void;
 }
@@ -67,7 +78,7 @@ export function keyBalanceView(
   const locked = (): boolean =>
     !core.keys.lock.unlocked() || (state?.kind === 'error' && errorCode(state.error) === 'locked');
 
-  const fullBalance = (status: KeyStatus): Child => {
+  const fullBalance = (status: KeyStatus, refreshFailed: unknown): Child => {
     const balance = keyBalance(status);
     const stat = (label: string, value: Child, testId: string): HTMLElement =>
       h(
@@ -120,6 +131,14 @@ export function keyBalanceView(
         status.isFreeTier ? 'No credits bought yet (free tier). ' : '',
         `Checked ${formatRelativeTime(status.fetchedAt)}.`,
       ),
+      refreshFailed !== undefined &&
+        h(
+          'div',
+          { class: 'small text-warning-emphasis mt-1', 'data-testid': 'key-balance-stale' },
+          icon('exclamation-circle', 'me-1'),
+          'Could not refresh: ',
+          balanceProblem(refreshFailed),
+        ),
     ];
   };
 
@@ -206,7 +225,7 @@ export function keyBalanceView(
     } else {
       body = compact
         ? compactBalance(state.status, options.detail === true)
-        : fullBalance(state.status);
+        : fullBalance(state.status, state.refreshFailed);
     }
     replace(element, body);
   };
@@ -219,6 +238,7 @@ export function keyBalanceView(
       paint();
       return;
     }
+    const shown = state?.kind === 'ok' ? state.status : null;
     // A refresh of a balance already on show keeps it there until the new one arrives.
     if (force || !state || state.kind === 'error') {
       state = { kind: 'loading' };
@@ -232,7 +252,11 @@ export function keyBalanceView(
         if (force) announce(`Balance of ${name()} updated.`);
       })
       .catch((error: unknown) => {
-        state = { kind: 'error', error };
+        // A failed refresh keeps the balance that was on show; a lock hides it (paint() checks the lock).
+        state =
+          shown && errorCode(error) !== 'locked'
+            ? { kind: 'ok', status: shown, refreshFailed: error }
+            : { kind: 'error', error };
         if (force) announce(`The balance of ${name()} could not be checked.`);
       })
       .finally(() => {
@@ -241,8 +265,15 @@ export function keyBalanceView(
       });
   };
 
+  const loadMissing = (): void => {
+    const missing =
+      state === null || (state.kind === 'error' && errorCode(state.error) === 'locked');
+    if (missing) load();
+    else paint();
+  };
+
   paint();
-  return { element, load, paint };
+  return { element, load, loadMissing, paint };
 }
 
 function compactBalance(status: KeyStatus, detail: boolean): Child {
@@ -277,16 +308,15 @@ function compactBalance(status: KeyStatus, detail: boolean): Child {
 }
 
 /**
- * OpenRouter's free-model counter for the account: from the first readable key (the default key first), or null
- * when locked, unreadable or not reported. Keys of one account share the counter.
+ * OpenRouter's free-model counter for the account, from the default key only (keys of one account share the
+ * counter, so asking every key would only cost requests), or null when locked, unreadable or not reported.
  */
 export async function accountFreeDaily(core: CoreServices): Promise<KeyStatus['freeDaily']> {
-  if (!core.keys.lock.unlocked()) return null;
-  const first = core.keys.resolve();
-  const keys = core.keys.list();
-  const ordered = first ? [first, ...keys.filter((key) => key.id !== first.id)] : keys;
-  const statuses = await Promise.all(
-    ordered.map((key) => core.keys.status(key.id).catch(() => null)),
-  );
-  return statuses.find((status) => status?.freeDaily)?.freeDaily ?? null;
+  const key = core.keys.resolve();
+  if (!key || !core.keys.lock.unlocked()) return null;
+  try {
+    return (await core.keys.status(key.id)).freeDaily;
+  } catch {
+    return null;
+  }
 }

@@ -4,7 +4,7 @@
  * Privacy page (cards with an icon-tile heading). Switches, meters, external links and settings writes are
  * shared with the other pages (src/ui/components/, src/ui/settings-actions.ts).
  */
-import { type Child, FOCUS_KEY, h, replace } from '../../ui/dom';
+import { type Child, FOCUS_KEY, h, replace, replaceWith } from '../../ui/dom';
 import { presentError } from '../../ui/feedback/errors';
 import { setFieldError } from '../../ui/feedback/field-error';
 import { icon } from '../../ui/icon';
@@ -52,7 +52,9 @@ export function rerender(
   const lostKey = hadFocus
     ? (active.closest(`[${FOCUS_KEY}]`)?.getAttribute(FOCUS_KEY) ?? null)
     : null;
-  replace(container, typeof content === 'function' ? content() : content);
+  replaceWith(container, typeof content === 'function' ? content() : content, {
+    fallback: (key) => options.fallback?.(key),
+  });
   if (!hadFocus) return;
   const now = document.activeElement;
   if (now instanceof HTMLElement && now !== document.body && container.contains(now)) return;
@@ -377,7 +379,12 @@ export function segmented<T extends string>(options: {
 export interface PassphraseInput {
   element: HTMLElement;
   input: HTMLInputElement;
-  invalid(message: string | null): void;
+  /**
+   * Shows (null: clears) the field's error; with `focus`, also moves the focus to the field. Like `numberField`,
+   * a message is announced once each time it changes (the same error on the next submit is not announced
+   * again), and an error that moves the focus is read with the field instead of announced too (`setFieldError`).
+   */
+  invalid(message: string | null, options?: { focus?: boolean }): void;
   /** Empties the field, its error and its strength meter. */
   clear(): void;
 }
@@ -425,7 +432,17 @@ export function passphraseInput(options: {
     strengthText.textContent = input.value ? result.label : '—';
     strengthHint.textContent = result.hint;
   };
-  const invalid = (message: string | null): void => setFieldError(input, feedback, message);
+  /** The message on show, as in `numberField`. */
+  let shown: string | null = null;
+  const invalid = (message: string | null, { focus = false }: { focus?: boolean } = {}): void => {
+    const next = message || null;
+    if (next === shown) {
+      if (next !== null && focus) input.focus();
+      return;
+    }
+    shown = next;
+    setFieldError(input, feedback, next, { focus });
+  };
   input.addEventListener('input', () => {
     if (options.strength) updateStrength();
     if (input.classList.contains('is-invalid')) invalid(null);
@@ -454,13 +471,11 @@ export function passphraseInput(options: {
 /** Checks a new passphrase and its confirmation; marks the fields and returns false when they fail. */
 export function validNewPassphrase(next: PassphraseInput, confirm: PassphraseInput): boolean {
   if (next.input.value.length < MIN_PASSPHRASE_LENGTH) {
-    next.invalid(`Use at least ${MIN_PASSPHRASE_LENGTH} characters.`);
-    next.input.focus();
+    next.invalid(`Use at least ${MIN_PASSPHRASE_LENGTH} characters.`, { focus: true });
     return false;
   }
   if (confirm.input.value !== next.input.value) {
-    confirm.invalid('The passphrases do not match.');
-    confirm.input.focus();
+    confirm.invalid('The passphrases do not match.', { focus: true });
     return false;
   }
   return true;
