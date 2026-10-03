@@ -59,6 +59,7 @@ All notable changes to this project are documented here. The format follows
 - Platform pages share small helpers instead of per-page copies (star button, data table, key balance view, `loadInto`, `copyWithToast`, `saveSettings`, `formatInt`/`formatDate`, `debounce`, one `CAPABILITY_INFO`); Settings builds a section when first shown; model search is debounced with cached normalised fields; `/` and Ctrl/Cmd+K respect dialogs and fields (b4948b5, 240f925, 78749a9).
 - `exportMenu` formats may set their own file name (6d07e24).
 - `replace()` falls back to the nearest keyed control when the focused one is gone or disabled; `documentInput` updates page tiles in place and opens each added PDF once (a60a24a).
+- `ChatStreamResult.annotations` (the PDF parser's text) and a `tool-state-changed` bus event from the tool state store (99eae10); Chat streams its PDF turns, hears other tabs on the bus, and uses the runner argument, `streamMarkdown`, PDF add-ons and the focus helpers (81fc471).
 - CSV/TSV keep phone-like values (`+44 20 7946 0958`) as written (c6d74d2).
 - File types: untyped source files (`.py`, `.yaml`, `.js`…) get `text/x-*` types, so `text/*` tools take them (5afda1e).
 
