@@ -19,7 +19,9 @@
  * several times faster than the single-threaded one for H.264 encoding.
  */
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
-import { sniffBlobMime } from '../files';
+import { InvalidInputError } from '../errors';
+import { extensionForMime, sniffBlobMime } from '../files';
+import { abortError, throwIfAborted } from '../util';
 import { disposeFfmpeg, loadFfmpeg, type LoadFfmpegOptions } from './ffmpeg';
 import { type MediaInfo, parseMediaInfo } from './ffmpeg-probe';
 
@@ -30,7 +32,12 @@ export interface FfmpegOpOptions {
   onProgress?: (ratio: number) => void;
   /** Reports the one-time download of the ffmpeg core (about 32 MB). */
   onLoadProgress?: LoadFfmpegOptions['onProgress'];
-  /** Aborting terminates ffmpeg and rejects with an `AbortError`. */
+  /**
+   * Aborting rejects with an `AbortError` at once: while the job waits its turn
+   * it leaves the queue without ever starting, while the core loads it stops
+   * waiting (the load itself finishes in the background for the next job), and
+   * while ffmpeg runs it terminates the instance.
+   */
   signal?: AbortSignal;
   /** Use the single-threaded core even when threads are available. */
   singleThread?: boolean;
@@ -38,12 +45,9 @@ export interface FfmpegOpOptions {
 
 // --- job plumbing -----------------------------------------------------------
 
-let queue: Promise<unknown> = Promise.resolve();
+/** Resolves when every job queued so far has finished (or has left the queue). Never rejects. */
+let queue: Promise<void> = Promise.resolve();
 let jobCounter = 0;
-
-function abortError(): DOMException {
-  return new DOMException('Aborted', 'AbortError');
-}
 
 interface Job {
   ffmpeg: FFmpeg;
@@ -92,124 +96,164 @@ function threadLimits(multiThreaded: boolean): ThreadArgs {
   };
 }
 
-function withFfmpeg<T>(options: FfmpegOpOptions, work: (job: Job) => Promise<T>): Promise<T> {
-  const task = async (): Promise<T> => {
-    if (options.signal?.aborted) throw abortError();
-    const { ffmpeg, multiThreaded } = await loadFfmpeg({
-      ...(options.onLoadProgress ? { onProgress: options.onLoadProgress } : {}),
-      ...(options.singleThread ? { singleThread: true } : {}),
-    });
-    if (options.signal?.aborted) throw abortError();
-
-    const id = ++jobCounter;
-    const files = new Set<string>();
-    let sink: string[] | undefined;
-    const recent: string[] = [];
-    let onTime: ((seconds: number, ratio: number) => void) | undefined;
-    let aborted = false;
-
-    const onLog = ({ message }: { message: string }): void => {
-      sink?.push(message);
-      recent.push(message);
-      if (recent.length > 8) recent.shift();
-    };
-    const onProgress = ({ progress, time }: { progress: number; time: number }): void => {
-      onTime?.(Math.max(0, time) / 1e6, Math.min(1, Math.max(0, progress)));
-    };
-    const onAbort = (): void => {
-      aborted = true;
-      disposeFfmpeg();
-    };
-    ffmpeg.on('log', onLog);
-    ffmpeg.on('progress', onProgress);
-    options.signal?.addEventListener('abort', onAbort, { once: true });
-
-    const name = (label: string, extension: string): string => {
-      const file = `j${id}-${label}.${extension}`;
-      files.add(file);
-      return file;
-    };
-    const remove = async (file: string): Promise<void> => {
-      files.delete(file);
-      await ffmpeg.deleteFile(file).catch(() => false);
-    };
-
-    const job: Job = {
-      ffmpeg,
-      multiThreaded,
-      threads: threadLimits(multiThreaded),
-      name,
-      write: async (blob, label, extension) => {
-        const file = name(label, extension);
-        await ffmpeg.writeFile(file, new Uint8Array(await blob.arrayBuffer()));
-        return file;
-      },
-      run: async (args, listener) => {
-        onTime = listener;
-        recent.length = 0;
-        try {
-          const code = await ffmpeg.exec(args);
-          if (code !== 0) {
-            throw new Error(`ffmpeg failed (exit code ${code}): ${recent.slice(-3).join(' ')}`);
-          }
-        } finally {
-          onTime = undefined;
-        }
-      },
-      capture: async (args) => {
-        const lines: string[] = [];
-        sink = lines;
-        try {
-          await ffmpeg.exec(args);
-        } finally {
-          sink = undefined;
-        }
-        return lines.join('\n');
-      },
-      read: async (file, type) => {
-        const data = await ffmpeg.readFile(file);
-        await remove(file);
-        if (typeof data === 'string') throw new Error('ffmpeg wrote no output.');
-        // A worker message delivers a plain ArrayBuffer, so the cast only narrows the type.
-        return new Blob([data as Uint8Array<ArrayBuffer>], { type });
-      },
-      remove,
-    };
-
-    try {
-      return await work(job);
-    } catch (error) {
-      if (aborted || options.signal?.aborted) throw abortError();
-      throw error;
-    } finally {
-      options.signal?.removeEventListener('abort', onAbort);
-      if (!aborted) {
-        ffmpeg.off('log', onLog);
-        ffmpeg.off('progress', onProgress);
-        for (const file of [...files]) await remove(file);
-      }
+/** `promise`, but rejecting with an AbortError as soon as `signal` aborts (the promise itself is left alone). */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError());
+      return;
     }
-  };
-
-  const result = queue.then(task, task);
-  queue = result.catch(() => undefined);
-  return result;
+    const onAbort = (): void => {
+      reject(abortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
 }
 
-const EXTENSIONS: Record<string, string> = {
-  'video/mp4': 'mp4',
-  'video/quicktime': 'mov',
-  'video/webm': 'webm',
-  'audio/mp4': 'm4a',
-  'audio/mpeg': 'mp3',
-  'audio/wav': 'wav',
-  'audio/ogg': 'ogg',
-};
+/**
+ * Runs `work` with a ready ffmpeg instance, one job at a time (the instance
+ * runs one command at a time and its log and progress events are global).
+ */
+async function withFfmpeg<T>(options: FfmpegOpOptions, work: (job: Job) => Promise<T>): Promise<T> {
+  const { signal } = options;
+  throwIfAborted(signal);
 
-/** A file extension for ffmpeg's input; it probes by content, the name only needs to be plausible. */
-async function inputExtension(blob: Blob): Promise<string> {
+  // Take a place in the queue. `finished` is what the next job waits for after the one before us:
+  // it is resolved when we are done, or when we give up our place (an abort while waiting must not
+  // let the jobs behind us overtake the one still running).
+  let finish = (): void => undefined;
+  const finished = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const turn = queue;
+  queue = turn.then(() => finished);
+
+  try {
+    await abortable(turn, signal);
+    throwIfAborted(signal);
+    return await runJob(options, work);
+  } finally {
+    finish();
+  }
+}
+
+async function runJob<T>(options: FfmpegOpOptions, work: (job: Job) => Promise<T>): Promise<T> {
+  const { signal } = options;
+  // The load cannot be cancelled (other jobs share it), but the caller need not wait for it.
+  const { ffmpeg, multiThreaded } = await abortable(
+    loadFfmpeg({
+      ...(options.onLoadProgress ? { onProgress: options.onLoadProgress } : {}),
+      ...(options.singleThread ? { singleThread: true } : {}),
+    }),
+    signal,
+  );
+  throwIfAborted(signal);
+
+  const id = ++jobCounter;
+  const files = new Set<string>();
+  let sink: string[] | undefined;
+  const recent: string[] = [];
+  let onTime: ((seconds: number, ratio: number) => void) | undefined;
+  let aborted = false;
+
+  const onLog = ({ message }: { message: string }): void => {
+    sink?.push(message);
+    recent.push(message);
+    if (recent.length > 8) recent.shift();
+  };
+  const onProgress = ({ progress, time }: { progress: number; time: number }): void => {
+    onTime?.(Math.max(0, time) / 1e6, Math.min(1, Math.max(0, progress)));
+  };
+  const onAbort = (): void => {
+    aborted = true;
+    disposeFfmpeg();
+  };
+  ffmpeg.on('log', onLog);
+  ffmpeg.on('progress', onProgress);
+  signal?.addEventListener('abort', onAbort, { once: true });
+
+  const name = (label: string, extension: string): string => {
+    const file = `j${id}-${label}.${extension}`;
+    files.add(file);
+    return file;
+  };
+  const remove = async (file: string): Promise<void> => {
+    files.delete(file);
+    await ffmpeg.deleteFile(file).catch(() => false);
+  };
+
+  const job: Job = {
+    ffmpeg,
+    multiThreaded,
+    threads: threadLimits(multiThreaded),
+    name,
+    write: async (blob, label, extension) => {
+      const file = name(label, extension);
+      await ffmpeg.writeFile(file, new Uint8Array(await blob.arrayBuffer()));
+      return file;
+    },
+    run: async (args, listener) => {
+      onTime = listener;
+      recent.length = 0;
+      try {
+        const code = await ffmpeg.exec(args);
+        if (code !== 0) {
+          throw new InvalidInputError(
+            `Could not process this file: ffmpeg stopped with exit code ${code}. Its format may be unsupported or damaged.`,
+            { cause: new Error(recent.slice(-3).join(' ')) },
+          );
+        }
+      } finally {
+        onTime = undefined;
+      }
+    },
+    capture: async (args) => {
+      const lines: string[] = [];
+      sink = lines;
+      try {
+        await ffmpeg.exec(args);
+      } finally {
+        sink = undefined;
+      }
+      return lines.join('\n');
+    },
+    read: async (file, type) => {
+      const data = await ffmpeg.readFile(file);
+      await remove(file);
+      if (typeof data === 'string') throw new InvalidInputError('ffmpeg wrote no output.');
+      // A worker message delivers a plain ArrayBuffer, so the cast only narrows the type.
+      return new Blob([data as Uint8Array<ArrayBuffer>], { type });
+    },
+    remove,
+  };
+
+  try {
+    return await work(job);
+  } catch (error) {
+    if (aborted || signal?.aborted) throw abortError();
+    throw error;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    if (!aborted) {
+      ffmpeg.off('log', onLog);
+      ffmpeg.off('progress', onProgress);
+      for (const file of [...files]) await remove(file);
+    }
+  }
+}
+
+/**
+ * What kind of file this is, from one sniff (`sniffBlobMime`, which looks at
+ * the tracks of MP4 and WebM), and the extension to give ffmpeg's copy of it:
+ * ffmpeg probes by content, so the name only needs to be plausible.
+ */
+async function describeInput(blob: Blob): Promise<{ type: string; extension: string }> {
   const type = (await sniffBlobMime(blob)) ?? blob.type;
-  return EXTENSIONS[type] ?? 'bin';
+  return { type, extension: extensionForMime(type) ?? 'bin' };
 }
 
 function seconds(value: number): string {
@@ -221,7 +265,7 @@ function seconds(value: number): string {
 /** What ffmpeg reports about a media file: duration, video and audio stream formats. Works without a browser decoder. */
 export function probeMedia(blob: Blob, options: FfmpegOpOptions = {}): Promise<MediaInfo> {
   return withFfmpeg(options, async (job) => {
-    const input = await job.write(blob, 'probe', await inputExtension(blob));
+    const input = await job.write(blob, 'probe', (await describeInput(blob)).extension);
     return parseMediaInfo(await job.capture(['-i', input]));
   });
 }
@@ -248,7 +292,7 @@ export function transcodeAudio(
   options: TranscodeAudioOptions = {},
 ): Promise<Blob> {
   return withFfmpeg(options, async (job) => {
-    const input = await job.write(blob, 'in', await inputExtension(blob));
+    const input = await job.write(blob, 'in', (await describeInput(blob)).extension);
     const output = job.name('out', format);
     const codec =
       format === 'mp3'
@@ -275,28 +319,53 @@ export function transcodeAudio(
 
 // --- trim -------------------------------------------------------------------
 
+export interface TrimOptions extends FfmpegOpOptions {
+  /**
+   * What the file is, when the caller knows: `'video'` or `'audio'`. Without it
+   * the streams decide: sound only (also in an MP4 or WebM, whose container
+   * says "video") means audio, and a file that has a video stream is video.
+   */
+  kind?: 'audio' | 'video';
+}
+
+/** Even width and height: H.264 in yuv420p cannot carry odd sizes. Adds at most one black pixel row and column. */
+const EVEN_SIZE_FILTER = 'pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black';
+
 /**
  * Cuts `[start, end)` seconds out of a media file (`end` omitted: to the
- * end), frame-accurately. Video becomes an H.264/AAC MP4; audio stays MP3 or
- * WAV (other audio becomes WAV). Always re-encodes, so it takes about as long
- * as the clip is.
+ * end), frame-accurately. Video becomes an H.264/AAC MP4 (odd dimensions are
+ * padded to even ones, as in `concatVideos`); audio stays MP3 as MP3 and
+ * anything else becomes WAV. Which of the two a file is comes from
+ * `options.kind` or from its streams (see `TrimOptions`). Always re-encodes,
+ * so it takes about as long as the clip is.
  */
 export function trimMedia(
   blob: Blob,
   start: number,
   end: number | undefined,
-  options: FfmpegOpOptions = {},
+  options: TrimOptions = {},
 ): Promise<Blob> {
   if (!(start >= 0)) throw new RangeError('start must be 0 or more.');
   if (end !== undefined && !(end > start)) throw new RangeError('end must be after start.');
   return withFfmpeg(options, async (job) => {
-    const type = (await sniffBlobMime(blob)) ?? blob.type;
-    const input = await job.write(blob, 'in', await inputExtension(blob));
-    const isVideo = type.startsWith('video/');
+    const { type, extension } = await describeInput(blob);
+    const input = await job.write(blob, 'in', extension);
+    // A sniffed audio type is trusted; a video container (or an unknown one) is checked for a video stream.
+    let kind = options.kind;
+    if (!kind) {
+      kind = type.startsWith('audio/')
+        ? 'audio'
+        : parseMediaInfo(await job.capture(['-i', input])).video
+          ? 'video'
+          : 'audio';
+    }
+    const isVideo = kind === 'video';
     const format = isVideo ? 'mp4' : type === 'audio/mpeg' ? 'mp3' : 'wav';
     const output = job.name('out', format);
     const codec = isVideo
       ? [
+          '-vf',
+          EVEN_SIZE_FILTER,
           '-c:v',
           'libx264',
           '-preset',
@@ -323,6 +392,7 @@ export function trimMedia(
         ...(isVideo ? job.threads.decode : []),
         '-i',
         input,
+        ...(isVideo ? [] : ['-vn']),
         ...codec,
         ...(isVideo ? job.threads.encode : []),
         output,
@@ -393,9 +463,13 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
     // 1. Load and probe every clip.
     const sources: { name: string; info: MediaInfo }[] = [];
     for (const [index, clip] of clips.entries()) {
-      const name = await job.write(clip.blob, `c${index}`, await inputExtension(clip.blob));
+      const name = await job.write(
+        clip.blob,
+        `c${index}`,
+        (await describeInput(clip.blob)).extension,
+      );
       const info = parseMediaInfo(await job.capture(['-i', name]));
-      if (!info.video) throw new Error(`Clip ${index + 1} has no video.`);
+      if (!info.video) throw new InvalidInputError(`Clip ${index + 1} has no video.`);
       sources.push({ name, info });
     }
 
@@ -424,7 +498,7 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
 
     // 2. Re-encode every clip to one common format.
     const reference = first?.video;
-    if (!reference) throw new Error('Clip 1 has no video.');
+    if (!reference) throw new InvalidInputError('Clip 1 has no video.');
     const width = even(reference.rotation % 180 !== 0 ? reference.height : reference.width);
     const height = even(reference.rotation % 180 !== 0 ? reference.width : reference.height);
     const fps = Math.min(60, Math.max(1, reference.fps || 24));
@@ -447,7 +521,7 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
     });
     for (const [index, { length }] of plans.entries()) {
       if (sources[index] && sources[index].info.duration > 0 && length <= 0.01) {
-        throw new Error(`Nothing is left of clip ${index + 1} after trimming.`);
+        throw new InvalidInputError(`Nothing is left of clip ${index + 1} after trimming.`);
       }
     }
     const lengths = plans.map(({ length }, index) =>

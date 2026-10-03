@@ -221,7 +221,7 @@ describe('concatMp3', () => {
   });
 
   it('refuses an empty list and a segment without audio', async () => {
-    await expect(concatMp3([])).rejects.toThrow(/Nothing/);
+    await expect(concatMp3([])).rejects.toThrow(/no audio to join/);
     await expect(concatMp3([new Blob([new Uint8Array(100)])])).rejects.toThrow(/No MP3 audio/);
   });
 

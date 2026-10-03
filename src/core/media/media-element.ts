@@ -6,6 +6,8 @@
  * the document: Safari does not reliably decode frames of a detached video
  * that is only being seeked.
  */
+import { InvalidInputError } from '../errors';
+import { abortError } from '../util';
 
 export interface OpenedMedia<T extends HTMLMediaElement> {
   element: T;
@@ -38,11 +40,11 @@ export function waitForEvent(
     };
     const onAbort = (): void => {
       cleanup();
-      reject(new DOMException('Aborted', 'AbortError'));
+      reject(abortError());
     };
     const timer = setTimeout(() => {
       cleanup();
-      reject(new Error('The browser took too long to read this media file.'));
+      reject(new InvalidInputError('The browser took too long to read this media file.'));
     }, timeoutMs);
     for (const name of events) target.addEventListener(name, onEvent);
     if (signal?.aborted) onAbort();
@@ -50,12 +52,12 @@ export function waitForEvent(
   });
 }
 
-function describeError(element: HTMLMediaElement, kind: string): Error {
+function describeError(element: HTMLMediaElement, kind: string): InvalidInputError {
   const detail =
     element.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
       ? ' (its format or codec is not supported by this browser)'
       : '';
-  return new Error(`This ${kind} file cannot be played${detail}.`);
+  return new InvalidInputError(`This ${kind} file cannot be played${detail}.`);
 }
 
 /**

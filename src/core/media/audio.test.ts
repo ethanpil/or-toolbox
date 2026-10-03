@@ -75,6 +75,82 @@ describe('planChunks', () => {
     }
   });
 
+  it('finds the pauses of a quiet recording too: the threshold is relative, not absolute', () => {
+    // A very quiet speaker (peak 0.006, far below any fixed "silence" level) with a room-tone pause.
+    const rate = 8000;
+    const audio = signal(25, rate, [], 0.006);
+    const samples = audio.channels[0] as Float32Array;
+    for (let i = Math.round(9.0 * rate); i < Math.round(9.4 * rate); i++) {
+      samples[i] = 0.0002 * Math.sin(i * 0.37);
+    }
+    const [first] = planChunks(audio, { maxSeconds: 10 });
+    // Cut in the middle of the pause (9.2 s), not at the 10 s limit.
+    expect(first?.end).toBeGreaterThan(9.1 * rate);
+    expect(first?.end).toBeLessThan(9.3 * rate);
+  });
+
+  it('cuts at a clear dip even when no pause is long enough, and never at the limit', () => {
+    const rate = 8000;
+    const audio = signal(25, rate, [], 0.02);
+    const samples = audio.channels[0] as Float32Array;
+    for (let i = Math.round(8.6 * rate); i < Math.round(8.7 * rate); i++) {
+      samples[i] = (samples[i] ?? 0) * 0.1;
+    }
+    const [first] = planChunks(audio, { maxSeconds: 10, minSilenceSeconds: 2 });
+    expect(first?.end).toBeGreaterThan(8.55 * rate);
+    expect(first?.end).toBeLessThan(8.75 * rate);
+  });
+
+  it('prefers the latest of several equally good pauses in a quiet recording', () => {
+    const rate = 8000;
+    const audio = signal(25, rate, [], 0.005);
+    const samples = audio.channels[0] as Float32Array;
+    for (const [from, to] of [
+      [8.0, 8.4],
+      [9.3, 9.7],
+    ] as const) {
+      for (let i = Math.round(from * rate); i < Math.round(to * rate); i++) samples[i] = 0;
+    }
+    const [first] = planChunks(audio, { maxSeconds: 10 });
+    expect(first?.end).toBeGreaterThan(9.4 * rate);
+    expect(first?.end).toBeLessThan(9.6 * rate);
+  });
+
+  it('merges a tail shorter than one second into the previous chunk', () => {
+    // 100 Hz keeps the arrays tiny; the silence makes every cut land exactly on the limit.
+    const silent = (seconds: number): AudioData => ({
+      sampleRate: 100,
+      channels: [new Float32Array(Math.round(seconds * 100))],
+    });
+    expect(planChunks(silent(10.5), { maxSeconds: 10 })).toEqual([{ start: 0, end: 1050 }]);
+    expect(planChunks(silent(10.99), { maxSeconds: 10 })).toEqual([{ start: 0, end: 1099 }]);
+    expect(planChunks(silent(11), { maxSeconds: 10 })).toEqual([
+      { start: 0, end: 1000 },
+      { start: 1000, end: 1100 },
+    ]);
+    // Sound instead of silence, same rule.
+    const ranges = planChunks(signal(10.4, 8000), { maxSeconds: 10 });
+    expect(ranges.at(-1)?.end).toBe(Math.round(10.4 * 8000));
+    for (const range of ranges) expect(range.end - range.start).toBeGreaterThanOrEqual(8000);
+  });
+
+  it('never leaves a short last chunk of a long silent file', () => {
+    const rate = 100;
+    const audio: AudioData = {
+      sampleRate: rate,
+      channels: [new Float32Array(Math.round(1800.4 * rate))],
+    };
+    const ranges = planChunks(audio, { maxSeconds: 600 });
+    expect(ranges).toHaveLength(3);
+    const last = ranges.at(-1);
+    expect((last?.end ?? 0) - (last?.start ?? 0)).toBeGreaterThanOrEqual(rate);
+    expect(last?.end).toBe(Math.round(1800.4 * rate));
+  });
+
+  it('keeps a recording shorter than one second whole', () => {
+    expect(planChunks(signal(0.4, 8000), { maxSeconds: 10 })).toEqual([{ start: 0, end: 3200 }]);
+  });
+
   it('returns one chunk for short audio, none for empty audio', () => {
     expect(planChunks(signal(5, 8000), { maxSeconds: 10 })).toEqual([{ start: 0, end: 40000 }]);
     expect(planChunks({ sampleRate: 8000, channels: [] })).toEqual([]);

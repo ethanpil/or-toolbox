@@ -27,7 +27,9 @@
  * `splitForTranscription` then adds 2 bytes per sample (115 MB per hour of
  * 16 kHz mono) as WAV Blobs, which the browser may keep outside the JS heap.
  */
+import { InvalidInputError } from '../errors';
 import { sniffBlobMime } from '../files';
+import { sleep } from '../util';
 import { mediaDuration } from './media-element';
 import { mp3Duration } from './mp3';
 import { encodeWav, wavDuration } from './wav';
@@ -69,7 +71,7 @@ export interface DecodeOptions {
 export async function decodeAudio(blob: Blob, options: DecodeOptions = {}): Promise<AudioData> {
   const rate = options.sampleRate ?? 44100;
   if (typeof OfflineAudioContext === 'undefined') {
-    throw new Error('This browser cannot decode audio.');
+    throw new InvalidInputError('This browser cannot decode audio.');
   }
   const bytes = await blob.arrayBuffer();
   let buffer: AudioBuffer;
@@ -77,17 +79,16 @@ export async function decodeAudio(blob: Blob, options: DecodeOptions = {}): Prom
     buffer = await new OfflineAudioContext(1, 1, rate).decodeAudioData(bytes);
   } catch (error) {
     if (error instanceof DOMException && error.name === 'EncodingError') {
-      throw new Error(
+      throw new InvalidInputError(
         'This audio cannot be decoded. The format may not be supported by this browser.',
-        {
-          cause: error,
-        },
+        { cause: error },
       );
     }
     if (error instanceof RangeError) {
-      throw new Error('This recording is too long to decode in the browser. Try a shorter file.', {
-        cause: error,
-      });
+      throw new InvalidInputError(
+        'This recording is too long to decode in the browser. Try a shorter file.',
+        { cause: error },
+      );
     }
     throw error;
   }
@@ -200,17 +201,22 @@ function rms(channels: Float32Array[], from: number, to: number): number {
   return count > 0 ? Math.sqrt(sum / count) : 0;
 }
 
-/** Absolute level (about -40 dBFS) below which a frame always counts as silence. */
-const SILENCE_FLOOR = 0.01;
+/** A level so low (-100 dBFS) that it is digital silence whatever else the window holds. */
+const DIGITAL_SILENCE = 1e-5;
 /** Analysis frame length in seconds. */
 const FRAME_SECONDS = 0.02;
 
 /**
  * Where to cut inside `[low, high)`: the middle of the latest pause of at
  * least `minSilence` samples (or `high` itself if the pause runs to the end of
- * the window), where "pause" means frames within 1.5x of the quietest frame
- * (and under the absolute floor if the window is quiet), or, when there is no
- * such pause, the middle of the single quietest frame.
+ * the window), or, when there is no such pause, the middle of the single
+ * quietest frame.
+ *
+ * "Pause" is relative to the window, so a recording made at any volume has
+ * them: a frame is quiet when its level is within 1.5x of the window's low
+ * end (the 10th percentile), but never above half the window's median level,
+ * so ordinary speech is not mistaken for silence; the quietest frame always
+ * qualifies. Nothing here depends on an absolute level.
  */
 function quietestCut(
   channels: Float32Array[],
@@ -235,7 +241,10 @@ function quietestCut(
     }
   }
 
-  const limit = Math.max(SILENCE_FLOOR, quietest * 1.5);
+  const sorted = Float32Array.from(levels).sort();
+  const median = sorted[count >> 1] ?? quietest;
+  const lowEnd = sorted[Math.floor(count * 0.1)] ?? quietest;
+  const limit = Math.max(Math.min(Math.max(lowEnd * 1.5, DIGITAL_SILENCE), median * 0.5), quietest);
   const minFrames = Math.max(1, Math.ceil(minSilence / frame));
   let bestMiddle = -1;
   let runStart = -1;
@@ -252,18 +261,26 @@ function quietestCut(
   return Math.min(high, Math.max(low + 1, low + Math.round(middleFrame * frame)));
 }
 
+/** A last chunk shorter than this is merged into the one before it. */
+const MIN_TAIL_SECONDS = 1;
+
 /**
  * Decides where to cut a recording: sample ranges, each at most `maxSeconds`
  * long, with every cut placed at the quietest point (preferably inside a real
  * pause) in the last `searchSeconds` before the limit. A cut is never made in
  * the first half of a chunk.
+ *
+ * The one exception to the limit: a tail shorter than one second (which a
+ * transcription model may refuse, or answer with nothing) is merged into the
+ * chunk before it, so that chunk can run up to one second over `maxSeconds`.
+ * A caller with a hard limit passes a `maxSeconds` that leaves that margin.
  */
 export function planChunks(audio: AudioData, options: SplitOptions = {}): SampleRange[] {
   const total = audioLength(audio);
   if (total === 0) return [];
   const rate = audio.sampleRate;
   const maxSeconds = options.maxSeconds ?? 600;
-  if (!(maxSeconds > 0)) throw new Error('maxSeconds must be positive.');
+  if (!(maxSeconds > 0)) throw new RangeError('maxSeconds must be positive.');
   const maxSamples = Math.max(1, Math.floor(maxSeconds * rate));
   const searchSamples = Math.min(
     Math.floor((options.searchSeconds ?? Math.min(30, maxSeconds / 4)) * rate),
@@ -279,7 +296,9 @@ export function planChunks(audio: AudioData, options: SplitOptions = {}): Sample
     ranges.push({ start, end: cut });
     start = cut;
   }
-  ranges.push({ start, end: total });
+  const previous = ranges.at(-1);
+  if (previous && total - start < Math.floor(MIN_TAIL_SECONDS * rate)) previous.end = total;
+  else ranges.push({ start, end: total });
   return ranges;
 }
 
@@ -304,7 +323,7 @@ export async function splitForTranscription(
       duration: (end - start) / audio.sampleRate,
     });
     // Let the page breathe between chunks of a long recording.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await sleep(0);
   }
   return chunks;
 }
@@ -338,13 +357,11 @@ export function peaks(audio: AudioData, buckets: number): Float32Array {
  */
 export async function getAudioDuration(blob: Blob): Promise<number> {
   const type = await sniffBlobMime(blob);
-  if (type === 'audio/wav') return wavDuration(blob);
-  if (type === 'audio/mpeg') {
-    try {
-      return await mp3Duration(blob);
-    } catch {
-      // Not parseable as MP3 after all: let the browser have a go.
-    }
+  try {
+    if (type === 'audio/wav') return await wavDuration(blob);
+    if (type === 'audio/mpeg') return await mp3Duration(blob);
+  } catch {
+    // Not readable as the format its first bytes claim (truncated, odd header): let the browser have a go.
   }
   return mediaDuration(blob, 'audio');
 }

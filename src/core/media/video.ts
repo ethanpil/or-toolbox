@@ -6,6 +6,7 @@
  * clip becomes the next clip's first frame), the frame grabber and the
  * timeline thumbnails.
  */
+import { InvalidInputError } from '../errors';
 import { resizeCanvas, toBlob } from './image';
 import { openMedia, waitForEvent } from './media-element';
 
@@ -39,7 +40,7 @@ export async function getVideoMetadata(blob: Blob): Promise<VideoMetadata> {
   const { element, dispose } = await openMedia(blob, 'video');
   try {
     if (element.videoWidth === 0 || element.videoHeight === 0) {
-      throw new Error('This file has no video track.');
+      throw new InvalidInputError('This file has no video track.');
     }
     return {
       duration: Number.isFinite(element.duration) ? element.duration : 0,
@@ -65,13 +66,17 @@ function framePresented(video: HTMLVideoElement): Promise<void> {
 }
 
 /**
- * Moves the playhead and waits until the frame there can be drawn. The same
- * position as now counts as already there, except while the first frame is
- * still loading.
+ * Moves the playhead (to `clampSeekTime(time, ...)`) and waits until the frame
+ * there can be drawn. The same position as now counts as already there,
+ * except while the first frame is still loading.
  */
-async function seekTo(video: HTMLVideoElement, time: number, signal?: AbortSignal): Promise<void> {
-  const length = Number.isFinite(video.duration) ? video.duration : time;
-  const target = Math.min(Math.max(0, time), Math.max(0, length));
+async function seekTo(
+  video: HTMLVideoElement,
+  time: number,
+  fps: number | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  const target = clampSeekTime(time, video.duration, fps);
 
   if (Math.abs(video.currentTime - target) < 0.001 && !video.seeking) {
     if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -82,7 +87,9 @@ async function seekTo(video: HTMLVideoElement, time: number, signal?: AbortSigna
 
   const finished = waitForEvent(video, ['seeked', 'error'], SEEK_TIMEOUT_MS, signal);
   video.currentTime = target;
-  if ((await finished) === 'error') throw new Error('The browser could not seek in this video.');
+  if ((await finished) === 'error') {
+    throw new InvalidInputError('The browser could not seek in this video.');
+  }
   if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
     await waitForEvent(video, ['loadeddata', 'error'], SEEK_TIMEOUT_MS, signal);
   }
@@ -103,8 +110,20 @@ export function lastFrameTime(duration: number, fps?: number): number {
 }
 
 /**
+ * Where to seek for a requested time: negative or unknown times go to the
+ * start, and anything at or past the final frame goes to `lastFrameTime`
+ * instead of to `duration` itself, where browsers may show nothing or the
+ * wrong frame. A video of unknown (not finite) length is not clamped at the end.
+ */
+export function clampSeekTime(time: number, duration: number, fps?: number): number {
+  const wanted = Number.isNaN(time) ? 0 : Math.max(0, time);
+  return Math.min(wanted, lastFrameTime(duration, fps));
+}
+
+/**
  * Takes one frame of a video as a full-size PNG. `at` is a time in seconds
- * (clamped to the video), `'first'` or `'last'`.
+ * (see `clampSeekTime`: a time at or past the end gives the final frame),
+ * `'first'` or `'last'`.
  */
 export async function captureFrame(
   blob: Blob,
@@ -114,12 +133,14 @@ export async function captureFrame(
   const { element: video, dispose } = await openMedia(blob, 'video', options.signal);
   try {
     if (video.videoWidth === 0 || video.videoHeight === 0) {
-      throw new Error('This file has no video track.');
+      throw new InvalidInputError('This file has no video track.');
     }
-    const duration = Number.isFinite(video.duration) ? video.duration : 0;
-    const time =
-      at === 'first' ? 0 : at === 'last' ? lastFrameTime(duration, options.fps) : Math.max(0, at);
-    await seekTo(video, time, options.signal);
+    await seekTo(
+      video,
+      at === 'first' ? 0 : at === 'last' ? Infinity : at,
+      options.fps,
+      options.signal,
+    );
     return await toBlob(video, { type: 'image/png' });
   } finally {
     dispose();
@@ -127,6 +148,8 @@ export async function captureFrame(
 }
 
 export interface ThumbnailOptions {
+  /** The video's frame rate, if known (see `CaptureOptions.fps`). */
+  fps?: number;
   /** Width of each thumbnail in pixels (never enlarged). Default 160. */
   maxWidth?: number;
   /** Default `image/jpeg`. */
@@ -139,7 +162,7 @@ export interface ThumbnailOptions {
 }
 
 /**
- * Small frames at the given times (seconds, clamped to the video), in the
+ * Small frames at the given times (seconds, clamped like `clampSeekTime`), in the
  * order asked for, from one load of the file: for scrubbing strips and
  * timeline thumbnails.
  */
@@ -151,13 +174,13 @@ export async function frameAtTimes(
   const { element: video, dispose } = await openMedia(blob, 'video', options.signal);
   try {
     if (video.videoWidth === 0 || video.videoHeight === 0) {
-      throw new Error('This file has no video track.');
+      throw new InvalidInputError('This file has no video track.');
     }
     const width = Math.min(options.maxWidth ?? 160, video.videoWidth);
     const height = Math.max(1, Math.round((video.videoHeight * width) / video.videoWidth));
     const frames: Blob[] = [];
     for (const [index, time] of times.entries()) {
-      await seekTo(video, time, options.signal);
+      await seekTo(video, time, options.fps, options.signal);
       const thumbnail = await toBlob(resizeCanvas(video, width, height), {
         type: options.type ?? 'image/jpeg',
         quality: options.quality ?? 0.7,
