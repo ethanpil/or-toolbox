@@ -37,6 +37,7 @@ All notable changes to this project are documented here. The format follows
 - History page: timeline by day with search and filters, run detail drawer (reopen, re-run with another model, star, copy, export, delete with Undo), bulk export and delete, live updates, `?tool=` and `?run=` links (d7fdb94).
 - Stats page: KPI tiles, spend, requests and tokens charts (Chart.js, loaded on demand, light and dark, table view for each), breakdowns by tool, model and key, budget burn-down, key balances and free requests today (1f5ecd7).
 - `HistoryService.restore()` for Undo (d7fdb94).
+- Chat tool: branching threads (edit and regenerate keep the old branch, ‹ 1/3 ›), per-chat model switch, fallback models, image/PDF/audio/text attachments, system prompt presets, reasoning effort, streamed Markdown replies with tokens, cost and latency, context trimming, Markdown and JSON export, thread search, rename and delete with Undo (b820a75, 90fa95b, fef8d74).
 
 ### Changed
 
@@ -49,6 +50,7 @@ All notable changes to this project are documented here. The format follows
 - `models.resolve`: `?model=` and tool bindings apply to a tool's primary capability only (5072110).
 - Tool framework: `ToolInstance.estimate()` with `ui.refreshEstimate()`, one error rule through `output.fail(error)`, `createToolTestContext()`, `data-testid="tool-prompt"` convention (9760b10).
 - One modal at a time (queued), toasts with actions never auto-hide, `setFieldError()` for field errors (1db3bfd); re-renders keep focus through `data-focus-key` (20bdddc).
+- File types: untyped source files (`.py`, `.yaml`, `.js`…) get `text/x-*` types, so `text/*` tools take them (5afda1e).
 
 ### Fixed
 
