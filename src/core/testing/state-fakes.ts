@@ -15,8 +15,20 @@ import type {
   KeysService,
   ModelsService,
   OAuthService,
+  StoredKeysFile,
 } from '../types';
+import { InvalidInputError, KeysChangedError } from '../errors';
+import { isFreeModelId } from '../models/free';
 import { closeDbForTests } from '../storage/db';
+import {
+  LS_KEYS,
+  SS_KEYS,
+  local,
+  readJson,
+  removeItem,
+  session,
+  writeJson,
+} from '../storage/local';
 import { createBus } from '../bus';
 import { createSettingsService } from '../settings';
 import { createBudgetsService } from '../budgets';
@@ -105,25 +117,44 @@ export function isolateChannels(): void {
   globalThis.BroadcastChannel = FakeBroadcastChannel as unknown as typeof BroadcastChannel;
 }
 
-/** Web Locks with exclusive locks and `ifAvailable`, shared by every "tab" in the test. */
+type FakeLockCallback = (lock: { name: string; mode: 'exclusive' } | null) => unknown;
+
+/**
+ * Web Locks with exclusive locks, shared by every "tab" in the test. `ifAvailable` requests get `null` when
+ * the lock is held; other requests wait in line. `release(name)` frees a lock as if its tab had closed.
+ */
 export class FakeLockManager {
   readonly held = new Set<string>();
+  private readonly waiting = new Map<string, (() => void)[]>();
 
   async request(
     name: string,
-    options: { ifAvailable?: boolean },
-    callback: (lock: { name: string; mode: 'exclusive' } | null) => Promise<unknown>,
+    optionsOrCallback: { ifAvailable?: boolean } | FakeLockCallback,
+    maybeCallback?: FakeLockCallback,
   ): Promise<unknown> {
+    const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
+    const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback!;
     if (this.held.has(name)) {
       if (options.ifAvailable) return callback(null);
-      throw new Error('FakeLockManager only supports ifAvailable requests');
+      await new Promise<void>((resolve) => {
+        const queue = this.waiting.get(name) ?? [];
+        queue.push(resolve);
+        this.waiting.set(name, queue);
+      });
     }
     this.held.add(name);
     try {
       return await callback({ name, mode: 'exclusive' });
     } finally {
-      this.held.delete(name);
+      this.release(name);
     }
+  }
+
+  /** Frees `name` and hands it to the next waiter, if any. */
+  release(name: string): void {
+    const next = this.waiting.get(name)?.shift();
+    if (next) next();
+    else this.held.delete(name);
   }
 }
 
@@ -150,7 +181,12 @@ export interface TestCore {
   keyState: KeyState;
 }
 
-/** Real state services plus fakes for keys (list/get/resolve/lock), models (isFree) and api (unused). */
+const EMPTY_KEYS_FILE: StoredKeysFile = { version: 1, keys: [], lock: null };
+
+/**
+ * Real state services plus fakes for keys (list/get/resolve/lock, and the backup/reset file operations on
+ * localStorage `ortoolbox:keys`), models (isFree) and api (unused).
+ */
 export function createTestCore(opts: { keys?: KeyInfo[]; locked?: boolean } = {}): TestCore {
   const keyState: KeyState = {
     keys: opts.keys ?? [fakeKey({ id: 'k1', name: 'Work' })],
@@ -160,7 +196,14 @@ export function createTestCore(opts: { keys?: KeyInfo[]; locked?: boolean } = {}
 
   const get = (id: string | null | undefined): KeyInfo | undefined =>
     keyState.keys.find((key) => key.id === id);
-  const keys: Pick<KeysService, 'list' | 'get' | 'resolve' | 'subscribe'> & {
+  const storedFile = (): StoredKeysFile => {
+    const file = readJson<StoredKeysFile>(local(), LS_KEYS.keys);
+    return file && Array.isArray(file.keys) ? file : EMPTY_KEYS_FILE;
+  };
+  const keys: Pick<
+    KeysService,
+    'list' | 'get' | 'resolve' | 'subscribe' | 'exportFile' | 'replaceFile' | 'clear'
+  > & {
     lock: Pick<KeysService['lock'], 'enabled' | 'unlocked'>;
   } = {
     list: () => keyState.keys,
@@ -173,10 +216,28 @@ export function createTestCore(opts: { keys?: KeyInfo[]; locked?: boolean } = {}
       null,
     subscribe: () => () => undefined,
     lock: { enabled: () => keyState.locked, unlocked: () => !keyState.locked },
+    exportFile: storedFile,
+    replaceFile(next, { expected } = {}) {
+      if (next.version !== 1 || !Array.isArray(next.keys)) {
+        throw new InvalidInputError('The keys file is not valid.');
+      }
+      const current = storedFile();
+      if (expected && JSON.stringify(expected) !== JSON.stringify(current)) {
+        throw new KeysChangedError();
+      }
+      writeJson(local(), LS_KEYS.keys, next);
+      if (JSON.stringify(current.lock) !== JSON.stringify(next.lock)) {
+        removeItem(session(), SS_KEYS.unlocked);
+      }
+      core.bus.emit({ type: 'keys-changed' });
+    },
+    clear() {
+      removeItem(local(), LS_KEYS.keys);
+      removeItem(session(), SS_KEYS.unlocked);
+      core.bus.emit({ type: 'keys-changed' });
+    },
   };
-  const models: Pick<ModelsService, 'isFree'> = {
-    isFree: (id) => id.endsWith(':free') || id === 'openrouter/free',
-  };
+  const models: Pick<ModelsService, 'isFree'> = { isFree: isFreeModelId };
 
   core.bus = createBus();
   core.settings = createSettingsService(core);

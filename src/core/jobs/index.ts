@@ -4,7 +4,10 @@
  * Web Lock `ortoolbox:job:<id>` (requested with `ifAvailable`); other tabs retry at the poll interval, so one
  * of them takes over when the polling tab closes. Without the Web Locks API every tab polls.
  *
- * `attempts` counts failed polls. Results are applied with a read-modify-write that skips jobs that became
+ * Failures: storage errors are logged and retried with backoff. A poll error backs off (×2 per failure, up
+ * to 60 s) and counts in `attempts`; a non-retryable error (4xx other than 408/429, no key, invalid input)
+ * or MAX_POLL_FAILURES failures in a row mark the job `failed`. KeyLockedError pauses polling until the
+ * keys change (unlock) instead. Results are applied with a read-modify-write that skips jobs that became
  * final meanwhile, so a cancel from another tab is never overwritten by a late poll.
  */
 
@@ -16,40 +19,47 @@ import type {
   JobState,
   JobsService,
 } from '../types';
+import { ApiError, InvalidInputError, KeyLockedError, OrError, userMessage } from '../errors';
 import { getDb } from '../storage/db';
+import { MAX_TIMEOUT_MS, sleep } from '../util';
 import { getTool } from '../../tools/registry';
 
 export const DEFAULT_POLL_MS = 5000;
 export const MAX_POLL_MS = 60_000;
+export const MAX_POLL_FAILURES = 20;
 
 const FINAL_STATES: readonly JobState[] = ['succeeded', 'failed', 'cancelled'];
 export const isFinalState = (state: JobState): boolean => FINAL_STATES.includes(state);
 
 type AnyHandler = JobHandler<unknown, unknown>;
 
-function intervalFor(handler: AnyHandler, job: JobRecord, errors: number): number {
+/** The poll interval, doubled per consecutive failure, capped at MAX_POLL_MS. */
+function intervalFor(handler: AnyHandler, job: JobRecord, failures: number): number {
   const base =
     typeof handler.intervalMs === 'function'
       ? handler.intervalMs(job)
       : (handler.intervalMs ?? DEFAULT_POLL_MS);
-  return Math.min(Math.max(0, base) * 2 ** errors, MAX_POLL_MS);
+  return Math.min(Math.max(0, base) * 2 ** failures, MAX_POLL_MS);
 }
 
-/** Resolves after `ms`, or as soon as `signal` aborts. Never rejects. */
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const done = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', done);
-      resolve();
-    };
-    const timer = setTimeout(done, ms);
-    signal.addEventListener('abort', done);
-  });
+/** Backoff after a storage error, before the job (and so its handler) is known. */
+const backoff = (failures: number): number =>
+  Math.min(DEFAULT_POLL_MS * 2 ** failures, MAX_POLL_MS);
+
+/** Waits `ms`, or less if `signal` aborts. Never rejects. */
+const pause = (ms: number, signal: AbortSignal): Promise<void> =>
+  sleep(Math.min(ms, MAX_TIMEOUT_MS), signal).catch(() => undefined);
+
+/** Errors that will not go away by polling again. */
+function isPermanent(error: unknown): boolean {
+  if (error instanceof ApiError) return !error.retryable;
+  return (
+    error instanceof OrError && ['no-key', 'invalid-key', 'invalid-input'].includes(error.code)
+  );
 }
 
-function lockManager(): LockManager | null {
+/** The Web Locks API, or null where it is missing or refused. */
+export function webLocks(): LockManager | null {
   try {
     return typeof navigator !== 'undefined' && navigator.locks ? navigator.locks : null;
   } catch {
@@ -77,12 +87,46 @@ export function createJobsService(core: CoreServices): JobsService {
   const handlers = new Map<string, AnyHandler>();
   /** Jobs this tab is polling, or waiting for the lock to poll. */
   const pollers = new Map<string, AbortController>();
+  /** The last record this tab saw of each job: the body of its tombstone when it is removed. */
+  const known = new Map<string, JobRecord>();
+  const subscribers = new Set<(job: JobRecord) => void>();
   let resumed = false;
 
   const changed = (id: string): void => core.bus.emit({ type: 'jobs-changed', id });
 
+  /** Ids already reported removed, so a reset followed by per-job events reports each removal once. */
+  const removed = new Set<string>();
+
+  const remember = <T extends JobRecord | undefined>(job: T): T => {
+    if (job) {
+      known.set(job.id, job);
+      removed.delete(job.id);
+    }
+    return job;
+  };
+
   const read = async (id: string): Promise<JobRecord | undefined> =>
-    (await getDb()).get('jobs', id);
+    remember(await (await getDb()).get('jobs', id));
+
+  const dispatch = (job: JobRecord): void => {
+    for (const fn of [...subscribers]) {
+      try {
+        fn(job);
+      } catch (error) {
+        console.error(error);
+      }
+    }
+  };
+
+  /** Reports a removed job once, as the last known record marked `removed`. */
+  const tombstone = (id: string): void => {
+    const last = known.get(id);
+    known.delete(id);
+    if (removed.has(id)) return;
+    removed.add(id);
+    // When this tab never saw the job, only id, state and removed are meaningful (see JobsService).
+    dispatch({ ...(last ?? ({ id } as JobRecord)), state: 'cancelled', removed: true });
+  };
 
   /** Read-modify-write; `onlyIfOpen` skips jobs that are already final. */
   const write = async (
@@ -106,14 +150,60 @@ export function createJobsService(core: CoreServices): JobsService {
     };
     await tx.store.put(next);
     await tx.done;
+    remember(next);
     changed(id);
     return next;
   };
 
+  /** Resolves on the next `keys-changed` (e.g. unlock), or when `signal` aborts. */
+  const keysChanged = (signal: AbortSignal): Promise<void> =>
+    new Promise((resolve) => {
+      if (signal.aborted) return resolve();
+      const done = (): void => {
+        off();
+        signal.removeEventListener('abort', done);
+        resolve();
+      };
+      const off = core.bus.on('keys-changed', done);
+      signal.addEventListener('abort', done, { once: true });
+    });
+
+  /** Writes a poll result; true when the job is now final (or gone). */
+  const apply = async (job: JobRecord, result: JobPollResult<unknown>): Promise<boolean> => {
+    if (result.state === 'running') {
+      const progress = result.progress === undefined ? job.progress : result.progress;
+      const remoteStatus = result.remoteStatus ?? job.remoteStatus;
+      if (
+        job.state !== 'running' ||
+        progress !== job.progress ||
+        remoteStatus !== job.remoteStatus
+      ) {
+        return !(await write(job.id, { state: 'running', progress, remoteStatus }, true));
+      }
+      return false;
+    }
+    const done = await write(
+      job.id,
+      result.state === 'succeeded'
+        ? { state: 'succeeded', result: result.result, error: null }
+        : { state: 'failed', error: result.error },
+      true,
+    );
+    if (done) notifyCompletion(done);
+    return true;
+  };
+
   const pollLoop = async (id: string, signal: AbortSignal): Promise<void> => {
-    let errors = 0;
+    let failures = 0;
     while (!signal.aborted) {
-      const job = await read(id);
+      let job: JobRecord | undefined;
+      try {
+        job = await read(id);
+      } catch (error) {
+        console.error(error);
+        await pause(backoff(++failures), signal);
+        continue;
+      }
       if (!job || isFinalState(job.state)) return;
       const handler = handlers.get(job.type);
       if (!handler) return;
@@ -121,44 +211,43 @@ export function createJobsService(core: CoreServices): JobsService {
       let result: JobPollResult<unknown>;
       try {
         result = await handler.poll(job, signal);
-      } catch {
+      } catch (error) {
         if (signal.aborted) return;
-        errors++;
-        await write(id, { attempts: job.attempts + 1 }, true);
-        await sleep(intervalFor(handler, job, errors), signal);
+        if (error instanceof KeyLockedError) {
+          await keysChanged(signal);
+          continue;
+        }
+        failures++;
+        const permanent = isPermanent(error) || failures >= MAX_POLL_FAILURES;
+        try {
+          const patch: Partial<JobRecord> = { attempts: job.attempts + 1 };
+          if (permanent) Object.assign(patch, { state: 'failed', error: userMessage(error) });
+          const done = await write(id, patch, true);
+          if (permanent && done) notifyCompletion(done);
+        } catch (storageError) {
+          console.error(storageError);
+        }
+        if (permanent) return;
+        await pause(intervalFor(handler, job, failures), signal);
         continue;
       }
       if (signal.aborted) return;
-      errors = 0;
+      failures = 0;
 
-      if (result.state === 'running') {
-        const progress = result.progress === undefined ? job.progress : result.progress;
-        const remoteStatus = result.remoteStatus ?? job.remoteStatus;
-        if (
-          job.state !== 'running' ||
-          progress !== job.progress ||
-          remoteStatus !== job.remoteStatus
-        ) {
-          await write(id, { state: 'running', progress, remoteStatus }, true);
-        }
-      } else {
-        const done = await write(
-          id,
-          result.state === 'succeeded'
-            ? { state: 'succeeded', result: result.result, error: null }
-            : { state: 'failed', error: result.error },
-          true,
-        );
-        if (done) notifyCompletion(done);
-        return;
+      try {
+        if (await apply(job, result)) return;
+      } catch (error) {
+        console.error(error);
+        await pause(intervalFor(handler, job, ++failures), signal);
+        continue;
       }
-      await sleep(intervalFor(handler, job, 0), signal);
+      await pause(intervalFor(handler, job, 0), signal);
     }
   };
 
   /** Polls under the job's lock; while another tab holds it, checks back at the poll interval. */
   const acquireAndPoll = async (id: string, signal: AbortSignal): Promise<void> => {
-    const locks = lockManager();
+    const locks = webLocks();
     while (!signal.aborted) {
       const job = await read(id);
       const handler = job && handlers.get(job.type);
@@ -178,12 +267,13 @@ export function createJobsService(core: CoreServices): JobsService {
         return;
       }
       if (held) return;
-      await sleep(intervalFor(handler, job, 0), signal);
+      await pause(intervalFor(handler, job, 0), signal);
     }
   };
 
   const startPolling = (job: JobRecord): void => {
     if (pollers.has(job.id) || isFinalState(job.state) || !handlers.has(job.type)) return;
+    ensureWired(); // a data reset must be able to stop this poller
     const controller = new AbortController();
     pollers.set(job.id, controller);
     void acquireAndPoll(job.id, controller.signal)
@@ -202,12 +292,24 @@ export function createJobsService(core: CoreServices): JobsService {
   const ensureWired = (): void => {
     if (wired) return;
     wired = true;
-    // Jobs added or reopened in another tab: be ready to take over when that tab closes.
     core.bus.on('jobs-changed', ({ id }) => {
-      if (!resumed || pollers.has(id)) return;
-      void read(id).then((job) => {
-        if (job) startPolling(job);
-      });
+      if (!subscribers.size && (!resumed || pollers.has(id))) return;
+      void read(id)
+        .then((job) => {
+          if (!job) {
+            tombstone(id);
+            return;
+          }
+          dispatch(job);
+          // Jobs added or reopened in another tab: be ready to take over when that tab closes.
+          if (resumed) startPolling(job);
+        })
+        .catch((error: unknown) => console.error(error));
+    });
+    // Everything was deleted (here or in another tab): stop polling and report every known job removed.
+    core.bus.on('data-reset', () => {
+      for (const id of [...pollers.keys()]) stopPolling(id);
+      for (const id of [...known.keys()]) tombstone(id);
     });
   };
 
@@ -246,6 +348,7 @@ export function createJobsService(core: CoreServices): JobsService {
         attempts: 0,
       };
       await (await getDb()).put('jobs', job);
+      remember(job);
       changed(job.id);
       startPolling(job);
       return job;
@@ -253,7 +356,7 @@ export function createJobsService(core: CoreServices): JobsService {
 
     async update<P, R>(id: string, patch: Partial<Omit<JobRecord<P, R>, 'id' | 'createdAt'>>) {
       const next = await write(id, patch);
-      if (!next) throw new Error(`Job ${id} not found.`);
+      if (!next) throw new InvalidInputError('That job no longer exists.');
       if (isFinalState(next.state)) stopPolling(id);
       else startPolling(next);
       return next as JobRecord<P, R>;
@@ -264,12 +367,25 @@ export function createJobsService(core: CoreServices): JobsService {
     },
 
     async list(filter = {}) {
-      const all = await (await getDb()).getAll('jobs');
-      return all
+      const db = await getDb();
+      // Narrow with the most selective index, then apply the remaining filters.
+      const jobs =
+        filter.groupId !== undefined
+          ? await db.getAllFromIndex('jobs', 'groupId', filter.groupId)
+          : filter.tool !== undefined
+            ? await db.getAllFromIndex('jobs', 'tool', filter.tool)
+            : filter.states !== undefined
+              ? (
+                  await Promise.all(
+                    filter.states.map((state) => db.getAllFromIndex('jobs', 'state', state)),
+                  )
+                ).flat()
+              : await db.getAll('jobs');
+      return jobs
+        .map(remember)
         .filter(
           (job) =>
             (filter.tool === undefined || job.tool === filter.tool) &&
-            (filter.groupId === undefined || job.groupId === filter.groupId) &&
             (filter.states === undefined || filter.states.includes(job.state)),
         )
         .sort((a, b) => a.createdAt - b.createdAt);
@@ -290,17 +406,19 @@ export function createJobsService(core: CoreServices): JobsService {
       resumed = true;
       ensureWired();
       void (async () => {
-        for (const job of await (await getDb()).getAll('jobs')) startPolling(job);
+        const db = await getDb();
+        for (const state of ['queued', 'running'] as const) {
+          for (const job of await db.getAllFromIndex('jobs', 'state', state)) startPolling(job);
+        }
       })().catch((error: unknown) => console.error(error));
     },
 
     subscribe(fn) {
       ensureWired();
-      return core.bus.on('jobs-changed', ({ id }) => {
-        void read(id).then((job) => {
-          if (job) fn(job);
-        });
-      });
+      subscribers.add(fn);
+      return () => {
+        subscribers.delete(fn);
+      };
     },
   };
 }
