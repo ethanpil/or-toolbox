@@ -60,19 +60,67 @@ export function contrastText(background: Rgb): Rgb {
 
 /** Moves `colour` towards white or black in small steps until it reaches AA on `background`. */
 export function readableOn(colour: Rgb, background: Rgb): Rgb {
-  const towards = luminance(background) > 0.5 ? shade : tint;
-  let result = colour;
-  for (let step = 1; step <= 20 && contrast(result, background) < AA; step++) {
-    result = towards(colour, step * 0.05);
-  }
-  return result;
+  return readableOnAll(colour, [background]);
 }
+
+/**
+ * Moves `colour` towards black (light backgrounds) or white (dark ones) in small steps until it has at least
+ * `ratio` against every background in `backgrounds`. All backgrounds of one theme are on the same side, so a
+ * single direction always gets there.
+ */
+export function readableOnAll(colour: Rgb, backgrounds: readonly Rgb[], ratio = AA): Rgb {
+  const light = backgrounds.every((background) => luminance(background) > 0.18);
+  const towards = light ? shade : tint;
+  // Judged on the rounded colour that will be emitted (as hex), so rounding can never drop it below `ratio`.
+  const round = (candidate: Rgb): Rgb => candidate.map((c) => Math.round(c)) as Rgb;
+  const worst = (candidate: Rgb): number =>
+    Math.min(...backgrounds.map((background) => contrast(round(candidate), background)));
+  let result = colour;
+  for (let step = 1; step <= 40 && worst(result) < ratio; step++) {
+    result = towards(colour, step * 0.025);
+  }
+  return round(result);
+}
+
+/**
+ * The surfaces text and outlines sit on, per theme (Bootstrap's values): light = white cards and the
+ * `--bs-tertiary-bg` canvas; dark = the body (canvas) and `--bs-tertiary-bg` cards. See _shell.scss.
+ */
+export const SURFACES: Readonly<Record<'light' | 'dark', readonly Rgb[]>> = {
+  light: [WHITE, [248, 249, 250]],
+  dark: [DARK_BODY, [43, 48, 53]],
+};
+
+/** Non-text contrast for focus indicators and input borders (WCAG 1.4.11). */
+const NON_TEXT = 3;
+
+/** Bootstrap's form-control SVGs, recoloured: a `url()` value for a custom property. */
+function svgUrl(svg: string): string {
+  return `url("data:image/svg+xml,${svg.replace(/</g, '%3c').replace(/>/g, '%3e').replace(/#/g, '%23')}")`;
+}
+
+const tickSvg = (colour: string): string =>
+  svgUrl(
+    `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path fill='none' stroke='${colour}' stroke-linecap='round' stroke-linejoin='round' stroke-width='3' d='m6 10 3 3 6-6'/></svg>`,
+  );
+const dashSvg = (colour: string): string =>
+  svgUrl(
+    `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path fill='none' stroke='${colour}' stroke-linecap='round' stroke-linejoin='round' stroke-width='3' d='M6 10h8'/></svg>`,
+  );
+const dotSvg = (colour: string, radius: number): string =>
+  svgUrl(
+    `<svg xmlns='http://www.w3.org/2000/svg' viewBox='-4 -4 8 8'><circle r='${radius}' fill='${colour}'/></svg>`,
+  );
 
 const rgbList = ([r, g, b]: Rgb): string => `${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)}`;
 
 /**
  * The custom properties for one accent colour in one theme. Keys are CSS custom property names. `--bs-*` are
- * Bootstrap's own (overridden on <html>); `--or-accent-*` feed the component rules in _accent.scss.
+ * Bootstrap's own (overridden on <html>); `--or-*` feed the component rules in _accent.scss and _shell.scss.
+ *
+ * Guarantees, for any colour: links and outline-button text reach 4.5:1 on every surface of the theme (cards and
+ * canvas); focus outlines and the focused-field border reach 3:1 on them; text, ticks and knobs on an accent
+ * fill use whichever of black and white contrasts more.
  */
 export function accentProperties(
   hex: string,
@@ -87,27 +135,42 @@ export function accentProperties(
   const active = darkText ? tint(accent, 0.2) : shade(accent, 0.2);
 
   const light = theme === 'light';
-  const textEmphasis = light ? shade(accent, 0.6) : tint(accent, 0.4);
+  const surfaces = SURFACES[theme];
   const bgSubtle = light ? tint(accent, 0.8) : shade(accent, 0.8);
   const borderSubtle = light ? tint(accent, 0.6) : shade(accent, 0.4);
-  const link = readableOn(light ? accent : tint(accent, 0.4), light ? WHITE : DARK_BODY);
+  const textEmphasis = readableOnAll(light ? shade(accent, 0.6) : tint(accent, 0.4), [
+    bgSubtle,
+    ...surfaces,
+  ]);
+  const link = readableOnAll(light ? accent : tint(accent, 0.4), surfaces);
   const linkHover = light ? shade(link, 0.2) : tint(link, 0.2);
+  // Focus: an outline and a field border that stand out from the surface (and from the resting #dee2e6 or
+  // #495057 border) by at least 3:1, never the faint subtle shade.
+  const focus = readableOnAll(light ? accent : tint(accent, 0.25), surfaces, NON_TEXT);
+  const contrastHex = toHex(onAccent);
 
   return {
     '--bs-primary': toHex(accent),
     '--bs-primary-rgb': rgbList(accent),
-    '--bs-primary-text-emphasis': toHex(readableOn(textEmphasis, light ? bgSubtle : DARK_BODY)),
+    '--bs-primary-text-emphasis': toHex(textEmphasis),
     '--bs-primary-bg-subtle': toHex(bgSubtle),
     '--bs-primary-border-subtle': toHex(borderSubtle),
     '--bs-link-color': toHex(link),
     '--bs-link-color-rgb': rgbList(link),
     '--bs-link-hover-color': toHex(linkHover),
     '--bs-link-hover-color-rgb': rgbList(linkHover),
-    '--bs-focus-ring-color': `rgba(${rgbList(accent)}, 0.25)`,
-    '--or-accent-contrast': toHex(onAccent),
+    '--bs-focus-ring-color': `rgba(${rgbList(focus)}, 0.35)`,
+    '--or-accent-contrast': contrastHex,
     '--or-accent-hover': toHex(hover),
     '--or-accent-active': toHex(active),
     '--or-accent-text': toHex(link),
+    '--or-focus-color': toHex(focus),
+    '--or-focus-border': toHex(focus),
+    '--or-check-tick': tickSvg(contrastHex),
+    '--or-check-dash': dashSvg(contrastHex),
+    '--or-radio-dot': dotSvg(contrastHex, 2),
+    '--or-switch-knob': dotSvg(contrastHex, 3),
+    '--or-switch-knob-focus': dotSvg(toHex(focus), 3),
   };
 }
 
