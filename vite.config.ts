@@ -1,4 +1,6 @@
-import { defineConfig } from 'vite';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { defineConfig, searchForWorkspaceRoot } from 'vite';
 import { ffmpegAssets, ffmpegAssetsInfo } from './vite-plugins/ffmpeg-assets.ts';
 import { htmlHead } from './vite-plugins/html-head.ts';
 import { discoverPages } from './vite-plugins/pages.ts';
@@ -50,7 +52,13 @@ export default defineConfig({
   },
 
   // The dev server isolates pages itself (no service worker in dev).
-  server: { port: DEV_PORT, strictPort: true, headers: ISOLATION_HEADERS },
+  server: {
+    port: DEV_PORT,
+    strictPort: true,
+    headers: ISOLATION_HEADERS,
+    // Git worktrees used for parallel work link node_modules to the main checkout; allow its real path too.
+    fs: { allow: [searchForWorkspaceRoot(root), realpathSync(resolve(root, 'node_modules'))] },
+  },
   // `vite preview` behaves like GitHub Pages: no special headers (it would
   // otherwise inherit server.headers), so isolation comes from the worker.
   preview: { port: PREVIEW_PORT, strictPort: true, headers: {} },
