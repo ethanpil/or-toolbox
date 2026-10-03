@@ -156,6 +156,9 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
         doc.values[field.name] = value;
       },
     });
+    // Show the value as it was understood ("€ 99,95" becomes 99.95).
+    if (!problem && input instanceof HTMLInputElement)
+      input.value = valueText(doc.values[field.name]);
     setFieldError(input, feedbackFor(input), problem);
     options.onEdit(doc);
     refreshIssues(doc);
@@ -174,6 +177,7 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
           item[column.name] = value;
         },
       });
+      if (!problem && input instanceof HTMLInputElement) input.value = valueText(item[column.name]);
       setFieldError(input, feedbackFor(input), problem);
       options.onEdit(doc);
       refreshIssues(doc);
