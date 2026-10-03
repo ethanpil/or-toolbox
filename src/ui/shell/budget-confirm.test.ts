@@ -41,6 +41,20 @@ describe('budgetConfirm', () => {
     await expect(next).resolves.toBe(false);
   });
 
+  it('shows the estimate with paid add-ons included', async () => {
+    const answer = budgetConfirm(check, {
+      ...spec(),
+      addons: [
+        { id: 'pdf-engine:mistral-ocr', label: 'Mistral OCR (PDF parser)', estimateUsd: 0.25 },
+      ],
+    });
+    await shown();
+    expect($('budget-estimate')?.textContent).toContain('$0.75');
+    expect($('budget-estimate')?.textContent).toContain('Includes Mistral OCR (PDF parser)');
+    $('budget-cancel')!.click();
+    await answer;
+  });
+
   it('declines before following the budgets link', async () => {
     const answer = budgetConfirm(check, spec());
     await shown();

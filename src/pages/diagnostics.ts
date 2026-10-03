@@ -10,7 +10,7 @@ import { type FfmpegDownloadProgress, loadFfmpeg } from '../core/media/ffmpeg';
 import { url } from '../core/paths';
 import { getServiceWorkerReport, type ServiceWorkerReport } from '../core/sw-register';
 import { clear, h } from '../ui/dom';
-import { formatBytes, formatInt } from '../ui/format';
+import { formatInt } from '../ui/format';
 import { mountPage } from '../ui/shell/index';
 
 // --- environment ------------------------------------------------------------
@@ -24,6 +24,11 @@ interface Row {
   text?: string;
   /** Colours the value: true = good, false = bad, undefined = neutral. */
   ok?: boolean;
+}
+
+/** Always MB with one decimal (not `formatBytes`, which changes unit), so readings stay comparable. */
+function megabytes(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function serviceWorkerText(report: ServiceWorkerReport): string {
@@ -50,7 +55,7 @@ async function storageRow(): Promise<Row> {
   try {
     const { usage, quota } = await navigator.storage.estimate();
     if (usage === undefined || quota === undefined) throw new Error('no estimate');
-    return { ...row, value: String(usage), text: `${formatBytes(usage)} of ${formatBytes(quota)}` };
+    return { ...row, value: String(usage), text: `${megabytes(usage)} of ${megabytes(quota)}` };
   } catch {
     return { ...row, value: 'unknown', text: 'Not reported by this browser' };
   }

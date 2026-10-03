@@ -9,19 +9,24 @@ import { isStop, presentError, wasPresented } from '../feedback/errors';
 import { formatShortcut } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
-import type { Runner, RunnerOptions } from './types';
+import type { Runner, RunnerOptions, RunnerState, Triggered } from './types';
 
-export interface RunnerInternals extends Runner {
+export interface RunnerInternals<A = unknown> extends Runner<A> {
   /** Set by the framework (e.g. no model resolves); wins over the tool's own reason. */
   setFrameworkReason(reason: string | null): void;
 }
 
-export function createRunner(options: RunnerOptions, primary: boolean): RunnerInternals {
+export function createRunner<A = unknown>(
+  options: RunnerOptions<A>,
+  primary: boolean,
+): RunnerInternals<A> {
   const hintId = uid('runner-hint');
   let busy = false;
   let controller: AbortController | null = null;
   let ownReason: string | null = null;
   let frameworkReason: string | null = null;
+  const listeners = new Set<(state: RunnerState) => void>();
+  let lastState = '';
 
   const label = h('span', null, options.label ?? 'Run');
   const spinner = h('span', {
@@ -84,21 +89,31 @@ export function createRunner(options: RunnerOptions, primary: boolean): RunnerIn
     stopButton.hidden = !busy;
     hint.textContent = blocked ?? options.hint ?? '';
     hint.classList.toggle('text-warning-emphasis', blocked !== null);
+    const state: RunnerState = { busy, disabledReason: blocked };
+    const signature = JSON.stringify(state);
+    if (signature === lastState) return;
+    lastState = signature;
+    for (const fn of [...listeners]) fn(state);
   };
 
-  async function trigger(): Promise<void> {
-    if (busy || reason() !== null) return;
+  function trigger(arg?: A): Triggered {
+    if (busy || reason() !== null) return Object.assign(Promise.resolve(), { started: false });
+    return Object.assign(execute(arg), { started: true });
+  }
+
+  async function execute(arg?: A): Promise<void> {
     busy = true;
     controller = new AbortController();
     render();
     try {
-      await options.run(controller.signal);
+      await options.run(controller.signal, arg);
     } catch (error) {
       // Stop and a declined budget confirmation are silent; an error the output panel already showed inline
-      // (`output.fail(error)`) is not shown again; anything else goes through presentError once.
+      // (`output.fail(error)`) is not shown again; anything else goes through presentError once, and its Retry
+      // runs the same thing again (same argument).
       if (isStop(error)) {
         if (!wasPresented(error)) announce('Stopped.');
-      } else void presentError(error, { retry: () => void trigger() });
+      } else void presentError(error, { retry: () => void trigger(arg) });
     } finally {
       busy = false;
       controller = null;
@@ -118,6 +133,9 @@ export function createRunner(options: RunnerOptions, primary: boolean): RunnerIn
     get busy() {
       return busy;
     },
+    get disabledReason() {
+      return reason();
+    },
     trigger,
     stop,
     setDisabled(next) {
@@ -127,6 +145,13 @@ export function createRunner(options: RunnerOptions, primary: boolean): RunnerIn
     setFrameworkReason(next) {
       frameworkReason = next;
       render();
+    },
+    subscribe(fn) {
+      listeners.add(fn);
+      fn({ busy, disabledReason: reason() });
+      return () => {
+        listeners.delete(fn);
+      };
     },
   };
 }

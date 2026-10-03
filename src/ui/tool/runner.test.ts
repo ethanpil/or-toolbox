@@ -88,4 +88,68 @@ describe('createRunner', () => {
     await declined.trigger();
     expect(document.querySelector('[data-testid="error-toast"]')).toBeNull();
   });
+
+  it('passes the argument to run, and Retry replays the same one', async () => {
+    const seen: (string | undefined)[] = [];
+    let fail = true;
+    const runner = createRunner<string>(
+      {
+        run: (_signal, arg) => {
+          seen.push(arg);
+          return fail ? Promise.reject(new Error('boom')) : Promise.resolve();
+        },
+      },
+      true,
+    );
+    document.body.append(runner.element);
+    const started = runner.trigger('page-3');
+    expect(started.started).toBe(true);
+    await started;
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-retry"]')).not.toBeNull(),
+    );
+    fail = false;
+    document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
+    await vi.waitFor(() => expect(seen).toEqual(['page-3', 'page-3']));
+    await runner.trigger();
+    expect(seen).toEqual(['page-3', 'page-3', undefined]);
+  });
+
+  it('answers false at once when it cannot start, and tells subscribers why', async () => {
+    let finish!: () => void;
+    const runner = createRunner(
+      {
+        run: () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          }),
+      },
+      true,
+    );
+    const states: { busy: boolean; disabledReason: string | null }[] = [];
+    const off = runner.subscribe((state) => states.push({ ...state }));
+    expect(states).toEqual([{ busy: false, disabledReason: null }]);
+
+    runner.setDisabled('Add a file first');
+    expect(runner.disabledReason).toBe('Add a file first');
+    expect(runner.trigger().started).toBe(false);
+    runner.setDisabled(null);
+
+    const first = runner.trigger();
+    expect(first.started).toBe(true);
+    expect(runner.busy).toBe(true);
+    expect(runner.trigger().started).toBe(false); // busy
+    finish();
+    await first;
+    expect(states).toEqual([
+      { busy: false, disabledReason: null },
+      { busy: false, disabledReason: 'Add a file first' },
+      { busy: false, disabledReason: null },
+      { busy: true, disabledReason: null },
+      { busy: false, disabledReason: null },
+    ]);
+    off();
+    runner.setDisabled('x');
+    expect(states).toHaveLength(5);
+  });
 });

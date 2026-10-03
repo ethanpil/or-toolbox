@@ -60,8 +60,9 @@ export function keysSection(core: CoreServices): SectionView {
     return view;
   };
 
+  /** Only keys without a balance yet: a rename or a colour change does not ask OpenRouter again. */
   const loadMissing = (): void => {
-    for (const key of core.keys.list()) balanceOf(key).load();
+    for (const key of core.keys.list()) balanceOf(key).loadMissing();
   };
 
   // --- actions ------------------------------------------------------------------------------------------

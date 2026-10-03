@@ -8,6 +8,7 @@ import type {
   CoreServices,
   ResolvedModel,
   ResultKind,
+  RunAddon,
   RunHandle,
   RunSpec,
   SessionResult,
@@ -46,6 +47,12 @@ export interface ToolInstance {
    * shows the newest answer in the header and books it with `ctx.beginRun` when the spec has no `estimateUsd`.
    */
   estimate?(model: string): Promise<number | null>;
+  /**
+   * Paid extras the current input would incur besides the model (e.g. `pdfEngineAddon(engine, pages)` from
+   * src/core/models/pdf-engines.ts). Keep them out of `estimate`: the framework adds them to the header badge and
+   * passes them to `ctx.beginRun` (free-only refuses a paid one, budgets add them). Cheap and synchronous.
+   */
+  addons?(): readonly RunAddon[];
 }
 
 /** The tool's saved options: `manifest.defaults` merged with `settings.tools[id].options`. */
@@ -58,7 +65,11 @@ export interface ToolOptions<T extends Record<string, unknown> = Record<string, 
   reset(): void;
 }
 
-export interface RunnerOptions {
+/**
+ * `A` is what `trigger(arg)` hands to `run` (e.g. the item keys of a per-item Retry); a plain Run passes
+ * nothing. The framework's Retry (after an error) replays the same argument.
+ */
+export interface RunnerOptions<A = unknown> {
   /** Button text, default "Run". */
   label?: string;
   /** Bootstrap Icons name, default `play-fill`. */
@@ -67,23 +78,46 @@ export interface RunnerOptions {
    * The work. `signal` aborts when the user presses Stop (pass it to `ctx.beginRun`, which links it to the run).
    * Throw to report failure; errors go through `presentError` with a Retry.
    */
-  run: (signal: AbortSignal) => Promise<void>;
+  run: (signal: AbortSignal, arg?: A) => Promise<void>;
   /** Text after the button (e.g. a reason it is disabled); also its description. */
   hint?: string;
   /** Where the bar goes; default the end of `ui.input`. */
   container?: HTMLElement;
 }
 
-export interface Runner {
+/**
+ * `Runner.trigger()`'s answer: settles when the run is over (errors are already reported, so it never rejects),
+ * and says at once whether it started at all (false: busy or disabled, nothing happened).
+ */
+export type Triggered = Promise<void> & { readonly started: boolean };
+
+/** What a runner's subscribers are told on every change. */
+export interface RunnerState {
+  readonly busy: boolean;
+  /** Why Run cannot start (the framework's reason wins over the tool's), or null. */
+  readonly disabledReason: string | null;
+}
+
+export interface Runner<A = unknown> {
   readonly element: HTMLElement;
   readonly button: HTMLButtonElement;
   readonly stopButton: HTMLButtonElement;
   readonly busy: boolean;
-  /** Same as pressing Run (ignored while busy or disabled). */
-  trigger(): Promise<void>;
+  /** Why Run cannot start right now, or null (busy is separate: see `busy`). */
+  readonly disabledReason: string | null;
+  /**
+   * Same as pressing Run, with `arg` passed to `run` (and replayed by the error's Retry). `.started` is false when
+   * it could not start (busy or disabled); the promise settles once the run is over.
+   */
+  trigger(arg?: A): Triggered;
   stop(): void;
   /** Disables Run with a visible reason; null re-enables it (the framework also disables it when no model resolves). */
   setDisabled(reason: string | null): void;
+  /**
+   * Calls `fn` now and on every change of `busy` or `disabledReason`; returns an unsubscribe function. Use it to
+   * enable or disable a tool's own buttons that trigger this runner (per-item Retry).
+   */
+  subscribe(fn: (state: RunnerState) => void): () => void;
 }
 
 export interface ResultHandle {
@@ -110,7 +144,7 @@ export interface ToolUi {
   /** An accordion section at the end of the drawer, for advanced options; returns its body. */
   advanced: (title: string) => HTMLElement;
   /** Creates the primary Run/Stop bar (the first runner also gets Ctrl/Cmd+Enter). */
-  runner: (options: RunnerOptions) => Runner;
+  runner: <A = unknown>(options: RunnerOptions<A>) => Runner<A>;
   /** Recomputes the estimate through `ToolInstance.estimate` (call it when the input changes); resolves with it. */
   refreshEstimate: () => Promise<number | null>;
   /**
@@ -146,8 +180,11 @@ export interface ToolContext extends CoreServices {
   readonly modelOverride: string | null;
   /**
    * `runs.begin` for this tool: fills `tool`, defaults `model` to `ctx.model().model`, `prompt`/`settings` to the
-   * instance's `getState()`, `estimateUsd` to the framework's current estimate (recomputed first when stale), and
-   * aborts the run when `signal` (the runner's) aborts.
+   * instance's `getState()`, `estimateUsd` to the framework's current estimate (recomputed first when stale),
+   * `addons` to the instance's `addons()`, and aborts the run when `signal` (the runner's) aborts.
+   *
+   * It may refuse (no key, locked, free-only, budget, a declined confirmation) before anything is sent: call it
+   * BEFORE changing any tool state (results, statuses, output), so a refused run leaves the page as it was.
    */
   beginRun: (
     spec: Omit<RunSpec, 'tool' | 'model'> & { model?: string; tool?: ToolId },

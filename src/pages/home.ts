@@ -217,7 +217,8 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     );
   };
 
-  const renderRecent = (): void => {
+  /** `live`: a change in the history, not a load the user asked for (only then does a failure keep the list). */
+  const renderRecent = (live = false): void => {
     void loadInto(
       recentList,
       async () => {
@@ -241,8 +242,8 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
           inline: true,
           testId: 'recent-error',
         },
-        retry: renderRecent,
-        keepOnLiveFailure: true,
+        retry: () => renderRecent(),
+        keepOnLiveFailure: live,
       },
     );
   };
@@ -399,5 +400,5 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     if (next.onboarding.completed !== prev.onboarding.completed && !next.onboarding.completed)
       showOnboarding();
   });
-  core.history.subscribe(renderRecent);
+  core.history.subscribe(() => renderRecent(true));
 });

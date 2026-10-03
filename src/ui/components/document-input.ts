@@ -19,11 +19,12 @@
  * import) and at most two stay open; the others are closed and reopened on demand.
  */
 import { InvalidInputError, userMessage } from '../../core/errors';
+import { runPool } from '../../core/pool';
 import { readAsDataUrl, formatBytes } from '../../core/files';
 import type * as ImageModuleTypes from '../../core/media/image';
 import type * as PdfModuleTypes from '../../core/media/pdf';
 import type { PdfDocument } from '../../core/media/pdf';
-import { h, replace } from '../dom';
+import { focusKey, focusedKey, h, replace } from '../dom';
 import { announce } from '../feedback/announce';
 import { setFieldError } from '../feedback/field-error';
 import { toast } from '../feedback/toast';
@@ -235,6 +236,8 @@ interface Entry extends DocumentFile {
   /** Last range text the user typed that did not parse (kept in the field). */
   draft: string | null;
   error: string | null;
+  /** The drawn card's controls, so a selection change updates them in place (no rebuild, no scroll jump). */
+  view?: { range: HTMLInputElement; tiles: Map<number, HTMLElement> };
 }
 
 function kindOf(file: File): 'image' | 'pdf' | null {
@@ -419,7 +422,8 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
           entry.selected = togglePage(entry.selected, page);
           entry.draft = null;
           entry.error = null;
-          update(entry);
+          markTile(button, entry.selected.includes(page));
+          syncRange(entry);
           changed();
         },
       },
@@ -438,6 +442,28 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
     return button;
   };
 
+  /** Shows a tile as selected or not, in place. */
+  const markTile = (tile: HTMLElement, selected: boolean): void => {
+    if (tile.getAttribute('aria-pressed') === String(selected)) return;
+    tile.setAttribute('aria-pressed', String(selected));
+    tile
+      .querySelector('.or-doc-page-check')
+      ?.replaceWith(icon(selected ? 'check-circle-fill' : 'circle', 'or-doc-page-check'));
+  };
+
+  /** The range field follows the selection (unless the user is mid-way through a bad range). */
+  const syncRange = (entry: Entry): void => {
+    if (!entry.view || entry.draft !== null) return;
+    entry.view.range.value = formatPageRange(entry.selected);
+  };
+
+  /** A selection change drawn in place: every tile's state and the range field; the card is not rebuilt. */
+  const syncSelection = (entry: Entry): void => {
+    if (!entry.view) return;
+    for (const [page, tile] of entry.view.tiles) markTile(tile, entry.selected.includes(page));
+    syncRange(entry);
+  };
+
   const card = (entry: Entry): HTMLElement => {
     const thumb = h('img', { class: 'or-doc-thumb', alt: '', decoding: 'async' });
     requestThumb(entry, 1, thumb);
@@ -446,6 +472,7 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
     const nameId = uid('doc-name');
     const feedback = h('div', { class: 'invalid-feedback' });
     const isPdf = entry.kind === 'pdf';
+    const tiles = new Map<number, HTMLElement>();
 
     const range = h('input', {
       id: rangeId,
@@ -481,7 +508,8 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
             entry.selected = pages();
             entry.draft = null;
             entry.error = null;
-            update(entry);
+            setFieldError(range, feedback, null);
+            syncSelection(entry);
             changed();
           },
         },
@@ -498,9 +526,14 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
               role: 'group',
               'aria-label': `Pages of ${entry.name}`,
             },
-            allPages(entry.pageCount).map((page) => tile(entry, page)),
+            allPages(entry.pageCount).map((page) => {
+              const button = tile(entry, page);
+              tiles.set(page, button);
+              return button;
+            }),
           )
         : null;
+    entry.view = { range, tiles };
 
     return h(
       'li',
@@ -541,6 +574,7 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
                 class: 'btn btn-sm btn-outline-secondary',
                 'aria-label': `Remove ${entry.name}`,
                 title: 'Remove',
+                'data-focus-key': `remove:${entry.id}`,
                 'data-testid': 'doc-remove',
                 onclick: () => {
                   remove(entry.id);
@@ -590,17 +624,10 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
     const old = cardOf(entry.id);
     if (!old) return;
     const fresh = card(entry);
-    const focusedKey = old.contains(document.activeElement)
-      ? (document.activeElement?.closest('[data-focus-key]')?.getAttribute('data-focus-key') ??
-        null)
-      : null;
+    const key = focusedKey(old);
     unobserve(old);
     old.replaceWith(fresh);
-    if (focusedKey) {
-      [...fresh.querySelectorAll<HTMLElement>('[data-focus-key]')]
-        .find((candidate) => candidate.getAttribute('data-focus-key') === focusedKey)
-        ?.focus();
-    }
+    if (key) focusKey(fresh, key);
   };
 
   /** Stops watching the tiles of a card that is about to go. */
@@ -634,7 +661,7 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
       return;
     }
     entry.selected = result.pages;
-    update(entry);
+    syncSelection(entry);
     changed();
   };
 
@@ -652,39 +679,46 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
     pending += usable.filter((file) => kindOf(file) === 'pdf').length;
     renderCount();
     const failures: string[] = [];
-    await Promise.all(
-      usable.map(async (file) => {
-        const kind = kindOf(file)!;
-        const entry: Entry = {
-          id: uid('doc'),
-          file,
-          name: file.name || (kind === 'pdf' ? 'document.pdf' : 'image'),
-          kind,
-          pageCount: 1,
-          selected: [1],
-          thumbs: new Map(),
-          thumbJobs: new Map(),
-          open: false,
-          draft: null,
-          error: null,
-        };
-        if (kind === 'pdf') {
-          try {
-            entry.pageCount = await pdfs.use(entry.id, file, (doc) =>
-              Promise.resolve(doc.numPages),
-            );
-            entry.selected = allPages(entry.pageCount);
-          } catch (error) {
-            pdfs.drop(entry.id);
-            failures.push(`${entry.name}: ${userMessage(error)}`);
-            return;
-          } finally {
-            pending--;
+    // Two PDFs at a time (at most two stay open anyway), each opened once: its page count and the card's
+    // thumbnail (page 1) are read together.
+    await runPool(usable, 2, async (file) => {
+      const kind = kindOf(file)!;
+      const entry: Entry = {
+        id: uid('doc'),
+        file,
+        name: file.name || (kind === 'pdf' ? 'document.pdf' : 'image'),
+        kind,
+        pageCount: 1,
+        selected: [1],
+        thumbs: new Map(),
+        thumbJobs: new Map(),
+        open: false,
+        draft: null,
+        error: null,
+      };
+      if (kind === 'pdf') {
+        try {
+          const first = await pdfs.use(entry.id, file, async (doc) => ({
+            pages: doc.numPages,
+            thumb: await doc
+              .renderPage(1, { maxWidth: THUMB_WIDTH, type: 'image/jpeg', quality: 0.7 })
+              .catch(() => null), // no thumbnail is fine; the page count is what matters
+          }));
+          entry.pageCount = first.pages;
+          entry.selected = allPages(entry.pageCount);
+          if (first.thumb && typeof URL.createObjectURL === 'function') {
+            entry.thumbs.set(1, URL.createObjectURL(first.thumb));
           }
+        } catch (error) {
+          pdfs.drop(entry.id);
+          failures.push(`${entry.name}: ${userMessage(error)}`);
+          return;
+        } finally {
+          pending--;
         }
-        entries.push(entry);
-      }),
-    );
+      }
+      entries.push(entry);
+    });
     // Keep the order the files were given in, after the ones already listed.
     const order = new Map(usable.map((file, index) => [file, index]));
     const before = entries.filter((entry) => !order.has(entry.file));
@@ -713,10 +747,9 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
     const focusNext = list.contains(document.activeElement);
     render();
     if (focusNext) {
-      const next = list.querySelectorAll<HTMLElement>('[data-testid="doc-remove"]')[
-        Math.min(index, entries.length - 1)
-      ];
-      (next ?? zone.querySelector<HTMLElement>('button'))?.focus();
+      const next = entries[Math.min(index, entries.length - 1)];
+      if (!next || !focusKey(list, `remove:${next.id}`))
+        zone.querySelector<HTMLElement>('button')?.focus();
     }
     changed(false);
   }
@@ -820,7 +853,8 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
       const target =
         (entry.kind === 'pdf'
           ? fileCard?.querySelector<HTMLElement>(`.or-doc-page[data-page="${ref.pageNumber}"]`)
-          : fileCard?.querySelector<HTMLElement>('[data-testid="doc-remove"]')) ?? fileCard;
+          : fileCard?.querySelector<HTMLElement>(`[data-focus-key="remove:${entry.id}"]`)) ??
+        fileCard;
       if (!target) return;
       target.scrollIntoView({ block: 'center', behavior: 'smooth' });
       target.focus({ preventScroll: true });

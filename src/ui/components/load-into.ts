@@ -31,8 +31,10 @@ export interface LoadIntoOptions {
   /** Runs again when the user presses "Try again" (or Retry on the error toast). */
   retry: () => void;
   /**
-   * A reload while content is on screen leaves that content alone when it fails (and shows no skeleton), so a
-   * live update that cannot read storage does not wipe a list the user is reading.
+   * Set it on live (bus-driven) reloads only. Such a reload, while content is on screen, leaves that content
+   * alone when it fails (and shows no skeleton), so a live update that cannot read storage does not wipe a list
+   * the user is reading. A load the user asked for (search, filter, reset, Try again) leaves it unset: the
+   * content on screen no longer matches the request, so its failure must show the error state.
    */
   keepOnLiveFailure?: boolean;
   /** Also show the failure as a toast, even when the content on screen was kept (default: only inline). */

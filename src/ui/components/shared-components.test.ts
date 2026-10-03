@@ -3,7 +3,7 @@ import { ApiError } from '../../core/errors';
 import type { CoreServices, KeyInfo, KeyStatus } from '../../core/types';
 import { h, replace } from '../dom';
 import { dataTable } from './data-table';
-import { balanceProblem, keyBalanceView } from './key-balance';
+import { accountFreeDaily, balanceProblem, keyBalanceView } from './key-balance';
 import { listSkeleton, loadInto } from './load-into';
 import { setStarred, starButton } from './star-button';
 
@@ -174,6 +174,22 @@ describe('loadInto', () => {
     expect(container.textContent).toBe('Shown');
   });
 
+  it('without keepOnLiveFailure (a load the user asked for), a failure shows the error state', async () => {
+    const container = h('div');
+    await loadInto(container, () => Promise.resolve(h('p', null, 'Shown')), {
+      error,
+      retry: () => undefined,
+      keepOnLiveFailure: true,
+    });
+    expect(
+      await loadInto(container, () => Promise.reject(new Error('search failed')), {
+        error,
+        retry: () => undefined,
+      }),
+    ).toBe(false);
+    expect(container.querySelector('[data-testid="load-error"]')).not.toBeNull();
+  });
+
   it('builds a hidden skeleton', () => {
     const skeleton = listSkeleton(3);
     expect(skeleton.getAttribute('aria-hidden')).toBe('true');
@@ -277,5 +293,91 @@ describe('keyBalanceView', () => {
       compact.element.querySelector('[data-testid="balance-error"]')?.getAttribute('title'),
     ).toContain('OpenRouter rejected');
     expect(balanceProblem(new ApiError('Upstream broke', 500))).not.toContain('rejected');
+  });
+
+  it('loadMissing asks only while no balance is known, and repaints otherwise', async () => {
+    const { core, load } = fakeCore({});
+    const view = keyBalanceView(core, key);
+    view.loadMissing();
+    await vi.waitFor(() => expect(text(view, 'key-usage')).toBe('$1.25'));
+    // Re-renders (a rename, a colour, the lock) call it again: nothing is asked.
+    view.loadMissing();
+    view.loadMissing();
+    expect(load).toHaveBeenCalledOnce();
+    expect(text(view, 'key-usage')).toBe('$1.25');
+
+    // A failed balance is known too (Refresh asks again); only the lock leaves it missing.
+    const rejected = fakeCore({ status: () => Promise.reject(new ApiError('No auth', 401)) });
+    const failed = keyBalanceView(rejected.core, key);
+    failed.loadMissing();
+    await vi.waitFor(() => expect(text(failed, 'key-balance-error')).toBeDefined());
+    failed.loadMissing();
+    expect(rejected.load).toHaveBeenCalledOnce();
+  });
+
+  it('loads again after the lock got in the way', async () => {
+    let unlocked = false;
+    const load = vi.fn(() => Promise.resolve(status()));
+    const core = {
+      keys: { lock: { unlocked: () => unlocked }, get: () => key, status: load },
+    } as unknown as CoreServices;
+    const view = keyBalanceView(core, key);
+    view.loadMissing();
+    expect(load).not.toHaveBeenCalled();
+    unlocked = true;
+    view.loadMissing();
+    await vi.waitFor(() => expect(text(view, 'key-usage')).toBe('$1.25'));
+    expect(load).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a good balance on show when a refresh fails, and says so', async () => {
+    let fail = false;
+    const { core, load } = fakeCore({
+      status: () =>
+        fail ? Promise.reject(new ApiError('Upstream broke', 502)) : Promise.resolve(status()),
+    });
+    const view = keyBalanceView(core, key);
+    view.load();
+    await vi.waitFor(() => expect(text(view, 'key-usage')).toBe('$1.25'));
+    fail = true;
+    view.load(true);
+    await vi.waitFor(() => expect(text(view, 'key-balance-stale')).toContain('Could not refresh'));
+    expect(text(view, 'key-usage')).toBe('$1.25');
+    expect(text(view, 'key-balance-error')).toBeUndefined();
+    expect(load).toHaveBeenLastCalledWith('k1', { force: true });
+    // The next good answer clears the note.
+    fail = false;
+    view.load(true);
+    await vi.waitFor(() => expect(text(view, 'key-usage')).toBe('$1.25'));
+    expect(text(view, 'key-balance-stale')).toBeUndefined();
+  });
+});
+
+describe('accountFreeDaily', () => {
+  it('asks the default key only', async () => {
+    const status = vi.fn(() =>
+      Promise.resolve({ freeDaily: { used: 1, limit: 50, remaining: 49 } } as KeyStatus),
+    );
+    const core = {
+      keys: {
+        lock: { unlocked: () => true },
+        resolve: () => ({ id: 'default' }),
+        list: () => [{ id: 'other' }, { id: 'default' }, { id: 'third' }],
+        status,
+      },
+    } as unknown as CoreServices;
+    expect(await accountFreeDaily(core)).toEqual({ used: 1, limit: 50, remaining: 49 });
+    expect(status).toHaveBeenCalledExactlyOnceWith('default');
+  });
+
+  it('is null when locked, without a key or when the default key cannot be read', async () => {
+    const status = vi.fn(() => Promise.reject(new ApiError('No auth', 401)));
+    const keys = { lock: { unlocked: () => true }, resolve: () => ({ id: 'default' }), status };
+    expect(await accountFreeDaily({ keys } as unknown as CoreServices)).toBeNull();
+    const locked = { ...keys, lock: { unlocked: () => false } };
+    expect(await accountFreeDaily({ keys: locked } as unknown as CoreServices)).toBeNull();
+    const none = { ...keys, resolve: () => null };
+    expect(await accountFreeDaily({ keys: none } as unknown as CoreServices)).toBeNull();
+    expect(status).toHaveBeenCalledOnce();
   });
 });

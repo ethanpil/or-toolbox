@@ -6,7 +6,7 @@ import { getTool } from '../../tools/registry';
 import { h } from '../dom';
 import { comingSoon } from './coming-soon';
 import { createToolTestContext, type ToolTestContext } from './testing';
-import type { ToolSetup } from './types';
+import type { ToolInstance, ToolSetup } from './types';
 
 let t: ToolTestContext | null = null;
 
@@ -66,6 +66,36 @@ describe('createToolTestContext', () => {
     const record = await (await getDb()).get('runs', run.id);
     expect(record).toMatchObject({ reservedUsd: 0.05, prompt: 'x'.repeat(50), tool: 'chat' });
     await run.finish();
+  });
+
+  it('adds paid add-ons to the badge and passes them to the run', async () => {
+    t = createToolTestContext(getTool('ocr'));
+    let pages = 10;
+    const tool = await t.mount((ctx) => {
+      const base = tinyTool(ctx) as ToolInstance;
+      return {
+        ...base,
+        estimate: () => Promise.resolve(0.01),
+        addons: () => [
+          { id: 'pdf-engine:mistral-ocr', label: 'Mistral OCR', estimateUsd: pages * 0.002 },
+        ],
+      };
+    });
+    expect(t.estimate()).toBeCloseTo(0.03);
+    pages = 20;
+    await t.ctx.ui.refreshEstimate();
+    expect(t.estimate()).toBeCloseTo(0.05);
+    const run = await t.ctx.beginRun({});
+    expect((await (await getDb()).get('runs', run.id))?.reservedUsd).toBeCloseTo(0.05);
+    await run.finish();
+
+    t.core.settings.update((draft) => {
+      draft.freeOnly = true;
+    });
+    await expect(t.ctx.beginRun({ model: 'a/b:free' })).rejects.toMatchObject({
+      addons: ['Mistral OCR'],
+    });
+    expect(tool.getState()).toBeDefined();
   });
 
   it('applies the header model only to the primary capability', () => {

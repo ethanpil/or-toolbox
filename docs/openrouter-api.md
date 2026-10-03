@@ -175,7 +175,7 @@ Works with any model. Send the PDF as a `file` part (URL or `data:application/pd
 
 | `pdf.engine` | Behaviour |
 | --- | --- |
-| `mistral-ocr` | Best for scans/images. Paid per 1,000 pages; billed to your OpenRouter account even with BYOK. At most 8 images per PDF forwarded. The per-page price is a template variable that did not render in the fetched text, so the number is **[unverified]**. This is the **default when the model has no native file input**, so omitting `plugins` can silently incur OCR charges: set `engine:"cloudflare-ai"` explicitly for the free path. |
+| `mistral-ocr` | Best for scans/images. Paid per 1,000 pages; billed to your OpenRouter account even with BYOK. At most 8 images per PDF forwarded. The per-page price is a template variable that did not render in the fetched text (still so on 2026-10-03); OpenRouter's "Universal PDF Support" announcement gives **$2 per 1,000 pages**, and the docs mention a 10% US regional upcharge, so estimates use $2.20 per 1,000 pages (`src/core/models/pdf-engines.ts`). Not yet confirmed by a paid probe. This is the **default when the model has no native file input**, so omitting `plugins` can silently incur OCR charges: set `engine:"cloudflare-ai"` explicitly for the free path. |
 | `cloudflare-ai` | PDF to markdown via Workers AI. **Free.** |
 | `native` | Only for models with native file input; charged as input tokens. **Default first choice when available.** |
 | `pdf-text` | Deprecated; redirected to `cloudflare-ai`. |

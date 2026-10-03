@@ -130,8 +130,35 @@ describe('formula defusing', () => {
     expect(csv([{ a: -5 }], ['a'], { header: false })).toBe('-5');
   });
 
+  it('leaves phone numbers and other digits-only text as written: they cannot call anything', () => {
+    for (const text of [
+      '+44 20 7946 0958',
+      '+1 (555) 010-9999',
+      '-0 12/34',
+      '+49.30.1234',
+      '--5',
+      '-',
+    ]) {
+      expect(csv([{ a: text }], ['a'], { header: false }).replace(/^"|"$/g, ''), text).toBe(text);
+      expect(toTsv([{ a: text }], ['a'], { header: false }), text).toBe(text);
+    }
+  });
+
   it('still defuses text that only starts like a number', () => {
-    for (const text of ['-5+3', '-5 USD', '--5', '-', '+', '-$', '-5%+1', '-1,2,3x', '-5\n=1']) {
+    for (const text of [
+      '-5+3',
+      '-5 USD',
+      '+',
+      '-$',
+      '-5%+1',
+      '-1,2,3x',
+      '-5\n=1',
+      '+44 20 7946 0958|cmd',
+      '-1!A1',
+      '+"1"',
+      "-'1'",
+      '-2*3',
+    ]) {
       const row = csv([{ a: text }], ['a'], { header: false }).replace(/^"|"$/g, '');
       expect(row.startsWith("'"), text).toBe(true);
     }

@@ -1,29 +1,12 @@
 /**
  * Budgets set in Settings take effect on a tool page: Hard stop with a tiny monthly limit blocks a run before
  * anything is sent. No built tool can start a run yet, so the spec starts one through the page's own core
- * (imported from /src, which only the dev server serves; see hooks.spec.ts). Run:
+ * (imported from /src, which only the dev server serves; see page-core.ts). Run:
  * `npm run e2e:dev -- tests/e2e/dev --project=chromium`.
  */
-import type { Page } from '@playwright/test';
-import type { CoreServices } from '../../../src/core/types';
-import { basePath } from '../../../vite-plugins/site.ts';
 import { expect, test } from '../../mock/index.ts';
 import { seedApp } from '../app.ts';
-
-declare global {
-  interface Window {
-    __core?: CoreServices;
-  }
-}
-
-async function exposeCore(page: Page): Promise<void> {
-  await page.evaluate(async (base) => {
-    const module = (await import(/* @vite-ignore */ `${base}src/core/index.ts`)) as {
-      getCore: () => CoreServices;
-    };
-    window.__core = module.getCore();
-  }, basePath());
-}
+import { openWithCore } from './page-core.ts';
 
 test('Hard stop and a tiny monthly limit set in Settings block a run on a tool page', async ({
   page,
@@ -40,9 +23,7 @@ test('Hard stop and a tiny monthly limit set in Settings block a run on a tool p
     '$0.00 of $0.01 · $0.01 left',
   );
 
-  await page.goto('tools/chat/');
-  await expect(page.getByTestId('page-title')).toHaveText('Chat');
-  await exposeCore(page);
+  await openWithCore(page, 'tools/chat/', 'Chat');
   const result = await page.evaluate(async () => {
     try {
       await window.__core!.runs.begin({

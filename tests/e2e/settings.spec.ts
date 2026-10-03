@@ -202,14 +202,41 @@ test.describe('keys', () => {
     expect(await page.content()).not.toContain(TEST_API_KEY);
     expect(problems).toEqual([]);
 
-    // Refresh asks OpenRouter again; a failure is shown in place.
+    // Refresh asks OpenRouter again; a failure keeps the balance on show and says why.
     const before = mock.calls('/api/v1/key').length;
     mock.error('/api/v1/key', 401);
     await row.getByTestId('key-refresh').click();
+    await expect(row.getByTestId('key-balance-stale')).toContainText(
+      'OpenRouter rejected this key',
+    );
+    await expect(row.getByTestId('key-usage')).toHaveText('$1.25');
+    expect(mock.calls('/api/v1/key').length).toBe(before + 1);
+  });
+
+  test('a change to the keys does not ask OpenRouter for a balance again', async ({
+    page,
+    context,
+    mock,
+  }) => {
+    // A failure is not cached by the core, so asking again would reach the network.
+    mock.error('/api/v1/key', 401);
+    await seedApp(context, { key: true });
+    await page.goto('settings/#keys');
+    const row = page.getByTestId('key-row');
     await expect(row.getByTestId('key-balance-error')).toContainText(
       'OpenRouter rejected this key',
     );
-    expect(mock.calls('/api/v1/key').length).toBe(before + 1);
+    const asked = page
+      .waitForRequest((request) => request.url().endsWith('/api/v1/key'), { timeout: 1000 })
+      .then(
+        () => true,
+        () => false,
+      );
+    // Every keys change re-renders the section.
+    await row.getByTestId('key-no-retention').check();
+    await expect(row.getByTestId('key-no-retention')).toBeChecked();
+    expect(await asked).toBe(false);
+    await expect(row.getByTestId('key-balance-error')).toBeVisible();
   });
 
   test('make default, rename, and remove with Undo (settings that pointed at it come back)', async ({
@@ -874,10 +901,11 @@ test.describe('review fixes', () => {
     await expect(page.getByTestId('key-usage')).toHaveText('$1.25');
     expect(await focusedTestId(page)).toBe('key-refresh');
 
-    // A failed forced refresh never says "updated".
+    // A failed forced refresh never says "updated" (and keeps the balance on show).
     mock.error('/api/v1/key', 401, undefined, { method: 'GET' });
     await page.keyboard.press('Enter');
-    await expect(page.getByTestId('key-balance-error')).toBeVisible();
+    await expect(page.getByTestId('key-balance-stale')).toBeVisible();
+    await expect(page.getByTestId('key-usage')).toHaveText('$1.25');
     await expect(page.getByTestId('announcer-polite')).toHaveText(
       'The balance of Test key could not be checked.',
     );

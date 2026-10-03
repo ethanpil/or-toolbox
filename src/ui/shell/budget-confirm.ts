@@ -5,6 +5,7 @@
  * as a quiet stop. Parallel runs of one group share one dialog; following a link in it declines first.
  */
 import { getCore } from '../../core/index';
+import { paidAddons, withAddons } from '../../core/runs/addons';
 import type { BudgetCheck, BudgetReason, RunSpec } from '../../core/types';
 import { getTool } from '../../tools/registry';
 import { h } from '../dom';
@@ -77,7 +78,14 @@ function askToConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
         h(
           'dd',
           { class: 'col-8 mb-1', 'data-testid': 'budget-estimate' },
-          formatEstimate(spec.estimateUsd ?? null),
+          formatEstimate(withAddons(spec.estimateUsd ?? null, spec.addons ?? [])),
+          paidAddons(spec.addons ?? []).map((addon) =>
+            h(
+              'div',
+              { class: 'small text-body-secondary' },
+              `Includes ${addon.label}: ${formatEstimate(addon.estimateUsd)}`,
+            ),
+          ),
         ),
         h('dt', { class: 'col-4 fw-normal text-body-secondary' }, 'Tool'),
         h('dd', { class: 'col-8 mb-1' }, getTool(spec.tool).name),

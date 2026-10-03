@@ -53,9 +53,10 @@ export interface DelimitedOptions {
    * `-`, `@`, tab or carriage return as a formula (`=HYPERLINK(...)`, DDE).
    * With this on, such a text cell gets a leading apostrophe, so the
    * spreadsheet shows it instead of running it. Cells that are plain numbers
-   * (`-5`, `+1,234.56`, `-$5.00`, `5%`) are left alone, and so are numbers
-   * that are not text. Default true; turn it off for data you trust, to write
-   * values exactly as they are.
+   * (`-5`, `+1,234.56`, `-$5.00`, `5%`) are left alone, and so are phone-like
+   * codes made only of digits, spaces, brackets, dots, slashes and dashes
+   * (`+44 20 7946 0958`), and numbers that are not text. Default true; turn it
+   * off for data you trust, to write values exactly as they are.
    */
   formulaSafe?: boolean;
 }
@@ -115,9 +116,18 @@ const FORMULA_START = /^[=+\-@\t\r]/;
 const WRITTEN_NUMBER =
   /^[+-]? ?[$€£¥]? ?(?=\.?\d)(?:\d{1,3}(?:,\d{3})+|\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?%?$/;
 
-/** Prefixes an apostrophe to text a spreadsheet would run, unless it is just a number. */
+/**
+ * Digits with spaces, brackets, dots, slashes and dashes after an optional sign: phone numbers such as
+ * "+44 20 7946 0958" and codes like "-0 12/34". A spreadsheet may read some as arithmetic, but without letters,
+ * quotes, `|`, `!` or `@` they cannot call a function, reach another cell or start a program, so they are written
+ * as they are rather than with an apostrophe the reader would see.
+ */
+const DIGITS_ONLY = /^[+-]?[\d\s()./-]+$/;
+
+/** Prefixes an apostrophe to text a spreadsheet would run, unless it is a number or a phone-like code. */
 function defuseFormula(text: string): string {
-  return FORMULA_START.test(text) && !WRITTEN_NUMBER.test(text) ? `'${text}` : text;
+  const harmless = WRITTEN_NUMBER.test(text) || DIGITS_ONLY.test(text);
+  return FORMULA_START.test(text) && !harmless ? `'${text}` : text;
 }
 
 /**

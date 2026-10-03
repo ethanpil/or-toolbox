@@ -17,7 +17,11 @@ import type { CoreServices, KeyInfo, KeyStatus, StatsRow } from '../core/types';
 import { findTool } from '../tools/registry';
 import { dataTable } from '../ui/components/data-table';
 import { emptyState } from '../ui/components/empty-state';
-import { accountFreeDaily, keyBalanceView } from '../ui/components/key-balance';
+import {
+  accountFreeDaily,
+  keyBalanceView,
+  type KeyBalanceView,
+} from '../ui/components/key-balance';
 import { keyDot } from '../ui/components/key-picker';
 import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
@@ -360,6 +364,11 @@ class StatsPage {
   private generation = 0;
   private readonly reloadSoon = debounce(() => void this.reload(), 250);
   private budgetGeneration = 0;
+  /**
+   * One balance view per key, kept across re-renders (range, ledger, keys and budget changes), so a balance is
+   * asked for once, not on every render.
+   */
+  private readonly balances = new Map<string, KeyBalanceView>();
 
   private readonly presetButtons = new Map<RangePreset, HTMLButtonElement>();
   private readonly rangeLabelNode = h('span', {
@@ -1159,6 +1168,8 @@ class StatsPage {
     const mine = ++this.budgetGeneration;
     const keys = this.core.keys.list();
     const settings = this.core.settings.get();
+    for (const id of [...this.balances.keys()])
+      if (!keys.some((key) => key.id === id)) this.balances.delete(id);
 
     const monthCard = h('div', { class: 'col-12 col-lg-6' });
     const freeCard = h('div', { class: 'col-12 col-lg-6' });
@@ -1441,8 +1452,12 @@ class StatsPage {
       );
     };
     const row = (key: KeyInfo): HTMLElement => {
-      const balance = keyBalanceView(this.core, key, { compact: true });
-      balance.load();
+      let balance = this.balances.get(key.id);
+      if (!balance) {
+        balance = keyBalanceView(this.core, key, { compact: true });
+        this.balances.set(key.id, balance);
+      }
+      balance.loadMissing();
       return h(
         'tr',
         { 'data-testid': 'budget-key-row' },

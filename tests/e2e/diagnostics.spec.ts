@@ -27,6 +27,10 @@ test('reports the environment', async ({ page }, testInfo) => {
     'data-value',
     new URL(page.url()).pathname.replace(/diagnostics\/$/, ''),
   );
+  // Always MB with one decimal, so readings taken at different times compare.
+  await expect(page.getByTestId('diag-storage')).toHaveText(
+    /^(\d+\.\d MB of \d+\.\d MB|Not reported by this browser)$/,
+  );
   expect(problems).toEqual([]);
 });
 

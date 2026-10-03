@@ -1,5 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
-import { append, clear, h, isSafeUrl, on, onReplaceRemove, replace, type Props } from './dom';
+import {
+  append,
+  clear,
+  focusedKey,
+  focusKey,
+  h,
+  isSafeUrl,
+  on,
+  onReplaceRemove,
+  replace,
+  replaceWith,
+  type Props,
+} from './dom';
 
 /** Calls h() with props the types forbid, to test the runtime guards. */
 const unsafe = (tag: string, props: Record<string, unknown>) =>
@@ -262,6 +274,77 @@ describe('replace', () => {
     expect(document.activeElement).toBe(outside);
     outside.remove();
     el.remove();
+  });
+
+  it('falls back to the nearest enabled keyed control when the successor is disabled or gone', () => {
+    const row = (keys: string[], disabled: string[] = []) =>
+      keys.map((key) =>
+        h(
+          'button',
+          { type: 'button', 'data-focus-key': key, disabled: disabled.includes(key) },
+          key,
+        ),
+      );
+    const el = h('div', null, row(['a', 'b', 'c', 'd']));
+    document.body.append(el);
+    (el.querySelector('[data-focus-key="b"]') as HTMLElement).focus();
+    replace(el, row(['a', 'b', 'c', 'd'], ['b'])); // disabled now: the next one after it
+    expect(document.activeElement?.getAttribute('data-focus-key')).toBe('c');
+    replace(el, row(['a', 'b', 'd'])); // gone: the following one that is left
+    expect(document.activeElement?.getAttribute('data-focus-key')).toBe('d');
+    replace(el, row(['a', 'b'])); // nothing after it: the one before
+    expect(document.activeElement?.getAttribute('data-focus-key')).toBe('b');
+    replace(el, h('p', null, 'Empty'), h('a', { href: '#x' }, 'Add one')); // no keys: the first focusable
+    expect(document.activeElement?.textContent).toBe('Add one');
+    el.remove();
+  });
+
+  it('lets the caller choose where focus goes when the successor is gone', () => {
+    const heading = h('h2', { tabIndex: -1 }, 'Keys');
+    const el = h('div', null, [
+      h('button', { type: 'button', 'data-focus-key': 'key:a:remove' }, 'Remove A'),
+      h('button', { type: 'button', 'data-focus-key': 'key:b:remove' }, 'Remove B'),
+    ]);
+    document.body.append(heading, el);
+    (el.firstElementChild as HTMLElement).focus();
+    const lost: string[] = [];
+    replaceWith(
+      el,
+      [h('button', { type: 'button', 'data-focus-key': 'key:b:remove' }, 'Remove B')],
+      {
+        fallback: (key) => {
+          lost.push(key);
+          return heading;
+        },
+      },
+    );
+    expect(lost).toEqual(['key:a:remove']);
+    expect(document.activeElement).toBe(heading);
+    heading.remove();
+    el.remove();
+  });
+
+  it('focusKey and focusedKey cover single-node swaps', () => {
+    const card = h(
+      'div',
+      null,
+      h('button', { type: 'button', 'data-focus-key': 'retry:"1"' }, 'Retry'),
+    );
+    document.body.append(card);
+    expect(focusedKey(card)).toBeNull();
+    (card.firstElementChild as HTMLElement).focus();
+    const key = focusedKey(card);
+    expect(key).toBe('retry:"1"');
+    const fresh = h(
+      'div',
+      null,
+      h('button', { type: 'button', 'data-focus-key': 'retry:"1"' }, 'Retry'),
+    );
+    card.replaceWith(fresh);
+    expect(focusKey(fresh, key!)).toBe(true);
+    expect(document.activeElement?.parentElement).toBe(fresh);
+    expect(focusKey(fresh, 'missing')).toBe(false);
+    fresh.remove();
   });
 
   it('runs removal hooks for every dropped child', () => {

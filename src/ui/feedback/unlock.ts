@@ -63,21 +63,35 @@ function show(): Promise<boolean> {
     error,
   );
 
+  /**
+   * The message on show. As in `numberField`, it is announced once each time it changes: an error stays until
+   * the passphrase is edited, so submitting the same passphrase again does not announce it again. Errors move
+   * the focus to the field, which reads the message with it (`setFieldError`'s `focus`).
+   */
+  let shown: string | null = null;
+  const showError = (message: string | null): void => {
+    if (message === shown) {
+      if (message !== null) input.focus();
+      return;
+    }
+    shown = message;
+    setFieldError(input, error, message, { focus: message !== null });
+  };
+  input.addEventListener('input', () => showError(null));
+
   const attempt = async (): Promise<void> => {
     if (!input.value) {
-      setFieldError(input, error, 'Enter your passphrase.');
-      input.focus();
+      showError('Enter your passphrase.');
       return;
     }
     submit.disabled = true;
-    setFieldError(input, error, null);
     let ok: boolean;
     try {
       ok = await lock.unlock(input.value);
     } catch (failure) {
       // Not a wrong passphrase: storage, crypto or a keys file changed in another tab.
       submit.disabled = false;
-      setFieldError(input, error, `Could not unlock: ${userMessage(failure)}`);
+      showError(`Could not unlock: ${userMessage(failure)}`);
       return;
     }
     submit.disabled = false;
@@ -86,7 +100,7 @@ function show(): Promise<boolean> {
       modal.hide();
       return;
     }
-    setFieldError(input, error, 'Wrong passphrase. Try again.');
+    showError('Wrong passphrase. Try again.');
     input.select();
   };
 
