@@ -18,6 +18,7 @@ interface ToolInstance {
   getState(): ToolSnapshot;                     // { prompt: string; settings: Record<string, unknown> }
   applyState(state: ToolSnapshot): void;         // must reproduce exactly what getState() returned
   estimate?(model: string): Promise<number | null>; // cost of the current input on `model` (see Cost estimates)
+  addons?(): readonly RunAddon[];                // paid extras besides the model, e.g. a PDF parser (see Paid add-ons)
   onFiles?(files: File[]): void;                 // page-wide drop and paste, filtered by manifest.accepts
   onReceive?(items: SendItem[]): void;           // "Send to…" from another tool, filtered by manifest.accepts
   sample?(): void | Promise<void>;               // ?sample=1 and onboarding's "Try a sample"
@@ -48,7 +49,7 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `ui` | The zones and helpers below. |
 | `model(cap?)` | `ResolvedModel` for a capability (default: the primary one, `capabilities[0]`), with free-only applied. `model === null` means nothing may run; for the primary capability the framework already shows the notice and disables Run. See Models per capability. |
 | `modelOverride` | `?model=` or null. |
-| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (default `ctx.model().model`), `prompt` and `settings` (from your `getState()`), `estimateUsd` (default: the header's current estimate, recomputed first if the input changed since), and aborts the run when `signal` aborts. |
+| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (default `ctx.model().model`), `prompt` and `settings` (from your `getState()`), `estimateUsd` (default: the header's current estimate, recomputed first if the input changed since), `addons` (default: your `addons()`), and aborts the run when `signal` aborts. Call it **before** changing any tool state (see Refused runs change nothing). |
 
 ### Models per capability
 
@@ -61,7 +62,7 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `input`, `output` | The two zone bodies (`.card-body`). Input is left on wide screens, output right; they stack on narrow ones. |
 | `drawer` | Body of the Settings offcanvas. Put everyday options here. |
 | `advanced(title)` | Adds a collapsed accordion section at the end of the drawer and returns its body. |
-| `runner({ label, icon, run, hint, container })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter. Returns `Runner` (`trigger`, `stop`, `setDisabled(reason)`, `busy`). |
+| `runner<A>({ label, icon, run(signal, arg?), hint, container })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter. Returns `Runner<A>`: `trigger(arg?)` (see Runner arguments), `stop()`, `setDisabled(reason)`, `busy`, `disabledReason`, `subscribe(fn)`. |
 | `refreshEstimate()` | Recomputes the estimate through `ToolInstance.estimate` and shows it; resolves with the value. Call it when the input changes. |
 | `setEstimate(usd \| null, note?)` | Sets the badge directly (`≈ $0.0012`, `Free` for 0, `Unknown` for null), for tools without `estimate`. |
 | `status(text)` | A short, politely announced status in the output header ("Page 3 of 20"). |
@@ -98,7 +99,74 @@ Outside the runner (reading a dropped file, an export, a button of your own), ca
 
 `beginRun` (via `runs.begin`) refuses before anything is sent: no key (`no-key`), locked keys (`locked`), free-only with a paid model (`free-only`), a hard budget (`budget-blocked`). In Warn mode, or above the per-run threshold, the shell's **budget confirmation** opens by itself (one dialog for parallel runs of one `groupId`); Cancel throws `RunCancelledError`. You never handle any of this yourself: throw, and the rule above applies.
 
-Long runs: `run.checkpoint({ output })` persists partial text (bot transcripts, batches). Parallel runs of one action share a `groupId` (arena contenders). A run that calls several models lists them in `models` so free-only checks them all.
+Long runs: `run.checkpoint({ output })` persists partial text (bot transcripts, batches), throttled to one write per interval. Pass `output` as a function (`run.checkpoint({ output: () => combined() })`) when building the text is costly: it is called only when a write actually happens (and once more by `finish()` without an output). Parallel runs of one action share a `groupId` (arena contenders). A run that calls several models lists them in `models` so free-only checks them all.
+
+### Refused runs change nothing
+
+`beginRun` may refuse (no key, locked, free-only, budget, Cancel in the confirmation) before anything is sent. So read the form and plan first, call `beginRun`, and only then reset results, mark items queued or start the output panel. A refused run then leaves the page exactly as it was (the previous results stay):
+
+```ts
+run: async (signal) => {
+  const plan = planPages();                       // reads the form; changes nothing
+  if (plan.length === 0) return ui.status('Choose at least one page.');
+  const run = await ctx.beginRun({ title: batchTitle(plan.map((p) => p.fileName)) }, signal);
+  results = plan.map(toQueuedResult);             // only now: the run is on
+  output.start();
+  // …
+},
+```
+
+### Runner arguments and per-item Retry
+
+`ui.runner<A>({ run: (signal, arg) => … })` takes an optional argument through `runner.trigger(arg)`, and the error toast's Retry replays the **same** argument. Use it for "retry these items" instead of a variable set before `trigger()`. `trigger()` answers at once whether it started (`.started` is false while busy or disabled; nothing happened then) and settles when the run is over. Keep a tool's own Retry buttons in step with the runner through `subscribe`:
+
+```ts
+const runner = ui.runner<string[] | undefined>({ label: 'Read', run: (signal, keys) => read(signal, keys) });
+const retry = (keys: string[]) => runner.trigger(keys);           // .started === false: busy or disabled
+runner.subscribe(({ busy, disabledReason }) => {
+  for (const button of retryButtons()) button.disabled = busy || disabledReason !== null;
+});
+```
+
+### Batches: `runItems`
+
+**Every batch tool (pages, documents, segments, images) works through its items with `runItems()`** (`src/ui/tool/batch.ts`, built on `runPool`) inside one run, so statuses, stopping and error reporting are the same everywhere:
+
+```ts
+const run = await ctx.beginRun({ title: batchTitle(names, { retry: keys !== undefined }) }, signal);
+try {
+  const result = await runItems({
+    items: plan,
+    concurrency: 3,
+    signal: run.signal,
+    work: (page, signal) => readPage(run, page, signal),   // return the item's value; throw on failure
+    onItem: (outcome) => draw(outcome),                     // queued → running → done | failed | stopped
+  });
+  await run.finish({ output: combined() });
+  ui.status(batchSummary(result, 'page'));                  // "Done · 3 of 4 pages; 1 failed"
+} catch (error) {
+  await run.fail(error);
+  throw error;
+}
+```
+
+- A failed item does not stop the others; a fatal error (`isFatalError`: no key, locked, invalid key, budget, free-only, storage full, HTTP 401/402) stops scheduling, marks the rest `stopped` and is rethrown for the runner to present.
+- Stop: nothing new starts, running items settle, the abort reason is rethrown (silent, as always).
+- Every item failed: the last error is rethrown already marked as shown (each item shows its own), so the runner stays quiet but the run is still recorded as failed.
+- `batchTitle(names, { retry, noun })` names the run: "Retry: a.pdf and 2 more files".
+
+### Paid add-ons
+
+Some requests cost money besides the model's tokens, even on a free model: OpenRouter's Mistral OCR PDF parser bills per page. Declare such extras with the instance's `addons()` hook (cheap and synchronous); keep them **out** of `estimate`. The framework adds them to the header badge and passes them to `beginRun`, where free-only mode refuses a paid one (`FreeOnlyError` names it), budgets and the reservation include its estimate, and the run no longer counts as free. The PDF engines live in one table, `src/core/models/pdf-engines.ts` (`PDF_ENGINES`, `pdfEngine(id)`, `isPdfEngineId`):
+
+```ts
+addons: () => {
+  const addon = pdfEngineAddon(engine.value as PdfEngineId, pdfPagesSelected());
+  return addon ? [addon] : [];          // null for cloudflare-ai (free) and native (billed as tokens)
+},
+```
+
+A run can also pass `addons` (`RunSpec.addons: { id, label, estimateUsd }[]`) itself, e.g. a retry that reads only some pages.
 
 ### Streaming into the output panel
 
@@ -118,6 +186,14 @@ output.finish();                                   // final render, "Done · 245
 ```
 
 Streaming stays cheap on long answers: blocks that are complete (up to the last blank line outside a code fence) are rendered once; only the unfinished tail is re-rendered, paced by how long rendering takes. The streamed text itself is never a live region (it would read every token); start, finish and Stop are announced.
+
+Tools with their own layout (chat bubbles, bot turns, arena columns) stream with the same renderer, without the panel's chrome: `streamMarkdown(target, { format?, caret?, after?, onRender? })` (`src/ui/components/stream-markdown.ts`) returns `{ append(chunk), set(text), text(), finish(), dispose() }`. Nothing touches `target` before the first chunk or after `dispose()`; `await finish()` resolves when the final render is on screen.
+
+```ts
+const stream = streamMarkdown(bubble, { onRender: () => scrollToEnd() });
+await ctx.api.chatStream(body, { run, onEvent: (e) => e.type === 'text' && stream.append(e.text) });
+await stream.finish();
+```
 
 ## Cost estimates
 
@@ -141,7 +217,7 @@ card.append(imageViewer({ src: ctx.results.objectUrl(handle.result.id), alt: 'Pr
 
 `handle.button()` downloads and turns into "Downloaded"; it stops listening when it leaves the page or the result is removed, so re-rendering a list of results leaks nothing. Until a result is downloaded, leaving through a link asks first (listing "3 images and 1 video not downloaded", with Download all), and reloading or closing the tab triggers the browser's own prompt. Call `handle.remove()` when the user discards a result.
 
-For text and table exports use `exportMenu({ filename, formats, resultIds })`, where `resultIds: () => readonly string[]` is read at click time: each format's Blob is built only when chosen (`toCsv`, `toXlsx`, `toDocx`, `zipFiles`, `toSrt`… from `src/core/export`), and the listed results are marked downloaded.
+For text and table exports use `exportMenu({ filename, formats, resultIds })`, where `resultIds: () => readonly string[]` is read at click time: each format's Blob is built only when chosen (`toCsv`, `toXlsx`, `toDocx`, `zipFiles`, `toSrt`… from `src/core/export`), and the listed results are marked downloaded. Build it once and change it with `menu.update(formats)` or `menu.update({ formats, disabled })`: the menu stays in place, so one the user has open stays open.
 
 ## Jobs (long remote work)
 
@@ -228,12 +304,13 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 | Component | Use it for |
 | --- | --- |
 | `dropZone(options)` | File input target (drag, keyboard, accept filter). |
-| `documentInput(options)` | Images and PDFs with thumbnails and page choice (`1-3, 7`, tile toggles); `selection()` lists pages, `loadPage(ref)` renders one for upload (`{ fileName, pageNumber, imageDataUrl, text? }`), `pageImage`/`reveal` show the source. Pair with `runPool()` (`src/core/pool.ts`) for per-page requests. |
+| `documentInput(options)` | Images and PDFs with thumbnails and page choice (`1-3, 7`, tile toggles); `selection()` lists pages, `loadPage(ref)` renders one for upload (`{ fileName, pageNumber, imageDataUrl, text? }`), `pageImage`/`reveal` show the source. Pair with `runItems()` for per-page requests. |
 | `modelPicker(ctx, { capability, selected })` → `Promise<string \| null>` | Extra model choices (arena contenders, bot B, a secondary capability). The header chip covers the primary capability only. |
 | `keyPicker({ keys, value, onChange, focusKey? })` | A key choice beyond the header's. |
 | `costBadge(usd?, note?)` | An estimate pill for a sub-part (e.g. per sequence step). |
 | `outputPanel(options)` | Streaming text or Markdown with Copy, Download, Send to…. |
-| `exportMenu({ filename, formats, resultIds })` | Lazily built downloads in several formats. |
+| `streamMarkdown(target, options)` | The output panel's streaming renderer without the panel, for custom layouts. |
+| `exportMenu({ filename, formats, resultIds })` | Lazily built downloads in several formats; `update(…)` changes it in place. |
 | `imageViewer({ src \| blob, alt })` | Fit/zoom, checkerboard behind transparency. |
 | `audioPlayer({ src \| blob, peaks?, label })` | Native controls plus a waveform (`peaks()` from `src/core/media/audio`, or decoded lazily at 8 kHz mono; none beyond 30 minutes). |
 | `videoPlayer({ src \| blob, label })` | Native controls in a letterboxed frame. |
@@ -243,7 +320,7 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 
 Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` (a toast with an action stays until dismissed), `confirmDialog`, `typedConfirm({ phrase })` (destructive data actions), `promptDialog`, `unlockDialog()`, `presentError(error, { retry })`, `announce(text)`, `setFieldError(input, feedback, message | null)` (field validation: `is-invalid`, `aria-invalid`, `aria-describedby`, announced), and `openModal(options)` for anything custom (one modal at a time, later ones queue; await `closed`). Formatting: `src/ui/format.ts` (`formatUsd`, `formatEstimate`, `formatTokens`, `formatMs`, `formatBytes`, `formatDuration`, `formatRelativeTime`, `formatModelPrice`, `plural`). Links: `src/ui/shell/links.ts` (`toolUrl`, `settingsUrl(section)`, `historyUrl`, `modelsUrl`).
 
-**Re-rendering a list** (results, saved items, chips): give each focusable control a stable `data-focus-key` (for example `` `remove:${item.id}` ``) and swap the children with `replace(container, ...children)` from `src/ui/dom.ts`. Focus moves to the new element with the same key, and Bootstrap dropdowns, collapses and toasts inside the old children are disposed. Never key focus on `data-testid`.
+**Re-rendering a list** (results, saved items, chips): give each focusable control a stable `data-focus-key` (for example `` `remove:${item.id}` ``) and swap the children with `replace(container, ...children)` from `src/ui/dom.ts`. Focus moves to the new element with the same key; when that one is gone or disabled (a Retry button while busy), to the nearest keyed control that can take focus, else to the first focusable element in the container. Bootstrap dropdowns, collapses and toasts inside the old children are disposed. For a single node you swap yourself: `const key = focusedKey(card); card.replaceWith(next); if (key) focusKey(next, key);`. Never key focus on `data-testid`, and better still, update a control in place (attributes, text) when only its state changes.
 
 ## Media and heavy libraries
 
@@ -454,7 +531,7 @@ mountTool(getTool('chat'), setup);
 1. Write `setup` in `src/tools/<id>/` (split into modules as it grows); keep `main.ts` to the `mountTool` call, and the manifest's `accepts`, `capabilities` (primary first) and `lazyLibs` true to what the tool does.
 2. Remove the `comingSoon` import from your `main.ts`. When the last tool is done, delete `src/ui/tool/coming-soon.ts`.
 3. Main prompt field: `data-testid="tool-prompt"`. Implement `getState`/`applyState` (exact round trip), `estimate` (and call `ui.refreshEstimate()` on input changes), `sample()` (onboarding offers it), and `onFiles`/`onReceive` if the manifest accepts anything.
-4. Follow the error rule: `output.fail(error)` / `run.fail(error)` / rethrow; `presentError` outside the runner.
+4. Follow the error rule: `output.fail(error)` / `run.fail(error)` / rethrow; `presentError` outside the runner. Call `beginRun` before touching tool state; batches go through `runItems`, per-item Retry through `runner.trigger(arg)`, paid extras (the PDF parser) through `addons()`.
 5. Media: lazy imports, `stitchAudio`, `isolateImage`, `zipFiles`/`zipSync`, explicit ffmpeg `-threads`; stay inside the 80 KB budget.
 6. Tests: unit tests for the pipeline and the tool through `createToolTestContext`, and an e2e spec against the mock (run, error, Stop, files, prompts round trip).
 7. Check the page in both themes at 320 px and on a desktop, with the keyboard only.

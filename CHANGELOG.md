@@ -42,6 +42,7 @@ All notable changes to this project are documented here. The format follows
 - Data extractor: visual schema builder with five presets and saved schemas, batch extraction with strict structured outputs (JSON mode and one repair otherwise), editable review grid, JSON, CSV and XLSX exports (a83381c).
 - Table extractor: tables and charts per page into editable grids with merge across pages; CSV, ZIP, XLSX and Markdown exports, copy as TSV (25d06e2).
 - Stage 3 e2e gates for the document tools, a 20-page PDF fixture with its generator, and `mock.respond()` for request-dependent mocks.
+- Framework for batch and multi-model tools: `runner.trigger(arg)` with Retry replaying the argument, `runItems()` batches, `RunSpec.addons` and `ToolInstance.addons()` for paid extras with one PDF engine table, `run.checkpoint({ output: () => text })`, `streamMarkdown()`, `exportMenu().update()`, `focusKey()`/`focusedKey()` and `replaceWith()` (08eb65c, cac4ab0, a60a24a, 7bcb412).
 - Chat tool: branching threads (edit and regenerate keep the old branch, ‹ 1/3 ›), per-chat model switch, fallback models, image/PDF/audio/text attachments, system prompt presets, reasoning effort, streamed Markdown replies with tokens, cost and latency, context trimming, Markdown and JSON export, thread search, rename and delete with Undo (b820a75, 90fa95b, fef8d74).
 
 ### Changed
@@ -57,6 +58,8 @@ All notable changes to this project are documented here. The format follows
 - One modal at a time (queued), toasts with actions never auto-hide, `setFieldError()` for field errors (1db3bfd); re-renders keep focus through `data-focus-key` (20bdddc).
 - Platform pages share small helpers instead of per-page copies (star button, data table, key balance view, `loadInto`, `copyWithToast`, `saveSettings`, `formatInt`/`formatDate`, `debounce`, one `CAPABILITY_INFO`); Settings builds a section when first shown; model search is debounced with cached normalised fields; `/` and Ctrl/Cmd+K respect dialogs and fields (b4948b5, 240f925, 78749a9).
 - `exportMenu` formats may set their own file name (6d07e24).
+- `replace()` falls back to the nearest keyed control when the focused one is gone or disabled; `documentInput` updates page tiles in place and opens each added PDF once (a60a24a).
+- CSV/TSV keep phone-like values (`+44 20 7946 0958`) as written (c6d74d2).
 - File types: untyped source files (`.py`, `.yaml`, `.js`…) get `text/x-*` types, so `text/*` tools take them (5afda1e).
 
 ### Fixed
@@ -68,6 +71,7 @@ All notable changes to this project are documented here. The format follows
 
 - Stage 1 review: orphaned runs, double-booked and lost spend, retried paid POSTs, OAuth while locked, stale unlock sessions, non-atomic backup import, CSV formula injection, invalid XLSX/DOCX output, WAV/MP3/video edge cases.
 - Stage 2 review, shared parts: orphans that sent nothing no longer book their reservation, Undo never restores a running run (5072110); duplicate budget and add-key dialogs, offcanvas focus trap lost under a dialog (1db3bfd); accent contrast on cards and canvas, weak dark-mode focus border (9f3d343); stalled streaming, leaking result buttons, waveform memory, stray drops leaving the page (9760b10); inaccurate privacy copy, stale Home state (9f0ce68).
+- Stage 2 polish regressions: History drawer keeps focus on Output/Prompt; key balances load once and survive a failed refresh; the free counter asks only the default key; failed History and Home searches show the error; passphrase errors are announced once; Diagnostics storage in MB; dev specs use the page's own core at default timeouts (7cfa6a8).
 
 ### Removed
 
