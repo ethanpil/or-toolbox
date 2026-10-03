@@ -6,15 +6,13 @@
  *
  * With the passphrase lock on and this tab locked, nothing is consumed: the page asks for the passphrase,
  * unlocks, and then connects with the same code (the query stays until then, so a reload still works).
- * Functional markup only; Stage 2 restyles it.
  */
-import { boot } from '../core/boot';
 import { errorCode, userMessage } from '../core/errors';
-import { getCore } from '../core/index';
 import { url } from '../core/paths';
 import type { KeyLock, OAuthService } from '../core/types';
 import { h } from '../ui/dom';
-import { renderStubPage } from '../ui/stub';
+import { icon } from '../ui/icon';
+import { mountPage } from '../ui/shell/index';
 
 export interface AuthCallbackEnv {
   oauth: Pick<OAuthService, 'start' | 'complete'>;
@@ -30,8 +28,8 @@ export interface AuthCallbackEnv {
 function progress(text: string): HTMLElement {
   return h(
     'p',
-    { class: 'd-flex align-items-center gap-2' },
-    h('span', { class: 'spinner-border spinner-border-sm', 'aria-hidden': 'true' }),
+    { class: 'd-flex align-items-center gap-3 mb-0 fs-5' },
+    h('span', { class: 'spinner-border text-primary', 'aria-hidden': 'true' }),
     text,
   );
 }
@@ -57,15 +55,20 @@ function showError(status: HTMLElement, env: AuthCallbackEnv, error: unknown): v
   status.replaceChildren(
     h(
       'div',
-      { class: 'alert alert-danger', 'data-testid': 'auth-error' },
-      h('p', { class: 'fw-semibold' }, 'Could not connect to OpenRouter.'),
-      message,
+      { class: 'alert alert-danger d-flex gap-3', 'data-testid': 'auth-error' },
+      icon('x-octagon-fill', 'fs-4 lh-1'),
+      h(
+        'div',
+        null,
+        h('p', { class: 'fw-semibold mb-1' }, 'Could not connect to OpenRouter.'),
+        message,
+      ),
     ),
     h(
       'div',
-      { class: 'd-flex gap-2' },
+      { class: 'd-flex flex-wrap gap-2' },
       retry,
-      h('a', { class: 'btn btn-secondary', href: url('settings/') }, 'Back to Settings'),
+      h('a', { class: 'btn btn-outline-secondary', href: url('settings/') }, 'Back to Settings'),
     ),
   );
 }
@@ -130,8 +133,13 @@ async function connect(
     status.replaceChildren(
       h(
         'div',
-        { class: 'alert alert-success', 'data-testid': 'auth-success' },
-        `Connected. The key “${key.name}” (${key.masked}) is saved. Taking you back…`,
+        { class: 'alert alert-success d-flex gap-3 mb-0', 'data-testid': 'auth-success' },
+        icon('check-circle-fill', 'fs-4 lh-1'),
+        h(
+          'div',
+          null,
+          `Connected. The key “${key.name}” (${key.masked}) is saved. Taking you back…`,
+        ),
       ),
     );
     env.redirect(returnTo ?? url('settings/'));
@@ -153,15 +161,29 @@ export async function mountAuthCallback(status: HTMLElement, env: AuthCallbackEn
 }
 
 if (document.getElementById('app')) {
-  boot();
-  const status = h('div', { role: 'status', 'aria-live': 'polite', 'data-testid': 'auth-status' });
-  renderStubPage('Signing in', status);
-  const core = getCore();
-  void mountAuthCallback(status, {
-    oauth: core.oauth,
-    lock: core.keys.lock,
-    search: location.search,
-    clearQuery: () => history.replaceState(history.state, '', location.pathname),
-    redirect: (path) => location.replace(path),
-  });
+  mountPage(
+    {
+      title: 'Signing in',
+      icon: 'box-arrow-in-right',
+      lead: 'Connecting ORtoolbox to your OpenRouter account.',
+      narrow: true,
+    },
+    ({ core, main }) => {
+      const status = h('div', {
+        role: 'status',
+        'aria-live': 'polite',
+        'data-testid': 'auth-status',
+      });
+      main.append(
+        h('div', { class: 'card shadow-sm' }, h('div', { class: 'card-body p-4' }, status)),
+      );
+      void mountAuthCallback(status, {
+        oauth: core.oauth,
+        lock: core.keys.lock,
+        search: location.search,
+        clearQuery: () => history.replaceState(history.state, '', location.pathname),
+        redirect: (path) => location.replace(path),
+      });
+    },
+  );
 }

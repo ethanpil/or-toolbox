@@ -1,5 +1,14 @@
-import { boot } from '../core/boot';
-import { placeholder, renderStubPage } from '../ui/stub';
+import { mountPage } from '../ui/shell/index';
+import { comingNext } from './placeholder';
 
-boot();
-renderStubPage('Stats', placeholder('Stage 2'));
+mountPage(
+  {
+    title: 'Stats',
+    icon: 'bar-chart',
+    lead: 'Spend, requests and tokens, computed from this browser’s history.',
+    nav: 'stats',
+  },
+  ({ main }) => {
+    main.append(comingNext('bar-chart', 'Charts of spend, usage and budgets arrive here next.'));
+  },
+);

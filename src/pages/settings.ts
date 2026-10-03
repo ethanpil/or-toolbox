@@ -1,5 +1,19 @@
-import { boot } from '../core/boot';
-import { placeholder, renderStubPage } from '../ui/stub';
+import { mountPage } from '../ui/shell/index';
+import { comingNext } from './placeholder';
 
-boot();
-renderStubPage('Settings', placeholder('Stage 2'));
+mountPage(
+  {
+    title: 'Settings',
+    icon: 'gear',
+    lead: 'Keys, default models, budgets, appearance and your data.',
+    nav: 'settings',
+  },
+  ({ main }) => {
+    main.append(
+      comingNext(
+        'gear',
+        'Keys, default models, budgets, appearance, data and backup arrive here next.',
+      ),
+    );
+  },
+);

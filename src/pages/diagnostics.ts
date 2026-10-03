@@ -6,12 +6,11 @@
  * tests read it too, so every value has a `data-testid` and a machine-readable
  * `data-value`.
  */
-import { boot } from '../core/boot';
 import { type FfmpegDownloadProgress, loadFfmpeg } from '../core/media/ffmpeg';
 import { url } from '../core/paths';
 import { getServiceWorkerReport, type ServiceWorkerReport } from '../core/sw-register';
 import { clear, h } from '../ui/dom';
-import { renderStubPage } from '../ui/stub';
+import { mountPage } from '../ui/shell/index';
 
 // --- environment ------------------------------------------------------------
 
@@ -115,7 +114,7 @@ async function environmentRows(): Promise<Row[]> {
 function environmentTable(rows: Row[]): HTMLElement {
   return h(
     'table',
-    { class: 'table align-middle', 'data-testid': 'diag-environment' },
+    { class: 'table align-middle mb-0', 'data-testid': 'diag-environment' },
     h(
       'tbody',
       null,
@@ -312,56 +311,71 @@ function ffmpegPanel(): HTMLElement {
 
   return h(
     'section',
-    { 'aria-labelledby': 'ffmpeg-heading' },
-    h('h2', { class: 'h4 mt-4', id: 'ffmpeg-heading' }, 'ffmpeg test'),
-    h(
-      'p',
-      null,
-      'Downloads the ffmpeg core (about 32 MB, cached afterwards) and encodes a short test clip. ',
-      'The automatic choice is the multi-threaded core when this page is cross-origin isolated, ',
-      'and the single-threaded core otherwise.',
-    ),
+    { class: 'card shadow-sm', 'aria-labelledby': 'ffmpeg-heading' },
     h(
       'div',
-      { class: 'd-flex flex-wrap gap-2 mb-3' },
-      button('Run ffmpeg test', 'diag-ffmpeg-run', false),
-      button('Run with the single-threaded core', 'diag-ffmpeg-run-single', true),
-    ),
-    progress,
-    h(
-      'table',
-      { class: 'table align-middle' },
+      { class: 'card-body p-4' },
+      h('h2', { class: 'h5', id: 'ffmpeg-heading' }, 'ffmpeg test'),
       h(
-        'tbody',
-        { 'aria-live': 'polite' },
-        result('Result', status),
-        result('Core', core),
-        result('Load time', loadTime),
-        result('Encode time', runTime),
-        result('Output', output),
+        'p',
+        null,
+        'Downloads the ffmpeg core (about 32 MB, cached afterwards) and encodes a short test clip. ',
+        'The automatic choice is the multi-threaded core when this page is cross-origin isolated, ',
+        'and the single-threaded core otherwise.',
       ),
+      h(
+        'div',
+        { class: 'd-flex flex-wrap gap-2 mb-3' },
+        button('Run ffmpeg test', 'diag-ffmpeg-run', false),
+        button('Run with the single-threaded core', 'diag-ffmpeg-run-single', true),
+      ),
+      progress,
+      h(
+        'table',
+        { class: 'table align-middle' },
+        h(
+          'tbody',
+          { 'aria-live': 'polite' },
+          result('Result', status),
+          result('Core', core),
+          result('Load time', loadTime),
+          result('Encode time', runTime),
+          result('Output', output),
+        ),
+      ),
+      preview,
+      h('h3', { class: 'h6 mt-3' }, 'ffmpeg log'),
+      log,
     ),
-    preview,
-    h('h3', { class: 'h6 mt-3' }, 'ffmpeg log'),
-    log,
   );
 }
 
 // --- page -------------------------------------------------------------------
 
-boot({ isolation: 'required' });
-
 const environment = h('div', { 'data-testid': 'diag-environment-loading' }, 'Checking…');
-renderStubPage(
-  'Diagnostics',
-  h(
-    'p',
-    { class: 'lead' },
-    'What this browser supports on this site. Video joining is fastest when the page is cross-origin isolated.',
-  ),
-  h('h2', { class: 'h4' }, 'Environment'),
-  environment,
-  ffmpegPanel(),
+mountPage(
+  {
+    title: 'Diagnostics',
+    icon: 'activity',
+    lead: 'What this browser supports on this site. Video joining is fastest when the page is cross-origin isolated.',
+    nav: 'diagnostics',
+    isolation: 'required',
+  },
+  ({ main }) => {
+    main.append(
+      h(
+        'section',
+        { class: 'card shadow-sm mb-4', 'aria-labelledby': 'environment-heading' },
+        h(
+          'div',
+          { class: 'card-body p-4' },
+          h('h2', { class: 'h5', id: 'environment-heading' }, 'Environment'),
+          environment,
+        ),
+      ),
+      ffmpegPanel(),
+    );
+  },
 );
 
 environmentRows()
