@@ -5,7 +5,6 @@ import {
   estimateTokens,
   imageTokens,
   inlineMarkdown,
-  PARSER_PAGE_FEE_USD,
   pageRequest,
   type PageResult,
   pdfRequest,
@@ -103,12 +102,6 @@ describe('prompts and requests', () => {
     const parsed = estimateTokens({ imagePages: 0, hintPages: 0, parsedPages: 10, maxSide: 1600 });
     expect(parsed.promptTokens).toBeGreaterThan(0);
     expect(parsed.completionTokens).toBe(small.completionTokens / 2);
-  });
-
-  it('knows which parser bills per page', () => {
-    expect(PARSER_PAGE_FEE_USD['mistral-ocr']).toBeGreaterThan(0);
-    expect(PARSER_PAGE_FEE_USD['cloudflare-ai']).toBe(0);
-    expect(PARSER_PAGE_FEE_USD.native).toBe(0);
   });
 });
 

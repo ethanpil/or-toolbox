@@ -3,7 +3,7 @@
  * Required box; choices for a Choice field and columns for a table of line items. Fields and columns move
  * with Up/Down buttons (no drag-only interaction), and every control keeps focus across redraws.
  */
-import { h, replace } from '../../ui/dom';
+import { focusKey, h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { setFieldError } from '../../ui/feedback/field-error';
 import { icon } from '../../ui/icon';
@@ -439,22 +439,12 @@ export function schemaBuilder(options: { onChange: () => void }): SchemaBuilder 
    * its other move button (Up is disabled at the top), else on its name.
    */
   function focusMoved(keys: readonly string[]): void {
-    for (const key of keys) {
-      const target = [...element.querySelectorAll<HTMLElement>('[data-focus-key]')].find(
-        (candidate) => candidate.getAttribute('data-focus-key') === key,
-      );
-      if (target && !(target instanceof HTMLButtonElement && target.disabled)) {
-        target.focus();
-        return;
-      }
-    }
+    for (const key of keys) if (focusKey(element, key)) return;
   }
 
   /** Focuses a control by its focus key after a redraw. */
   function focusLater(key: string): void {
-    [...element.querySelectorAll<HTMLElement>('[data-focus-key]')]
-      .find((candidate) => candidate.getAttribute('data-focus-key') === key)
-      ?.focus();
+    focusKey(element, key);
   }
 
   function draw(): void {

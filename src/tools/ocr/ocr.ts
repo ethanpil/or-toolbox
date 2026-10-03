@@ -3,9 +3,9 @@
  * parser), the combined Markdown, and the token estimate. tool.ts draws the page and runs these.
  */
 import type { ChatRequest, ContentPart } from '../../core/api/types';
+import type { PdfEngineId } from '../../core/models/pdf-engines';
 
 export type OcrMode = 'printed' | 'handwriting' | 'math' | 'layout';
-export type PdfEngine = 'cloudflare-ai' | 'mistral-ocr' | 'native';
 
 export const OCR_MODES: readonly { id: OcrMode; label: string; hint: string }[] = [
   { id: 'printed', label: 'Printed text', hint: 'Books, letters, receipts, screenshots.' },
@@ -18,28 +18,8 @@ export const OCR_MODES: readonly { id: OcrMode; label: string; hint: string }[] 
   },
 ];
 
-export const PDF_ENGINES: readonly { id: PdfEngine; label: string; hint: string }[] = [
-  {
-    id: 'cloudflare-ai',
-    label: 'Cloudflare AI (free)',
-    hint: 'Free. Best for PDFs that already contain text.',
-  },
-  {
-    id: 'mistral-ocr',
-    label: 'Mistral OCR (paid per page)',
-    hint: 'For scans. OpenRouter bills it per page, even with a free model.',
-  },
-  {
-    id: 'native',
-    label: "The model's own PDF reading",
-    hint: 'Only models with file input; billed as tokens.',
-  },
-];
-
 export const isOcrMode = (value: unknown): value is OcrMode =>
   OCR_MODES.some((mode) => mode.id === value);
-export const isPdfEngine = (value: unknown): value is PdfEngine =>
-  PDF_ENGINES.some((engine) => engine.id === value);
 
 /** Older snapshots said `standard` for printed text. */
 export function readMode(value: unknown): OcrMode {
@@ -114,7 +94,7 @@ export function pageRequest(
 export function pdfRequest(
   model: string,
   file: { fileName: string; dataUrl: string },
-  settings: { mode: OcrMode; language: string; instructions: string; engine: PdfEngine },
+  settings: { mode: OcrMode; language: string; instructions: string; engine: PdfEngineId },
 ): ChatRequest {
   const text = [
     `Transcribe the whole of “${file.fileName}”, page by page. Start every page with a line “Page N” in italics (*Page N*).`,
@@ -182,17 +162,6 @@ export function estimateTokens(plan: {
     completionTokens: (plan.imagePages + plan.parsedPages) * PER_PAGE_COMPLETION_TOKENS,
   };
 }
-
-/**
- * What OpenRouter's file parser bills per page on top of the model's tokens, in USD. Only Mistral OCR charges; its
- * price did not render in the fetched docs (docs/openrouter-api.md, [unverified]), so this is OpenRouter's listed
- * $2 per 1,000 pages, on the high side for an estimate.
- */
-export const PARSER_PAGE_FEE_USD: Record<PdfEngine, number> = {
-  'cloudflare-ai': 0,
-  'mistral-ocr': 0.002,
-  native: 0,
-};
 
 // --- results --------------------------------------------------------------------------------------------
 

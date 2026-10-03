@@ -5,31 +5,33 @@
  * one Run press (its output is the combined text, checkpointed as pages finish).
  */
 import type { ChatRequest } from '../../core/api/types';
-import { ApiError, errorCode, InvalidInputError, userMessage } from '../../core/errors';
+import { InvalidInputError, userMessage } from '../../core/errors';
 import { readAsDataUrl } from '../../core/files';
-import { runPool } from '../../core/pool';
-import { abortError } from '../../core/util';
-import type { RunHandle } from '../../core/types';
+import {
+  isPdfEngineId,
+  PDF_ENGINES,
+  type PdfEngineId,
+  pdfEngine,
+  pdfEngineAddon,
+} from '../../core/models/pdf-engines';
+import type { RunAddon, RunHandle } from '../../core/types';
 import { documentInput, textImage, type PageRef } from '../../ui/components/document-input';
 import { outputPanel } from '../../ui/components/output-panel';
-import { h, replace } from '../../ui/dom';
+import { focusedKey, focusKey, h, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, needsAction, presentError } from '../../ui/feedback/errors';
+import { isStop } from '../../ui/feedback/errors';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import type { Runner, ToolContext, ToolInstance } from '../../ui/tool/index';
+import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
+import type { RunnerState, ToolContext, ToolInstance } from '../../ui/tool/index';
 import {
   combineMarkdown,
   combinePlainText,
   estimateTokens,
-  isPdfEngine,
   OCR_MODES,
   type OcrMode,
-  PARSER_PAGE_FEE_USD,
-  PDF_ENGINES,
   type PageResult,
-  type PdfEngine,
   pageLabel,
   pageRequest,
   pdfRequest,
@@ -62,14 +64,6 @@ const STATUS_BADGE: Record<PageResult['status'], string> = {
   stopped: 'text-bg-secondary',
 };
 
-/** Errors that will fail every other page too: stop the run instead of trying them all. */
-function isFatal(error: unknown): boolean {
-  if (needsAction(error)) return true;
-  const code = errorCode(error);
-  if (code === 'invalid-key' || code === 'no-key' || code === 'locked') return true;
-  return error instanceof ApiError && (error.status === 401 || error.status === 402);
-}
-
 export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
   const saved = ctx.options.get();
@@ -91,10 +85,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   const docs = documentInput({
     accept: ctx.manifest.accepts,
     maxSide: () => Number(size.value) || DEFAULT_SIZE,
-    onChange: () => {
-      checkEngine();
-      void ui.refreshEstimate();
-    },
+    onChange: () => void ui.refreshEstimate(),
   });
 
   const mode = h(
@@ -126,21 +117,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     'data-testid': 'tool-prompt',
   });
 
-  const engineNotice = h(
-    'div',
-    {
-      class: 'alert alert-warning d-flex gap-2 align-items-start mb-0',
-      hidden: true,
-      'data-testid': 'ocr-engine-notice',
-    },
-    icon('slash-circle'),
-    h(
-      'div',
-      null,
-      'Free-only mode is on, and Mistral OCR is billed per page even with a free model. Choose the free Cloudflare parser in Settings, or turn off the PDF parser.',
-    ),
-  );
-
   ui.input.append(
     docs.element,
     h(
@@ -160,7 +136,6 @@ export function setup(ctx: ToolContext): ToolInstance {
       ),
       prompt,
     ),
-    engineNotice,
   );
 
   // --- drawer ---------------------------------------------------------------------------------------------
@@ -191,7 +166,6 @@ export function setup(ctx: ToolContext): ToolInstance {
         ctx.options.set({ [key]: input.checked });
         if (key === 'pdfParser') {
           engine.disabled = !input.checked;
-          checkEngine();
           void ui.refreshEstimate();
         }
         if (key === 'separators') refreshCombined();
@@ -224,18 +198,17 @@ export function setup(ctx: ToolContext): ToolInstance {
       'data-testid': 'ocr-engine',
       onchange: () => {
         ctx.options.set({ engine: engine.value });
-        engineHint.textContent = PDF_ENGINES.find((entry) => entry.id === engine.value)?.hint ?? '';
-        checkEngine();
+        engineHint.textContent = pdfEngine(engine.value as PdfEngineId).hint;
         void ui.refreshEstimate();
       },
     },
     PDF_ENGINES.map((entry) => h('option', { value: entry.id }, entry.label)),
   );
-  engine.value = isPdfEngine(saved['engine']) ? saved['engine'] : 'cloudflare-ai';
+  engine.value = isPdfEngineId(saved['engine']) ? saved['engine'] : 'cloudflare-ai';
   const engineHint = h(
     'div',
     { id: ids.engineHint, class: 'form-text' },
-    PDF_ENGINES.find((entry) => entry.id === engine.value)?.hint ?? '',
+    pdfEngine(engine.value as PdfEngineId).hint,
   );
 
   const formCheck = (
@@ -464,26 +437,31 @@ export function setup(ctx: ToolContext): ToolInstance {
     combinedTimer ??= setTimeout(refreshCombined, 250);
   };
 
-  /** A Retry button: disabled, with the reason, whenever Run cannot start (see `syncRetryButtons`). */
+  /** The runner's state, kept by `runner.subscribe`: Retry buttons follow it. */
+  let runnerState: RunnerState = { busy: false, disabledReason: null };
+  /** Why a Retry cannot start now (Run busy or disabled), or null. */
+  const retryBlocked = (): string | null =>
+    runnerState.busy ? 'Wait until the current run ends.' : runnerState.disabledReason;
+
+  /** Shows a Retry button as available or not, with the reason; it stays focusable (aria-disabled). */
+  const setRetryState = (button: HTMLElement): void => {
+    const reason = retryBlocked();
+    button.setAttribute('aria-disabled', String(reason !== null));
+    button.classList.toggle('disabled', reason !== null);
+    button.title = reason ?? '';
+  };
+
   const retryButton = (
     attributes: Record<string, string>,
     keys: () => string[],
     ...children: (HTMLElement | string)[]
   ): HTMLButtonElement => {
-    const reason = runBlocked();
     const button = h(
       'button',
-      {
-        type: 'button',
-        ...attributes,
-        class: [attributes['class'], reason !== null && 'disabled'],
-        'aria-disabled': String(reason !== null),
-        title: reason ?? '',
-        'data-retry': '',
-        onclick: () => retry(keys()),
-      },
+      { type: 'button', ...attributes, 'data-retry': '', onclick: () => retry(keys()) },
       ...children,
     );
+    setRetryState(button);
     return button;
   };
 
@@ -551,23 +529,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     return item;
   };
 
-  /** Keeps keyboard focus on a page when the control it was on goes away (a Retry that started). */
-  const keepFocus = (key: string | null, fallback: () => HTMLElement | undefined): void => {
-    if (!key) return;
-    const active = document.activeElement;
-    if (active && active !== document.body && active.isConnected) return;
-    const same = [...ui.output.querySelectorAll<HTMLElement>('[data-focus-key]')].find(
-      (candidate) => candidate.getAttribute('data-focus-key') === key,
-    );
-    (same ?? fallback())?.focus();
-  };
-  const focusedKey = (within: Element): string | null => {
-    const active = document.activeElement;
-    return active && within.contains(active)
-      ? (active.closest('[data-focus-key]')?.getAttribute('data-focus-key') ?? null)
-      : null;
-  };
-
   /** Redraws one page (streaming text, a new status) without touching the others. */
   const updatePage = (result: PageResult): void => {
     const old = pageItems.get(result.key);
@@ -578,7 +539,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     const key = focusedKey(old);
     const fresh = pageItem(result);
     old.replaceWith(fresh);
-    keepFocus(key, () => fresh);
+    // A Retry that started takes its button away: stay on that page.
+    if (key && !focusKey(fresh, key)) fresh.focus();
   };
 
   const renderFailed = (): void => {
@@ -586,7 +548,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       (result) => result.status === 'failed' || result.status === 'stopped',
     );
     failedNotice.hidden = failed.length === 0 || reading;
-    replace(
+    replaceWith(
       failedNotice,
       failed.length === 0
         ? null
@@ -605,23 +567,20 @@ export function setup(ctx: ToolContext): ToolInstance {
               `Retry ${failed.length === 1 ? 'it' : 'them'}`,
             ),
           ),
+      // "Retry them" hides while reading: keep focus on the view switch next to the progress bar.
+      { fallback: () => pagesButton },
     );
   };
 
   const renderPages = (): void => {
     textElements.clear();
     pageItems.clear();
-    const key = focusedKey(ui.output);
-    replace(pagesList, results.map(pageItem));
+    // A Retry that started takes its button away: stay on that page.
+    replaceWith(pagesList, results.map(pageItem), {
+      fallback: (lost) =>
+        lost.startsWith('retry:') ? pageItems.get(lost.slice('retry:'.length)) : undefined,
+    });
     renderFailed();
-    // A Retry that started takes its button away: stay on that page (or the list).
-    keepFocus(key, () =>
-      key?.startsWith('retry:')
-        ? pageItems.get(key.slice('retry:'.length))
-        : key === 'retry-failed'
-          ? pagesButton
-          : undefined,
-    );
   };
 
   const updateProgress = (): void => {
@@ -641,7 +600,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     separators: separators.checked,
     textHint: textHint.checked,
     pdfParser: pdfParser.checked,
-    engine: engine.value as PdfEngine,
+    engine: engine.value as PdfEngineId,
     maxSide: Number(size.value),
     concurrency: Number(concurrency.value),
   });
@@ -665,31 +624,45 @@ export function setup(ctx: ToolContext): ToolInstance {
   const pagesIn = (plan: readonly Unit[]): number =>
     plan.reduce((sum, unit) => sum + (unit.kind === 'pdf' ? unit.ref.pageCount : 1), 0);
 
-  /** The plan's cost: page images at the chosen size (plus the PDF text hint), parsed pages, and the parser's fee. */
+  /** Pages a plan sends through the PDF parser (whole PDFs). */
+  const parsedPagesIn = (plan: readonly Unit[]): number =>
+    plan.reduce((sum, unit) => sum + (unit.kind === 'pdf' ? unit.ref.pageCount : 0), 0);
+
+  /** The plan's model cost: page images at the chosen size (plus the PDF text hint) and parsed pages. */
   const estimatePlan = async (plan: readonly Unit[], model: string): Promise<number | null> => {
     if (plan.length === 0) return null;
     const s = settings();
     let imagePages = 0;
     let hintPages = 0;
-    let parsedPages = 0;
     for (const unit of plan) {
-      if (unit.kind === 'pdf') parsedPages += unit.ref.pageCount;
-      else {
-        imagePages += 1;
-        if (s.textHint && unit.ref.kind === 'pdf') hintPages += 1;
-      }
+      if (unit.kind === 'pdf') continue;
+      imagePages += 1;
+      if (s.textHint && unit.ref.kind === 'pdf') hintPages += 1;
     }
-    const tokens = await ctx.models.estimate({
+    return ctx.models.estimate({
       kind: 'tokens',
       model,
-      ...estimateTokens({ imagePages, hintPages, parsedPages, maxSide: s.maxSide }),
+      ...estimateTokens({
+        imagePages,
+        hintPages,
+        parsedPages: parsedPagesIn(plan),
+        maxSide: s.maxSide,
+      }),
     });
-    // The paid parser bills per page even with a free model (temporarily part of the estimate, so budgets see it).
-    const fee = parsedPages * PARSER_PAGE_FEE_USD[s.engine];
-    return tokens === null ? null : tokens + fee;
   };
 
-  const readUnit = async (run: RunHandle, unit: Unit, result: PageResult): Promise<void> => {
+  /** The parser's own charge for a plan (Mistral OCR bills per page, even with a free model). */
+  const addonsFor = (plan: readonly Unit[]): RunAddon[] => {
+    const addon = pdfEngineAddon(settings().engine, parsedPagesIn(plan));
+    return addon ? [addon] : [];
+  };
+
+  const readUnit = async (
+    run: RunHandle,
+    unit: Unit,
+    result: PageResult,
+    signal: AbortSignal,
+  ): Promise<void> => {
     const s = settings();
     const instructions = prompt.value;
     let body: ChatRequest;
@@ -705,6 +678,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       const page = await docs.loadPage(unit.ref);
       body = pageRequest(run.model, page, { ...s, instructions });
     }
+    signal.throwIfAborted();
     result.text = '';
     const answer = await ctx.api.chatStream(body, {
       run,
@@ -722,97 +696,16 @@ export function setup(ctx: ToolContext): ToolInstance {
     result.truncated = answer.finishReason === 'length';
   };
 
-  /** Reads `plan` within `run`; returns the last page error (for a run where every page failed). */
-  const process = async (run: RunHandle, plan: readonly Unit[]): Promise<Error | null> => {
-    let lastError: Error | null = null;
-    const batch = results.filter((result) => plan.some((unit) => unit.key === result.key));
-    try {
-      await runPool(
-        plan,
-        Number(concurrency.value) || DEFAULT_CONCURRENCY,
-        async (unit) => {
-          const result = results.find((candidate) => candidate.key === unit.key);
-          if (!result) return;
-          result.status = 'running';
-          result.error = null;
-          updatePage(result);
-          updateProgress();
-          try {
-            await readUnit(run, unit, result);
-            result.status = 'done';
-          } catch (error) {
-            if (isStop(error) || run.signal.aborted) {
-              result.status = 'stopped';
-              throw error;
-            }
-            result.status = 'failed';
-            result.error = userMessage(error);
-            lastError = error instanceof Error ? error : new InvalidInputError(userMessage(error));
-            if (isFatal(error)) throw error;
-          } finally {
-            updatePage(result);
-            updateProgress();
-            scheduleCombined();
-            void run.checkpoint({ output: combined() }).catch(() => undefined);
-          }
-        },
-        run.signal,
-      );
-    } finally {
-      for (const result of batch) if (result.status === 'queued') result.status = 'stopped';
-      if (run.signal.aborted) {
-        for (const result of batch) if (result.status === 'running') result.status = 'stopped';
-      }
-    }
-    if (run.signal.aborted) {
-      const reason: unknown = run.signal.reason;
-      throw reason instanceof Error ? reason : abortError('Stopped.');
-    }
-    return lastError;
-  };
-
   /** True while a run reads pages (the runner's own flag is still set while its `run` returns). */
   let reading = false;
-  /** The pages a Retry asks for; `run` takes them the moment the runner starts it (see `retry`). */
-  let pendingRetry: string[] | null = null;
 
-  /** Why Run cannot start now (busy, or disabled with a reason); null when it can. */
-  function runBlocked(): string | null {
-    if (runner.busy) return 'Wait until the current run ends.';
-    if (runner.button.getAttribute('aria-disabled') !== 'true') return null;
-    return (
-      runner.element.querySelector('[data-testid="run-hint"]')?.textContent?.trim() ||
-      'Reading is not possible right now.'
-    );
-  }
-
-  /** Brings every Retry button in line with the runner (Run disabled or busy disables them, with the reason). */
-  const syncRetryButtons = (): void => {
-    const reason = runBlocked();
-    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]')) {
-      button.setAttribute('aria-disabled', String(reason !== null));
-      button.classList.toggle('disabled', reason !== null);
-      button.title = reason ?? '';
-    }
-  };
-
+  /** Reads `keys` again (a Retry); the runner's own Retry after a refusal repeats the same pages. */
   const retry = (keys: string[]): void => {
-    const blocked = runBlocked();
-    if (blocked) {
-      announce(blocked);
-      return;
-    }
     if (keys.length === 0) return;
-    pendingRetry = keys;
-    void runner.trigger();
-    // The runner calls `run` synchronously when it starts; if it did not start, these keys must not wait around to
-    // turn a later Run press into a retry.
-    pendingRetry = null;
+    if (!runner.trigger(keys).started) announce(retryBlocked() ?? 'Reading cannot start now.');
   };
 
-  const run = async (signal: AbortSignal): Promise<void> => {
-    const keys = pendingRetry;
-    pendingRetry = null;
+  const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
     const plan = keys ? units.filter((unit) => keys.includes(unit.key)) : planUnits();
     if (plan.length === 0) {
       if (!keys) {
@@ -823,26 +716,24 @@ export function setup(ctx: ToolContext): ToolInstance {
       return;
     }
 
-    const files = new Set(plan.map((unit) => unit.ref.fileName));
-    const first = plan[0]!.ref.fileName;
-    const title = `${keys ? 'Retry: ' : ''}${first}${files.size > 1 ? ` and ${plural(files.size - 1, 'more file')}` : ''}`;
     const model = ctx.model().model;
-    let runHandle: RunHandle;
-    try {
-      runHandle = await ctx.beginRun(
-        {
-          title,
-          // A retry books only what it reads; a full run uses the header's estimate.
-          ...(keys && model ? { estimateUsd: await estimatePlan(plan, model) } : {}),
-        },
-        signal,
-      );
-    } catch (error) {
-      // Refused before anything was sent (no key, locked, free-only, budget, Cancel): every page stays exactly as
-      // it was. A refused retry offers to retry the same pages (the runner's own Retry would read them all).
-      if (keys && !isStop(error)) void presentError(error, { retry: () => retry(keys) });
-      throw error;
-    }
+    // Refused before anything was sent (no key, locked, free-only, budget, Cancel): every page stays as it was.
+    const runHandle = await ctx.beginRun(
+      {
+        title: batchTitle(
+          plan.map((unit) => unit.ref.fileName),
+          { retry: keys !== undefined },
+        ),
+        // A retry books only what it reads; a full run uses the header's estimate and add-ons.
+        ...(keys
+          ? {
+              estimateUsd: model ? await estimatePlan(plan, model) : null,
+              addons: addonsFor(plan),
+            }
+          : {}),
+      },
+      signal,
+    );
 
     // The run is on: only now replace (or reset) what it reads.
     if (keys) {
@@ -877,29 +768,37 @@ export function setup(ctx: ToolContext): ToolInstance {
         : `Reading ${plural(pagesIn(plan), 'page')}…`,
     );
     if (keys) output.setText(combined());
+    const resultOf = (unit: Unit): PageResult | undefined =>
+      results.find((candidate) => candidate.key === unit.key);
     try {
-      const lastError = await process(runHandle, plan);
+      await runItems({
+        items: plan,
+        concurrency: Number(concurrency.value) || DEFAULT_CONCURRENCY,
+        signal: runHandle.signal,
+        work: async (unit, itemSignal) => {
+          const result = resultOf(unit);
+          if (result) await readUnit(runHandle, unit, result, itemSignal);
+        },
+        onItem: (outcome) => {
+          const result = resultOf(outcome.item);
+          if (!result) return;
+          result.status = outcome.status;
+          if (outcome.status === 'running') result.error = null;
+          if (outcome.status === 'failed') result.error = userMessage(outcome.error);
+          updatePage(result);
+          updateProgress();
+          if (outcome.status === 'running' || outcome.status === 'queued') return;
+          scheduleCombined();
+          void runHandle.checkpoint({ output: combined }).catch(() => undefined);
+        },
+      });
       refreshCombined();
-      // Only this run's pages decide whether it failed: a retry whose pages all fail again is a failed run.
-      const read = results.filter(
-        (result) => plan.some((unit) => unit.key === result.key) && result.status === 'done',
-      );
-      if (read.length === 0 && lastError) throw lastError;
+      // The whole document, not just this run's pages (a retry reads a few).
       const done = results.filter((result) => result.status === 'done').length;
-      const failed = results.length - done;
       const cut = results.filter((result) => result.status === 'done' && result.truncated).length;
-      const summary = [
-        failed === 0
-          ? `Done · ${plural(done, 'page')}`
-          : `Done · ${done} of ${plural(results.length, 'page')}; ${failed} not read`,
-        cut ? `${cut} cut off` : '',
-      ]
-        .filter(Boolean)
-        .join('; ');
-      output.finish(summary);
-      ui.status(
-        failed === 0 ? `Read ${plural(done, 'page')}` : `${plural(failed, 'page')} not read`,
-      );
+      const summary = batchSummary({ done, failed: results.length - done, stopped: 0 }, 'page');
+      output.finish(cut ? `${summary}; ${cut} cut off` : summary);
+      ui.status(summary);
       await runHandle.finish({
         output: combined(),
         meta: {
@@ -929,28 +828,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner: Runner = ui.runner({ label: 'Read', icon: 'file-earmark-text', run });
+  const runner = ui.runner<string[]>({ label: 'Read', icon: 'file-earmark-text', run });
   // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry buttons.
-  new MutationObserver(syncRetryButtons).observe(runner.element, {
-    subtree: true,
-    childList: true,
-    characterData: true,
-    attributes: true,
-    attributeFilter: ['aria-disabled'],
+  runner.subscribe((state) => {
+    runnerState = state;
+    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]'))
+      setRetryState(button);
   });
-
-  /** Free-only mode allows only the free parser. */
-  const checkEngine = (): void => {
-    const blocked =
-      pdfParser.checked &&
-      engine.value === 'mistral-ocr' &&
-      ctx.settings.get().freeOnly &&
-      docs.selection().some((ref) => ref.kind === 'pdf');
-    engineNotice.hidden = !blocked;
-    runner.setDisabled(blocked ? 'Mistral OCR is not free; free-only mode is on.' : null);
-  };
-  ctx.settings.subscribe(() => checkEngine());
-  checkEngine();
   renderPages();
 
   const applyState = ({
@@ -967,15 +851,14 @@ export function setup(ctx: ToolContext): ToolInstance {
     if (typeof state['separators'] === 'boolean') separators.checked = state['separators'];
     if (typeof state['textHint'] === 'boolean') textHint.checked = state['textHint'];
     if (typeof state['pdfParser'] === 'boolean') pdfParser.checked = state['pdfParser'];
-    if (isPdfEngine(state['engine'])) engine.value = state['engine'];
+    if (isPdfEngineId(state['engine'])) engine.value = state['engine'];
     engine.disabled = !pdfParser.checked;
-    engineHint.textContent = PDF_ENGINES.find((entry) => entry.id === engine.value)?.hint ?? '';
+    engineHint.textContent = pdfEngine(engine.value as PdfEngineId).hint;
     if (IMAGE_SIZES.includes(state['maxSide'] as (typeof IMAGE_SIZES)[number]))
       size.value = String(state['maxSide']);
     if (CONCURRENCY.includes(state['concurrency'] as (typeof CONCURRENCY)[number])) {
       concurrency.value = String(state['concurrency']);
     }
-    checkEngine();
     void ui.refreshEstimate();
   };
 
@@ -983,6 +866,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     getState: () => ({ prompt: prompt.value, settings: settings() }),
     applyState,
     estimate: (model) => estimatePlan(planUnits(), model),
+    addons: () => (pdfParser.checked ? addonsFor(planUnits()) : []),
     onFiles: (files) => void docs.add(files),
     onReceive: (items) => {
       const files = items.flatMap((item) =>

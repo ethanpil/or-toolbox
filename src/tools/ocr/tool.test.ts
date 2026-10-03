@@ -7,6 +7,7 @@ import type {
   RawModel,
 } from '../../core/api/types';
 import { ApiError, FreeOnlyError, RunCancelledError } from '../../core/errors';
+import { MISTRAL_OCR_PAGE_USD } from '../../core/models/pdf-engines';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
@@ -131,7 +132,7 @@ describe('OCR tool', { timeout: 30_000 }, () => {
     expect(t.estimate()).toBeGreaterThan(2 * (0.002713 + 0.003));
   });
 
-  it('adds the PDF text hint, and the paid parser fee per page', async () => {
+  it('adds the PDF text hint, and declares the paid parser as an add-on', async () => {
     t = createToolTestContext(getTool('ocr'), { catalog: [MODEL], modelOverride: 'test/vision' });
     const tool = await t.mount(setup);
     tool.applyState({ prompt: '', settings: { textHint: false } });
@@ -147,9 +148,19 @@ describe('OCR tool', { timeout: 30_000 }, () => {
     tool.applyState({ prompt: '', settings: { pdfParser: true, engine: 'cloudflare-ai' } });
     await t.ctx.ui.refreshEstimate();
     const free = t.estimate()!;
+    expect(tool.addons?.()).toEqual([]);
     tool.applyState({ prompt: '', settings: { engine: 'mistral-ocr' } });
     await t.ctx.ui.refreshEstimate();
-    expect(t.estimate()! - free).toBeCloseTo(2 * 0.002, 8);
+    // The parser's per-page fee is an add-on, kept out of the model estimate but shown in the badge.
+    expect(tool.addons?.()).toEqual([
+      {
+        id: 'pdf-engine:mistral-ocr',
+        label: 'Mistral OCR (PDF parser)',
+        estimateUsd: 2 * MISTRAL_OCR_PAGE_USD,
+      },
+    ]);
+    expect(await tool.estimate?.('test/vision')).toBeCloseTo(free, 8);
+    expect(t.estimate()! - free).toBeCloseTo(2 * MISTRAL_OCR_PAGE_USD, 8);
   });
 
   it('reads every page, combines them in order, and retries a failed page', async () => {
@@ -376,21 +387,35 @@ describe('OCR tool', { timeout: 30_000 }, () => {
     ]);
   });
 
-  it('blocks the paid Mistral parser in free-only mode, with a notice', async () => {
-    t = createToolTestContext(getTool('ocr'), { catalog: [MODEL] });
+  it('free-only mode refuses the paid Mistral parser before anything is sent', async () => {
+    const FREE: RawModel = {
+      ...MODEL,
+      id: 'test/vision:free',
+      pricing: { prompt: '0', completion: '0' },
+    };
+    const fake = fakeStream();
+    t = createToolTestContext(getTool('ocr'), {
+      catalog: [FREE],
+      modelOverride: 'test/vision:free',
+      api: { chatStream: fake.chatStream },
+    });
     const tool = await t.mount(setup);
     tool.applyState({ prompt: '', settings: { pdfParser: true, engine: 'mistral-ocr' } });
     t.core.settings.update((draft) => {
       draft.freeOnly = true;
     });
-    expect($(t.zones.input, 'ocr-engine-notice')?.hidden).toBe(true); // no PDF yet
     tool.onFiles?.([new File(['%PDF'], 'scan.pdf', { type: 'application/pdf' })]);
-    await vi.waitFor(() => expect($(t!.zones.input, 'ocr-engine-notice')?.hidden).toBe(false));
-    expect(t.runners[0]?.button.getAttribute('aria-disabled')).toBe('true');
-    expect($(t.zones.input, 'run-hint')?.textContent).toMatch(/Mistral OCR is not free/);
-
-    tool.applyState({ prompt: '', settings: { engine: 'cloudflare-ai' } });
-    expect($(t.zones.input, 'ocr-engine-notice')?.hidden).toBe(true);
-    expect(t.runners[0]?.button.getAttribute('aria-disabled')).toBe('false');
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(1));
+    // No notice of its own: the run refuses, naming the parser, and nothing is read or recorded.
+    expect($(t.zones.input, 'ocr-engine-notice')).toBeNull();
+    const begin = vi.spyOn(t.ctx, 'beginRun');
+    await t.runners[0]!.trigger();
+    await expect(begin.mock.results[0]?.value).rejects.toMatchObject({
+      code: 'free-only',
+      addons: ['Mistral OCR (PDF parser)'],
+    });
+    expect(fake.calls).toHaveLength(0);
+    expect(await t.core.history.query({ tool: 'ocr' })).toHaveLength(0);
+    expect($$(t.zones.output, 'ocr-page')).toHaveLength(0);
   });
 });
