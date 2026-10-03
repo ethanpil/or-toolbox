@@ -3,12 +3,14 @@
  * `GET /key` (loaded when the section is first shown, refreshable), the "no retention" preference, rename,
  * recolour, make default, remove with Undo, and adding a key (Connect with OpenRouter or paste).
  *
- * Undo of a removal restores the keys file as it was (`keys.replaceFile` with `expected`, so a change made
- * meanwhile in another tab is never overwritten) and the settings the removal cleared (default key, tool pins,
- * the per-key budget). The secret itself never passes through the page.
+ * Undo of a removal puts just that key back into the keys file as it is at Undo time (its stored record, same
+ * id, at its old position, through `keys.replaceFile` with `expected` = that file), then restores the settings
+ * the removal cleared (default key, tool pins, per-key budget) where nothing else has taken their place. Only if
+ * the passphrase lock changed in between is the key added again from its secret, which is held in memory for
+ * the Undo window only and dropped when the toast closes.
  */
-import { ApiError, errorCode, userMessage } from '../../core/errors';
-import type { CoreServices, KeyInfo, KeyStatus, StoredKeysFile, ToolId } from '../../core/types';
+import { ApiError, errorCode, InvalidInputError, userMessage } from '../../core/errors';
+import type { CoreServices, KeyInfo, KeyStatus, StoredKey, ToolId } from '../../core/types';
 import { connectKey } from '../../ui/components/connect-key';
 import { emptyState } from '../../ui/components/empty-state';
 import { keyDot } from '../../ui/components/key-picker';
@@ -26,6 +28,22 @@ import { attempt, card, externalLink, meter, rerender, type SectionView, switchF
 
 type BalanceState =
   { state: 'loading' } | { state: 'ok'; status: KeyStatus } | { state: 'error'; error: unknown };
+
+/** What Undo needs to put a removed key back. */
+interface RemovedKey {
+  record: StoredKey;
+  /** Its position in the list. */
+  index: number;
+  /** The lock it was stored under (JSON), to know whether the record still fits the file. */
+  lock: string;
+  /** Plain secret, only for re-adding it if the lock changed; null when it could not be read. */
+  secret: string | null;
+  wasDefault: boolean;
+  /** The default key right after the removal: Undo restores the default only if it is still this one. */
+  defaultAfter: string | null;
+  pinned: ToolId[];
+  budget: number | null | undefined;
+}
 
 /** Shown for keys without a colour (the dot itself is grey then). */
 const NO_COLOUR = '#6c757d';
@@ -48,12 +66,17 @@ export function keysSection(core: CoreServices): SectionView {
     renderBalance(key);
     core.keys
       .status(key.id, { force })
-      .then((status) => balances.set(key.id, { state: 'ok', status }))
-      .catch((error: unknown) => balances.set(key.id, { state: 'error', error }))
+      .then((status) => {
+        balances.set(key.id, { state: 'ok', status });
+        if (force) announce(`Balance of ${key.name} updated.`);
+      })
+      .catch((error: unknown) => {
+        balances.set(key.id, { state: 'error', error });
+        if (force) announce(`The balance of ${key.name} could not be checked.`);
+      })
       .finally(() => {
         const current = core.keys.get(key.id);
         if (current) renderBalance(current);
-        if (force) announce(`Balance of ${key.name} updated.`);
       });
   };
 
@@ -78,20 +101,25 @@ export function keysSection(core: CoreServices): SectionView {
   const renderBalance = (key: KeyInfo): void => {
     const slot = balanceSlots.get(key.id);
     if (!slot) return;
+    const entry = balances.get(key.id);
+    const loading = entry?.state === 'loading';
+    // Stays in place (aria-disabled, still focusable) while loading, so keyboard focus survives the refresh.
     const refresh = h(
       'button',
       {
         type: 'button',
-        class: 'btn btn-sm btn-outline-secondary',
+        class: ['btn btn-sm btn-outline-secondary', loading && 'disabled'],
         'aria-label': `Refresh the balance of ${key.name}`,
+        'aria-disabled': loading ? 'true' : null,
         title: 'Refresh balance',
         'data-testid': 'key-refresh',
         'data-focus': `key:${key.id}:refresh`,
-        onclick: () => loadBalance(key, true),
+        onclick: () => {
+          if (balances.get(key.id)?.state !== 'loading') loadBalance(key, true);
+        },
       },
       icon('arrow-clockwise'),
     );
-    const entry = balances.get(key.id);
     let body: Child;
     if (
       !core.keys.lock.unlocked() ||
@@ -125,7 +153,8 @@ export function keysSection(core: CoreServices): SectionView {
         'div',
         { class: 'd-flex align-items-center gap-2 small text-body-secondary' },
         h('span', { class: 'spinner-border spinner-border-sm', 'aria-hidden': 'true' }),
-        'Checking the balance with OpenRouter…',
+        h('span', { class: 'flex-grow-1' }, 'Checking the balance with OpenRouter…'),
+        refresh,
       );
     } else if (entry.state === 'error') {
       body = h(
@@ -239,37 +268,94 @@ export function keysSection(core: CoreServices): SectionView {
     });
     if (!confirmed) return;
 
+    const file = core.keys.exportFile();
+    const index = file.keys.findIndex((stored) => stored.id === key.id);
+    const record = file.keys[index];
+    if (!record) return; // removed meanwhile (another tab)
+    // Only needed if the lock changes before Undo; unreadable while locked, which is fine.
+    const secret = await core.keys.secret(key.id).catch(() => null);
     const settings = core.settings.get();
-    const before: StoredKeysFile = core.keys.exportFile();
-    const wasDefault = settings.defaultKeyId === key.id;
-    const pinned = Object.entries(settings.tools)
-      .filter(([, binding]) => binding?.keyId === key.id)
-      .map(([tool]) => tool as ToolId);
-    const budget = settings.budgets.perKeyMonthlyUsd[key.id];
     if (!attempt(() => core.keys.remove(key.id))) return;
     balances.delete(key.id);
-    const after = core.keys.exportFile();
+    let pending: RemovedKey | null = {
+      record,
+      index,
+      lock: JSON.stringify(file.lock),
+      secret,
+      wasDefault: settings.defaultKeyId === key.id,
+      defaultAfter: core.settings.get().defaultKeyId,
+      pinned: Object.entries(settings.tools)
+        .filter(([, binding]) => binding?.keyId === key.id)
+        .map(([tool]) => tool as ToolId),
+      budget: settings.budgets.perKeyMonthlyUsd[key.id],
+    };
 
-    toast({
+    const undo = (removed: RemovedKey): void => {
+      restore(removed)
+        .then(() => toast({ message: `Key “${removed.record.name}” is back.`, variant: 'success' }))
+        .catch((error: unknown) => void presentError(error, { retry: () => undo(removed) }));
+    };
+    const handle = toast({
       message: `Key “${key.name}” removed.`,
       action: {
         label: 'Undo',
         testId: 'toast-undo',
         onClick: () => {
-          try {
-            core.keys.replaceFile(before, { expected: after });
-            core.settings.update((draft) => {
-              if (wasDefault) draft.defaultKeyId = key.id;
-              for (const tool of pinned)
-                draft.tools[tool] = { ...draft.tools[tool], keyId: key.id };
-              if (budget !== undefined) draft.budgets.perKeyMonthlyUsd[key.id] = budget;
-            });
-            toast({ message: `Key “${key.name}” is back.`, variant: 'success' });
-          } catch (error) {
-            void presentError(error);
-          }
+          const removed = pending;
+          pending = null;
+          if (removed) undo(removed);
         },
       },
+    });
+    // The Undo window is over: let go of the record and the secret.
+    handle.element.addEventListener('hidden.bs.toast', () => {
+      pending = null;
+    });
+  };
+
+  /** Puts a removed key back into the keys file as it is now, then the settings that pointed at it. */
+  const restore = async (removed: RemovedKey): Promise<void> => {
+    let id = removed.record.id;
+    for (let tries = 1; ; tries++) {
+      const current = core.keys.exportFile();
+      if (current.keys.some((stored) => stored.id === id)) break; // already back (Undo in another tab)
+      if (JSON.stringify(current.lock) === removed.lock) {
+        const keys = [...current.keys];
+        keys.splice(Math.min(removed.index, keys.length), 0, removed.record);
+        try {
+          // `expected` is the file read a moment ago: only a write from another tab in between is refused.
+          core.keys.replaceFile({ ...current, keys }, { expected: current });
+          break;
+        } catch (error) {
+          if (errorCode(error) === 'keys-changed' && tries === 1) continue;
+          throw error;
+        }
+      }
+      if (!removed.secret) {
+        throw new InvalidInputError(
+          'This key cannot be put back because the passphrase lock changed since it was removed. Add it again.',
+        );
+      }
+      const added = await core.keys.add({
+        name: removed.record.name,
+        secret: removed.secret,
+        colour: removed.record.colour,
+        source: removed.record.source,
+      });
+      if (removed.record.noRetention) core.keys.update(added.id, { noRetention: true });
+      id = added.id;
+      break;
+    }
+    core.settings.update((draft) => {
+      if (removed.wasDefault && draft.defaultKeyId === removed.defaultAfter)
+        draft.defaultKeyId = id;
+      for (const tool of removed.pinned) {
+        if (draft.tools[tool]?.keyId === undefined)
+          draft.tools[tool] = { ...draft.tools[tool], keyId: id };
+      }
+      if (removed.budget !== undefined && draft.budgets.perKeyMonthlyUsd[id] === undefined) {
+        draft.budgets.perKeyMonthlyUsd[id] = removed.budget;
+      }
     });
   };
 
@@ -421,6 +507,16 @@ export function keysSection(core: CoreServices): SectionView {
               testId: 'keys-empty',
             }),
           ),
+      {
+        // A button that went away (Make default) → the same key's Rename; a removed key → the section heading.
+        fallback: (lost) => {
+          const id = lost?.startsWith('key:') ? lost.split(':')[1] : undefined;
+          const rename = id
+            ? list.querySelector<HTMLElement>(`[data-focus="key:${CSS.escape(id)}:rename"]`)
+            : null;
+          return rename ?? document.getElementById('keys-title');
+        },
+      },
     );
     for (const key of keys) renderBalance(key);
     if (shown) loadMissing();

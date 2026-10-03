@@ -17,23 +17,43 @@ export function sectionFromHash(hash: string): SettingsSection | null {
 
 export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
 
+/** Digits grouped by commas in threes, not starting with 0: `1,000`, `12,345,678`. */
+const THOUSANDS = /^[1-9]\d{0,2}(,\d{3})+$/;
+
+const AMBIGUOUS_COMMA = 'Use a dot for cents and commas only between thousands, like 1,234.50.';
+
 /**
- * A dollar amount typed by the user: `5`, `0.25`, `$1,000`. Empty is `null` (no limit) when `optional`.
- * Negative, non-numeric or above `max` is an error with a message for the field.
+ * Resolves commas in a typed number: thousands separators (`1,000`, `1,234.56`) are dropped, a single decimal
+ * comma (`0,25`, `1,5`: no dot, one or two digits after it) becomes a dot, and anything else with a comma is
+ * ambiguous (null), so `0,25` can never be read as 25.
+ */
+function resolveCommas(text: string): string | null {
+  if (!text.includes(',')) return text;
+  const [whole, fraction, ...rest] = text.split('.');
+  if (rest.length > 0) return null;
+  if (fraction !== undefined)
+    return THOUSANDS.test(whole!) ? `${whole!.replace(/,/g, '')}.${fraction}` : null;
+  if (THOUSANDS.test(text)) return text.replace(/,/g, '');
+  if (/^\d+,\d{1,2}$/.test(text)) return text.replace(',', '.');
+  return null;
+}
+
+/**
+ * A dollar amount typed by the user: `5`, `0.25`, `$1,000`, `0,25`. Empty is `null` (no limit) when `optional`.
+ * Negative, non-numeric, ambiguous (`0,250`) or above `max` is an error with a message for the field.
  */
 export function parseUsd(
   text: string,
   options: { max: number; optional?: boolean },
 ): Parsed<number | null> {
-  const cleaned = text
-    .trim()
-    .replace(/^\$\s*/, '')
-    .replace(/,/g, '');
-  if (cleaned === '') {
+  const trimmed = text.trim().replace(/^\$\s*/, '');
+  if (trimmed === '') {
     return options.optional
       ? { ok: true, value: null }
       : { ok: false, error: 'Enter an amount in dollars, like 0.25.' };
   }
+  const cleaned = resolveCommas(trimmed);
+  if (cleaned === null) return { ok: false, error: AMBIGUOUS_COMMA };
   if (!/^(\d+(\.\d*)?|\.\d+)$/.test(cleaned)) {
     return { ok: false, error: 'Enter an amount in dollars, like 5 or 0.25.' };
   }
@@ -43,9 +63,10 @@ export function parseUsd(
   return { ok: true, value: Math.round(value * 1e6) / 1e6 };
 }
 
-/** A whole number between `min` and `max`, e.g. retention days or auto-lock minutes. */
+/** A whole number between `min` and `max` (`1440` or `1,440`), e.g. retention days or auto-lock minutes. */
 export function parseWhole(text: string, options: { min: number; max: number }): Parsed<number> {
-  const cleaned = text.trim();
+  const trimmed = text.trim();
+  const cleaned = THOUSANDS.test(trimmed) ? trimmed.replace(/,/g, '') : trimmed;
   const value = /^\d+$/.test(cleaned) ? Number(cleaned) : NaN;
   if (!Number.isSafeInteger(value) || value < options.min || value > options.max) {
     return {
@@ -179,6 +200,14 @@ export function passphraseStrength(text: string): PassphraseStrength {
         ? 'Remember it: a forgotten passphrase cannot be recovered.'
         : 'Longer is stronger: try four or more unrelated words.',
   };
+}
+
+/**
+ * True for a backup preview line (`BackupService.inspect` wording) that deletes or overwrites something in this
+ * browser: Replace's "Delete …"/"Replace …", lock changes, and pins, budgets or the default key dropped.
+ */
+export function isDestructiveChange(line: string): boolean {
+  return /^(Delete|Replace|Turn off|Use the backup)/.test(line) || /removed:|cleared/.test(line);
 }
 
 /** `ortoolbox-2026-10-03.ortoolbox.json`, dated in the user's time zone. */

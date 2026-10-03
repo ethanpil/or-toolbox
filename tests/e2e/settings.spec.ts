@@ -21,6 +21,8 @@ import { seedApp, TEST_KEY_ID, testKeysFile } from './app.ts';
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 
 const PASSPHRASE = 'correct horse battery staple';
+/** PBKDF2 runs 600,000 rounds on purpose; several specs doing it at once on a busy machine need the room. */
+const PBKDF2_WAIT = 60_000;
 
 const section = (page: Page, id: string) => page.getByTestId(`settings-section-${id}`);
 
@@ -231,6 +233,10 @@ test.describe('keys', () => {
     await expect(work.getByTestId('key-default-badge')).toBeVisible();
     await expect(test1.getByTestId('key-default-badge')).toHaveCount(0);
     await expect(page.getByTestId('key-chip')).toHaveAttribute('aria-label', 'Key: Work');
+    // The toast can sit over this row's buttons, and a pointer resting on it pauses its timer.
+    const madeDefault = page.getByTestId('toast').filter({ hasText: 'is now the default key' });
+    await madeDefault.getByRole('button', { name: 'Close' }).click();
+    await expect(madeDefault).toHaveCount(0);
 
     await work.getByTestId('key-rename').click();
     await page.getByTestId('prompt-input').fill('Work key');
@@ -409,7 +415,7 @@ test('passphrase lock: enable, lock now, unlock', async ({ page, context }) => {
 
   await page.getByTestId('lock-confirm').fill(PASSPHRASE);
   await page.getByTestId('lock-enable').click();
-  await expect(page.getByTestId('lock-state')).toHaveText('Unlocked', { timeout: 30_000 });
+  await expect(page.getByTestId('lock-state')).toHaveText('Unlocked', { timeout: PBKDF2_WAIT });
   const stored = await page.evaluate(() => localStorage.getItem('ortoolbox:keys') ?? '');
   expect(stored).not.toContain(TEST_API_KEY);
   expect(stored).toContain('"verifier"');
@@ -422,11 +428,11 @@ test('passphrase lock: enable, lock now, unlock', async ({ page, context }) => {
   await page.getByTestId('unlock-passphrase').fill('wrong passphrase');
   await page.getByTestId('unlock-submit').click();
   await expect(page.getByTestId('unlock-error')).toHaveText('Wrong passphrase. Try again.', {
-    timeout: 30_000,
+    timeout: PBKDF2_WAIT,
   });
   await page.getByTestId('unlock-passphrase').fill(PASSPHRASE);
   await page.getByTestId('unlock-submit').click();
-  await expect(page.getByTestId('lock-state')).toHaveText('Unlocked', { timeout: 30_000 });
+  await expect(page.getByTestId('lock-state')).toHaveText('Unlocked', { timeout: PBKDF2_WAIT });
 
   // Auto-lock: 0–1440 minutes.
   const minutes = page.getByTestId('auto-lock-minutes');
@@ -635,17 +641,17 @@ test.describe('backup', () => {
     await expect(page.getByTestId('backup-passphrase-block')).toBeVisible();
 
     await page.getByTestId('backup-import-passphrase').fill('not the passphrase');
-    await page.getByTestId('backup-check-passphrase').click();
+    await page.getByTestId('backup-preview-button').click();
     await expect(page.getByTestId('backup-import-passphrase')).toHaveClass(/is-invalid/, {
-      timeout: 30_000,
+      timeout: PBKDF2_WAIT,
     });
     await expect(page.getByTestId('backup-apply')).toBeDisabled();
 
     await page.getByTestId('backup-import-passphrase').fill(PASSPHRASE);
-    await page.getByTestId('backup-check-passphrase').click();
-    await expect(changes.filter({ hasText: 'Add 1 key' })).toBeVisible({ timeout: 30_000 });
+    await page.getByTestId('backup-preview-button').click();
+    await expect(changes.filter({ hasText: 'Add 1 key' })).toBeVisible({ timeout: PBKDF2_WAIT });
     await page.getByTestId('backup-apply').click();
-    await expect(page.getByTestId('backup-restored')).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByTestId('backup-restored')).toBeVisible({ timeout: PBKDF2_WAIT });
 
     // Everything is back, on the live page and after a reload.
     await page.reload();
@@ -666,5 +672,289 @@ test.describe('backup', () => {
       ),
     ).toBe('#0f766e');
     expect(problems).toEqual([]);
+  });
+});
+
+/** Downloads a backup with keys from the Backup section; returns its name and text. */
+async function exportWithKeys(page: Page): Promise<{ name: string; text: string }> {
+  await page.getByTestId('settings-nav-backup').click();
+  await page.getByTestId('backup-include-keys').check();
+  await page.getByTestId('backup-passphrase').fill(PASSPHRASE);
+  await page.getByTestId('backup-passphrase-confirm').fill(PASSPHRASE);
+  const download = page.waitForEvent('download');
+  await page.getByTestId('backup-export').click();
+  const saved = await download;
+  return { name: saved.suggestedFilename(), text: readFileSync(await saved.path(), 'utf8') };
+}
+
+async function chooseBackup(page: Page, file: { name: string; text: string }): Promise<void> {
+  await page
+    .getByTestId('backup-drop')
+    .locator('input[type=file]')
+    .setInputFiles({
+      name: file.name,
+      mimeType: 'application/json',
+      buffer: Buffer.from(file.text),
+    });
+}
+
+const focusedTestId = (page: Page): Promise<string | null> =>
+  page.evaluate(() => (document.activeElement as HTMLElement | null)?.dataset.testid ?? null);
+
+test.describe('review fixes', () => {
+  test('backup: Apply uses only what was previewed; any change asks for a new preview', async ({
+    page,
+    context,
+  }) => {
+    test.slow(); // PBKDF2 several times
+    await seedApp(context, { key: true });
+    await page.goto('settings/#backup');
+    const file = await exportWithKeys(page);
+    await expect(page.getByTestId('backup-passphrase-strength')).toHaveText('—');
+
+    await chooseBackup(page, file);
+    const apply = page.getByTestId('backup-apply');
+    await expect(page.getByTestId('backup-change').filter({ hasText: 'Skip keys' })).toBeVisible();
+    await expect(apply).toBeEnabled();
+
+    // Typing the passphrase makes the shown preview stale.
+    await page.getByTestId('backup-import-passphrase').fill(PASSPHRASE);
+    await expect(apply).toBeDisabled();
+    await expect(page.getByTestId('backup-stale')).toBeVisible();
+    await page.getByTestId('backup-preview-button').click();
+    await expect(apply).toBeEnabled({ timeout: PBKDF2_WAIT });
+    await expect(page.getByTestId('backup-stale')).toBeHidden();
+
+    // Editing it again, or changing the mode, disables Apply until Preview runs again.
+    await page.getByTestId('backup-import-passphrase').fill('something else');
+    await expect(apply).toBeDisabled();
+    await page.getByTestId('backup-import-passphrase').fill(PASSPHRASE);
+    await expect(apply).toBeDisabled();
+    await page.getByTestId('backup-preview-button').click();
+    await expect(apply).toBeEnabled({ timeout: PBKDF2_WAIT });
+    await page.getByTestId('backup-mode-replace').check();
+    await expect(apply).toBeDisabled();
+  });
+
+  test('backup: Replace lists what it deletes and asks before applying', async ({
+    page,
+    context,
+  }) => {
+    test.slow();
+    await seedApp(context, { key: true });
+    await page.goto('settings/#backup');
+    const file = await exportWithKeys(page);
+    // Something the backup does not have: Replace would delete it.
+    await page.evaluate(async () => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('ortoolbox');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error ?? new Error('open failed'));
+      });
+      const tx = db.transaction('prompts', 'readwrite');
+      tx.objectStore('prompts').put({
+        id: 'later',
+        tool: 'chat',
+        kind: 'saved',
+        name: 'Made after the backup',
+        text: 'x',
+        settings: {},
+        createdAt: 1,
+        usedAt: 1,
+      });
+      await new Promise<void>((resolve) => {
+        tx.oncomplete = () => resolve();
+      });
+      db.close();
+    });
+
+    await chooseBackup(page, file);
+    await page.getByTestId('backup-mode-replace').check();
+    await page.getByTestId('backup-preview-button').click();
+    const destructive = page.getByTestId('backup-destructive');
+    await expect(destructive).toBeVisible();
+    await expect(destructive).toContainText('Delete 1 saved prompt');
+
+    await page.getByTestId('backup-apply').click();
+    const dialog = page.getByTestId('replace-confirm-dialog');
+    await expect(dialog).toContainText('Delete 1 saved prompt');
+    await expect(dialog).toContainText('runs and jobs that are not in the backup');
+    await dialog.getByTestId('dialog-cancel').click();
+    await expect(page.getByTestId('backup-restored')).toHaveCount(0);
+
+    await page.getByTestId('backup-apply').click();
+    await page.getByTestId('replace-confirm-dialog').getByTestId('dialog-confirm').click();
+    await expect(page.getByTestId('backup-restored')).toBeVisible({ timeout: PBKDF2_WAIT });
+  });
+
+  test('budgets: per-key labels follow renames', async ({ page, context }) => {
+    await seedApp(context, { key: true });
+    await page.goto('settings/#budgets');
+    const label = page.locator('[data-testid="budget-key"][data-key-id="key-test"] label');
+    await expect(label).toHaveText('Test key');
+    await page.getByTestId('settings-nav-keys').click();
+    await page.getByTestId('key-rename').click();
+    await page.getByTestId('prompt-input').fill('Renamed');
+    await page.getByTestId('rename-key-dialog').getByTestId('dialog-confirm').click();
+    await page.getByTestId('settings-nav-budgets').click();
+    await expect(label).toHaveText('Renamed');
+  });
+
+  test('Back to the bare URL shows the first section', async ({ page, context }) => {
+    await seedApp(context);
+    await page.goto('settings/');
+    await page.getByTestId('settings-nav-budgets').click();
+    await expect(section(page, 'budgets')).toBeVisible();
+    await page.goBack();
+    await expect(page).toHaveURL(/settings\/$/);
+    await expect(section(page, 'keys')).toBeVisible();
+    await expect(page.getByTestId('settings-nav-keys')).toHaveAttribute('aria-current', 'true');
+    await expect(page.getByTestId('settings-nav-budgets')).not.toHaveAttribute(
+      'aria-current',
+      'true',
+    );
+  });
+
+  test('number fields validate as you type, announce the error and keep what you typed', async ({
+    page,
+    context,
+  }) => {
+    await seedApp(context);
+    await page.goto('settings/#budgets');
+    const perRun = page.getByTestId('budget-per-run');
+    await perRun.fill('a lot');
+    await expect(perRun).toHaveAttribute('aria-invalid', 'true');
+    await expect(page.getByTestId('announcer-assertive')).toContainText(
+      'Enter an amount in dollars',
+    );
+    await perRun.press('Tab');
+    // Another change re-syncs the section; the field the user is fixing keeps their text and its error.
+    await page.getByTestId('budget-mode-hard').check();
+    await expect(perRun).toHaveValue('a lot');
+    await expect(perRun).toHaveClass(/is-invalid/);
+    await perRun.fill('0,25');
+    await expect(perRun).not.toHaveClass(/is-invalid/);
+    await perRun.press('Enter');
+    await page.reload();
+    await expect(page.getByTestId('budget-per-run')).toHaveValue('0.25');
+  });
+
+  test('Undo of a key removal works after the keys changed again', async ({ page }) => {
+    await seedTwoKeys(page, { tools: { ocr: { keyId: 'key-work' } } });
+    await page.goto('settings/#keys');
+    const work = page.getByTestId('key-row').filter({ hasText: 'Work' });
+    await work.getByTestId('key-remove').click();
+    await page.getByTestId('remove-key-dialog').getByTestId('dialog-confirm').click();
+    await expect(page.getByTestId('key-row')).toHaveCount(1);
+    // The removed row's button is gone: focus lands on the section heading, not the page.
+    await expect(page.locator('#keys-title')).toBeFocused();
+    // Another change to the keys file after the removal.
+    await page.getByTestId('key-no-retention').check();
+    await page
+      .getByTestId('toast')
+      .filter({ hasText: 'removed' })
+      .getByTestId('toast-undo')
+      .click();
+    await expect(page.getByTestId('key-row')).toHaveCount(2);
+    await expect(page.getByTestId('key-row').first().getByTestId('key-no-retention')).toBeChecked();
+    await expect(page.getByTestId('error-toast')).toHaveCount(0);
+    await page.getByTestId('settings-nav-tools').click();
+    await expect(page.getByTestId('tool-row-ocr').getByTestId('tool-key')).toHaveValue('key-work');
+  });
+
+  test('focus stays on a sensible control after re-renders', async ({ page, context, mock }) => {
+    test.slow(); // PBKDF2
+    mockKeyStatus(mock);
+    await seedApp(context, { key: true });
+    await page.goto('settings/#keys');
+    await expect(page.getByTestId('key-usage')).toHaveText('$1.25');
+
+    await page.getByTestId('key-refresh').focus();
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('key-usage')).toHaveText('$1.25');
+    expect(await focusedTestId(page)).toBe('key-refresh');
+
+    // A failed forced refresh never says "updated".
+    mock.error('/api/v1/key', 401, undefined, { method: 'GET' });
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('key-balance-error')).toBeVisible();
+    await expect(page.getByTestId('announcer-polite')).toHaveText(
+      'The balance of Test key could not be checked.',
+    );
+    expect(await focusedTestId(page)).toBe('key-refresh');
+
+    // The lock: the toggle button keeps focus as it flips between Lock now and Unlock.
+    await page.getByTestId('settings-nav-security').click();
+    await page.getByTestId('lock-new').fill(PASSPHRASE);
+    await page.getByTestId('lock-confirm').fill(PASSPHRASE);
+    await page.getByTestId('lock-confirm').press('Enter');
+    await expect(page.getByTestId('lock-state')).toHaveText('Unlocked', { timeout: PBKDF2_WAIT });
+    expect(await focusedTestId(page)).toBe('lock-now');
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('lock-state')).toHaveText('Locked');
+    expect(await focusedTestId(page)).toBe('lock-unlock');
+  });
+
+  test('per-tool delete leaves focus in the table card', async ({ page, context }) => {
+    await seedApp(context, { key: true });
+    await page.goto('settings/#data');
+    await expect(page.getByTestId('data-row-chat').getByTestId('data-recent')).toHaveText('0');
+    await seedHistory(page, 'chat', 2, 1);
+    const remove = page.getByTestId('data-row-chat').getByTestId('data-delete');
+    await expect(remove).toBeEnabled();
+    await remove.focus();
+    await page.keyboard.press('Enter');
+    await page.getByTestId('delete-tool-dialog').getByTestId('dialog-confirm').click();
+    await expect(remove).toBeDisabled();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            document
+              .querySelector('[data-testid="data-per-tool"]')
+              ?.contains(document.activeElement) ?? false,
+        ),
+      )
+      .toBe(true);
+  });
+
+  test('a mode that cannot be saved does not stay selected', async ({ page, context }) => {
+    await seedApp(context);
+    await page.goto('settings/#budgets');
+    await expect(page.getByTestId('budget-mode-warn')).toBeChecked();
+    // Browser storage is full: the next settings write fails as it would at the quota.
+    await page.evaluate(() => {
+      const original = Object.getOwnPropertyDescriptor(Storage.prototype, 'setItem')!.value as (
+        this: Storage,
+        key: string,
+        value: string,
+      ) => void;
+      Storage.prototype.setItem = function (this: Storage, key: string, value: string) {
+        if (key === 'ortoolbox:settings') throw new DOMException('full', 'QuotaExceededError');
+        original.call(this, key, value);
+      };
+    });
+    // click(), not check(): the radio is put back at once, which check() would report as a failure.
+    await page.getByTestId('budget-mode-hard').click();
+    await expect(page.getByTestId('error-toast')).toBeVisible();
+    await expect(page.getByTestId('budget-mode-warn')).toBeChecked();
+    await expect(page.getByTestId('budget-mode-hard')).not.toBeChecked();
+  });
+
+  test('the Reset dialog’s backup link closes it and opens Backup', async ({ page, context }) => {
+    await seedApp(context);
+    await page.goto('settings/#data');
+    await page.getByTestId('reset-everything').click();
+    await page.getByTestId('reset-dialog').getByRole('link', { name: 'Download a backup' }).click();
+    await expect(page.getByTestId('reset-dialog')).toHaveCount(0);
+    await expect(section(page, 'backup')).toBeVisible();
+  });
+
+  test('accent presets are at least 24 px', async ({ page, context }) => {
+    await seedApp(context);
+    await page.goto('settings/#appearance');
+    const box = await page.getByTestId('accent-preset-teal').boundingBox();
+    expect(box?.width).toBeGreaterThanOrEqual(24);
+    expect(box?.height).toBeGreaterThanOrEqual(24);
   });
 });

@@ -9,6 +9,7 @@ import {
   capabilityDefault,
   freeOnlyImpact,
   freeOnlyModel,
+  isDestructiveChange,
   keyBalance,
   parseUsd,
   parseWhole,
@@ -51,12 +52,41 @@ describe('parseUsd', () => {
     expect(parseUsd('1.2.3', { max: 10 })).toMatchObject({ ok: false });
     expect(parseUsd('11', { max: 10 })).toEqual({ ok: false, error: 'Enter at most $10.00.' });
   });
+
+  it('reads a decimal comma as cents, never as thousands', () => {
+    expect(parseUsd('0,25', { max: 100 })).toEqual({ ok: true, value: 0.25 });
+    expect(parseUsd('1,5', { max: 100 })).toEqual({ ok: true, value: 1.5 });
+    expect(parseUsd('$12,50', { max: 100 })).toEqual({ ok: true, value: 12.5 });
+  });
+
+  it('keeps thousands separators with or without cents', () => {
+    expect(parseUsd('1,234.56', { max: 100_000 })).toEqual({ ok: true, value: 1234.56 });
+    expect(parseUsd('12,345,678', { max: 1e9 })).toEqual({ ok: true, value: 12_345_678 });
+  });
+
+  it('refuses amounts whose comma could mean either', () => {
+    const ambiguous = {
+      ok: false,
+      error: 'Use a dot for cents and commas only between thousands, like 1,234.50.',
+    };
+    expect(parseUsd('0,250', { max: 100 })).toEqual(ambiguous);
+    expect(parseUsd('1,2345', { max: 100_000 })).toEqual(ambiguous);
+    expect(parseUsd('1,23.4', { max: 100 })).toEqual(ambiguous);
+    expect(parseUsd('1.234,56', { max: 100_000 })).toEqual(ambiguous);
+    expect(parseUsd('1,,5', { max: 100 })).toEqual(ambiguous);
+  });
 });
 
 describe('parseWhole', () => {
   it('accepts whole numbers in range', () => {
     expect(parseWhole('0', { min: 0, max: 1440 })).toEqual({ ok: true, value: 0 });
     expect(parseWhole(' 90 ', { min: 1, max: 3650 })).toEqual({ ok: true, value: 90 });
+  });
+
+  it('accepts thousands separators, as its own message prints them', () => {
+    expect(parseWhole('1,440', { min: 0, max: 1440 })).toEqual({ ok: true, value: 1440 });
+    expect(parseWhole('1,44', { min: 0, max: 1440 })).toMatchObject({ ok: false });
+    expect(parseWhole('0,440', { min: 0, max: 1440 })).toMatchObject({ ok: false });
   });
 
   it('refuses fractions, signs, text and out-of-range values', () => {
@@ -215,6 +245,32 @@ describe('passphraseStrength', () => {
   it('marks common and repeated passphrases weak', () => {
     expect(passphraseStrength('MyPassword2026!!').score).toBe(1);
     expect(passphraseStrength('aaaaaaaaaaaaaaaaaaaa').score).toBe(1);
+  });
+});
+
+describe('isDestructiveChange', () => {
+  it('picks out the lines that delete or overwrite', () => {
+    for (const line of [
+      'Delete 3 saved prompts',
+      'Replace 2 keys with 1 from the backup',
+      'Replace all settings (4 settings differ)',
+      'Turn off the passphrase lock',
+      'Use the backup’s passphrase lock',
+      '2 tool key pins removed: their keys are not in this browser',
+      'Default key cleared: it is not in this browser',
+    ]) {
+      expect(isDestructiveChange(line), line).toBe(true);
+    }
+    for (const line of [
+      'Add 120 runs',
+      'Update 2 jobs',
+      'Settings unchanged',
+      'Change 2 settings: budgets.mode, freeOnly',
+      'Skip keys (enter the backup passphrase to import them)',
+      'Turn on the backup’s passphrase lock',
+    ]) {
+      expect(isDestructiveChange(line), line).toBe(false);
+    }
   });
 });
 

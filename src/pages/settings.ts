@@ -148,8 +148,9 @@ mountPage(
         heading.scrollIntoView({ block: 'start' });
     }
     window.addEventListener('hashchange', () => {
-      const id = sectionFromHash(location.hash);
-      // Other fragments (the skip link's #main) are not sections.
+      // Back to the bare URL shows the first section, as a fresh visit does. Other fragments (the skip link's
+      // #main) are not sections and change nothing.
+      const id = location.hash === '' ? SETTINGS_SECTIONS[0]!.id : sectionFromHash(location.hash);
       if (id) show(id, true);
     });
   },
