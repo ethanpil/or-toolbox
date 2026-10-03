@@ -32,6 +32,7 @@ All notable changes to this project are documented here. The format follows
 - Tool framework `mountTool()`: header chips, three-zone layout, Run/Stop, URL state, drop and paste, Send to…; all 14 tools mount through it (0e06dde).
 - Home with search, favourites, recent runs and first-run onboarding; Privacy page (39fd198).
 - Tool authoring guide and Stage 2 e2e specs (4c42391).
+- Settings page: keys and balances, default models and free-only mode, tool bindings, budgets, appearance, passphrase lock, data, backup and restore; every section deep-linkable (d8c959f).
 
 ### Changed
 
