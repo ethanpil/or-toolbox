@@ -102,12 +102,12 @@ describe('formatModelPrice', () => {
     );
   });
 
-  it('falls back to per-request, per-image or "Price varies"', () => {
+  it('falls back to per-request, per-input-image or "Price varies"', () => {
     expect(
       formatModelPrice({ isFree: false, pricing: pricing(null, null, { request: 0.04 }) }),
     ).toBe('$0.04 per request');
     expect(formatModelPrice({ isFree: false, pricing: pricing(null, null, { image: 0.03 }) })).toBe(
-      '$0.03 per image',
+      '$0.03 per input image',
     );
     expect(formatModelPrice({ isFree: false, pricing: pricing(null, null) })).toBe('Price varies');
     expect(formatModelPrice({ isFree: false, pricing: pricing(0, 0) })).toBe('Price varies');
