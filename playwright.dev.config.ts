@@ -18,6 +18,8 @@ const baseURL = `http://localhost:${DEV_PORT}${basePath()}`;
 export default defineConfig({
   ...gate,
   metadata: { server: 'dev' },
+  // Let Vite pre-bundle dependencies before the first spec (see the file's comment).
+  globalSetup: './tests/e2e/dev-warmup.ts',
   use: { ...gate.use, baseURL },
   // The dev server also runs the media specs, which the gate (production build) ignores.
   projects: projects
