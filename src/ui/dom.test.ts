@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { append, clear, h, isSafeUrl, on, type Props } from './dom';
+import { append, clear, h, isSafeUrl, on, replace, type Props } from './dom';
 
 /** Calls h() with props the types forbid, to test the runtime guards. */
 const unsafe = (tag: string, props: Record<string, unknown>) =>
@@ -221,6 +221,15 @@ describe('clear', () => {
     const el = h('ul', null, h('li'), h('li'), 'text');
     clear(el);
     expect(el.childNodes).toHaveLength(0);
+  });
+});
+
+describe('replace', () => {
+  it('replaces the children with the same child rules as h()', () => {
+    const el = h('div', null, 'old', h('span', null, 'old'));
+    replace(el, null, 'a', false, [h('b', null, 'b')], undefined, 0);
+    expect(el.childNodes).toHaveLength(3);
+    expect(el.textContent).toBe('ab0');
   });
 });
 

@@ -1,0 +1,69 @@
+// Motion: short (150–250 ms), transform and opacity only, and off under the OS "reduce motion" preference or
+// Settings → Appearance → Reduced motion (`data-reduced-motion` on <html>, set before first paint by
+// public/theme-init.js and kept current by src/ui/shell/appearance.ts).
+
+@keyframes or-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes or-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.or-fade-in {
+  animation: or-fade-in 0.2s ease-out both;
+}
+
+@mixin no-motion {
+  *,
+  ::before,
+  ::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+    animation-iteration-count: 1 !important;
+  }
+
+  // Spinners keep turning (slowly): they are the only sign that something is loading.
+  .spinner-border,
+  .spinner-grow {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  .or-caret {
+    animation: none !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @include no-motion;
+}
+
+// Set for two frames while the theme or accent changes (src/ui/shell/appearance.ts).
+:root[data-no-transition] {
+  *,
+  ::before,
+  ::after {
+    transition: none !important;
+  }
+}
+
+:root[data-reduced-motion] {
+  @include no-motion;
+
+  &::view-transition-old(root),
+  &::view-transition-new(root) {
+    animation: none;
+  }
+}

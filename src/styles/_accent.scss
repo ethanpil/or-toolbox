@@ -1,0 +1,85 @@
+// A custom accent colour (Settings → Appearance). src/ui/shell/appearance.ts sets Bootstrap's primary-colour
+// custom properties on <html> plus `--or-accent-*` and the `data-accent` attribute. Bootstrap compiles the
+// primary colour into some components as fixed values; while `data-accent` is set, these rules point those
+// components at the custom properties instead. Without it, nothing here applies and Bootstrap is untouched.
+
+[data-accent] {
+  .btn-primary {
+    --bs-btn-color: var(--or-accent-contrast);
+    --bs-btn-bg: var(--bs-primary);
+    --bs-btn-border-color: var(--bs-primary);
+    --bs-btn-hover-color: var(--or-accent-contrast);
+    --bs-btn-hover-bg: var(--or-accent-hover);
+    --bs-btn-hover-border-color: var(--or-accent-active);
+    --bs-btn-focus-shadow-rgb: var(--bs-primary-rgb);
+    --bs-btn-active-color: var(--or-accent-contrast);
+    --bs-btn-active-bg: var(--or-accent-active);
+    --bs-btn-active-border-color: var(--or-accent-active);
+    --bs-btn-disabled-color: var(--or-accent-contrast);
+    --bs-btn-disabled-bg: var(--bs-primary);
+    --bs-btn-disabled-border-color: var(--bs-primary);
+  }
+
+  .btn-outline-primary {
+    --bs-btn-color: var(--or-accent-text);
+    --bs-btn-border-color: var(--bs-primary);
+    --bs-btn-hover-color: var(--or-accent-contrast);
+    --bs-btn-hover-bg: var(--bs-primary);
+    --bs-btn-hover-border-color: var(--bs-primary);
+    --bs-btn-focus-shadow-rgb: var(--bs-primary-rgb);
+    --bs-btn-active-color: var(--or-accent-contrast);
+    --bs-btn-active-bg: var(--bs-primary);
+    --bs-btn-active-border-color: var(--bs-primary);
+    --bs-btn-disabled-color: var(--or-accent-text);
+    --bs-btn-disabled-border-color: var(--bs-primary);
+  }
+
+  .text-bg-primary {
+    color: var(--or-accent-contrast) !important;
+  }
+
+  .form-check-input:checked {
+    background-color: var(--bs-primary);
+    border-color: var(--bs-primary);
+  }
+
+  .form-control:focus,
+  .form-select:focus,
+  .form-check-input:focus {
+    border-color: var(--bs-primary-border-subtle);
+    box-shadow: 0 0 0 0.25rem var(--bs-focus-ring-color);
+  }
+
+  .nav-link:focus-visible,
+  .btn-close:focus,
+  .accordion-button:focus {
+    box-shadow: 0 0 0 0.25rem var(--bs-focus-ring-color);
+  }
+
+  .nav-pills {
+    --bs-nav-pills-link-active-color: var(--or-accent-contrast);
+    --bs-nav-pills-link-active-bg: var(--bs-primary);
+  }
+
+  .dropdown-menu {
+    --bs-dropdown-link-active-color: var(--or-accent-contrast);
+    --bs-dropdown-link-active-bg: var(--bs-primary);
+  }
+
+  .list-group {
+    --bs-list-group-active-color: var(--or-accent-contrast);
+    --bs-list-group-active-bg: var(--bs-primary);
+    --bs-list-group-active-border-color: var(--bs-primary);
+  }
+
+  .progress,
+  .progress-stacked {
+    --bs-progress-bar-color: var(--or-accent-contrast);
+    --bs-progress-bar-bg: var(--bs-primary);
+  }
+
+  .accordion {
+    --bs-accordion-active-color: var(--bs-primary-text-emphasis);
+    --bs-accordion-active-bg: var(--bs-primary-bg-subtle);
+  }
+}

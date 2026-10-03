@@ -12,7 +12,12 @@
   $font-family-sans-serif: v.$font-family-sans-serif,
   $border-radius-sm: v.$border-radius-sm,
   $border-radius: v.$border-radius,
-  $border-radius-lg: v.$border-radius-lg
+  $border-radius-lg: v.$border-radius-lg,
+  $transition-fade: v.$transition-fade,
+  $transition-collapse: v.$transition-collapse,
+  $modal-transition: v.$modal-transition,
+  $offcanvas-transition-duration: v.$offcanvas-transition-duration,
+  $progress-bar-transition: v.$progress-bar-transition
 );
 
 // Self-hosted icon font. Vite bundles the font file next to the CSS; nothing
@@ -24,6 +29,14 @@
 @use 'bootstrap-icons/font/bootstrap-icons' with (
   $bootstrap-icons-font-src: url('bootstrap-icons/font/fonts/bootstrap-icons.woff2') format('woff2')
 );
+
+// The few rules Bootstrap lacks, one partial per concern. They use Bootstrap's CSS custom properties only, so
+// they follow light/dark and the accent colour automatically.
+@use 'shell';
+@use 'components';
+@use 'tool';
+@use 'accent';
+@use 'motion';
 
 // Cross-page View Transitions: a short cross-fade between pages so the
 // multi-page site feels like one app. Browsers without support navigate
@@ -37,4 +50,9 @@
   ::view-transition-new(root) {
     animation-duration: 200ms;
   }
+}
+
+// The navbar stays put while the page content cross-fades.
+.or-navbar {
+  view-transition-name: or-navbar;
 }

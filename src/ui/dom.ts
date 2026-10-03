@@ -207,6 +207,12 @@ export function clear(el: Element): void {
   el.replaceChildren();
 }
 
+/** Replaces every child of `el` with `children`; same rules as `h()` (rule 1), so `null`/`false` are skipped. */
+export function replace(el: Element, ...children: Child[]): void {
+  el.replaceChildren();
+  appendChildren(el, children);
+}
+
 /**
  * Adds an event listener and returns a function that removes it.
  *

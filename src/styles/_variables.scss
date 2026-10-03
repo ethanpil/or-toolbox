@@ -25,3 +25,10 @@ $font-family-sans-serif:
 $border-radius-sm: 0.375rem;
 $border-radius: 0.5rem;
 $border-radius-lg: 0.75rem;
+
+// Motion stays within 150–250 ms (CLAUDE.md); Bootstrap's defaults go up to 600 ms.
+$transition-fade: opacity 0.2s linear;
+$transition-collapse: height 0.25s ease;
+$modal-transition: transform 0.2s ease-out;
+$offcanvas-transition-duration: 0.25s;
+$progress-bar-transition: width 0.25s ease;
