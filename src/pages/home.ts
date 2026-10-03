@@ -3,13 +3,14 @@
  * onboarding, Favourites (starred tools), the five latest runs, then every tool by category. A tool card shows
  * a "Free" badge when its primary capability currently resolves to a free model.
  */
-import type { RunRecord } from '../core/types';
+import type { RunRecord, Settings } from '../core/types';
 import { getTool, tools } from '../tools/registry';
 import { TOOL_CATEGORIES, type ToolId, type ToolManifest } from '../tools/types';
 import { emptyState } from '../ui/components/empty-state';
-import { type Child, h } from '../ui/dom';
+import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
 import { presentError } from '../ui/feedback/errors';
+import { modalOpen } from '../ui/feedback/modal';
 import { formatDateTime, formatRelativeTime, formatUsd, plural } from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
@@ -104,6 +105,8 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
             'aria-pressed': String(starred),
             'aria-label': `Favourite: ${tool.name}`,
             title: starred ? 'Remove from favourites' : 'Add to favourites',
+            // Re-rendering a grid gives focus back to the same tool's star (see replace() in dom.ts).
+            'data-focus-key': `star-${tool.id}`,
             'data-testid': `star-${tool.id}`,
             onclick: () => toggleFavourite(tool),
           },
@@ -161,7 +164,8 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
 
   const renderFavourites = (): void => {
     const list = core.settings.get().favouriteTools.map(getTool);
-    favourites.replaceChildren(
+    replace(
+      favourites,
       sectionHeading('favourites-title', 'star', 'Favourites'),
       list.length > 0
         ? grid(list, 'fav-')
@@ -177,12 +181,14 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
 
   const runRow = (run: RunRecord): HTMLElement => {
     const tool = getTool(run.tool);
+    // "Free" only for runs on free models; a failed paid run that cost nothing shows $0.00.
+    const allFree = run.models.length > 0 && run.models.every((model) => core.models.isFree(model));
     const cost =
       run.status === 'running'
         ? 'Running'
         : run.usage.costUnknown
           ? 'Cost unknown'
-          : run.usage.costUsd === 0
+          : run.usage.costUsd === 0 && allFree
             ? 'Free'
             : formatUsd(run.usage.costUsd);
     return h(
@@ -263,12 +269,24 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
         );
       })
       .catch(() => {
-        if (mine === recentGeneration) recent.hidden = true;
+        // Replace the skeleton for good (hiding it would let the search bring it back).
+        if (mine !== recentGeneration) return;
+        recent.replaceChildren(
+          heading,
+          emptyState({
+            icon: 'exclamation-triangle',
+            title: 'Recent runs could not be loaded',
+            text: 'Browser storage is unavailable right now. Your tools still work.',
+            inline: true,
+            testId: 'recent-error',
+          }),
+        );
       });
   };
 
   const renderCategories = (): void => {
-    categories.replaceChildren(
+    replace(
+      categories,
       ...TOOL_CATEGORIES.map((category) => {
         const id = `category-${category}-title`;
         return h(
@@ -302,7 +320,8 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
       })),
       query,
     ).map((entry) => entry.tool);
-    results.replaceChildren(
+    replace(
+      results,
       h(
         'h2',
         { id: 'results-title', class: 'or-section-title mb-3' },
@@ -356,7 +375,7 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
       (target instanceof HTMLElement && target.isContentEditable)
     )
       return;
-    if (document.querySelector('.modal.show')) return;
+    if (modalOpen()) return;
     event.preventDefault();
     search.focus();
   });
@@ -374,7 +393,7 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
       h(
         'p',
         { class: 'or-hero-lead text-body-secondary mb-4' },
-        'AI tools that run in your browser, on your own OpenRouter key. Nothing is stored anywhere but here.',
+        'AI tools that run in your browser on your own OpenRouter key. What you run goes to OpenRouter and the model provider; your history, settings and keys stay here.',
       ),
       h(
         'div',
@@ -398,39 +417,29 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
   renderRecent();
   renderCategories();
 
-  /** Updates every star of the page in place (re-rendering would drop keyboard focus). */
-  const updateStars = (): void => {
-    for (const button of main.querySelectorAll<HTMLButtonElement>('.or-card-star')) {
-      const id = button.dataset.testid?.replace(/^star-/, '') as ToolId | undefined;
-      if (!id) continue;
-      const on = isFavourite(id);
-      button.setAttribute('aria-pressed', String(on));
-      button.title = on ? 'Remove from favourites' : 'Add to favourites';
-      button.replaceChildren(icon(on ? 'star-fill' : 'star'));
-    }
-  };
+  /** Anything that changes a card (star, Free badge) re-renders all grids; replace() keeps focus. */
+  const affectsCards = (next: Readonly<Settings>, prev: Readonly<Settings>): boolean =>
+    next.freeOnly !== prev.freeOnly ||
+    JSON.stringify(next.defaultModels) !== JSON.stringify(prev.defaultModels) ||
+    JSON.stringify(next.tools) !== JSON.stringify(prev.tools);
 
   core.settings.subscribe((next, prev) => {
-    if (next.favouriteTools.join() !== prev.favouriteTools.join()) {
-      const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      const focusedStar =
-        focused?.dataset.testid?.startsWith('star-') && favourites.contains(focused)
-          ? focused.dataset.testid
+    const favouritesChanged = next.favouriteTools.join() !== prev.favouriteTools.join();
+    if (favouritesChanged || affectsCards(next, prev)) {
+      // A star un-starred inside Favourites disappears with its card: continue on that tool's other star.
+      const focused = document.activeElement;
+      const key =
+        focused instanceof HTMLElement && favourites.contains(focused)
+          ? focused.closest('[data-focus-key]')?.getAttribute('data-focus-key')
           : null;
       renderFavourites();
-      updateStars();
-      // A star clicked in Favourites was re-rendered (or removed): keep focus on that tool's star.
-      if (focusedStar) {
-        (
-          favourites.querySelector<HTMLElement>(`[data-testid="${focusedStar}"]`) ??
-          categories.querySelector<HTMLElement>(`[data-testid="${focusedStar}"]`)
-        )?.focus();
-      }
-    } else if (
-      next.freeOnly !== prev.freeOnly ||
-      JSON.stringify(next.defaultModels) !== JSON.stringify(prev.defaultModels)
-    ) {
       renderCategories();
+      if (search.value.trim()) applySearch();
+      if (key && !main.contains(document.activeElement)) {
+        [...categories.querySelectorAll<HTMLElement>('[data-focus-key]')]
+          .find((candidate) => candidate.getAttribute('data-focus-key') === key)
+          ?.focus();
+      }
     }
     if (next.onboarding.completed !== prev.onboarding.completed && !next.onboarding.completed)
       showOnboarding();

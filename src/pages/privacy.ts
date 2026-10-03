@@ -41,7 +41,7 @@ mountPage(
   {
     title: 'Privacy',
     icon: 'shield-check',
-    lead: 'ORtoolbox has no server and no accounts. Your keys, prompts and results stay in this browser.',
+    lead: 'ORtoolbox has no server and no accounts. What you run goes to OpenRouter and the model provider; everything else stays in this browser.',
     nav: 'privacy',
     narrow: true,
   },
@@ -50,11 +50,11 @@ mountPage(
       section(
         'privacy-local',
         'laptop',
-        'Everything stays in this browser',
+        'No ORtoolbox server',
         h(
           'p',
           null,
-          'The site is a set of static files. Once loaded, every tool runs on your device. There is no ORtoolbox server that could see your data, no analytics and no tracking, and no cookies.',
+          'The site is a set of static files. Once loaded, every tool runs on your device. There is no ORtoolbox server that could see your data, no analytics, no tracking and no cookies.',
         ),
         h(
           'p',
@@ -68,7 +68,11 @@ mountPage(
         'privacy-network',
         'arrow-left-right',
         'What leaves your browser',
-        h('p', null, 'Only two kinds of network traffic happen:'),
+        h(
+          'p',
+          null,
+          'When you run a tool, your prompt and any files you added to that run are sent to OpenRouter, which passes them to the provider of the model you chose. Apart from that, only two kinds of traffic happen:',
+        ),
         h(
           'ul',
           null,
@@ -76,7 +80,13 @@ mountPage(
             'li',
             null,
             h('strong', null, 'Requests to OpenRouter'),
-            ' (openrouter.ai) when you run a tool, check a key or load the model list. The request carries your prompt and any files you added to that run.',
+            ' (openrouter.ai): runs, key checks and the model list. Requests made with your key also say which app sent them: the site address (',
+            h('code', null, 'HTTP-Referer'),
+            '), the name ORtoolbox (',
+            h('code', null, 'X-OpenRouter-Title'),
+            ') and, for some tools, a category (',
+            h('code', null, 'X-OpenRouter-Categories'),
+            '). OpenRouter uses these for its app listings.',
           ),
           h(
             'li',
@@ -97,7 +107,7 @@ mountPage(
         'What is stored where',
         h(
           'div',
-          { class: 'table-responsive' },
+          { class: 'table-responsive position-relative' },
           h(
             'table',
             { class: 'table align-middle mb-0' },
@@ -116,7 +126,7 @@ mountPage(
                 h(
                   'td',
                   null,
-                  'Settings, favourites and your API keys (encrypted when the passphrase lock is on).',
+                  'Settings, favourites and your API keys (keys encrypted when the passphrase lock is on).',
                 ),
               ),
               h(
@@ -126,7 +136,7 @@ mountPage(
                 h(
                   'td',
                   null,
-                  'Text-only history of runs, recent and saved prompts, the video job queue, the cached model list and spending stats.',
+                  'Text-only history of runs (prompts, settings and text results), recent and saved prompts, each tool’s own saved work (such as a video sequence), the video job queue, the cached model list and spending stats.',
                 ),
               ),
               h(
@@ -154,10 +164,15 @@ mountPage(
         ),
         h(
           'p',
-          { class: 'mt-3 mb-0' },
-          'History and recent prompts are deleted after the retention period you choose. You can delete them, or everything, any time in ',
+          { class: 'mt-3' },
+          'History and recent prompts are deleted after the retention period you choose; starred runs, saved prompts and spending stats are kept until you delete them. You can delete any of it, or everything, in ',
           h('a', { href: settingsUrl('data') }, 'Settings → Data'),
           '.',
+        ),
+        h(
+          'p',
+          { class: 'mb-0' },
+          'The passphrase lock encrypts your API keys only. History, prompts and settings are stored unencrypted, readable by anyone who can use this browser profile.',
         ),
       ),
       section(
@@ -170,7 +185,7 @@ mountPage(
           h(
             'li',
             null,
-            'Keys are shown masked (sk-or-…a1b2), never written to history or logs, and never put in a URL.',
+            'Keys are shown masked (sk-or-…a1b2), never written to history or logs, never put in a URL, and sent only to openrouter.ai.',
           ),
           h(
             'li',
@@ -211,11 +226,27 @@ mountPage(
       section(
         'privacy-openrouter',
         'building',
-        'What OpenRouter does with your requests',
+        'What OpenRouter and the providers do with your requests',
         h(
           'p',
           null,
-          'OpenRouter forwards each request to the model provider you chose. How OpenRouter and the providers handle that data is set by their policies, not by ORtoolbox.',
+          'OpenRouter forwards each request to the provider of the model you chose. How they handle that data is set by their policies, not by ORtoolbox.',
+        ),
+        h(
+          'ul',
+          null,
+          h(
+            'li',
+            null,
+            h('strong', null, 'Free models'),
+            ' are often offered by providers that log prompts or use them for training. Do not send anything private to a free model.',
+          ),
+          h(
+            'li',
+            null,
+            h('strong', null, '“Prefer providers that do not retain data”'),
+            ', a per-key setting, asks OpenRouter to route only to providers that keep nothing. It is not applied to free models (none qualify) or to image and video generation, so those requests go out without it.',
+          ),
         ),
         h(
           'ul',
@@ -225,7 +256,7 @@ mountPage(
             'li',
             null,
             external(OPENROUTER_ZDR_URL, 'Zero data retention'),
-            ': how to limit requests to providers that keep nothing. Each key in Settings can also ask for providers that do not retain data.',
+            ': how OpenRouter limits requests to providers that keep nothing.',
           ),
         ),
       ),
