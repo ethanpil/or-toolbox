@@ -18,7 +18,7 @@ export function comingSoon(ctx: ToolContext): ToolInstance {
     class: 'form-control',
     rows: 6,
     placeholder: 'What should it do?',
-    'data-testid': 'stub-prompt',
+    'data-testid': 'tool-prompt',
   });
   const files = h('ul', {
     class: 'list-unstyled small mb-0',

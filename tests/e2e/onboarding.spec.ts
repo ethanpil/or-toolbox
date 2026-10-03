@@ -43,7 +43,8 @@ test('paste a key, pick favourites and try a sample', async ({ page, mock }) => 
   await expect(wizard.getByRole('heading', { level: 3 })).toHaveText('Try a sample');
   await page.getByTestId('try-chat').click();
   await expect(page).toHaveURL(/\/tools\/chat\/$/);
-  await expect(page.getByTestId('stub-prompt')).toHaveValue('A sample for Chat.');
+  // Whatever the tool's sample is, it fills the main prompt field (the `tool-prompt` convention).
+  await expect(page.getByTestId('tool-prompt')).not.toHaveValue('');
 
   await page.goto('');
   await expect(page.getByTestId('onboarding')).toHaveCount(0);

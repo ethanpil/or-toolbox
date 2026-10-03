@@ -3,10 +3,9 @@
  * keyboard users do not lose their place); Stop aborts the signal handed to `run`. Errors other than aborts and
  * declined budget confirmations go through `presentError` with a Retry.
  */
-import { errorCode } from '../../core/errors';
 import { h } from '../dom';
 import { announce } from '../feedback/announce';
-import { presentError } from '../feedback/errors';
+import { isStop, presentError, wasPresented } from '../feedback/errors';
 import { formatShortcut } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
@@ -95,9 +94,11 @@ export function createRunner(options: RunnerOptions, primary: boolean): RunnerIn
     try {
       await options.run(controller.signal);
     } catch (error) {
-      const code = errorCode(error);
-      if (code === 'aborted' || code === 'cancelled') announce('Stopped.');
-      else void presentError(error, { retry: () => void trigger() });
+      // Stop and a declined budget confirmation are silent; an error the output panel already showed inline
+      // (`output.fail(error)`) is not shown again; anything else goes through presentError once.
+      if (isStop(error)) {
+        if (!wasPresented(error)) announce('Stopped.');
+      } else void presentError(error, { retry: () => void trigger() });
     } finally {
       busy = false;
       controller = null;

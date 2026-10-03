@@ -79,7 +79,7 @@ test('save the current prompt, use it, rename it, copy it', async ({ page, conte
   await context.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => undefined);
   const problems = await watchForProblems(page);
   await page.goto('tools/chat/');
-  const prompt = page.getByTestId('stub-prompt');
+  const prompt = page.getByTestId('tool-prompt');
   await prompt.fill('Summarise the meeting notes');
 
   await openPanel(page, 'saved');
@@ -162,8 +162,10 @@ async function seedBothLists(page: Page): Promise<void> {
   await openPanel(page, 'recent');
   await seedRecent(page, 'ocr', ['One', 'Two']);
   await expect(entries(page, 'recent')).toHaveCount(2);
-  await page.getByTestId('stub-prompt').evaluate((el: HTMLTextAreaElement) => {
+  // The panel's backdrop covers the form, so type through the DOM (with the input event a real tool listens to).
+  await page.getByTestId('tool-prompt').evaluate((el: HTMLTextAreaElement) => {
     el.value = 'Saved one';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
   });
   await page.getByTestId('prompts-save-current').click();
   await answerPrompt(page, 'Kept');
@@ -233,7 +235,7 @@ test('changes in one tab show up live in another', async ({ page, context }) => 
   await expect(other.getByTestId('prompts-saved')).toContainText('No saved prompts');
 
   await page.bringToFront();
-  await page.getByTestId('stub-prompt').fill('Shared between tabs');
+  await page.getByTestId('tool-prompt').fill('Shared between tabs');
   await openPanel(page, 'saved');
   await page.getByTestId('prompts-save-current').click();
   await answerPrompt(page, 'From tab one');
@@ -259,4 +261,33 @@ test('a note explains when recording recent prompts is off', async ({ page, cont
   await page.goto('tools/chat/');
   await openPanel(page, 'recent');
   await expect(page.getByTestId('recording-off')).toContainText('Recording recent prompts is off');
+});
+
+test('the panel keeps its focus trap after a dialog or the palette over it closes', async ({
+  page,
+}) => {
+  await page.goto('tools/chat/');
+  await page.getByTestId('tool-prompt').fill('Draft');
+  await openPanel(page, 'saved');
+  // From the keyboard: WebKit does not focus buttons on click, so a click leaves nothing to return to.
+  await page.getByTestId('prompts-save-current').focus();
+  await page.keyboard.press('Enter');
+  await answerPrompt(page, 'Draft');
+  await expect(page.getByTestId('prompts-save-current')).toBeFocused();
+  const tabStaysInside = async (): Promise<void> => {
+    for (let step = 0; step < 12; step++) {
+      await page.keyboard.press('Tab');
+      expect(await panel(page).evaluate((el) => el.contains(document.activeElement))).toBe(true);
+    }
+  };
+  await tabStaysInside();
+
+  await page.keyboard.press('Control+k');
+  await expect(page.getByTestId('palette-input')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('palette')).toHaveCount(0);
+  await expect(panel(page)).toBeVisible();
+  await tabStaysInside();
+  await page.keyboard.press('Escape');
+  await expect(panel(page)).toBeHidden();
 });

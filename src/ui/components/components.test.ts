@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { JobRecord, KeyInfo } from '../../core/types';
+import { ApiError, NoKeyError } from '../../core/errors';
+import { wasPresented } from '../feedback/errors';
 import { costBadge } from './cost-badge';
 import { dropZone } from './drop-zone';
 import { emptyState } from './empty-state';
 import { exportMenu } from './export-menu';
 import { jobList } from './job-list';
 import { keyPicker } from './key-picker';
-import { outputPanel } from './output-panel';
+import { outputPanel, stableBoundary } from './output-panel';
 
 const $ = <T extends HTMLElement = HTMLElement>(root: ParentNode, testId: string): T | null =>
   root.querySelector<T>(`[data-testid="${testId}"]`);
@@ -148,6 +150,54 @@ describe('outputPanel', () => {
     expect($(panel.element, 'output-content')!.textContent).toContain('Partial');
   });
 
+  it('renders completed blocks once while streaming and keeps up with every chunk', async () => {
+    const panel = outputPanel({ format: 'markdown' });
+    document.body.append(panel.element);
+    panel.start();
+    panel.append('# Title\n\nFirst paragraph.\n\n');
+    const content = $(panel.element, 'output-content')!;
+    await vi.waitFor(() => expect(content.querySelector('h1')?.textContent).toBe('Title'));
+    const heading = content.querySelector('h1');
+    for (let i = 0; i < 20; i++) panel.append(`word${i} `);
+    // The stable block is not re-rendered: the very same <h1> node stays.
+    await vi.waitFor(() => expect(content.textContent).toContain('word19'));
+    expect(content.querySelector('h1')).toBe(heading);
+    panel.finish();
+    await vi.waitFor(() => expect(content.querySelector('.or-caret')).toBeNull());
+    expect(content.textContent).toContain('First paragraph.');
+    expect(content.textContent).toContain('word0 word1');
+  });
+
+  it('stays silent about a Stop and keeps the partial text', async () => {
+    const panel = outputPanel({ format: 'text' });
+    panel.start();
+    panel.append('Half');
+    panel.fail(new DOMException('Stopped by the user.', 'AbortError'));
+    await vi.waitFor(() => expect($(panel.element, 'output-content')!.textContent).toBe('Half'));
+    expect($(panel.element, 'output-error')).toBeNull();
+    expect($(panel.element, 'output-status')!.textContent).toBe(
+      'Stopped. The partial result is kept.',
+    );
+  });
+
+  it('leaves errors that need an action to presentError, and shows the rest once', async () => {
+    const panel = outputPanel({ format: 'text' });
+    panel.start();
+    const noKey = new NoKeyError();
+    panel.fail(noKey);
+    await vi.waitFor(() => expect($(panel.element, 'output-status')!.textContent).toBe('Not run.'));
+    expect($(panel.element, 'output-error')).toBeNull();
+    expect(wasPresented(noKey)).toBe(false);
+
+    panel.start();
+    const failure = new ApiError('The provider is overloaded.', 503);
+    panel.fail(failure);
+    await vi.waitFor(() =>
+      expect($(panel.element, 'output-error')?.textContent).toBe('The provider is overloaded.'),
+    );
+    expect(wasPresented(failure)).toBe(true);
+  });
+
   it('offers Send to… with the text', () => {
     const sendTo = vi.fn();
     const panel = outputPanel({ format: 'markdown', sendTo, filename: 'answer' });
@@ -158,6 +208,19 @@ describe('outputPanel', () => {
     expect(sendTo).toHaveBeenCalledWith([
       { kind: 'text', text: 'Done', type: 'text/markdown', name: 'answer.md' },
     ]);
+  });
+});
+
+describe('stableBoundary', () => {
+  it('ends after the last blank line outside a code fence', () => {
+    expect(stableBoundary('a\n\nb', 0)).toBe(3);
+    expect(stableBoundary('a\n\nb\n\nc', 0)).toBe(6);
+    expect(stableBoundary('no blank line yet', 0)).toBe(0);
+    // A blank line inside an open fence is not a boundary.
+    expect(stableBoundary('p\n\n```\ncode\n\nmore', 0)).toBe(3);
+    expect(stableBoundary('```\ncode\n\n```\n\nafter', 0)).toBe(15);
+    // Scanning resumes from the previous boundary.
+    expect(stableBoundary('a\n\nb\n\nc', 3)).toBe(6);
   });
 });
 
