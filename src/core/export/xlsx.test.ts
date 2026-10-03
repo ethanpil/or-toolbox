@@ -16,10 +16,45 @@ describe('sanitizeSheetName', () => {
   });
 
   it('never returns an empty or reserved name, or one over 31 characters', () => {
-    expect(sanitizeSheetName('')).toBe('Sheet');
-    expect(sanitizeSheetName("''")).toBe('Sheet');
+    expect(sanitizeSheetName('')).toBe('Sheet 1');
+    expect(sanitizeSheetName("''")).toBe('Sheet 1');
     expect(sanitizeSheetName('History')).toBe('History_');
     expect(sanitizeSheetName('x'.repeat(40))).toBe('x'.repeat(31));
+  });
+
+  it('numbers the fallback by position, and keeps it unique', () => {
+    const taken = new Set<string>();
+    expect(sanitizeSheetName('Sheet 1', taken)).toBe('Sheet 1');
+    expect(sanitizeSheetName('', taken)).toBe('Sheet 2');
+    expect(sanitizeSheetName('', taken)).toBe('Sheet 3');
+    expect(sanitizeSheetName('', taken, 1)).toBe('Sheet 1 (2)');
+  });
+
+  it('removes characters XML cannot hold before anything else', () => {
+    const NUL = String.fromCharCode(0);
+    const ESC = String.fromCharCode(27);
+    expect(sanitizeSheetName(`a${NUL}b${ESC}c`)).toBe('abc');
+    expect(sanitizeSheetName(`${NUL}${ESC}`)).toBe('Sheet 1');
+    expect(sanitizeSheetName('tab\there\nnew')).toBe('tab here new');
+    expect(sanitizeSheetName(`lone${String.fromCharCode(0xd83d)}surrogate`)).toBe('lonesurrogate');
+  });
+
+  it('cuts to 31 characters first, then drops the apostrophes that ends up at the edges', () => {
+    expect(sanitizeSheetName(`${'x'.repeat(30)}''`)).toBe('x'.repeat(30));
+    expect(sanitizeSheetName(`'${'x'.repeat(29)}'y`)).toBe('x'.repeat(29));
+    expect(sanitizeSheetName("it's fine")).toBe("it's fine");
+  });
+
+  it('checks uniqueness on the final names, after cutting and cleaning', () => {
+    const taken = new Set<string>();
+    const a = sanitizeSheetName(`${'x'.repeat(31)}A`, taken);
+    const b = sanitizeSheetName(`${'x'.repeat(31)}B`, taken);
+    expect(a).toBe('x'.repeat(31));
+    expect(b).toBe(`${'x'.repeat(27)} (2)`);
+    expect(sanitizeSheetName('Ab/', taken)).toBe('Ab_');
+    expect(sanitizeSheetName('AB_', taken)).toBe('AB_ (2)');
+    expect(sanitizeSheetName('history', taken)).toBe('history_');
+    expect(sanitizeSheetName('HISTORY_', taken)).toBe('HISTORY_ (2)');
   });
 
   it('makes names unique ignoring case, within 31 characters', () => {
@@ -71,7 +106,7 @@ describe('toXlsx', () => {
     expect(xml).not.toContain('r="D4"');
 
     expect(xml).not.toContain('r="A5"'); // null
-    expect(xml).not.toContain('r="B5"'); // NaN
+    expect(xml).toMatch(/<c r="B5" t="s">/); // NaN is never written as a number
     expect(xml).toMatch(/<c r="C5"[^>]*><v>46088\.4375<\/v>/); // date-time without a zone: UTC
     expect(xml).not.toContain('r="D5"');
 
@@ -141,6 +176,144 @@ describe('toXlsx', () => {
     expect(strings).toContain(`<t>${'y'.repeat(32767)}</t>`);
     expect(strings).toContain('<t>=SUM(A1:A2)</t>');
     expect(files['xl/worksheets/sheet1.xml']).not.toContain('<f>');
+  });
+
+  /** The cells of the first data row (row 2) of a one-column workbook, as `[type attribute, value]`. */
+  async function cellsOf(values: unknown[], type: 'number' | 'date'): Promise<string[]> {
+    const files = await open(
+      await toXlsx([
+        { name: 'T', columns: [{ key: 'v', type }], rows: values.map((v) => ({ v })) },
+      ]),
+    );
+    const xml = files['xl/worksheets/sheet1.xml'] ?? '';
+    const strings = [
+      ...(files['xl/sharedStrings.xml'] ?? '').matchAll(/<t[^>]*>([^<]*)<\/t>/g),
+    ].map((m) => m[1] ?? '');
+    return values.map((_, i) => {
+      const cell = new RegExp(`<c r="A${i + 2}"([^>]*)><v>([^<]*)</v></c>`).exec(xml);
+      if (!cell) return 'none';
+      return cell[1]?.includes('t="s"') ? `text:${strings[Number(cell[2])]}` : `value:${cell[2]}`;
+    });
+  }
+
+  it('writes NaN and infinities as text, never as numbers', async () => {
+    expect(await cellsOf([Number.NaN, Infinity, -Infinity, 5], 'number')).toEqual([
+      'text:NaN',
+      'text:Infinity',
+      'text:-Infinity',
+      'value:5',
+    ]);
+  });
+
+  it("converts only canonical decimal strings in a 'number' column", async () => {
+    const cells = await cellsOf(
+      [
+        '0',
+        '5',
+        '-5',
+        '0.5',
+        '-0.25',
+        '1.50',
+        '123456789012345',
+        '1234567.12345678',
+        '007',
+        '00.5',
+        '+5',
+        '.5',
+        '5.',
+        '1e5',
+        '1,234',
+        ' 5',
+        '5 ',
+        '0x10',
+        '1234567890123456',
+        '0.1234567890123456',
+        '-',
+        '',
+      ],
+      'number',
+    );
+    expect(cells).toEqual([
+      'value:0',
+      'value:5',
+      'value:-5',
+      'value:0.5',
+      'value:-0.25',
+      'value:1.5',
+      'value:123456789012345',
+      'value:1234567.12345678', // 15 digits
+      'text:007', // leading zeros are an identifier, not a number
+      'text:00.5',
+      'text:+5',
+      'text:.5',
+      'text:5.',
+      'text:1e5',
+      'text:1,234',
+      'text: 5',
+      'text:5 ',
+      'text:0x10',
+      'text:1234567890123456', // 16 digits would lose precision
+      'text:0.1234567890123456',
+      'text:-',
+      'none',
+    ]);
+  });
+
+  it("converts only real calendar dates in a 'date' column", async () => {
+    const cells = await cellsOf(
+      [
+        '2026-03-05',
+        '2024-02-29',
+        '2026-02-29',
+        '2026-02-31',
+        '2026-04-31',
+        '2026-13-01',
+        '2026-00-10',
+        '2026-03-00',
+        '2026-03-05T10:30',
+        '2026-03-05T24:00:00',
+        '2026-03-05T10:60:00',
+        '2026-03-05T10:30:61',
+        '2026-03-05T10:30:00+05:30',
+        '2026-03-05 10:30:00',
+        '2026-3-5',
+      ],
+      'date',
+    );
+    expect(cells).toEqual([
+      'value:46086',
+      'value:45351',
+      'text:2026-02-29',
+      'text:2026-02-31',
+      'text:2026-04-31',
+      'text:2026-13-01',
+      'text:2026-00-10',
+      'text:2026-03-00',
+      expect.stringMatching(/^value:46086\.4375$/),
+      'text:2026-03-05T24:00:00',
+      'text:2026-03-05T10:60:00',
+      'text:2026-03-05T10:30:61',
+      expect.stringMatching(/^value:46086\.20/), // 05:00 UTC
+      'value:46086.4375',
+      'text:2026-3-5',
+    ]);
+  });
+
+  it('keeps literal _xHHHH_ sequences literal, in cells and sheet names', async () => {
+    const files = await open(
+      await toXlsx([
+        {
+          name: 'a_x0041_b',
+          columns: ['_x0042_'],
+          rows: [{ _x0042_: 'x_x0043_y _X0044_ _x00G0_' }],
+        },
+      ]),
+    );
+    const strings = files['xl/sharedStrings.xml'] ?? '';
+    // Excel reads _xHHHH_ as an escaped character, so each underscore that starts one is itself escaped.
+    expect(strings).toContain('<t>_x005F_x0042_</t>');
+    expect(strings).toContain('<t>x_x005F_x0043_y _x005F_X0044_ _x00G0_</t>');
+    expect(files['xl/workbook.xml']).toContain('name="a_x005F_x0041_b"');
   });
 
   it('needs at least one sheet', async () => {

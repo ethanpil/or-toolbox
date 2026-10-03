@@ -68,6 +68,90 @@ describe('sniffMime', () => {
   });
 });
 
+describe('sniffMime: brands and SVG', () => {
+  it('tells HEIC, HEIF and AVIF images from video brands', () => {
+    expect(sniffMime(bytes(0, 0, 0, 0x18, 'ftypheic'))).toBe('image/heic');
+    expect(sniffMime(bytes(0, 0, 0, 0x18, 'ftypheix'))).toBe('image/heic');
+    expect(sniffMime(bytes(0, 0, 0, 0x18, 'ftypmif1'))).toBe('image/heif');
+    expect(sniffMime(bytes(0, 0, 0, 0x18, 'ftypmsf1'))).toBe('image/heif');
+    expect(sniffMime(bytes(0, 0, 0, 0x1c, 'ftypavif'))).toBe('image/avif');
+    expect(sniffMime(bytes(0, 0, 0, 0x1c, 'ftypavis'))).toBe('image/avif');
+    expect(sniffMime(bytes(0, 0, 0, 0x20, 'ftypisom'))).toBe('video/mp4');
+    expect(sniffMime(bytes(0, 0, 0, 0x20, 'ftypM4B '))).toBe('audio/mp4');
+    expect(sniffMime(bytes(0, 0, 0, 0x20, 'ftypM4P '))).toBe('audio/mp4');
+  });
+
+  const text = (value: string): Uint8Array<ArrayBuffer> => new TextEncoder().encode(value);
+
+  it('recognises SVG, with a byte order mark, an XML prolog, a doctype or comments', () => {
+    expect(sniffMime(text('<svg xmlns="http://www.w3.org/2000/svg"></svg>'))).toBe('image/svg+xml');
+    expect(sniffMime(text('  \n<svg width="1"/>'))).toBe('image/svg+xml');
+    expect(sniffMime(text('﻿<svg/>'))).toBe('image/svg+xml');
+    expect(sniffMime(text('<?xml version="1.0" encoding="UTF-8"?>\n<svg/>'))).toBe('image/svg+xml');
+    expect(
+      sniffMime(
+        text('<?xml version="1.0"?><!-- made by hand --><!DOCTYPE svg PUBLIC "x" "y"><svg/>'),
+      ),
+    ).toBe('image/svg+xml');
+  });
+
+  it('does not take HTML or other XML for SVG', () => {
+    expect(sniffMime(text('<html><body><svg/></body></html>'))).toBeNull();
+    expect(sniffMime(text('<?xml version="1.0"?><note>hi</note>'))).toBeNull();
+    expect(sniffMime(text('<svgish>'))).toBeNull();
+  });
+});
+
+/** An MP4 with an `ftyp` and a `moov` holding one `hdlr` box per handler type given. */
+function mp4With(handlers: string[], moovAtEnd = false): Blob {
+  const ascii = (value: string): Uint8Array<ArrayBuffer> =>
+    new Uint8Array([...value].map((c) => c.charCodeAt(0)));
+  const box = (type: string, ...parts: Uint8Array[]): Uint8Array<ArrayBuffer> => {
+    const body = parts.flatMap((part) => [...part]);
+    const out = new Uint8Array(8 + body.length);
+    new DataView(out.buffer).setUint32(0, out.length);
+    out.set(ascii(type), 4);
+    out.set(body, 8);
+    return out;
+  };
+  const hdlr = (handler: string): Uint8Array<ArrayBuffer> =>
+    box('hdlr', new Uint8Array(8), ascii(handler), new Uint8Array(13));
+  const ftyp = box('ftyp', ascii('isom'), new Uint8Array(8), ascii('isom'));
+  const moov = box('moov', ...handlers.map((h) => box('trak', box('mdia', hdlr(h)))));
+  const mdat = box('mdat', new Uint8Array(100));
+  return new Blob(moovAtEnd ? [ftyp, mdat, moov] : [ftyp, moov, mdat]);
+}
+
+/** A WebM with an EBML header and a Tracks element holding one TrackEntry per type (1 video, 2 audio). */
+function webmWith(trackTypes: number[]): Blob {
+  const entries = trackTypes.flatMap((type) => [0xae, 0x84, 0x83, 0x81, type, 0x00]);
+  return new Blob([
+    new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x80]),
+    new Uint8Array([0x18, 0x53, 0x80, 0x67, 0xff]), // Segment, unknown size
+    new Uint8Array([0x16, 0x54, 0xae, 0x6b, 0x80 | entries.length, ...entries]),
+  ]);
+}
+
+describe('sniffBlobMime: container contents', () => {
+  it('calls an MP4 with only sound audio/mp4, wherever the moov box is', async () => {
+    expect(await sniffBlobMime(mp4With(['soun']))).toBe('audio/mp4');
+    expect(await sniffBlobMime(mp4With(['soun'], true))).toBe('audio/mp4');
+    expect(await sniffBlobMime(mp4With(['vide', 'soun']))).toBe('video/mp4');
+    expect(await sniffBlobMime(mp4With(['vide']))).toBe('video/mp4');
+  });
+
+  it('calls a WebM with only an audio track audio/webm', async () => {
+    expect(await sniffBlobMime(webmWith([2]))).toBe('audio/webm');
+    expect(await sniffBlobMime(webmWith([1, 2]))).toBe('video/webm');
+    expect(await sniffBlobMime(webmWith([1]))).toBe('video/webm');
+  });
+
+  it('keeps the answer for the real video fixture and for files it cannot look into', async () => {
+    expect(await sniffBlobMime(new Blob([fixture('video-1s.mp4')]))).toBe('video/mp4');
+    expect(await sniffBlobMime(new Blob([bytes(0, 0, 0, 0x20, 'ftypisom')]))).toBe('video/mp4');
+  });
+});
+
 describe('formatBytes', () => {
   it('uses binary units with at most one decimal', () => {
     expect(formatBytes(0)).toBe('0 B');
@@ -113,6 +197,15 @@ describe('sanitizeFilename', () => {
     expect(sanitizeFilename('console.txt')).toBe('console.txt');
   });
 
+  it('sees through spaces before the dot, which Windows ignores', () => {
+    expect(sanitizeFilename('CON .txt')).toBe('_CON.txt');
+    expect(sanitizeFilename(' con')).toBe('_con');
+    expect(sanitizeFilename('con')).toBe('_con');
+    expect(sanitizeFilename('nul.tar.gz')).toBe('_nul.tar.gz');
+    expect(sanitizeFilename('com1 .log')).toBe('_com1.log');
+    expect(sanitizeFilename('report .txt')).toBe('report.txt');
+  });
+
   it('never returns an empty name', () => {
     expect(sanitizeFilename('')).toBe('file');
     expect(sanitizeFilename('...')).toBe('file');
@@ -149,6 +242,19 @@ describe('applyFilenamePattern', () => {
 
   it('keeps unknown placeholders visible and sanitises the result', () => {
     expect(applyFilenamePattern('{nope}-{name}.png', { name: 'a/b' })).toBe('{nope}-a_b.png');
+  });
+
+  it('reads only the values it was given, never inherited properties', () => {
+    expect(applyFilenamePattern('{constructor}-{toString}-{hasOwnProperty}', { n: 1 })).toBe(
+      '{constructor}-{toString}-{hasOwnProperty}',
+    );
+    expect(applyFilenamePattern('{__proto__}.png', {})).toBe('{__proto__}.png');
+  });
+
+  it('caps the padding width', () => {
+    const name = applyFilenamePattern('{n:999999999}.png', { n: 7 });
+    expect(name.length).toBeLessThanOrEqual(30);
+    expect(name.endsWith('7.png')).toBe(true);
   });
 });
 

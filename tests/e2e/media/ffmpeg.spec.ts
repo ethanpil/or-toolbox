@@ -239,3 +239,88 @@ test('aborting stops ffmpeg, rejects with an AbortError and leaves the next job 
   expect(result.codec).toBe('h264');
   expect(problems).toEqual([]);
 });
+
+test('looks inside MP4 and WebM files: audio-only ones stay audio, odd video sizes are padded', async ({
+  page,
+}) => {
+  const problems = await openMediaPage(page);
+
+  const result = await page.evaluate(
+    async ({ speech, clip }) => {
+      const { ffmpeg, ffmpegCore, files, video, helpers, audio } = window.__media as NonNullable<
+        Window['__media']
+      >;
+      const { ffmpeg: instance } = await ffmpegCore.loadFfmpeg();
+      const read = async (name: string, type: string): Promise<Blob> => {
+        const data = await instance.readFile(name);
+        await instance.deleteFile(name);
+        if (typeof data === 'string') throw new Error('text');
+        return new Blob([data as Uint8Array<ArrayBuffer>], { type });
+      };
+      // Single-threaded encodes: this test makes its input files with raw ffmpeg calls.
+      const make = async (...args: string[]): Promise<void> => {
+        const code = await instance.exec(['-threads', '1', ...args]);
+        if (code !== 0) throw new Error(`ffmpeg ${args.join(' ')} failed (${code})`);
+      };
+
+      await instance.writeFile(
+        'speech.mp3',
+        new Uint8Array(await helpers.blobOf(speech).arrayBuffer()),
+      );
+      await make('-i', 'speech.mp3', '-c:a', 'aac', '-f', 'mp4', 'audio.mp4');
+      await make('-i', 'speech.mp3', '-c:a', 'libopus', 'audio.webm');
+      await make(
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc=size=321x241:rate=24:duration=1',
+        '-c:v',
+        'mpeg4',
+        'odd.mp4',
+      );
+      await instance.deleteFile('speech.mp3');
+      const audioMp4 = await read('audio.mp4', 'video/mp4');
+      const audioWebm = await read('audio.webm', 'video/webm');
+      const oddVideo = await read('odd.mp4', 'video/mp4');
+
+      const sniffed = {
+        audioMp4: await files.sniffBlobMime(audioMp4),
+        audioWebm: await files.sniffBlobMime(audioWebm),
+        oddVideo: await files.sniffBlobMime(oddVideo),
+        fixture: await files.sniffBlobMime(helpers.blobOf(clip)),
+      };
+
+      const trimmedMp4 = await ffmpeg.trimMedia(audioMp4, 0.5, 2);
+      const trimmedWebm = await ffmpeg.trimMedia(audioWebm, 0.5, 2);
+      const hinted = await ffmpeg.trimMedia(helpers.blobOf(clip), 0.2, 0.7, { kind: 'audio' });
+      const trimmedOdd = await ffmpeg.trimMedia(oddVideo, 0, 0.5);
+      const oddMetadata = await video.getVideoMetadata(trimmedOdd);
+
+      return {
+        sniffed,
+        trimmedMp4: { type: trimmedMp4.type, seconds: await audio.getAudioDuration(trimmedMp4) },
+        trimmedWebm: { type: trimmedWebm.type, seconds: await audio.getAudioDuration(trimmedWebm) },
+        hinted: { type: hinted.type, seconds: await audio.getAudioDuration(hinted) },
+        trimmedOdd: { type: trimmedOdd.type, width: oddMetadata.width, height: oddMetadata.height },
+      };
+    },
+    { speech: fixture('speech.mp3'), clip: fixture('video-1s.mp4') },
+  );
+
+  expect(result.sniffed).toEqual({
+    audioMp4: 'audio/mp4',
+    audioWebm: 'audio/webm',
+    oddVideo: 'video/mp4',
+    fixture: 'video/mp4',
+  });
+  // Audio in, audio out, whatever the container says.
+  expect(result.trimmedMp4.type).toBe('audio/wav');
+  expect(result.trimmedMp4.seconds).toBeCloseTo(1.5, 1);
+  expect(result.trimmedWebm.type).toBe('audio/wav');
+  expect(result.trimmedWebm.seconds).toBeCloseTo(1.5, 1);
+  expect(result.hinted.type).toBe('audio/wav');
+  expect(result.hinted.seconds).toBeCloseTo(0.5, 1);
+  // 321 x 241 becomes 322 x 242: H.264 cannot carry odd sizes.
+  expect(result.trimmedOdd).toEqual({ type: 'video/mp4', width: 322, height: 242 });
+  expect(problems).toEqual([]);
+});

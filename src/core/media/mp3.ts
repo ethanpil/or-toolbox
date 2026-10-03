@@ -9,11 +9,17 @@
  * Pure byte handling, no DOM, so it is unit-tested in Node. Not handled:
  * free-format streams (bitrate index 0) and MPEG audio inside other containers.
  *
- * A joined file keeps the encoder delay and padding of each segment (tens of
- * milliseconds of near-silence at every seam) and carries no Xing header, so
- * players estimate its length from the bitrate: exact for constant-bitrate
- * files such as TTS output. Use `mp3Duration` for the true length.
+ * **Seams are not gapless.** A joined file keeps the encoder delay and padding
+ * of each segment (tens of milliseconds of near-silence at every seam), and a
+ * Layer III frame can depend on bits from the frame before it, which a fresh
+ * segment cannot supply. That is fine for a few seconds of audio to preview;
+ * for text-to-speech that is stitched into one file, use `stitchAudio` (stitch.ts),
+ * which joins the decoded audio and encodes once. The joined file carries no
+ * Xing header either, so players estimate its length from the bitrate: exact
+ * for constant-bitrate files such as TTS output. Use `mp3Duration` for the
+ * true length.
  */
+import { InvalidInputError } from '../errors';
 
 export type MpegVersion = 'MPEG1' | 'MPEG2' | 'MPEG2.5';
 
@@ -227,7 +233,7 @@ export function parseMp3(file: Uint8Array<ArrayBuffer>): ParsedMp3 {
     contiguousAt = offset;
   }
 
-  if (!first || frames === 0) throw new Error('No MP3 audio found in this file.');
+  if (!first || frames === 0) throw new InvalidInputError('No MP3 audio found in this file.');
 
   let audio: Uint8Array<ArrayBuffer>;
   const only = ranges[0];
@@ -263,17 +269,19 @@ export async function mp3Duration(blob: Blob): Promise<number> {
 
 /**
  * Joins MP3 segments of the same encoding (version, layer and sample rate)
- * into one file, dropping their tags and header frames. Throws if the
+ * into one file, dropping their tags and header frames, **without** removing
+ * the small gaps at the seams (see the module note): use it only where those
+ * are acceptable, and `stitchAudio` otherwise. Throws if the
  * segments were encoded differently, because the result would play at the
  * wrong speed. Mono and stereo can be mixed by the format, but TTS output
  * should not, and it is rejected too.
  */
 export async function concatMp3(blobs: Blob[]): Promise<Blob> {
-  if (blobs.length === 0) throw new Error('Nothing to join.');
+  if (blobs.length === 0) throw new InvalidInputError('There is no audio to join.');
   const parsed: ParsedMp3[] = [];
   for (const blob of blobs) parsed.push(parseMp3(new Uint8Array(await blob.arrayBuffer())));
   const first = parsed[0]?.info;
-  if (!first) throw new Error('Nothing to join.');
+  if (!first) throw new InvalidInputError('There is no audio to join.');
   for (const { info } of parsed) {
     if (
       info.version !== first.version ||
@@ -281,7 +289,9 @@ export async function concatMp3(blobs: Blob[]): Promise<Blob> {
       info.sampleRate !== first.sampleRate ||
       info.channels !== first.channels
     ) {
-      throw new Error('These MP3 segments were encoded differently and cannot be joined.');
+      throw new InvalidInputError(
+        'These MP3 segments were encoded differently and cannot be joined.',
+      );
     }
   }
   return new Blob(

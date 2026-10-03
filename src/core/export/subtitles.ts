@@ -64,6 +64,9 @@ function cleanCueText(text: string): string {
     .join('\n');
 }
 
+/** How long a cue lasts when its segment has no usable end time. */
+const DEFAULT_CUE_SECONDS = 2;
+
 interface Cue {
   start: number;
   end: number;
@@ -76,12 +79,15 @@ function toCues(segments: readonly SubtitleSegment[], options: SubtitleOptions):
   const result: Cue[] = [];
   for (const segment of segments) {
     const text = cleanCueText(segment.text);
-    if (!text) continue;
+    // No text, or no start time to show it at: nothing to write.
+    if (!text || !Number.isFinite(segment.start)) continue;
     const start = Math.max(0, segment.start);
     result.push({
       start,
-      // A cue must not be empty or run backwards.
-      end: Math.max(segment.end, start + 0.001),
+      // A cue must not be empty or run backwards; a missing end gets a short default.
+      end: Number.isFinite(segment.end)
+        ? Math.max(segment.end, start + 0.001)
+        : start + DEFAULT_CUE_SECONDS,
       lines: wrapLines(text, maxLength),
       speaker: segment.speaker?.replace(/\s+/g, ' ').trim() || undefined,
     });

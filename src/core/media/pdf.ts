@@ -27,6 +27,7 @@
 import type * as PdfJs from 'pdfjs-dist';
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { InvalidInputError } from '../errors';
 import { type EncodeOptions, toBlob } from './image';
 
 export interface PdfPageImageOptions extends EncodeOptions {
@@ -108,12 +109,12 @@ function loadPdfJs(): Promise<typeof PdfJs> {
 function describeOpenError(error: unknown): Error {
   const name = error instanceof Error ? error.name : '';
   if (name === 'PasswordException') {
-    return new Error('This PDF is password-protected.', { cause: error });
+    return new InvalidInputError('This PDF is password-protected.', { cause: error });
   }
   if (name === 'InvalidPDFException') {
-    return new Error('This file is not a valid PDF.', { cause: error });
+    return new InvalidInputError('This file is not a valid PDF.', { cause: error });
   }
-  return error instanceof Error ? error : new Error(String(error));
+  return new InvalidInputError('This PDF could not be read.', { cause: error });
 }
 
 /**

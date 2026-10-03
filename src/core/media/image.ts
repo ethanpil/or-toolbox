@@ -15,6 +15,7 @@
  * is 16 MB), and most algorithms here return a new one instead of editing in
  * place. Process large batches one image at a time.
  */
+import { InvalidInputError } from '../errors';
 import { readAsDataUrl } from '../files';
 
 // --- types ------------------------------------------------------------------
@@ -49,7 +50,7 @@ const WHITE: Rgb = [255, 255, 255];
 export function parseColour(colour: string | Rgb): Rgb {
   if (typeof colour !== 'string') return colour;
   const match = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(colour.trim());
-  if (!match?.[1]) throw new Error(`Not a hex colour: ${colour}`);
+  if (!match?.[1]) throw new RangeError(`Not a hex colour: ${colour}`);
   const hex =
     match[1].length === 3 ? [...match[1]].map((digit) => digit + digit).join('') : match[1];
   return [
@@ -82,7 +83,7 @@ function copyRaster(img: RasterImage): RasterImage {
 
 function assertSize(img: RasterImage): void {
   if (img.data.length !== img.width * img.height * 4) {
-    throw new Error('Image data does not match its width and height.');
+    throw new RangeError('Image data does not match its width and height.');
   }
 }
 
@@ -96,7 +97,7 @@ export function cropRaster(img: RasterImage, box: Box): RasterImage {
   const y1 = Math.min(img.height, Math.ceil(box.y + box.height));
   const width = x1 - x0;
   const height = y1 - y0;
-  if (width <= 0 || height <= 0) throw new Error('The crop area is outside the image.');
+  if (width <= 0 || height <= 0) throw new RangeError('The crop area is outside the image.');
   const out = new Uint8ClampedArray(width * height * 4);
   for (let y = 0; y < height; y++) {
     const from = ((y0 + y) * img.width + x0) * 4;
@@ -325,6 +326,12 @@ export interface PadToSquareOptions {
   margin?: number;
   /** Canvas colour, also what transparent pixels become. Default `#FFFFFF`. */
   background?: string | Rgb;
+  /**
+   * How to scale the crop. Default `resizeRaster`, which is exact and runs
+   * anywhere; `resizeAuto` (image-pipeline.ts) lets the browser's canvas do
+   * large resizes much faster.
+   */
+  resize?: (image: RasterImage, width: number, height: number) => RasterImage;
 }
 
 /**
@@ -341,8 +348,9 @@ export function padToSquare(
   const size = options.size ?? 2000;
   const margin = options.margin ?? 0.08;
   const background = parseColour(options.background ?? '#FFFFFF');
-  if (!Number.isInteger(size) || size < 1) throw new Error('size must be a positive integer.');
-  if (!(margin >= 0 && margin < 0.5)) throw new Error('margin must be at least 0 and below 0.5.');
+  if (!Number.isInteger(size) || size < 1) throw new RangeError('size must be a positive integer.');
+  if (!(margin >= 0 && margin < 0.5))
+    throw new RangeError('margin must be at least 0 and below 0.5.');
 
   const content = flattenRaster(cropRaster(img, box), background);
   const inner = Math.max(1, size - 2 * Math.round(size * margin));
@@ -352,7 +360,7 @@ export function padToSquare(
   const scaled =
     width === content.width && height === content.height
       ? content
-      : resizeRaster(content, width, height);
+      : (options.resize ?? resizeRaster)(content, width, height);
 
   const out = createRaster(size, size, background);
   const left = Math.floor((size - width) / 2);
@@ -422,30 +430,58 @@ export interface UnsharpMaskOptions {
   threshold?: number;
 }
 
-/** One 1-D Gaussian pass over a float plane, edges clamped. */
-function blurPass(
+/** Horizontal Gaussian pass over a float plane, edges clamped. */
+function blurHorizontal(
   source: Float32Array,
   target: Float32Array,
   width: number,
   height: number,
   kernel: Float32Array,
-  horizontal: boolean,
 ): void {
   const half = (kernel.length - 1) / 2;
-  const lineLength = horizontal ? width : height;
-  const lines = horizontal ? height : width;
-  const step = horizontal ? 1 : width;
-  const lineStep = horizontal ? width : 1;
-  for (let line = 0; line < lines; line++) {
-    const base = line * lineStep;
-    for (let i = 0; i < lineLength; i++) {
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
       let sum = 0;
-      for (let k = -half; k <= half; k++) {
-        const j = Math.min(lineLength - 1, Math.max(0, i + k));
-        sum += (source[base + j * step] ?? 0) * (kernel[k + half] ?? 0);
+      if (x >= half && x < width - half) {
+        // Away from the edges no tap needs clamping: the common case, and much faster.
+        for (let k = -half; k <= half; k++) {
+          sum += (source[row + x + k] ?? 0) * (kernel[k + half] ?? 0);
+        }
+      } else {
+        for (let k = -half; k <= half; k++) {
+          const j = Math.min(width - 1, Math.max(0, x + k));
+          sum += (source[row + j] ?? 0) * (kernel[k + half] ?? 0);
+        }
       }
-      target[base + i * step] = sum;
+      target[row + x] = sum;
     }
+  }
+}
+
+/**
+ * Vertical Gaussian pass, edges clamped. Adds whole rows (weighted) into a
+ * row accumulator instead of walking down each column, so memory is read in
+ * order: several times faster than a column walk on a large image.
+ */
+function blurVertical(
+  source: Float32Array,
+  target: Float32Array,
+  width: number,
+  height: number,
+  kernel: Float32Array,
+): void {
+  const half = (kernel.length - 1) / 2;
+  const row = new Float64Array(width);
+  for (let y = 0; y < height; y++) {
+    row.fill(0);
+    for (let k = -half; k <= half; k++) {
+      const weight = kernel[k + half] ?? 0;
+      const from = Math.min(height - 1, Math.max(0, y + k)) * width;
+      for (let x = 0; x < width; x++) row[x] = (row[x] ?? 0) + (source[from + x] ?? 0) * weight;
+    }
+    const out = y * width;
+    for (let x = 0; x < width; x++) target[out + x] = row[x] ?? 0;
   }
 }
 
@@ -479,8 +515,8 @@ export function unsharpMask(img: RasterImage, options: UnsharpMaskOptions = {}):
   const blurred = new Float32Array(pixels);
   for (let channel = 0; channel < 3; channel++) {
     for (let p = 0; p < pixels; p++) plane[p] = img.data[p * 4 + channel] ?? 0;
-    blurPass(plane, scratch, img.width, img.height, kernel, true);
-    blurPass(scratch, blurred, img.width, img.height, kernel, false);
+    blurHorizontal(plane, scratch, img.width, img.height, kernel);
+    blurVertical(scratch, blurred, img.width, img.height, kernel);
     for (let p = 0; p < pixels; p++) {
       const original = plane[p] ?? 0;
       const difference = original - (blurred[p] ?? 0);
@@ -536,10 +572,10 @@ export function checkIsolated(img: RasterImage, options: BoundingBoxOptions = {}
 
 function assertMatch(image: { width: number; height: number }, mask: Mask): void {
   if (mask.width !== image.width || mask.height !== image.height) {
-    throw new Error('The mask must be the same size as the image.');
+    throw new RangeError('The mask must be the same size as the image.');
   }
   if (mask.data.length !== mask.width * mask.height) {
-    throw new Error('Mask data does not match its width and height.');
+    throw new RangeError('Mask data does not match its width and height.');
   }
 }
 
@@ -613,7 +649,7 @@ function context2d(
   canvas: CanvasLike,
 ): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D {
   const context = canvas.getContext('2d', { willReadFrequently: true });
-  if (!context) throw new Error('This browser could not create a drawing surface.');
+  if (!context) throw new InvalidInputError('This browser could not create a drawing surface.');
   return context;
 }
 
@@ -629,7 +665,7 @@ function canvasToBlob(
     canvas.toBlob(
       (blob) => {
         if (blob) resolve(blob);
-        else reject(new Error('The browser could not encode the image.'));
+        else reject(new InvalidInputError('The browser could not encode the image.'));
       },
       type,
       quality,
@@ -645,7 +681,7 @@ export function imageSize(source: CanvasImageSource): { width: number; height: n
   if ('width' in source && typeof source.width === 'number') {
     return { width: source.width, height: source.height as number };
   }
-  throw new Error('Cannot tell the size of this image source.');
+  throw new TypeError('Cannot tell the size of this image source.');
 }
 
 function loadImageElement(blob: Blob): Promise<HTMLImageElement> {
@@ -658,7 +694,7 @@ function loadImageElement(blob: Blob): Promise<HTMLImageElement> {
     };
     img.onerror = () => {
       URL.revokeObjectURL(href);
-      reject(new Error('This file is not an image the browser can read.'));
+      reject(new InvalidInputError('This file is not an image the browser can read.'));
     };
     img.src = href;
   });
@@ -686,7 +722,7 @@ export function imageDataFrom(
   size?: { width: number; height: number },
 ): RasterImage {
   const { width, height } = size ?? imageSize(source);
-  if (width < 1 || height < 1) throw new Error('The image is empty.');
+  if (width < 1 || height < 1) throw new InvalidInputError('The image is empty.');
   const context = context2d(createCanvas(width, height));
   context.drawImage(source, 0, 0, width, height);
   const { data } = context.getImageData(0, 0, width, height);
@@ -729,6 +765,20 @@ export function resizeCanvas(source: CanvasImageSource, width: number, height: n
   context.imageSmoothingQuality = 'high';
   context.drawImage(source, 0, 0, canvas.width, canvas.height);
   return canvas;
+}
+
+/**
+ * `resizeRaster` done by the browser's canvas: high-quality smoothing at
+ * native speed, on the main thread or, with `OffscreenCanvas`, in a worker. The
+ * exact pixels differ a little between browsers, unlike `resizeRaster`. Meant
+ * for large images, where the pure version takes seconds.
+ */
+export function resizeRasterNative(img: RasterImage, width: number, height: number): RasterImage {
+  const source = createCanvas(img.width, img.height);
+  context2d(source).putImageData(new ImageData(img.data, img.width, img.height), 0, 0);
+  const scaled = resizeCanvas(source, width, height);
+  const { data } = context2d(scaled).getImageData(0, 0, scaled.width, scaled.height);
+  return { width: scaled.width, height: scaled.height, data };
 }
 
 /** Copies the `box` part of anything drawable onto a new canvas. */

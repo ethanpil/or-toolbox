@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { strFromU8, unzipSync } from 'fflate';
 import { describe, expect, it } from 'vitest';
+import { InvalidInputError } from '../errors';
 import { zipFiles } from './zip';
 
 async function unzip(blob: Blob): Promise<Record<string, Uint8Array>> {
@@ -43,21 +44,54 @@ describe('zipFiles', () => {
     expect(strFromU8(files['dir/a (2).txt'] ?? new Uint8Array())).toBe('5');
   });
 
-  it('keeps names inside the archive and free of characters Windows forbids', async () => {
+  it('keeps names free of characters Windows forbids and fills in empty ones', async () => {
     const zip = await zipFiles([
-      { name: '../evil.txt', data: '1' },
-      { name: '/abs/path.txt', data: '2' },
-      { name: 'C:\\x\\y.txt', data: '3' },
-      { name: 'a/./b/../c?.txt', data: '4' },
-      { name: '', data: '5' },
+      { name: 'a/./b/c?.txt', data: '1' },
+      { name: 'x\\y<z>.txt', data: '2' },
+      { name: '', data: '3' },
+    ]);
+    expect(Object.keys(await unzip(zip)).sort()).toEqual(['a/b/c_.txt', 'file', 'x/y_z_.txt']);
+  });
+
+  it('rejects names that climb out of the archive or are absolute', async () => {
+    for (const name of [
+      '../evil.txt',
+      'a/../b.txt',
+      '..\\evil.txt',
+      '/abs/path.txt',
+      '\\share\\x',
+      'C:\\x\\y.txt',
+      'c:/x.txt',
+    ]) {
+      await expect(zipFiles([{ name, data: 'x' }]), name).rejects.toThrow(InvalidInputError);
+    }
+  });
+
+  it('treats folders case-insensitively, like Windows and macOS', async () => {
+    const zip = await zipFiles([
+      { name: 'Dir/a.txt', data: '1' },
+      { name: 'dir/a.txt', data: '2' },
+      { name: 'DIR/b.txt', data: '3' },
     ]);
     expect(Object.keys(await unzip(zip)).sort()).toEqual([
-      'C_/x/y.txt',
-      'a/b/c_.txt',
-      'abs/path.txt',
-      'evil.txt',
-      'file',
+      'Dir/a (2).txt',
+      'Dir/a.txt',
+      'Dir/b.txt',
     ]);
+  });
+
+  it('never lets a file and a folder share a name', async () => {
+    const fileFirst = await zipFiles([
+      { name: 'a', data: '1' },
+      { name: 'a/b.txt', data: '2' },
+    ]);
+    expect(Object.keys(await unzip(fileFirst)).sort()).toEqual(['a', 'a (2)/b.txt']);
+
+    const folderFirst = await zipFiles([
+      { name: 'a/b.txt', data: '1' },
+      { name: 'A', data: '2' },
+    ]);
+    expect(Object.keys(await unzip(folderFirst)).sort()).toEqual(['A (2)', 'a/b.txt']);
   });
 
   it('deflates text but stores formats that are already compressed', async () => {

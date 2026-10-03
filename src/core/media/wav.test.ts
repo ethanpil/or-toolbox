@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest';
 import {
   concatWav,
   encodeWav,
-  parsePcmContentType,
   parseWav,
   pcmToWav,
   WAV_HEADER_BYTES,
@@ -89,40 +88,6 @@ describe('pcmToWav', () => {
   });
 });
 
-describe('parsePcmContentType', () => {
-  it('reads rate and channels', () => {
-    expect(parsePcmContentType('audio/pcm;rate=24000;channels=1')).toEqual({
-      sampleRate: 24000,
-      channels: 1,
-    });
-    expect(parsePcmContentType('audio/pcm; rate=44100; channels=2')).toEqual({
-      sampleRate: 44100,
-      channels: 2,
-    });
-    expect(parsePcmContentType('AUDIO/PCM;RATE=16000')).toEqual({ sampleRate: 16000, channels: 1 });
-    expect(parsePcmContentType('audio/pcm;rate="22050"')).toEqual({
-      sampleRate: 22050,
-      channels: 1,
-    });
-  });
-
-  it('defaults to 24 kHz mono when parameters are missing or unreadable', () => {
-    expect(parsePcmContentType('audio/pcm')).toEqual({ sampleRate: 24000, channels: 1 });
-    expect(parsePcmContentType('audio/pcm;rate=abc;channels=0')).toEqual({
-      sampleRate: 24000,
-      channels: 1,
-    });
-  });
-
-  it('returns null for other types', () => {
-    expect(parsePcmContentType('audio/mpeg')).toBeNull();
-    expect(parsePcmContentType('audio/L16;rate=24000')).toBeNull();
-    expect(parsePcmContentType(null)).toBeNull();
-    expect(parsePcmContentType(undefined)).toBeNull();
-    expect(parsePcmContentType('')).toBeNull();
-  });
-});
-
 describe('parseWav', () => {
   it('reads the format and length', async () => {
     const blob = encodeWav([new Float32Array(16000)], 16000);
@@ -159,7 +124,70 @@ describe('parseWav', () => {
   });
 
   it('rejects other files', () => {
-    expect(() => parseWav(new Uint8Array(64))).toThrow(/Not a WAV/);
+    expect(() => parseWav(new Uint8Array(64))).toThrow(/not a WAV/i);
+  });
+});
+
+/**
+ * A 16-bit WAV whose `data` chunk follows `junk` bytes of a LIST chunk, and holds `dataBytes`
+ * bytes (the RIFF size field is left as the plain header wrote it; readers must not depend on it).
+ */
+function wavAfterJunk(junk: number, dataBytes: number, channels = 1, rate = 8000): Blob {
+  const header = wavHeader(dataBytes, rate, channels);
+  const list = new Uint8Array(8 + junk + (junk % 2));
+  list.set([0x4c, 0x49, 0x53, 0x54]);
+  new DataView(list.buffer).setUint32(4, junk, true);
+  return new Blob([
+    header.subarray(0, 36),
+    list,
+    header.subarray(36, 44),
+    new Uint8Array(dataBytes),
+  ]);
+}
+
+describe('WAV files with large chunks before the audio', () => {
+  it('finds the data chunk however far into the file it is', async () => {
+    for (const junk of [0, 5, 1000, 70_000, 300_001]) {
+      const blob = wavAfterJunk(junk, 16_000);
+      expect(await wavDuration(blob), `${junk} bytes of LIST`).toBe(1);
+    }
+  });
+
+  it('joins files like that, copying only their audio', async () => {
+    const joined = await concatWav([wavAfterJunk(70_000, 1000), wavAfterJunk(3, 600)]);
+    const bytes = await bytesOf(joined);
+    expect(bytes.length).toBe(WAV_HEADER_BYTES + 1600);
+    expect(parseWav(bytes).dataBytes).toBe(1600);
+  });
+
+  it('reports a file with no data chunk as unreadable', async () => {
+    const header = wavHeader(0, 8000, 1);
+    await expect(wavDuration(new Blob([header.subarray(0, 36)]))).rejects.toThrow(/no audio data/);
+    await expect(wavDuration(new Blob([new Uint8Array(100)]))).rejects.toThrow(/not a WAV/i);
+  });
+});
+
+describe('WAV data is counted in whole frames', () => {
+  it('rounds the length down in parseWav and wavDuration', async () => {
+    const mono = wavAfterJunk(0, 7);
+    expect(parseWav(await bytesOf(mono)).dataBytes).toBe(6);
+    expect(await wavDuration(mono)).toBe(3 / 8000);
+    const stereo = wavAfterJunk(0, 10, 2);
+    expect(parseWav(await bytesOf(stereo)).dataBytes).toBe(8);
+    expect(await wavDuration(stereo)).toBe(2 / 8000);
+  });
+
+  it('rounds streamed files (size 0) down too', async () => {
+    const bytes = await bytesOf(wavAfterJunk(0, 9));
+    new DataView(bytes.buffer).setUint32(40, 0, true);
+    expect(parseWav(bytes).dataBytes).toBe(8);
+  });
+
+  it('concatenates whole frames only', async () => {
+    const joined = await bytesOf(await concatWav([wavAfterJunk(0, 7), wavAfterJunk(0, 9)]));
+    expect(parseWav(joined).dataBytes).toBe(6 + 8);
+    expect(joined.length).toBe(WAV_HEADER_BYTES + 14);
+    expect(new DataView(joined.buffer).getUint32(40, true)).toBe(14);
   });
 });
 
@@ -186,6 +214,6 @@ describe('concatWav', () => {
   });
 
   it('refuses an empty list', async () => {
-    await expect(concatWav([])).rejects.toThrow(/Nothing/);
+    await expect(concatWav([])).rejects.toThrow(/no audio to join/);
   });
 });

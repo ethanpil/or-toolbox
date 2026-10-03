@@ -94,6 +94,29 @@ describe('toSrt', () => {
     expect(srt).toContain('00:00:05,000 --> 00:00:05,001');
     expect(srt).toContain('00:00:06,000 --> 00:00:06,001');
   });
+
+  it('skips cues with no usable start and gives a missing end a short default', () => {
+    const segments = [
+      { start: Number.NaN, end: 3, text: 'no start' },
+      { start: Infinity, end: Infinity, text: 'infinite start' },
+      { start: 1, end: Number.NaN, text: 'no end' },
+      { start: 2, end: Infinity, text: 'infinite end' },
+      { start: 4, end: 5, text: 'fine' },
+    ];
+    for (const output of [toSrt(segments), toVtt(segments)]) {
+      expect(output).not.toMatch(/NaN|Infinity|undefined/);
+      expect(output).toContain('no end');
+      expect(output).toContain('infinite end');
+      expect(output).toContain('fine');
+      expect(output).not.toContain('no start');
+      expect(output).not.toContain('infinite start');
+      for (const [, from, to] of output.matchAll(
+        /(\d\d:\d\d:\d\d[,.]\d{3}) --> (\d\d:\d\d:\d\d[,.]\d{3})/g,
+      )) {
+        expect((to ?? '') > (from ?? '')).toBe(true);
+      }
+    }
+  });
 });
 
 describe('toVtt', () => {
