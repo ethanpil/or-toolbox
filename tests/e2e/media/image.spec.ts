@@ -194,3 +194,124 @@ test('canvas wrappers round-trip pixels and the isolated-image pipeline runs on 
   expect(result.smallUrlSame).toBe(true);
   expect(problems).toEqual([]);
 });
+
+test('runs the isolated-image pipeline in a worker without freezing the page, and can abort it', async ({
+  page,
+}) => {
+  const workers: string[] = [];
+  page.on('worker', (worker) => workers.push(worker.url()));
+  const problems = await openMediaPage(page);
+
+  const result = await page.evaluate(async (photo) => {
+    const { image, imageAsync, imagePipeline, helpers } = window.__media as NonNullable<
+      Window['__media']
+    >;
+    const small = image.imageDataFrom(await image.loadImage(helpers.blobOf(photo)));
+
+    // A bigger studio photo (2400 x 1800), so that the canvas resize and the sharpening take real time.
+    const studio = new OffscreenCanvas(2400, 1800);
+    const context = studio.getContext('2d') as OffscreenCanvasRenderingContext2D;
+    context.fillStyle = '#fbfbfb';
+    context.fillRect(0, 0, 2400, 1800);
+    context.fillStyle = '#305080';
+    context.beginPath();
+    context.ellipse(1200, 900, 900, 600, 0, 0, 2 * Math.PI);
+    context.fill();
+    const large = image.imageDataFrom(studio);
+
+    /** The longest time the page went without running a timer while `work` ran. */
+    const longestStall = async <T>(
+      work: () => Promise<T>,
+    ): Promise<{ value: T; stallMs: number }> => {
+      let last = performance.now();
+      let stallMs = 0;
+      const timer = setInterval(() => {
+        const now = performance.now();
+        stallMs = Math.max(stallMs, now - last);
+        last = now;
+      }, 10);
+      try {
+        const value = await work();
+        // Work that blocked the page ends before the timer got to run: give it a turn to report the gap.
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        return { value, stallMs };
+      } finally {
+        clearInterval(timer);
+      }
+    };
+
+    // Same pixels as the pure pipeline (the small photo's crop is below the canvas-resize threshold).
+    const viaWorker = await imageAsync.isolateImage(small, { size: 2000 });
+    const direct = imagePipeline.isolateRaster(small, { size: 2000 });
+    let identical = viaWorker.image.data.length === direct.image.data.length;
+    for (let i = 0; identical && i < direct.image.data.length; i++) {
+      if (viaWorker.image.data[i] !== direct.image.data[i]) identical = false;
+    }
+
+    // The large one: the page keeps running during the job, and the result matches the main thread's.
+    const started = performance.now();
+    const worked = await longestStall(() => imageAsync.isolateImage(large, { size: 2000 }));
+    const workerMs = performance.now() - started;
+    const mainStarted = performance.now();
+    const onPage = await longestStall(() =>
+      Promise.resolve(imagePipeline.isolateRaster(large, { size: 2000 })),
+    );
+    const mainMs = performance.now() - mainStarted;
+    const difference = helpers.meanDifference(worked.value.image, onPage.value.image);
+
+    // Abort: a long job is stopped, and the next one runs in a fresh worker.
+    const controller = new AbortController();
+    const aborting = imageAsync.isolateImage(large, { size: 2000 }, { signal: controller.signal });
+    setTimeout(() => controller.abort(), 100);
+    const outcome = await aborting.then(
+      () => 'finished',
+      (error: unknown) => (error instanceof DOMException ? error.name : String(error)),
+    );
+    const after = await imageAsync.isolateImage(small, { size: 100 });
+
+    // The caller's pixels survive a normal call, and are handed over (emptied) with transfer.
+    const copy = image.createRaster(10, 10, '#ffffff');
+    await imageAsync.isolateImage(copy, { size: 20 });
+    const keptBytes = copy.data.length;
+    await imageAsync.isolateImage(copy, { size: 20 }, { transfer: true });
+
+    return {
+      identical,
+      checks: [viaWorker.check, worked.value.check],
+      size: [viaWorker.image.width, viaWorker.image.height],
+      boxLarge: worked.value.box,
+      workerStallMs: worked.stallMs,
+      pageStallMs: onPage.stallMs,
+      workerMs,
+      mainMs,
+      difference,
+      outcome,
+      afterSize: after.image.width,
+      keptBytes,
+      transferredBytes: copy.data.length,
+    };
+  }, fixture('generated-image.jpg'));
+
+  expect(result.identical).toBe(true);
+  expect(result.size).toEqual([2000, 2000]);
+  for (const check of result.checks) expect(check.borderPureWhite).toBe(true);
+  expect(Math.abs(result.boxLarge.width - 1800)).toBeLessThanOrEqual(3);
+  expect(result.difference).toBeLessThan(2);
+  console.info(
+    `isolated-image on 2400x1800: worker ${Math.round(result.workerMs)} ms (page stalled at most ${Math.round(result.workerStallMs)} ms), main thread ${Math.round(result.mainMs)} ms (stalled ${Math.round(result.pageStallMs)} ms)`,
+  );
+  // The page keeps running while the worker works, while the same work on the page blocks it for the whole job.
+  expect(result.workerStallMs).toBeLessThan(400);
+  expect(result.pageStallMs).toBeGreaterThan(result.workerStallMs);
+
+  expect(result.outcome).toBe('AbortError');
+  expect(result.afterSize).toBe(100);
+  expect(result.keptBytes).toBe(400);
+  expect(result.transferredBytes).toBe(0);
+
+  const origin = new URL(page.url()).origin;
+  expect(
+    workers.filter((url) => /image-worker/.test(url) && new URL(url).origin === origin).length,
+  ).toBeGreaterThanOrEqual(2);
+  expect(problems).toEqual([]);
+});

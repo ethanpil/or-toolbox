@@ -28,7 +28,10 @@ import type * as Audio from '../../../src/core/media/audio';
 import type * as FfmpegCore from '../../../src/core/media/ffmpeg';
 import type * as FfmpegOps from '../../../src/core/media/ffmpeg-ops';
 import type * as Image from '../../../src/core/media/image';
+import type * as ImageAsync from '../../../src/core/media/image-async';
+import type * as ImagePipeline from '../../../src/core/media/image-pipeline';
 import type * as Pdf from '../../../src/core/media/pdf';
+import type * as Stitch from '../../../src/core/media/stitch';
 import type * as Video from '../../../src/core/media/video';
 import { MEDIA_FIXTURES_DIR } from '../../mock/index.ts';
 import { watchForProblems } from '../support.ts';
@@ -36,6 +39,9 @@ import { watchForProblems } from '../support.ts';
 export interface MediaModules {
   files: typeof Files;
   image: typeof Image;
+  imageAsync: typeof ImageAsync;
+  imagePipeline: typeof ImagePipeline;
+  stitch: typeof Stitch;
   video: typeof Video;
   audio: typeof Audio;
   ffmpeg: typeof FfmpegOps;
@@ -146,6 +152,9 @@ export async function openMediaPage(page: Page): Promise<string[]> {
           helpers,
           files: await load('files'),
           image: await load('media/image'),
+          imageAsync: await load('media/image-async'),
+          imagePipeline: await load('media/image-pipeline'),
+          stitch: await load('media/stitch'),
           video: await load('media/video'),
           audio: await load('media/audio'),
           ffmpeg: await load('media/ffmpeg-ops'),
