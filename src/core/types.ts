@@ -206,10 +206,13 @@ export interface KeysService {
   status(id: string, opts?: { force?: boolean }): Promise<KeyStatus>;
   readonly lock: KeyLock;
   subscribe(fn: () => void): () => void;
-  /** Backup only: the validated keys file exactly as stored (secrets plain or encrypted, as configured). */
+  /**
+   * Backup, and Settings' Undo of a key removal: the validated keys file exactly as stored (secrets plain or
+   * encrypted, as configured).
+   */
   exportFile(): StoredKeysFile;
   /**
-   * Backup only: replace the whole keys file. Validates `next`; refuses with KeysChangedError when the stored file
+   * Backup, and Settings' Undo of a key removal: replace the whole keys file. Validates `next`; refuses with KeysChangedError when the stored file
    * no longer equals `expected` (another tab wrote meanwhile); drops this tab's unlocked session when the lock
    * changes; broadcasts `keys-changed`.
    */
