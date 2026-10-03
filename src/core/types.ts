@@ -585,6 +585,8 @@ export interface HistoryService {
   get(id: string): Promise<RunRecord | undefined>;
   setStarred(id: string, starred: boolean): Promise<void>;
   remove(ids: string[]): Promise<void>;
+  /** Puts runs back that `remove` deleted (Undo); an existing id is overwritten. Stats are never touched. */
+  restore(runs: RunRecord[]): Promise<void>;
   /** Removes all runs, or all runs of one tool; returns how many were removed. */
   clear(scope?: { tool?: ToolId }): Promise<number>;
   count(scope?: { tool?: ToolId }): Promise<number>;
