@@ -15,10 +15,14 @@ import { makeRun, seedDb } from './seed.ts';
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 
 const CHAT = '/api/v1/chat/completions';
-const RECORDED_STREAM = readFileSync(
-  join(import.meta.dirname, '..', 'fixtures', 'openrouter', 'chat-stream.recorded.sse.txt'),
-  'utf8',
-);
+const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'openrouter');
+const RECORDED_STREAM = readFileSync(join(FIXTURES, 'chat-stream.recorded.sse.txt'), 'utf8');
+/** A recorded answer about tests/fixtures/media/invoice.pdf, with the parser's annotations. */
+const PDF_RESPONSE = (
+  JSON.parse(readFileSync(join(FIXTURES, 'chat-completion-pdf.recorded.json'), 'utf8')) as {
+    response: { choices: { message: { annotations: unknown[] } }[] };
+  }
+).response;
 
 /** A streamed reply: one content chunk, the finish chunk and the usage chunk (the shape in docs §2.3). */
 function reply(text: string, model = 'test/text-model', cost = 0.00042): unknown[] {
@@ -95,8 +99,11 @@ test('sends a message and streams the reply, with reasoning, usage and the reque
   await expect(page.getByTestId('message-served')).toContainText('via liquid/lfm-2.5-2.6b:free');
   await expect(page.getByTestId('chat-title')).toHaveText('Say hi in exactly three words.');
   await expect(page.getByTestId('chat-totals')).toContainText('1 reply');
-  await expect(page.getByTestId('chat-log')).toHaveAttribute('role', 'log');
+  // A labelled region, not a live region; the start and the end are announced as status instead.
+  await expect(page.getByTestId('chat-log')).toHaveAttribute('role', 'region');
+  await expect(page.getByTestId('chat-log')).not.toHaveAttribute('aria-live', /.*/);
   await expect(page.getByTestId('chat-log')).toHaveAttribute('aria-busy', 'false');
+  await expect(page.getByTestId('tool-status')).toHaveText('Reply complete.');
 
   const [call] = mock.calls(CHAT, 'POST');
   expect(body(call)).toMatchObject({
@@ -232,8 +239,9 @@ test('an image attachment goes as an image_url part', async ({ page, mock }) => 
   expect(parts[1]?.image_url?.url).toMatch(/^data:image\/jpeg;base64,\/9j\//);
 });
 
-test('a pasted PDF goes as a file part with the free parser plugin', async ({ page, mock }) => {
-  mock.sse(CHAT, reply('Invoice number: 4711 / Total: 128.50 EUR'));
+test('a pasted PDF is read once; later messages send the parser text', async ({ page, mock }) => {
+  // Only a whole response carries the parser's annotations, so the first turn is not streamed.
+  mock.json('POST', CHAT, PDF_RESPONSE);
   await openChat(page);
   const pdf = readFileSync(join(MEDIA_FIXTURES_DIR, 'invoice.pdf')).toString('base64');
   // Paste a file (no text) onto the page: the framework hands it to the tool.
@@ -247,7 +255,7 @@ test('a pasted PDF goes as a file part with the free parser plugin', async ({ pa
   }, pdf);
   await expect(page.getByTestId('composer-attachment')).toContainText('invoice.pdf');
   await send(page, 'Invoice number and total?');
-  await expect(content(page, 1)).toHaveText('Invoice number: 4711 / Total: 128.50 EUR');
+  await expect(content(page, 1)).toContainText('Total: 128.50 EUR');
 
   const call = mock.calls(CHAT, 'POST')[0];
   const parts = messagesOf(call)[0]?.content as { type: string; file?: Record<string, string> }[];
@@ -255,7 +263,49 @@ test('a pasted PDF goes as a file part with the free parser plugin', async ({ pa
     type: 'file',
     file: { filename: 'invoice.pdf', file_data: `data:application/pdf;base64,${pdf}` },
   });
+  expect(body(call)['stream']).toBe(false);
   expect(body(call)['plugins']).toEqual([{ id: 'file-parser', pdf: { engine: 'cloudflare-ai' } }]);
+
+  // The next turn streams, and sends the parser's text instead of uploading the PDF again.
+  mock.sse(CHAT, reply('It has no date.'));
+  await send(page, 'And the date?');
+  await expect(content(page, 3)).toHaveText('It has no date.');
+  const next = mock.calls(CHAT, 'POST')[1];
+  const sent = messagesOf(next)[0]?.content as { type: string; text?: string }[];
+  expect(sent.map((part) => part.type)).toEqual(['text', 'text']);
+  expect(sent[1]?.text).toMatch(/^<file name="invoice\.pdf">\n# document\.pdf/);
+  expect(sent[1]?.text).toContain('Invoice 4711 total 128.50 EUR');
+  expect(body(next)['plugins']).toBeUndefined();
+
+  // The text is kept with the thread: after a reload the PDF still counts.
+  await page.reload();
+  await expect(content(page, 3)).toHaveText('It has no date.');
+  await expect(page.getByTestId('attachment-missing')).toHaveCount(0);
+});
+
+test('two tabs on one chat: each takes in what the other sent', async ({ page, context, mock }) => {
+  mock.sse(CHAT, reply('Answer in tab one.'));
+  await openChat(page);
+  await send(page, 'From tab one');
+  await expect(content(page, 1)).toHaveText('Answer in tab one.');
+
+  const other = await context.newPage();
+  await openChat(other);
+  await expect(content(other, 1)).toHaveText('Answer in tab one.');
+  mock.sse(CHAT, reply('Answer in tab two.'));
+  await send(other, 'From tab two');
+  await expect(content(other, 3)).toHaveText('Answer in tab two.');
+
+  // Tab one shows it without a reload, and its next message builds on both.
+  await expect(content(page, 3)).toHaveText('Answer in tab two.');
+  mock.sse(CHAT, reply('Third answer.'));
+  await send(page, 'Back in tab one');
+  await expect(content(page, 5)).toHaveText('Third answer.');
+  expect(messagesOf(mock.calls(CHAT, 'POST')[2])).toHaveLength(5);
+  await expect(content(other, 5)).toHaveText('Third answer.');
+
+  await page.reload();
+  await expect(messages(page)).toHaveCount(6);
 });
 
 test('a thread persists across a reload; its attachments are marked as not kept', async ({
@@ -372,7 +422,23 @@ test('an API error shows on the reply with Retry', async ({ page, mock }) => {
 
 test('a conversation passes axe in light and dark', async ({ page, mock }) => {
   await page.emulateMedia({ colorScheme: 'light' });
-  mock.sse(CHAT, reply('# Plan\n\n- **Day 1:** sights\n- Day 2: food\n\n```py\nprint("hi")\n```'));
+  // The PDF's first turn is not streamed (its annotations come with the whole response).
+  mock.json('POST', CHAT, {
+    id: 'gen-axe',
+    model: 'test/text-model',
+    choices: [
+      {
+        index: 0,
+        finish_reason: 'stop',
+        message: {
+          role: 'assistant',
+          content: '# Plan\n\n- **Day 1:** sights\n- Day 2: food\n\n```py\nprint("hi")\n```',
+          annotations: PDF_RESPONSE.choices[0]?.message.annotations,
+        },
+      },
+    ],
+    usage: { prompt_tokens: 12, completion_tokens: 20, cost: 0.0001 },
+  });
   await openChat(page);
   await page.getByTestId('composer-file').setInputFiles(join(MEDIA_FIXTURES_DIR, 'invoice.pdf'));
   await send(page, 'Plan a trip');

@@ -5,10 +5,15 @@
  * request sends and what Export writes.
  *
  * Threads are JSON in the tool's state (`thread:<id>`, one key per thread). Attachments keep only their name, type
- * and size (text files also their text, which is what the model reads); image, PDF and audio bytes live in memory
- * for the session and are never stored. `parseThread` validates, repairs and migrates whatever storage returns.
+ * and size (text files also their text, PDFs the parser's text once a reply brought it); image, PDF and audio bytes
+ * live in memory for the session and are never stored. `parseThread` validates, repairs and migrates whatever
+ * storage returns.
+ *
+ * Every stored change bumps `rev`. A tab that finds a higher `rev` in storage than the one it based its change on
+ * merges (`mergeInto`, three-way against `baseOf` that version) instead of writing over the other tab's change.
  */
 import { isFiniteNumber, isPlainObject, isString, isUnsafeKey } from '../../core/util';
+import { normalize } from '../../ui/shell/palette-search';
 
 export const THREAD_VERSION = 1;
 
@@ -23,6 +28,11 @@ export interface AttachmentRef {
   kind: AttachmentKind;
   /** Text files only: the content, inlined into the message. Binaries are never kept. */
   text?: string;
+  /**
+   * PDFs only: the parser's text of the file, from the `annotations` of the reply that first read it
+   * (docs/openrouter-api.md §2.5). Later turns send this text instead of uploading and parsing the file again.
+   */
+  parsed?: string;
 }
 
 export interface ReplyUsage {
@@ -69,6 +79,8 @@ export interface Thread {
   named: boolean;
   createdAt: number;
   updatedAt: number;
+  /** Bumped on every stored change (cross-tab conflict detection). */
+  rev: number;
   /** System prompt for this thread ('' = none). */
   system: string;
   /** The composer's model for this thread; null follows the header's (default) model. */
@@ -115,6 +127,7 @@ export function createThread(
     named: false,
     createdAt: now,
     updatedAt: now,
+    rev: 0,
     system: init.system ?? '',
     model: init.model ?? null,
     nodes: {},
@@ -256,27 +269,66 @@ export function selectSibling(thread: Thread, id: string, delta: -1 | 1): string
   return next;
 }
 
-/** Removes a message and everything after it on every branch below it. Returns the removed ids. */
-export function deleteBranch(thread: Thread, id: string): string[] {
+/** What `deleteBranch` took out, enough to put it back (`restoreBranch`). */
+export interface RemovedBranch {
+  parent: string | null;
+  /** Its place among its siblings. */
+  index: number;
+  /** It was its parent's selected child. */
+  selected: boolean;
+  /** The removed messages, parents before children. */
+  nodes: ChatNode[];
+}
+
+/** Removes a message and everything after it on every branch below it; null when `id` is unknown. */
+export function deleteBranch(thread: Thread, id: string): RemovedBranch | null {
   const node = thread.nodes[id];
-  if (!node) return [];
-  const removed: string[] = [];
-  const stack = [id];
-  while (stack.length > 0) {
-    const current = thread.nodes[stack.pop()!];
+  if (!node) return null;
+  const nodes: ChatNode[] = [];
+  const queue = [id];
+  while (queue.length > 0) {
+    const current = thread.nodes[queue.shift()!];
     if (!current) continue;
-    removed.push(current.id);
-    stack.push(...current.children);
+    nodes.push(current);
+    queue.push(...current.children);
     delete thread.nodes[current.id];
   }
   const siblings = childrenOf(thread, node.parent);
   const index = siblings.indexOf(id);
   if (index >= 0) siblings.splice(index, 1);
-  if (selectedOf(thread, node.parent) === id) {
+  const selected = selectedOf(thread, node.parent) === id;
+  if (selected) {
     // The neighbour that took its place, else the one before it, else nothing.
     select(thread, node.parent, siblings[index] ?? siblings[index - 1] ?? null);
   }
-  return removed;
+  return { parent: node.parent, index: Math.max(0, index), selected, nodes };
+}
+
+/**
+ * Puts a deleted branch back into the thread as it is now (whatever happened since stays). False, and nothing
+ * changes, when the branch's parent is gone or the branch is already back.
+ */
+export function restoreBranch(thread: Thread, removed: RemovedBranch): boolean {
+  const [top] = removed.nodes;
+  if (!top) return false;
+  if (removed.parent !== null && !thread.nodes[removed.parent]) return false;
+  if (removed.nodes.some((node) => thread.nodes[node.id])) return false;
+  for (const node of removed.nodes) thread.nodes[node.id] = node;
+  const siblings = childrenOf(thread, removed.parent);
+  siblings.splice(Math.min(removed.index, siblings.length), 0, top.id);
+  if (removed.selected || selectedOf(thread, removed.parent) === null) {
+    select(thread, removed.parent, top.id);
+  }
+  return true;
+}
+
+/** Ids of every attachment in the thread (all branches). */
+export function attachmentIds(thread: Thread): Set<string> {
+  const ids = new Set<string>();
+  for (const node of Object.values(thread.nodes)) {
+    for (const ref of node.attachments ?? []) ids.add(ref.id);
+  }
+  return ids;
 }
 
 /** Usage of every reply in the thread, on every branch (each one was paid for). */
@@ -301,17 +353,111 @@ export function threadTotals(thread: Thread): ThreadTotals {
   return totals;
 }
 
-/** Case-insensitive match on the title and the text of every message (all branches). */
-export function matchesQuery(thread: Thread, query: string): boolean {
-  const needle = query.trim().toLowerCase();
-  if (!needle) return true;
-  if (thread.title.toLowerCase().includes(needle)) return true;
-  return Object.values(thread.nodes).some((node) => node.content.toLowerCase().includes(needle));
+/** Normalised search text per thread, kept while the thread is unchanged (`rev`, title, message count). */
+const searchCache = new WeakMap<Thread, { stamp: string; text: string }>();
+
+function searchText(thread: Thread): string {
+  const stamp = `${thread.rev}\u0000${thread.title}\u0000${Object.keys(thread.nodes).length}`;
+  const hit = searchCache.get(thread);
+  if (hit?.stamp === stamp) return hit.text;
+  const text = normalize(
+    [thread.title, ...Object.values(thread.nodes).map((node) => node.content)].join('\n'),
+  );
+  searchCache.set(thread, { stamp, text });
+  return text;
 }
 
-/** A deep copy (for Undo). */
-export function cloneThread(thread: Thread): Thread {
-  return structuredClone(thread);
+/**
+ * True when every word of a search (already normalised, `queryWords` of src/ui/shell/palette-search.ts) is in
+ * the title or the text of some message, on any branch; accents and case do not matter.
+ */
+export function matchesQuery(thread: Thread, words: readonly string[]): boolean {
+  if (words.length === 0) return true;
+  const text = searchText(thread);
+  return words.every((word) => text.includes(word));
+}
+
+// --- changes from other tabs ----------------------------------------------------------------------------
+
+/** What a tab knew of a thread when it last read or wrote it: the base of a three-way merge. */
+export interface ThreadBase {
+  rev: number;
+  ids: ReadonlySet<string>;
+  title: string;
+  named: boolean;
+  system: string;
+  model: string | null;
+}
+
+export function baseOf(thread: Thread): ThreadBase {
+  return {
+    rev: thread.rev,
+    ids: new Set(Object.keys(thread.nodes)),
+    title: thread.title,
+    named: thread.named,
+    system: thread.system,
+    model: thread.model,
+  };
+}
+
+/** How final a reply is: a finished one beats a stopped or failed one, which beats one still streaming. */
+const replyRank = (node: ChatNode): number =>
+  node.status === 'done' ? 2 : node.status === 'streaming' ? 0 : 1;
+
+const REPLY_FIELDS = [
+  'content',
+  'model',
+  'servedModel',
+  'reasoning',
+  'usage',
+  'status',
+  'error',
+  'trimmed',
+] as const;
+
+/**
+ * Merges `theirs` (the stored version another tab wrote) into `ours` (this tab's, changed since `base`), in
+ * place, so references to `ours` and its messages stay valid. Messages either side added are kept; messages either
+ * side deleted stay deleted; a reply keeps its most final version (one still streaming here is never touched);
+ * the title, system prompt and model are ours where we changed them, else theirs. `ours.rev` becomes theirs.
+ */
+export function mergeInto(ours: Thread, base: ThreadBase, theirs: Thread): void {
+  if (ours.title === base.title && ours.named === base.named) {
+    ours.title = theirs.title;
+    ours.named = theirs.named;
+  }
+  if (ours.system === base.system) ours.system = theirs.system;
+  if (ours.model === base.model) ours.model = theirs.model;
+  // Their deletions: messages we both had that they no longer have.
+  for (const id of base.ids) if (ours.nodes[id] && !theirs.nodes[id]) delete ours.nodes[id];
+  for (const node of Object.values(theirs.nodes)) {
+    const mine = ours.nodes[node.id];
+    if (!mine) {
+      // Theirs alone: they added it (or we deleted it, then it stays deleted).
+      if (!base.ids.has(node.id)) ours.nodes[node.id] = structuredClone(node);
+      continue;
+    }
+    mine.children = [
+      ...node.children,
+      ...mine.children.filter((id) => !node.children.includes(id)),
+    ];
+    if (node.role === 'assistant' && mine.status !== 'streaming') {
+      const newer =
+        replyRank(node) > replyRank(mine) ||
+        (replyRank(node) === replyRank(mine) && node.content.length > mine.content.length);
+      if (newer) {
+        const target = mine as unknown as Record<string, unknown>;
+        const source = node as unknown as Record<string, unknown>;
+        for (const field of REPLY_FIELDS) {
+          if (source[field] === undefined) delete target[field];
+          else target[field] = structuredClone(source[field]);
+        }
+      }
+    }
+  }
+  ours.rev = Math.max(ours.rev, theirs.rev);
+  ours.updatedAt = Math.max(ours.updatedAt, theirs.updatedAt);
+  relink(ours, [...theirs.roots, ...ours.roots.filter((id) => !theirs.roots.includes(id))]);
 }
 
 // --- storage (a Thread is JSON-safe by construction and stored as it is) -------------------------------
@@ -335,6 +481,9 @@ function parseAttachment(raw: unknown): AttachmentRef | null {
     size: Math.max(0, finite(size, 0)),
     kind: kind as AttachmentKind,
     ...(kind === 'text' && isString(text) ? { text } : {}),
+    ...(kind === 'pdf' && isString(raw['parsed']) && raw['parsed']
+      ? { parsed: raw['parsed'] }
+      : {}),
   };
 }
 
@@ -498,6 +647,7 @@ export function parseThread(raw: unknown, now: number = Date.now()): Thread | nu
     named: raw['named'] === true,
     createdAt,
     updatedAt: finite(raw['updatedAt'], createdAt),
+    rev: Math.max(0, Math.floor(finite(raw['rev'], 0))),
     system: isString(raw['system']) ? raw['system'] : '',
     model: isString(raw['model']) && raw['model'] ? raw['model'] : null,
     nodes: {},

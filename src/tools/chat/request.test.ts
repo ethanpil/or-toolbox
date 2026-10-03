@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { buildRequest, nodeTokens, type RequestOptions, trimToBudget } from './request';
+import {
+  approxTokens,
+  buildRequest,
+  missingInput,
+  nodeTokens,
+  type RequestOptions,
+  trimToBudget,
+  unparsedPdfs,
+} from './request';
 import { activePath, addNode, appendUser, type ChatNode, createThread } from './thread';
 
 const options = (patch: Partial<RequestOptions> = {}): RequestOptions => ({
@@ -192,5 +200,110 @@ describe('context trimming', () => {
       { id: 'i', name: 'a.png', type: 'image/png', size: 1, kind: 'image' },
     ]);
     expect(nodeTokens(withImage) - nodeTokens(text)).toBe(1500);
+  });
+});
+
+describe('limits', () => {
+  it('counts tokens conservatively for scripts that are not Latin', () => {
+    expect(approxTokens('abcd')).toBe(1);
+    expect(approxTokens('你好世界')).toBe(4);
+    expect(approxTokens('こんにちは')).toBe(5);
+    expect(approxTokens('안녕하세요')).toBe(5);
+    expect(approxTokens('привет')).toBe(3);
+    expect(approxTokens('')).toBe(0);
+  });
+
+  it('clamps max_tokens to the model’s output cap and to what the context leaves', () => {
+    const path = longPath(0, 0);
+    const capped = buildRequest(
+      path,
+      options({ maxTokens: 50_000, maxCompletionTokens: 8000, contextLength: 200_000 }),
+      none,
+    );
+    expect(capped.body.max_tokens).toBe(8000);
+    expect(capped.completionTokens).toBe(8000);
+
+    const big = longPath(1, 40_000); // ~10,000 tokens each way
+    const room = buildRequest(big, options({ maxTokens: 30_000, contextLength: 32_000 }), none);
+    expect(room.tooLong).toBe(false);
+    expect(room.promptTokens + room.body.max_tokens!).toBeLessThanOrEqual(32_000);
+  });
+
+  it('flags a message that alone does not fit the context window', () => {
+    const thread = createThread();
+    appendUser(thread, 'x'.repeat(40_000)); // ~10,000 tokens
+    const tooLong = buildRequest(activePath(thread), options({ contextLength: 8000 }), none);
+    expect(tooLong.tooLong).toBe(true);
+    expect(buildRequest(activePath(thread), options({ contextLength: 64_000 }), none).tooLong).toBe(
+      false,
+    );
+    expect(buildRequest(activePath(thread), options(), none).tooLong).toBe(false);
+  });
+});
+
+describe('PDFs read before', () => {
+  const pdf = { id: 'pdf', name: 'b.pdf', type: 'application/pdf', size: 10, kind: 'pdf' as const };
+
+  it('go as the parser’s text, with no upload and no parser', () => {
+    const thread = createThread();
+    appendUser(thread, 'Total?', [{ ...pdf, parsed: '<file name="b.pdf">\nTotal 12\n</file>' }]);
+    const built = buildRequest(
+      activePath(thread),
+      options(),
+      () => 'data:application/pdf;base64,AA',
+    );
+    expect(built.body.messages[0]?.content).toEqual([
+      { type: 'text', text: 'Total?' },
+      { type: 'text', text: '<file name="b.pdf">\nTotal 12\n</file>' },
+    ]);
+    expect(built.body.plugins).toBeUndefined();
+    expect(unparsedPdfs(activePath(thread), () => 'data:')).toEqual([]);
+  });
+
+  it('are listed while they still need the parser', () => {
+    const thread = createThread();
+    const node = appendUser(thread, 'Total?', [pdf]);
+    expect(unparsedPdfs(activePath(thread), () => 'data:')).toEqual([node.attachments![0]]);
+    expect(unparsedPdfs(activePath(thread), none)).toEqual([]);
+  });
+});
+
+describe('what a model can read', () => {
+  const ref = (kind: 'image' | 'audio' | 'pdf', parsed?: string) => ({
+    id: kind,
+    name: `x.${kind}`,
+    type: '',
+    size: 1,
+    kind,
+    ...(parsed ? { parsed } : {}),
+  });
+  const has = (): boolean => true;
+
+  it('names the first attachment the model cannot take', () => {
+    expect(missingInput([ref('image')], ['text'], 'cloudflare-ai', has)).toBe('image');
+    expect(missingInput([ref('audio')], ['text', 'image'], 'cloudflare-ai', has)).toBe('audio');
+    expect(missingInput([ref('pdf')], ['text'], 'native', has)).toBe('file');
+    expect(missingInput([ref('pdf')], ['text'], 'cloudflare-ai', has)).toBeNull();
+    expect(missingInput([ref('pdf', 'text')], ['text'], 'native', has)).toBeNull();
+    expect(missingInput([ref('image')], ['text', 'image'], 'native', has)).toBeNull();
+    // Gone after a reload: sent as a note, so nothing is missing.
+    expect(missingInput([ref('image')], ['text'], 'native', () => false)).toBeNull();
+  });
+
+  it('turns an earlier PDF into a note for a model that cannot read files natively', () => {
+    const thread = createThread();
+    const first = appendUser(thread, 'Read', [ref('pdf')]);
+    addNode(thread, first.id, { role: 'assistant', content: 'Done.', status: 'done' });
+    appendUser(thread, 'Next');
+    const built = buildRequest(
+      activePath(thread),
+      options({ pdfEngine: 'native', inputModalities: ['text'] }),
+      () => 'data:application/pdf;base64,AA',
+    );
+    expect(built.body.messages[0]?.content).toEqual([
+      { type: 'text', text: 'Read' },
+      { type: 'text', text: '[PDF "x.pdf" not sent: this model cannot read it.]' },
+    ]);
+    expect(built.body.plugins).toBeUndefined();
   });
 });

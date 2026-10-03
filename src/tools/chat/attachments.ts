@@ -14,6 +14,7 @@
 import type { ContentPart } from '../../core/api/types';
 import { InvalidInputError } from '../../core/errors';
 import { readAsDataUrl, readAsText } from '../../core/files';
+import { isPlainObject, isString } from '../../core/util';
 import { formatBytes } from '../../ui/format';
 import { type AttachmentKind, type AttachmentRef, newId } from './thread';
 
@@ -29,6 +30,12 @@ export const SIZE_LIMITS: Readonly<Record<AttachmentKind, number>> = {
 
 /** At most this many attachments on one message. */
 export const MAX_ATTACHMENTS = 10;
+
+/** All text files of one message together: they are inlined into the prompt (and stored with the thread). */
+export const TEXT_TOTAL_LIMIT = 2 * MB;
+
+/** The longest parser text of a PDF kept with a thread; a longer one is uploaded and parsed again. */
+export const PARSED_LIMIT = 1 * MB;
 
 const KIND_LABELS: Readonly<Record<AttachmentKind, string>> = {
   image: 'Images',
@@ -183,6 +190,46 @@ export function textAttachment(name: string, text: string, type = 'text/plain'):
   return { id: newId(), name, type, size: new Blob([text]).size, kind: 'text', text };
 }
 
+/**
+ * Throws InvalidInputError when `size` bytes of text named `name` are over the per-file limit, or would take the
+ * text files of the message (`pending`) over TEXT_TOTAL_LIMIT.
+ */
+export function checkText(pending: readonly AttachmentRef[], name: string, size: number): void {
+  if (size > SIZE_LIMITS.text) {
+    throw new InvalidInputError(
+      `${name} is ${formatBytes(size)}. Text can be at most ${formatBytes(SIZE_LIMITS.text)}.`,
+    );
+  }
+  const total = pending.reduce((sum, ref) => sum + (ref.kind === 'text' ? ref.size : 0), 0);
+  if (total + size > TEXT_TOTAL_LIMIT) {
+    throw new InvalidInputError(
+      `${name} doesn't fit: one message takes at most ${formatBytes(TEXT_TOTAL_LIMIT)} of text files.`,
+    );
+  }
+}
+
+/**
+ * The parser's text of each PDF a reply's `annotations` describe (`{ type: 'file', file: { name, content } }`,
+ * docs/openrouter-api.md §2.5), in order: its text parts joined. Image parts (from OCR) are left out; texts over
+ * PARSED_LIMIT are skipped.
+ */
+export function parsedFiles(annotations: unknown): { name: string; text: string }[] {
+  if (!Array.isArray(annotations)) return [];
+  const files: { name: string; text: string }[] = [];
+  for (const annotation of annotations) {
+    if (!isPlainObject(annotation) || annotation['type'] !== 'file') continue;
+    const file = annotation['file'];
+    if (!isPlainObject(file) || !isString(file['name']) || !Array.isArray(file['content']))
+      continue;
+    const text = file['content']
+      .filter((part) => isPlainObject(part) && part['type'] === 'text' && isString(part['text']))
+      .map((part) => (part as { text: string }).text)
+      .join('\n');
+    if (text && text.length <= PARSED_LIMIT) files.push({ name: file['name'], text });
+  }
+  return files;
+}
+
 /** A note in place of an attachment whose bytes are gone (the thread was reloaded). */
 export function missingNote(ref: AttachmentRef): string {
   return `[Attachment "${ref.name}" (${ref.kind === 'pdf' ? 'PDF' : ref.kind}) is no longer available.]`;
@@ -196,6 +243,8 @@ export function toContentPart(ref: AttachmentRef, data: string | undefined): Con
   if (ref.kind === 'text') {
     return { type: 'text', text: `<file name="${ref.name}">\n${ref.text ?? ''}\n</file>` };
   }
+  // A PDF the parser read before: its text, without uploading or parsing it again.
+  if (ref.kind === 'pdf' && ref.parsed !== undefined) return { type: 'text', text: ref.parsed };
   if (!data) return { type: 'text', text: missingNote(ref) };
   switch (ref.kind) {
     case 'image':
