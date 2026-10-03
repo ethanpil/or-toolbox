@@ -1,9 +1,17 @@
 /**
- * Budget checks before every run. Spend comes from the local stats ledger for the current UTC month, because
- * OpenRouter's `/key` usage and `/generation` lag by minutes (docs/openrouter-api.md §0, §10).
+ * Budget checks before every run. Spend = finished spend this UTC month from the local stats ledger (one
+ * read per check) plus what every `running` run in any tab holds: its reservation, or what it has already
+ * spent if that is more. OpenRouter's `/key` usage and `/generation` lag by minutes, so they are never used
+ * (docs/openrouter-api.md §0, §10).
+ *
+ * When the spend cannot be read (IndexedDB failing), monthly rules cannot be evaluated: the verdict is
+ * `confirm` in both warn and hard mode, so the user decides instead of the run being silently allowed or
+ * blocked.
  */
 
 import type { BudgetCheck, BudgetReason, BudgetsService, CoreServices } from '../types';
+import { getDb } from '../storage/db';
+import { utcMonthRange } from '../stats';
 
 /** `$0.18`; amounts under a cent keep two significant digits (`$0.0042`). */
 export function formatUsd(value: number): string {
@@ -17,7 +25,28 @@ function exceeds(spent: number, estimate: number | null, limit: number): boolean
   return estimate == null ? spent >= limit : spent + estimate > limit;
 }
 
+interface MonthSpend {
+  total: number;
+  byKey: Map<string, number>;
+}
+
 export function createBudgetsService(core: CoreServices): BudgetsService {
+  /** Finished spend this month plus running runs' holds, overall and per key. */
+  const readSpend = async (): Promise<MonthSpend> => {
+    const [rows, running] = await Promise.all([
+      core.stats.rows(utcMonthRange()),
+      getDb().then((db) => db.getAllFromIndex('runs', 'status', 'running')),
+    ]);
+    const spend: MonthSpend = { total: 0, byKey: new Map() };
+    const add = (keyId: string, usd: number): void => {
+      spend.total += usd;
+      spend.byKey.set(keyId, (spend.byKey.get(keyId) ?? 0) + usd);
+    };
+    for (const row of rows) add(row.keyId, row.costUsd);
+    for (const run of running) add(run.keyId, Math.max(run.reservedUsd || 0, run.usage.costUsd));
+    return spend;
+  };
+
   return {
     async check({ keyId, estimateUsd }) {
       const budgets = core.settings.get().budgets;
@@ -36,37 +65,52 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
       }
 
       const monthly = budgets.monthlyUsd;
-      if (monthly != null) {
-        const spent = await core.stats.monthSpend();
-        if (exceeds(spent, estimate, monthly)) {
-          reasons.push({
-            kind: 'monthly',
-            limitUsd: monthly,
-            projectedUsd: spent + (estimate ?? 0),
-            message:
-              estimate == null
-                ? `You have spent ${formatUsd(spent)} this month, which reaches your ${formatUsd(monthly)} monthly limit.`
-                : `This run would bring this month's spend to ${formatUsd(spent + estimate)}, above your ${formatUsd(monthly)} monthly limit.`,
-          });
-        }
+      const keyLimit = budgets.perKeyMonthlyUsd[keyId] ?? null;
+      if (monthly == null && keyLimit == null) {
+        return { verdict: verdictFor(budgets.mode, reasons), reasons };
       }
 
-      const keyLimit = budgets.perKeyMonthlyUsd[keyId];
-      if (keyLimit != null) {
-        const spent = await core.stats.monthSpend({ keyId });
-        if (exceeds(spent, estimate, keyLimit)) {
-          const name = core.keys.get(keyId)?.name;
-          const label = name ? `the key “${name}”` : 'this key';
-          reasons.push({
-            kind: 'key-monthly',
-            limitUsd: keyLimit,
-            projectedUsd: spent + (estimate ?? 0),
-            message:
-              estimate == null
-                ? `You have spent ${formatUsd(spent)} on ${label} this month, which reaches its ${formatUsd(keyLimit)} monthly limit.`
-                : `This run would bring this month's spend on ${label} to ${formatUsd(spent + estimate)}, above its ${formatUsd(keyLimit)} monthly limit.`,
-          });
-        }
+      let spend: MonthSpend;
+      try {
+        spend = await readSpend();
+      } catch (error) {
+        console.error(error);
+        reasons.push({
+          kind: monthly != null ? 'monthly' : 'key-monthly',
+          limitUsd: monthly ?? keyLimit ?? 0,
+          projectedUsd: estimate ?? 0,
+          message:
+            "This month's spend could not be read, so your monthly limits cannot be checked.",
+        });
+        return { verdict: 'confirm', reasons };
+      }
+
+      if (monthly != null && exceeds(spend.total, estimate, monthly)) {
+        const spent = spend.total;
+        reasons.push({
+          kind: 'monthly',
+          limitUsd: monthly,
+          projectedUsd: spent + (estimate ?? 0),
+          message:
+            estimate == null
+              ? `You have spent ${formatUsd(spent)} this month, which reaches your ${formatUsd(monthly)} monthly limit.`
+              : `This run would bring this month's spend to ${formatUsd(spent + estimate)}, above your ${formatUsd(monthly)} monthly limit.`,
+        });
+      }
+
+      const spentOnKey = spend.byKey.get(keyId) ?? 0;
+      if (keyLimit != null && exceeds(spentOnKey, estimate, keyLimit)) {
+        const name = core.keys.get(keyId)?.name;
+        const label = name ? `the key “${name}”` : 'this key';
+        reasons.push({
+          kind: 'key-monthly',
+          limitUsd: keyLimit,
+          projectedUsd: spentOnKey + (estimate ?? 0),
+          message:
+            estimate == null
+              ? `You have spent ${formatUsd(spentOnKey)} on ${label} this month, which reaches its ${formatUsd(keyLimit)} monthly limit.`
+              : `This run would bring this month's spend on ${label} to ${formatUsd(spentOnKey + estimate)}, above its ${formatUsd(keyLimit)} monthly limit.`,
+        });
       }
 
       return { verdict: verdictFor(budgets.mode, reasons), reasons };

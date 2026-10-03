@@ -26,7 +26,13 @@ export interface OrDb extends DBSchema {
   runs: {
     key: string;
     value: RunRecord;
-    indexes: { startedAt: number; tool: string; 'tool-startedAt': [string, number] };
+    indexes: {
+      startedAt: number;
+      tool: string;
+      'tool-startedAt': [string, number];
+      /** `running` runs: budget reservations and the orphan sweep. */
+      status: string;
+    };
   };
   prompts: {
     key: string;
@@ -41,7 +47,7 @@ export interface OrDb extends DBSchema {
   stats: {
     key: string;
     value: StoredStatsRow;
-    indexes: { day: string };
+    indexes: { day: string; model: string };
   };
   kv: {
     key: string;
@@ -51,15 +57,35 @@ export interface OrDb extends DBSchema {
 
 let dbPromise: Promise<IDBPDatabase<OrDb>> | null = null;
 
-/** Shared connection. Closes itself when another tab upgrades the schema, and reopens on next use. */
+/**
+ * Shared connection. Closes itself when another tab upgrades the schema, and reopens on next use. A failed
+ * open (blocked storage, version error, a synchronous throw from `indexedDB.open`) is reported as a rejected
+ * promise and not cached, so the next call tries again.
+ */
 export function getDb(): Promise<IDBPDatabase<OrDb>> {
-  dbPromise ??= openDB<OrDb>(DB_NAME, DB_VERSION, {
+  if (dbPromise) return dbPromise;
+  let opening: Promise<IDBPDatabase<OrDb>>;
+  try {
+    opening = openDatabase();
+  } catch (error) {
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
+  dbPromise = opening;
+  opening.catch(() => {
+    if (dbPromise === opening) dbPromise = null;
+  });
+  return opening;
+}
+
+function openDatabase(): Promise<IDBPDatabase<OrDb>> {
+  return openDB<OrDb>(DB_NAME, DB_VERSION, {
     upgrade(db, oldVersion) {
       if (oldVersion < 1) {
         const runs = db.createObjectStore('runs', { keyPath: 'id' });
         runs.createIndex('startedAt', 'startedAt');
         runs.createIndex('tool', 'tool');
         runs.createIndex('tool-startedAt', ['tool', 'startedAt']);
+        runs.createIndex('status', 'status');
 
         const prompts = db.createObjectStore('prompts', { keyPath: 'id' });
         prompts.createIndex('tool-kind', ['tool', 'kind']);
@@ -73,6 +99,7 @@ export function getDb(): Promise<IDBPDatabase<OrDb>> {
 
         const stats = db.createObjectStore('stats', { keyPath: 'key' });
         stats.createIndex('day', 'day');
+        stats.createIndex('model', 'model');
 
         db.createObjectStore('kv', { keyPath: 'key' });
       }
@@ -86,12 +113,11 @@ export function getDb(): Promise<IDBPDatabase<OrDb>> {
       dbPromise = null;
     },
   });
-  return dbPromise;
 }
 
 /** Tests only: close and forget the connection (pair with a fresh fake-indexeddb instance). */
 export async function closeDbForTests(): Promise<void> {
-  const db = await dbPromise;
+  const db = await dbPromise?.catch(() => null);
   db?.close();
   dbPromise = null;
 }
