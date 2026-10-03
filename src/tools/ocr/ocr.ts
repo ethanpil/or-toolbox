@@ -150,16 +150,49 @@ export function pdfRequest(
 export const MAX_PAGE_TOKENS = 4096;
 export const MAX_DOCUMENT_TOKENS = 32_000;
 
-/** Deliberately high per-page figures for the estimate (an image at 1,600 px plus prompt; a dense page out). */
-export const PER_PAGE_PROMPT_TOKENS = 1800;
+/** The text of one page request besides the image and the hint: system prompt, page line, instructions. */
+export const PROMPT_TEXT_TOKENS = 300;
+/** A PDF text layer sent as a hint, at most `TEXT_HINT_CHARS` (about four characters per token). */
+export const TEXT_HINT_TOKENS = Math.ceil(TEXT_HINT_CHARS / 4);
+/** One page of a PDF read by the parser: its extracted text, as input tokens. */
+export const PARSED_PAGE_TOKENS = 1000;
+/** A dense page of small print, out. */
 export const PER_PAGE_COMPLETION_TOKENS = 1500;
 
-export function estimateTokens(pages: number): { promptTokens: number; completionTokens: number } {
+/**
+ * Input tokens of one page image whose longest side is `maxSide` px, for an A4-shaped page (sides 1 : √2): its
+ * pixels / 750, the usual rule of thumb for vision models (deliberately on the high side; most downscale).
+ */
+export function imageTokens(maxSide: number): number {
+  return Math.ceil((maxSide * Math.round(maxSide / Math.SQRT2)) / 750);
+}
+
+/** Tokens for a plan: pages sent as images (`hintPages` of them with their PDF text), and pages the parser reads. */
+export function estimateTokens(plan: {
+  imagePages: number;
+  hintPages: number;
+  parsedPages: number;
+  maxSide: number;
+}): { promptTokens: number; completionTokens: number } {
   return {
-    promptTokens: pages * PER_PAGE_PROMPT_TOKENS,
-    completionTokens: pages * PER_PAGE_COMPLETION_TOKENS,
+    promptTokens:
+      plan.imagePages * (PROMPT_TEXT_TOKENS + imageTokens(plan.maxSide)) +
+      plan.hintPages * TEXT_HINT_TOKENS +
+      plan.parsedPages * PARSED_PAGE_TOKENS,
+    completionTokens: (plan.imagePages + plan.parsedPages) * PER_PAGE_COMPLETION_TOKENS,
   };
 }
+
+/**
+ * What OpenRouter's file parser bills per page on top of the model's tokens, in USD. Only Mistral OCR charges; its
+ * price did not render in the fetched docs (docs/openrouter-api.md, [unverified]), so this is OpenRouter's listed
+ * $2 per 1,000 pages, on the high side for an estimate.
+ */
+export const PARSER_PAGE_FEE_USD: Record<PdfEngine, number> = {
+  'cloudflare-ai': 0,
+  'mistral-ocr': 0.002,
+  native: 0,
+};
 
 // --- results --------------------------------------------------------------------------------------------
 
@@ -176,6 +209,8 @@ export interface PageResult {
   status: PageStatus;
   text: string;
   error: string | null;
+  /** The answer stopped at the length limit (`finish_reason: length`): the end of the page may be missing. */
+  truncated: boolean;
 }
 
 /** "report.pdf · page 2 of 20", or "report.pdf · all pages". */
@@ -187,40 +222,97 @@ export function pageLabel(
   return `${result.fileName} · page ${result.pageNumber} of ${result.pageCount}`;
 }
 
-/** Removes a code fence the model wrapped the whole answer in (```markdown … ```). */
+/**
+ * Removes a code fence the model wrapped the whole answer in (```markdown … ```): only when the answer opens with
+ * a fence line, closes with the matching fence line, and has no other fence inside. A page with several code
+ * blocks (or a fenced block inside the wrapper) is left exactly as it is.
+ */
 export function unwrapFence(text: string): string {
-  const match = /^\s*```[\w-]*\s*\n([\s\S]*?)\n?```\s*$/.exec(text);
-  return match ? (match[1] ?? '') : text;
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return text;
+  const open = /^(`{3,}|~{3,})[\w+-]*$/.exec(lines[0]!.trim());
+  if (!open) return text;
+  const fence = open[1]!;
+  if (lines[lines.length - 1]!.trim() !== fence) return text;
+  const inner = lines.slice(1, -1);
+  if (inner.some((line) => /^\s*(`{3,}|~{3,})/.test(line))) return text;
+  return inner.join('\n');
+}
+
+/** Text safe inside a Markdown line: one line, with the characters Markdown reads as syntax escaped. */
+export function inlineMarkdown(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[\\`*_[\]#|<>~]/g, '\\$&');
+}
+
+/** Pages shown in the combined text: everything read or tried, but not a page still waiting or just started. */
+const isShown = (result: PageResult): boolean =>
+  result.status !== 'queued' && !(result.status === 'running' && !result.text.trim());
+
+/** What is missing from a page, said after its text; null when it was read in full (or is still being read). */
+export function pageNote(result: PageResult): string | null {
+  const label = pageLabel(result);
+  const partial = result.text.trim() !== '';
+  switch (result.status) {
+    case 'failed':
+      return partial
+        ? `${label} is incomplete: ${result.error ?? 'error'}`
+        : `${label} could not be read: ${result.error ?? 'error'}`;
+    case 'stopped':
+      return partial ? `${label} was stopped before its end` : `${label} was not read`;
+    case 'done':
+      if (result.truncated) return `${label} is cut off: the answer reached the length limit`;
+      return partial ? null : `No text on ${label}`;
+    default:
+      return null;
+  }
+}
+
+/** Pages not read in full: failed, never read, or cut off. */
+export function missingPages(results: readonly PageResult[]): PageResult[] {
+  return results.filter(
+    (result) => result.status === 'failed' || result.status === 'stopped' || result.truncated,
+  );
 }
 
 /**
- * The combined Markdown: every page that has text (or failed), in order, each after a separator line naming it.
- * A single page gets no separator. Pages still queued are left out.
+ * The combined Markdown: every page in order, each after a separator line naming it (a single page gets none).
+ * A page that failed, was not read or was cut off carries a marker saying so; pages still queued are left out.
  */
 export function combineMarkdown(results: readonly PageResult[], separators = true): string {
-  const shown = results.filter((result) => result.status !== 'queued' || result.text);
   const single = results.length <= 1;
-  return shown
+  return results
+    .filter(isShown)
     .map((result) => {
-      const body =
-        result.status === 'failed' && !result.text.trim()
-          ? `*[${pageLabel(result)} could not be read: ${result.error ?? 'error'}]*`
-          : unwrapFence(result.text).trim();
+      const note = pageNote(result);
+      const body = [unwrapFence(result.text).trim(), note ? `*[${inlineMarkdown(note)}]*` : '']
+        .filter(Boolean)
+        .join('\n\n');
       if (single || !separators) return body;
-      return `*${pageLabel(result)}*\n\n${body}`;
+      return `*${inlineMarkdown(pageLabel(result))}*\n\n${body}`;
     })
     .filter((block) => block.length > 0)
     .join(separators && !single ? '\n\n---\n\n' : '\n\n');
 }
 
-/** Plain text: the combined text with page separators as simple lines. */
+/**
+ * Plain text: the pages with simple separator lines and the same markers as the Markdown; when pages are
+ * missing, a first line lists them.
+ */
 export function combinePlainText(results: readonly PageResult[]): string {
-  return results
-    .filter((result) => result.text.trim())
-    .map((result) =>
-      results.length <= 1
-        ? unwrapFence(result.text).trim()
-        : `--- ${pageLabel(result)} ---\n\n${unwrapFence(result.text).trim()}`,
-    )
-    .join('\n\n');
+  const single = results.length <= 1;
+  const blocks = results.filter(isShown).map((result) => {
+    const note = pageNote(result);
+    const body = [unwrapFence(result.text).trim(), note ? `[${note}]` : '']
+      .filter(Boolean)
+      .join('\n\n');
+    return single ? body : `--- ${pageLabel(result)} ---\n\n${body}`;
+  });
+  const missing = missingPages(results);
+  if (missing.length > 0 && !single) {
+    blocks.unshift(`[Not read in full: ${missing.map((result) => pageLabel(result)).join('; ')}]`);
+  }
+  return blocks.filter(Boolean).join('\n\n');
 }

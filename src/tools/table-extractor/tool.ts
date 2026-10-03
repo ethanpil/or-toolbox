@@ -15,14 +15,22 @@ import { emptyState } from '../../ui/components/empty-state';
 import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
 import { h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, markPresented, needsAction } from '../../ui/feedback/errors';
+import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import type { ToolContext, ToolInstance } from '../../ui/tool/index';
-import { csvZip, tableCsv, tablesMarkdown, tablesWorkbook, tableStem, tableTsv } from './export';
-import { tableCard } from './grid';
+import type { Runner, ToolContext, ToolInstance } from '../../ui/tool/index';
+import {
+  csvZip,
+  tableCsv,
+  tablesMarkdown,
+  tablesWorkbook,
+  tableStem,
+  tableTitle,
+  tableTsv,
+} from './export';
+import { type TableCard, tableCard } from './grid';
 import {
   canMerge,
   describeTables,
@@ -40,6 +48,8 @@ interface PageState {
   status: 'queued' | 'running' | 'done' | 'failed' | 'stopped';
   error: string | null;
   found: number;
+  /** The answer hit the length limit: its complete rows were kept, later ones may be missing. */
+  truncated: boolean;
 }
 
 const IMAGE_SIZES = [1024, 1600, 2048] as const;
@@ -192,13 +202,17 @@ export function setup(ctx: ToolContext): ToolInstance {
   let tables: ExtractedTable[] = [];
   let pages: PageState[] = [];
   let reading = false;
+  /** Bumped whenever a run replaces tables: an Undo from before then would bring back a stale table. */
+  let extraction = 0;
 
   const summary = h('div', {
     class: 'small text-body-secondary me-auto',
+    tabIndex: -1,
     'data-testid': 'te-summary',
   });
   const exportSlot = h('span', { class: 'd-inline-block' });
   const failedBox = h('div', { hidden: true, 'data-testid': 'te-failed' });
+  const truncatedBox = h('div', { hidden: true, 'data-testid': 'te-truncated' });
   const list = h('div', { class: 'vstack gap-3', 'data-testid': 'te-tables' });
   const empty = emptyState({
     icon: 'table',
@@ -227,6 +241,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       h('div', { class: 'd-flex flex-wrap align-items-center gap-2' }, summary, exportSlot),
       progress,
       failedBox,
+      truncatedBox,
       empty,
       list,
     ),
@@ -270,9 +285,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     ];
   };
 
+  const pageName = (page: PageState): string =>
+    page.ref.pageCount > 1 ? `${page.ref.fileName} p. ${page.ref.pageNumber}` : page.ref.fileName;
+
   const renderSummary = (): void => {
     const done = pages.filter((page) => page.status === 'done').length;
     const failed = pages.filter((page) => page.status === 'failed' || page.status === 'stopped');
+    const cut = pages.filter((page) => page.status === 'done' && page.truncated);
     summary.textContent =
       pages.length === 0 && tables.length === 0
         ? ''
@@ -284,6 +303,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     progressBar.style.width = pages.length
       ? `${Math.round(((done + failed.length) / pages.length) * 100)}%`
       : '0%';
+    const retryHadFocus = failedBox.contains(document.activeElement);
     failedBox.hidden = reading || failed.length === 0;
     replace(
       failedBox,
@@ -298,22 +318,27 @@ export function setup(ctx: ToolContext): ToolInstance {
               { class: 'me-auto' },
               `${plural(failed.length, 'page')} not read: `,
               failed
-                .map(
-                  (page) =>
-                    `${page.ref.fileName} p. ${page.ref.pageNumber}${page.error ? ` (${page.error})` : ''}`,
-                )
+                .map((page) => `${pageName(page)}${page.error ? ` (${page.error})` : ''}`)
                 .join('; '),
             ),
+            retryButton(failed.map((page) => page.key)),
+          ),
+    );
+    // "Retry" hides while reading: keep keyboard focus nearby.
+    if (retryHadFocus && failedBox.hidden) summary.focus();
+    truncatedBox.hidden = cut.length === 0;
+    replace(
+      truncatedBox,
+      cut.length === 0
+        ? null
+        : h(
+            'div',
+            { class: 'alert alert-warning d-flex gap-2 mb-0' },
+            icon('scissors'),
             h(
-              'button',
-              {
-                type: 'button',
-                class: 'btn btn-sm btn-warning',
-                'data-focus-key': 'retry-failed',
-                'data-testid': 'te-retry-failed',
-                onclick: () => retry(failed.map((page) => page.key)),
-              },
-              'Retry',
+              'span',
+              null,
+              `Cut off at the length limit, so the last rows may be missing: ${cut.map(pageName).join('; ')}.`,
             ),
           ),
     );
@@ -335,62 +360,113 @@ export function setup(ctx: ToolContext): ToolInstance {
       ?.focus();
   };
 
-  /** Draws every table; `focus` names the control to focus afterwards. */
+  /** The card drawn for each table, reused for as long as the table object stays the same. */
+  const cards = new Map<string, TableCard>();
+
+  const cardHandlers = {
+    onReplace: (next: ExtractedTable, key?: string) => {
+      tables = tables.map((candidate) => (candidate.id === next.id ? next : candidate));
+      renderTables(key);
+      renderSummary();
+    },
+    onDelete: (gone: ExtractedTable) => deleteTable(gone),
+    onMerge: (first: ExtractedTable) => {
+      const at = tables.indexOf(first);
+      const next = tables[at + 1];
+      if (!next) return;
+      const merged = mergeTables(first, next);
+      tables = [...tables.slice(0, at), merged, ...tables.slice(at + 2)];
+      renderTables(`${merged.id}:title`);
+      renderSummary();
+      announce(
+        `Merged into “${tableTitle(merged, at + 1)}”: ${plural(merged.rows.length, 'row')}.`,
+      );
+    },
+    onCopy: (table: ExtractedTable) => {
+      void copyText(tableTsv(table)).then((ok) =>
+        toast(
+          ok
+            ? { message: 'Copied. Paste it into a spreadsheet.', variant: 'success' }
+            : { message: 'Copying was blocked by the browser.', variant: 'warning' },
+        ),
+      );
+    },
+  };
+
+  /**
+   * Shows `tables` in order. A card whose table (and name) did not change is kept as it is, so a page finishing
+   * never redraws, refocuses or resets the cards around it; only new or replaced tables get new cards.
+   */
   const renderTables = (focus?: string): void => {
-    replace(
-      list,
-      tables.map((table, index) =>
-        tableCard(table, {
-          position: index + 1,
-          canMerge: canMerge(table, tables[index + 1]),
-          onReplace: (next, key) => {
-            tables = tables.map((candidate) => (candidate.id === table.id ? next : candidate));
-            renderTables(key);
-            renderSummary();
-          },
-          onDelete: (gone) => {
-            const at = tables.indexOf(gone);
-            tables = tables.filter((candidate) => candidate !== gone);
-            renderTables();
-            renderSummary();
-            const neighbour = tables[Math.min(at, tables.length - 1)];
-            focusKey(neighbour ? `${neighbour.id}:title` : undefined);
+    const active = document.activeElement;
+    const activeKey =
+      active && list.contains(active)
+        ? (active.closest('[data-focus-key]')?.getAttribute('data-focus-key') ?? null)
+        : null;
+    const wanted = tables.map((table, index) => {
+      const mergeable = canMerge(table, tables[index + 1]);
+      const cached = cards.get(table.id);
+      if (cached?.table === table) {
+        cached.setCanMerge(mergeable);
+        cached.setPosition(index + 1);
+        return cached.element;
+      }
+      const card = tableCard(table, { position: index + 1, canMerge: mergeable, ...cardHandlers });
+      cards.set(table.id, card);
+      return card.element;
+    });
+    for (const id of [...cards.keys()])
+      if (!tables.some((table) => table.id === id)) cards.delete(id);
+    // Move only what is out of place, so cards that stay keep their focus and caret.
+    wanted.forEach((element, index) => {
+      const at = list.children[index];
+      if (at !== element) list.insertBefore(element, at ?? null);
+    });
+    while (list.children.length > wanted.length) list.lastElementChild!.remove();
+    if (focus) focusKey(focus);
+    else if (activeKey && !list.contains(document.activeElement)) focusKey(activeKey);
+  };
+
+  /** Deletes a table; Undo puts it back next to the neighbours it had, unless a run replaced the tables since. */
+  const deleteTable = (gone: ExtractedTable): void => {
+    const at = tables.indexOf(gone);
+    if (at < 0) return;
+    const before = tables[at - 1]?.id ?? null;
+    const after = tables[at + 1]?.id ?? null;
+    const deletedIn = extraction;
+    const name = tableTitle(gone, at + 1);
+    tables = tables.filter((candidate) => candidate !== gone);
+    renderTables();
+    renderSummary();
+    const neighbour = tables[Math.min(at, tables.length - 1)];
+    focusKey(neighbour ? `${neighbour.id}:title` : undefined);
+    toast({
+      message: `Deleted “${name}”.`,
+      action: {
+        label: 'Undo',
+        testId: 'toast-undo',
+        onClick: () => {
+          if (deletedIn !== extraction) {
             toast({
-              message: `Deleted “${gone.title}”.`,
-              action: {
-                label: 'Undo',
-                testId: 'toast-undo',
-                onClick: () => {
-                  tables = [...tables.slice(0, at), gone, ...tables.slice(at)];
-                  renderTables(`${gone.id}:title`);
-                  renderSummary();
-                },
-              },
+              variant: 'warning',
+              message: `“${name}” came from an earlier extraction, so it was not put back.`,
             });
-          },
-          onMerge: (first) => {
-            const at = tables.indexOf(first);
-            const next = tables[at + 1];
-            if (!next) return;
-            const merged = mergeTables(first, next);
-            tables = [...tables.slice(0, at), merged, ...tables.slice(at + 2)];
-            renderTables(`${merged.id}:title`);
-            renderSummary();
-            announce(`Merged into “${merged.title}”: ${plural(merged.rows.length, 'row')}.`);
-          },
-          onCopy: (table) => {
-            void copyText(tableTsv(table)).then((ok) =>
-              toast(
-                ok
-                  ? { message: 'Copied. Paste it into a spreadsheet.', variant: 'success' }
-                  : { message: 'Copying was blocked by the browser.', variant: 'warning' },
-              ),
-            );
-          },
-        }),
-      ),
-    );
-    focusKey(focus);
+            return;
+          }
+          if (tables.some((table) => table.id === gone.id)) return;
+          const indexOf = (id: string | null): number =>
+            id === null ? -1 : tables.findIndex((table) => table.id === id);
+          let index: number;
+          if (before === null) index = 0;
+          else if (indexOf(before) >= 0) index = indexOf(before) + 1;
+          else if (indexOf(after) >= 0) index = indexOf(after);
+          else index = Math.min(at, tables.length);
+          tables = [...tables.slice(0, index), gone, ...tables.slice(index)];
+          renderTables(`${gone.id}:title`);
+          renderSummary();
+        },
+      },
+    });
   };
 
   // --- running --------------------------------------------------------------------------------------------
@@ -404,12 +480,63 @@ export function setup(ctx: ToolContext): ToolInstance {
           completionTokens: count * 2500,
         });
 
-  let retryKeys: string[] | null = null;
-  const retry = (keys: string[]): void => {
-    if (runner.busy || keys.length === 0) return;
-    retryKeys = keys;
-    void runner.trigger();
+  /** The pages a Retry asks for; `run` takes them the moment the runner starts it (see `retry`). */
+  let pendingRetry: string[] | null = null;
+
+  /** Why Run cannot start now (busy, or disabled with a reason); null when it can. */
+  function runBlocked(): string | null {
+    if (runner.busy) return 'Wait until the current run ends.';
+    if (runner.button.getAttribute('aria-disabled') !== 'true') return null;
+    return (
+      runner.element.querySelector('[data-testid="run-hint"]')?.textContent?.trim() ||
+      'Reading is not possible right now.'
+    );
+  }
+
+  /** Brings every Retry button in line with the runner (Run disabled or busy disables them, with the reason). */
+  const syncRetryButtons = (): void => {
+    const reason = runBlocked();
+    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]')) {
+      button.setAttribute('aria-disabled', String(reason !== null));
+      button.classList.toggle('disabled', reason !== null);
+      button.title = reason ?? '';
+    }
   };
+
+  function retryButton(keys: string[]): HTMLButtonElement {
+    const reason = runBlocked();
+    return h(
+      'button',
+      {
+        type: 'button',
+        class: ['btn btn-sm btn-warning', reason !== null && 'disabled'],
+        'aria-disabled': String(reason !== null),
+        title: reason ?? '',
+        'data-retry': '',
+        'data-focus-key': 'retry-failed',
+        'data-testid': 'te-retry-failed',
+        onclick: () => retry(keys),
+      },
+      'Retry',
+    );
+  }
+
+  function retry(keys: string[]): void {
+    const blocked = runBlocked();
+    if (blocked) {
+      announce(blocked);
+      return;
+    }
+    if (keys.length === 0) return;
+    pendingRetry = keys;
+    void runner.trigger();
+    // The runner calls `run` synchronously when it starts; if it did not start, these keys must not wait around to
+    // turn a later Run press into a retry.
+    pendingRetry = null;
+  }
+
+  const CUT_OFF_NOTE =
+    'The answer was cut off at the length limit; rows at the end of this page may be missing.';
 
   const readPage = async (
     run: RunHandle,
@@ -424,7 +551,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       textHint: textHint.checked,
     });
     const response = await ctx.api.chat(body, { run });
-    const parsed = parseTables(response.choices[0]?.message.content ?? '');
+    const choice = response.choices[0];
+    const truncated = choice?.finish_reason === 'length';
+    // Cut off: keep the tables and rows that were complete, and say so.
+    const parsed = parseTables(choice?.message.content ?? '', { partial: truncated });
     if ('problem' in parsed)
       throw new InvalidInputError(`The model's answer could not be read: ${parsed.problem}`);
     // Replace this page's earlier tables (a retry), keep everything in file and page order.
@@ -438,7 +568,10 @@ export function setup(ctx: ToolContext): ToolInstance {
         index: tables.length + index + 1,
       }),
     );
+    const last = fresh.at(-1);
+    if (truncated && last) last.notes = [last.notes, CUT_OFF_NOTE].filter(Boolean).join('\n');
     page.found = fresh.length;
+    page.truncated = truncated;
     const order = pages.map((candidate) => candidate.key);
     const rank = (table: ExtractedTable): number =>
       order.indexOf(`${table.fileId}:${table.firstPage}`);
@@ -451,25 +584,52 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   const run = async (signal: AbortSignal): Promise<void> => {
-    const keys = retryKeys;
-    retryKeys = null;
+    const keys = pendingRetry;
+    pendingRetry = null;
+    const refs = keys ? [] : docs.selection();
+    if (!keys && refs.length === 0) {
+      ui.status(docs.files().length ? 'Choose at least one page.' : 'Add an image or a PDF first.');
+      return;
+    }
+    const planned = keys
+      ? pages.filter((page) => keys.includes(page.key)).map((page) => page.ref)
+      : refs;
+    if (planned.length === 0) return;
+
+    const model = ctx.model().model;
+    const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
+    const mode = outputMode(info?.supportedParameters ?? []);
+    const first = planned[0]!.fileName;
+    const files = new Set(planned.map((ref) => ref.fileName));
+    let handle: RunHandle;
+    try {
+      handle = await ctx.beginRun(
+        {
+          title: `${keys ? 'Retry: ' : ''}${first}${files.size > 1 ? ` and ${plural(files.size - 1, 'more file')}` : ''}`,
+          ...(keys && model ? { estimateUsd: await estimateFor(planned.length, model) } : {}),
+        },
+        signal,
+      );
+    } catch (error) {
+      // Refused before anything was sent (no key, locked, free-only, budget, Cancel): the tables, their edits and
+      // the list of failed pages stay exactly as they were. A refused retry offers to retry the same pages.
+      if (keys && !isStop(error)) void presentError(error, { retry: () => retry(keys) });
+      throw error;
+    }
+
+    // The run is on: only now replace (or reset) what it reads.
+    extraction += 1;
     let batch: PageState[];
     if (keys) {
       batch = pages.filter((page) => keys.includes(page.key));
     } else {
-      const refs = docs.selection();
-      if (refs.length === 0) {
-        ui.status(
-          docs.files().length ? 'Choose at least one page.' : 'Add an image or a PDF first.',
-        );
-        return;
-      }
       pages = refs.map((ref) => ({
         key: `${ref.fileId}:${ref.pageNumber}`,
         ref,
         status: 'queued',
         error: null,
         found: 0,
+        truncated: false,
       }));
       tables = [];
       batch = pages;
@@ -478,27 +638,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     for (const page of batch) {
       page.status = 'queued';
       page.error = null;
-    }
-    renderSummary();
-
-    const model = ctx.model().model;
-    const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
-    const mode = outputMode(info?.supportedParameters ?? []);
-    const first = batch[0]!.ref.fileName;
-    const files = new Set(batch.map((page) => page.ref.fileName));
-    let handle: RunHandle;
-    try {
-      handle = await ctx.beginRun(
-        {
-          title: `${keys ? 'Retry: ' : ''}${first}${files.size > 1 ? ` and ${plural(files.size - 1, 'more file')}` : ''}`,
-          ...(keys && model ? { estimateUsd: await estimateFor(batch.length, model) } : {}),
-        },
-        signal,
-      );
-    } catch (error) {
-      for (const page of batch) page.status = 'stopped';
-      renderSummary();
-      throw error;
+      page.truncated = false;
     }
     reading = true;
     renderSummary();
@@ -541,6 +681,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         const reason: unknown = handle.signal.reason;
         throw reason instanceof Error ? reason : abortError('Stopped.');
       }
+      // Only this run's pages decide whether it failed: a retry whose pages all fail again fails.
       const done = batch.filter((page) => page.status === 'done').length;
       if (done === 0 && lastError) {
         if (!needsAction(lastError)) markPresented(lastError);
@@ -554,6 +695,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           pages: pages.length,
           tables: tables.length,
           failed: pages.filter((page) => page.status !== 'done').length,
+          cutOff: pages.filter((page) => page.truncated).length,
           mode,
         },
       });
@@ -567,7 +709,15 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner = ui.runner({ label: 'Find tables', icon: 'table', run });
+  const runner: Runner = ui.runner({ label: 'Find tables', icon: 'table', run });
+  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry buttons.
+  new MutationObserver(syncRetryButtons).observe(runner.element, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['aria-disabled'],
+  });
   renderSummary();
 
   const settings = () => ({

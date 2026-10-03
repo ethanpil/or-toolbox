@@ -13,11 +13,12 @@ import type { RunHandle } from '../../core/types';
 import { documentInput, textImage, type PageRef } from '../../ui/components/document-input';
 import { outputPanel } from '../../ui/components/output-panel';
 import { h, replace } from '../../ui/dom';
-import { isStop, needsAction } from '../../ui/feedback/errors';
+import { announce } from '../../ui/feedback/announce';
+import { isStop, needsAction, presentError } from '../../ui/feedback/errors';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import type { ToolContext, ToolInstance } from '../../ui/tool/index';
+import type { Runner, ToolContext, ToolInstance } from '../../ui/tool/index';
 import {
   combineMarkdown,
   combinePlainText,
@@ -25,6 +26,7 @@ import {
   isPdfEngine,
   OCR_MODES,
   type OcrMode,
+  PARSER_PAGE_FEE_USD,
   PDF_ENGINES,
   type PageResult,
   type PdfEngine,
@@ -193,6 +195,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           void ui.refreshEstimate();
         }
         if (key === 'separators') refreshCombined();
+        if (key === 'textHint') void ui.refreshEstimate();
       },
     });
     return input;
@@ -223,6 +226,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         ctx.options.set({ engine: engine.value });
         engineHint.textContent = PDF_ENGINES.find((entry) => entry.id === engine.value)?.hint ?? '';
         checkEngine();
+        void ui.refreshEstimate();
       },
     },
     PDF_ENGINES.map((entry) => h('option', { value: entry.id }, entry.label)),
@@ -292,7 +296,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       id: ids.size,
       class: 'form-select',
       'data-testid': 'ocr-size',
-      onchange: () => ctx.options.set({ maxSide: Number(size.value) }),
+      onchange: () => {
+        ctx.options.set({ maxSide: Number(size.value) });
+        void ui.refreshEstimate();
+      },
     },
     IMAGE_SIZES.map((value) => h('option', { value: String(value) }, `${value} px`)),
   );
@@ -341,6 +348,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   let units: Unit[] = [];
   const openTexts = new Set<string>();
   const textElements = new Map<string, HTMLElement>();
+  const pageItems = new Map<string, HTMLElement>();
 
   const stem = (): string => {
     const first = results[0]?.fileName ?? docs.files()[0]?.name;
@@ -456,13 +464,37 @@ export function setup(ctx: ToolContext): ToolInstance {
     combinedTimer ??= setTimeout(refreshCombined, 250);
   };
 
+  /** A Retry button: disabled, with the reason, whenever Run cannot start (see `syncRetryButtons`). */
+  const retryButton = (
+    attributes: Record<string, string>,
+    keys: () => string[],
+    ...children: (HTMLElement | string)[]
+  ): HTMLButtonElement => {
+    const reason = runBlocked();
+    const button = h(
+      'button',
+      {
+        type: 'button',
+        ...attributes,
+        class: [attributes['class'], reason !== null && 'disabled'],
+        'aria-disabled': String(reason !== null),
+        title: reason ?? '',
+        'data-retry': '',
+        onclick: () => retry(keys()),
+      },
+      ...children,
+    );
+    return button;
+  };
+
   const pageItem = (result: PageResult): HTMLElement => {
     const text = h('div', { class: 'or-page-text', 'data-testid': 'ocr-page-text' }, result.text);
     textElements.set(result.key, text);
     const details = h(
       'details',
       {
-        open: openTexts.has(result.key),
+        // Open while the page streams in, so its text shows as it arrives.
+        open: openTexts.has(result.key) || result.status === 'running',
         ontoggle: () => {
           if (details.open) openTexts.add(result.key);
           else openTexts.delete(result.key);
@@ -471,12 +503,14 @@ export function setup(ctx: ToolContext): ToolInstance {
       h('summary', { class: 'small', 'data-focus-key': `summary:${result.key}` }, 'Text'),
       text,
     );
-    return h(
+    const item = h(
       'li',
       {
         class: 'border rounded p-2 vstack gap-2',
+        tabIndex: -1,
+        'data-focus-key': `page:${result.key}`,
         'data-testid': 'ocr-page',
-        dataset: { status: result.status, page: String(result.pageNumber) },
+        dataset: { status: result.status, page: String(result.pageNumber), key: result.key },
       },
       h(
         'div',
@@ -488,16 +522,14 @@ export function setup(ctx: ToolContext): ToolInstance {
           STATUS_TEXT[result.status],
         ),
         result.status === 'failed' || result.status === 'stopped'
-          ? h(
-              'button',
+          ? retryButton(
               {
-                type: 'button',
                 class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
                 'aria-label': `Retry ${pageLabel(result)}`,
                 'data-focus-key': `retry:${result.key}`,
                 'data-testid': 'ocr-page-retry',
-                onclick: () => retry([result.key]),
               },
+              () => [result.key],
               icon('arrow-clockwise'),
               'Retry',
             )
@@ -506,13 +538,50 @@ export function setup(ctx: ToolContext): ToolInstance {
       result.error
         ? h('div', { class: 'small text-danger-emphasis', role: 'note' }, result.error)
         : null,
+      result.truncated
+        ? h(
+            'div',
+            { class: 'small text-warning-emphasis', role: 'note', 'data-testid': 'ocr-page-cut' },
+            'The answer reached the length limit; the end of the page may be missing.',
+          )
+        : null,
       result.text || result.status === 'done' ? details : null,
     );
+    pageItems.set(result.key, item);
+    return item;
   };
 
-  const renderPages = (): void => {
-    textElements.clear();
-    replace(pagesList, results.map(pageItem));
+  /** Keeps keyboard focus on a page when the control it was on goes away (a Retry that started). */
+  const keepFocus = (key: string | null, fallback: () => HTMLElement | undefined): void => {
+    if (!key) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && active.isConnected) return;
+    const same = [...ui.output.querySelectorAll<HTMLElement>('[data-focus-key]')].find(
+      (candidate) => candidate.getAttribute('data-focus-key') === key,
+    );
+    (same ?? fallback())?.focus();
+  };
+  const focusedKey = (within: Element): string | null => {
+    const active = document.activeElement;
+    return active && within.contains(active)
+      ? (active.closest('[data-focus-key]')?.getAttribute('data-focus-key') ?? null)
+      : null;
+  };
+
+  /** Redraws one page (streaming text, a new status) without touching the others. */
+  const updatePage = (result: PageResult): void => {
+    const old = pageItems.get(result.key);
+    if (!old?.isConnected) {
+      renderPages();
+      return;
+    }
+    const key = focusedKey(old);
+    const fresh = pageItem(result);
+    old.replaceWith(fresh);
+    keepFocus(key, () => fresh);
+  };
+
+  const renderFailed = (): void => {
     const failed = results.filter(
       (result) => result.status === 'failed' || result.status === 'stopped',
     );
@@ -526,18 +595,32 @@ export function setup(ctx: ToolContext): ToolInstance {
             { class: 'alert alert-warning d-flex flex-wrap align-items-center gap-2 mb-0' },
             icon('exclamation-triangle'),
             h('span', { class: 'me-auto' }, `${plural(failed.length, 'page')} not read.`),
-            h(
-              'button',
+            retryButton(
               {
-                type: 'button',
                 class: 'btn btn-sm btn-warning',
                 'data-focus-key': 'retry-failed',
                 'data-testid': 'ocr-retry-failed',
-                onclick: () => retry(failed.map((result) => result.key)),
               },
+              () => failed.map((result) => result.key),
               `Retry ${failed.length === 1 ? 'it' : 'them'}`,
             ),
           ),
+    );
+  };
+
+  const renderPages = (): void => {
+    textElements.clear();
+    pageItems.clear();
+    const key = focusedKey(ui.output);
+    replace(pagesList, results.map(pageItem));
+    renderFailed();
+    // A Retry that started takes its button away: stay on that page (or the list).
+    keepFocus(key, () =>
+      key?.startsWith('retry:')
+        ? pageItems.get(key.slice('retry:'.length))
+        : key === 'retry-failed'
+          ? pagesButton
+          : undefined,
     );
   };
 
@@ -582,9 +665,28 @@ export function setup(ctx: ToolContext): ToolInstance {
   const pagesIn = (plan: readonly Unit[]): number =>
     plan.reduce((sum, unit) => sum + (unit.kind === 'pdf' ? unit.ref.pageCount : 1), 0);
 
-  const estimatePages = async (pages: number, model: string): Promise<number | null> => {
-    if (pages === 0) return null;
-    return ctx.models.estimate({ kind: 'tokens', model, ...estimateTokens(pages) });
+  /** The plan's cost: page images at the chosen size (plus the PDF text hint), parsed pages, and the parser's fee. */
+  const estimatePlan = async (plan: readonly Unit[], model: string): Promise<number | null> => {
+    if (plan.length === 0) return null;
+    const s = settings();
+    let imagePages = 0;
+    let hintPages = 0;
+    let parsedPages = 0;
+    for (const unit of plan) {
+      if (unit.kind === 'pdf') parsedPages += unit.ref.pageCount;
+      else {
+        imagePages += 1;
+        if (s.textHint && unit.ref.kind === 'pdf') hintPages += 1;
+      }
+    }
+    const tokens = await ctx.models.estimate({
+      kind: 'tokens',
+      model,
+      ...estimateTokens({ imagePages, hintPages, parsedPages, maxSide: s.maxSide }),
+    });
+    // The paid parser bills per page even with a free model (temporarily part of the estimate, so budgets see it).
+    const fee = parsedPages * PARSER_PAGE_FEE_USD[s.engine];
+    return tokens === null ? null : tokens + fee;
   };
 
   const readUnit = async (run: RunHandle, unit: Unit, result: PageResult): Promise<void> => {
@@ -609,20 +711,21 @@ export function setup(ctx: ToolContext): ToolInstance {
       onEvent: (event) => {
         if (event.type !== 'text') return;
         result.text += event.text;
+        // Only this page changes: its text element if it is showing, else its row (the first text arrived).
         const element = textElements.get(result.key);
-        if (element) element.textContent = result.text;
+        if (element?.isConnected) element.textContent = result.text;
+        else updatePage(result);
         scheduleCombined();
       },
     });
     result.text = answer.text;
-    if (answer.finishReason === 'length') {
-      result.error = 'The answer hit the length limit; the end of the page may be missing.';
-    }
+    result.truncated = answer.finishReason === 'length';
   };
 
   /** Reads `plan` within `run`; returns the last page error (for a run where every page failed). */
   const process = async (run: RunHandle, plan: readonly Unit[]): Promise<Error | null> => {
     let lastError: Error | null = null;
+    const batch = results.filter((result) => plan.some((unit) => unit.key === result.key));
     try {
       await runPool(
         plan,
@@ -632,7 +735,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           if (!result) return;
           result.status = 'running';
           result.error = null;
-          renderPages();
+          updatePage(result);
           updateProgress();
           try {
             await readUnit(run, unit, result);
@@ -647,7 +750,7 @@ export function setup(ctx: ToolContext): ToolInstance {
             lastError = error instanceof Error ? error : new InvalidInputError(userMessage(error));
             if (isFatal(error)) throw error;
           } finally {
-            renderPages();
+            updatePage(result);
             updateProgress();
             scheduleCombined();
             void run.checkpoint({ output: combined() }).catch(() => undefined);
@@ -656,9 +759,9 @@ export function setup(ctx: ToolContext): ToolInstance {
         run.signal,
       );
     } finally {
-      for (const result of results) if (result.status === 'queued') result.status = 'stopped';
+      for (const result of batch) if (result.status === 'queued') result.status = 'stopped';
       if (run.signal.aborted) {
-        for (const result of results) if (result.status === 'running') result.status = 'stopped';
+        for (const result of batch) if (result.status === 'running') result.status = 'stopped';
       }
     }
     if (run.signal.aborted) {
@@ -668,53 +771,57 @@ export function setup(ctx: ToolContext): ToolInstance {
     return lastError;
   };
 
-  let retryKeys: string[] | null = null;
   /** True while a run reads pages (the runner's own flag is still set while its `run` returns). */
   let reading = false;
+  /** The pages a Retry asks for; `run` takes them the moment the runner starts it (see `retry`). */
+  let pendingRetry: string[] | null = null;
+
+  /** Why Run cannot start now (busy, or disabled with a reason); null when it can. */
+  function runBlocked(): string | null {
+    if (runner.busy) return 'Wait until the current run ends.';
+    if (runner.button.getAttribute('aria-disabled') !== 'true') return null;
+    return (
+      runner.element.querySelector('[data-testid="run-hint"]')?.textContent?.trim() ||
+      'Reading is not possible right now.'
+    );
+  }
+
+  /** Brings every Retry button in line with the runner (Run disabled or busy disables them, with the reason). */
+  const syncRetryButtons = (): void => {
+    const reason = runBlocked();
+    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]')) {
+      button.setAttribute('aria-disabled', String(reason !== null));
+      button.classList.toggle('disabled', reason !== null);
+      button.title = reason ?? '';
+    }
+  };
 
   const retry = (keys: string[]): void => {
-    if (runner.busy) return;
-    retryKeys = keys;
+    const blocked = runBlocked();
+    if (blocked) {
+      announce(blocked);
+      return;
+    }
+    if (keys.length === 0) return;
+    pendingRetry = keys;
     void runner.trigger();
+    // The runner calls `run` synchronously when it starts; if it did not start, these keys must not wait around to
+    // turn a later Run press into a retry.
+    pendingRetry = null;
   };
 
   const run = async (signal: AbortSignal): Promise<void> => {
-    const keys = retryKeys;
-    retryKeys = null;
-    let plan: Unit[];
-    if (keys) {
-      plan = units.filter((unit) => keys.includes(unit.key));
-      for (const result of results) {
-        if (keys.includes(result.key)) {
-          result.status = 'queued';
-          result.error = null;
-          result.text = '';
-        }
-      }
-    } else {
-      plan = planUnits();
-      if (plan.length === 0) {
+    const keys = pendingRetry;
+    pendingRetry = null;
+    const plan = keys ? units.filter((unit) => keys.includes(unit.key)) : planUnits();
+    if (plan.length === 0) {
+      if (!keys) {
         ui.status(
           docs.files().length ? 'Choose at least one page.' : 'Add an image or a PDF first.',
         );
-        return;
       }
-      units = plan;
-      openTexts.clear();
-      results = plan.map((unit) => ({
-        key: unit.key,
-        fileId: unit.ref.fileId,
-        fileName: unit.ref.fileName,
-        pageNumber: unit.kind === 'pdf' ? 0 : unit.ref.pageNumber,
-        pageCount: unit.ref.pageCount,
-        status: 'queued',
-        text: '',
-        error: null,
-      }));
+      return;
     }
-    if (plan.length === 0) return;
-    renderPages();
-    updateProgress();
 
     const files = new Set(plan.map((unit) => unit.ref.fileName));
     const first = plan[0]!.ref.fileName;
@@ -726,35 +833,70 @@ export function setup(ctx: ToolContext): ToolInstance {
         {
           title,
           // A retry books only what it reads; a full run uses the header's estimate.
-          ...(keys && model ? { estimateUsd: await estimatePages(pagesIn(plan), model) } : {}),
+          ...(keys && model ? { estimateUsd: await estimatePlan(plan, model) } : {}),
         },
         signal,
       );
     } catch (error) {
-      // Refused before anything was sent (no key, budget, Cancel): nothing was read.
-      for (const result of results) if (result.status === 'queued') result.status = 'stopped';
-      renderPages();
-      updateProgress();
+      // Refused before anything was sent (no key, locked, free-only, budget, Cancel): every page stays exactly as
+      // it was. A refused retry offers to retry the same pages (the runner's own Retry would read them all).
+      if (keys && !isStop(error)) void presentError(error, { retry: () => retry(keys) });
       throw error;
     }
+
+    // The run is on: only now replace (or reset) what it reads.
+    if (keys) {
+      for (const result of results) {
+        if (!keys.includes(result.key)) continue;
+        result.status = 'queued';
+        result.error = null;
+        result.text = '';
+        result.truncated = false;
+      }
+    } else {
+      units = plan;
+      openTexts.clear();
+      results = plan.map((unit) => ({
+        key: unit.key,
+        fileId: unit.ref.fileId,
+        fileName: unit.ref.fileName,
+        pageNumber: unit.kind === 'pdf' ? 0 : unit.ref.pageNumber,
+        pageCount: unit.ref.pageCount,
+        status: 'queued',
+        text: '',
+        error: null,
+        truncated: false,
+      }));
+    }
+    reading = true;
+    renderPages();
+    updateProgress();
     output.start(
       keys
         ? `Retrying ${plural(plan.length, 'page')}…`
         : `Reading ${plural(pagesIn(plan), 'page')}…`,
     );
     if (keys) output.setText(combined());
-    reading = true;
     try {
       const lastError = await process(runHandle, plan);
       refreshCombined();
+      // Only this run's pages decide whether it failed: a retry whose pages all fail again is a failed run.
+      const read = results.filter(
+        (result) => plan.some((unit) => unit.key === result.key) && result.status === 'done',
+      );
+      if (read.length === 0 && lastError) throw lastError;
       const done = results.filter((result) => result.status === 'done').length;
       const failed = results.length - done;
-      if (done === 0 && lastError) throw lastError;
-      output.finish(
+      const cut = results.filter((result) => result.status === 'done' && result.truncated).length;
+      const summary = [
         failed === 0
           ? `Done · ${plural(done, 'page')}`
           : `Done · ${done} of ${plural(results.length, 'page')}; ${failed} not read`,
-      );
+        cut ? `${cut} cut off` : '',
+      ]
+        .filter(Boolean)
+        .join('; ');
+      output.finish(summary);
       ui.status(
         failed === 0 ? `Read ${plural(done, 'page')}` : `${plural(failed, 'page')} not read`,
       );
@@ -765,6 +907,13 @@ export function setup(ctx: ToolContext): ToolInstance {
           failed: results
             .filter((result) => result.status !== 'done')
             .map((result) => pageLabel(result)),
+          ...(cut
+            ? {
+                cutOff: results
+                  .filter((result) => result.status === 'done' && result.truncated)
+                  .map((result) => pageLabel(result)),
+              }
+            : {}),
         },
       });
     } catch (error) {
@@ -780,7 +929,15 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner = ui.runner({ label: 'Read', icon: 'file-earmark-text', run });
+  const runner: Runner = ui.runner({ label: 'Read', icon: 'file-earmark-text', run });
+  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry buttons.
+  new MutationObserver(syncRetryButtons).observe(runner.element, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['aria-disabled'],
+  });
 
   /** Free-only mode allows only the free parser. */
   const checkEngine = (): void => {
@@ -825,7 +982,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   return {
     getState: () => ({ prompt: prompt.value, settings: settings() }),
     applyState,
-    estimate: (model) => estimatePages(pagesIn(planUnits()), model),
+    estimate: (model) => estimatePlan(planUnits(), model),
     onFiles: (files) => void docs.add(files),
     onReceive: (items) => {
       const files = items.flatMap((item) =>

@@ -184,6 +184,7 @@ export function schemaBuilder(options: { onChange: () => void }): SchemaBuilder 
             row.columnIds = move(row.columnIds, index, -1);
             draw();
             changed();
+            focusMoved([`cup:${columnId}`, `cdown:${columnId}`, `cname:${columnId}`]);
           },
           index === 0,
         ),
@@ -196,6 +197,7 @@ export function schemaBuilder(options: { onChange: () => void }): SchemaBuilder 
             row.columnIds = move(row.columnIds, index, 1);
             draw();
             changed();
+            focusMoved([`cdown:${columnId}`, `cup:${columnId}`, `cname:${columnId}`]);
           },
           index === columns.length - 1,
         ),
@@ -363,6 +365,7 @@ export function schemaBuilder(options: { onChange: () => void }): SchemaBuilder 
             draw();
             changed();
             announce(`${fieldLabel(field.name)} moved up.`);
+            focusMoved([`up:${row.id}`, `down:${row.id}`, `name:${row.id}`]);
           },
           index === 0,
           'de-field-up',
@@ -376,6 +379,7 @@ export function schemaBuilder(options: { onChange: () => void }): SchemaBuilder 
             draw();
             changed();
             announce(`${fieldLabel(field.name)} moved down.`);
+            focusMoved([`down:${row.id}`, `up:${row.id}`, `name:${row.id}`]);
           },
           index === rows.length - 1,
           'de-field-down',
@@ -429,6 +433,22 @@ export function schemaBuilder(options: { onChange: () => void }): SchemaBuilder 
   );
 
   const element = h('div', { class: 'vstack gap-2' }, list, problem, h('div', null, addButton));
+
+  /**
+   * After a move, keeps focus on the moved field (or column): on the button pressed if it still works, else on
+   * its other move button (Up is disabled at the top), else on its name.
+   */
+  function focusMoved(keys: readonly string[]): void {
+    for (const key of keys) {
+      const target = [...element.querySelectorAll<HTMLElement>('[data-focus-key]')].find(
+        (candidate) => candidate.getAttribute('data-focus-key') === key,
+      );
+      if (target && !(target instanceof HTMLButtonElement && target.disabled)) {
+        target.focus();
+        return;
+      }
+    }
+  }
 
   /** Focuses a control by its focus key after a redraw. */
   function focusLater(key: string): void {

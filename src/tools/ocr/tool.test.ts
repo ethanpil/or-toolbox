@@ -6,7 +6,7 @@ import type {
   ChatStreamResult,
   RawModel,
 } from '../../core/api/types';
-import { ApiError } from '../../core/errors';
+import { ApiError, FreeOnlyError, RunCancelledError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
@@ -86,7 +86,7 @@ function fakeStream(failing: Set<string> = new Set()) {
       return Promise.resolve(streamResult(text));
     },
   );
-  return { chatStream, calls };
+  return { chatStream, calls, failing };
 }
 
 describe('OCR tool', { timeout: 30_000 }, () => {
@@ -123,8 +123,33 @@ describe('OCR tool', { timeout: 30_000 }, () => {
     tool.onFiles?.([png('a.png'), png('b.png')]);
     await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
     await t.ctx.ui.refreshEstimate();
-    // 2 pages × (1,800 × $1/M + 1,500 × $2/M)
-    expect(t.estimate()).toBeCloseTo(2 * (0.0018 + 0.003), 8);
+    // 2 pages × ((300 + 2,413 image tokens at 1,600 px) × $1/M + 1,500 × $2/M)
+    expect(t.estimate()).toBeCloseTo(2 * (0.002713 + 0.003), 8);
+    // A larger page image costs more input tokens.
+    tool.applyState({ prompt: '', settings: { maxSide: 2048 } });
+    await t.ctx.ui.refreshEstimate();
+    expect(t.estimate()).toBeGreaterThan(2 * (0.002713 + 0.003));
+  });
+
+  it('adds the PDF text hint, and the paid parser fee per page', async () => {
+    t = createToolTestContext(getTool('ocr'), { catalog: [MODEL], modelOverride: 'test/vision' });
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { textHint: false } });
+    tool.onFiles?.([new File(['%PDF'], 'scan.pdf', { type: 'application/pdf' })]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(1));
+    await t.ctx.ui.refreshEstimate();
+    const plain = t.estimate()!;
+    tool.applyState({ prompt: '', settings: { textHint: true } });
+    await t.ctx.ui.refreshEstimate();
+    // 2 pages × 1,500 hint tokens × $1/M
+    expect(t.estimate()! - plain).toBeCloseTo(0.003, 8);
+
+    tool.applyState({ prompt: '', settings: { pdfParser: true, engine: 'cloudflare-ai' } });
+    await t.ctx.ui.refreshEstimate();
+    const free = t.estimate()!;
+    tool.applyState({ prompt: '', settings: { engine: 'mistral-ocr' } });
+    await t.ctx.ui.refreshEstimate();
+    expect(t.estimate()! - free).toBeCloseTo(2 * 0.002, 8);
   });
 
   it('reads every page, combines them in order, and retries a failed page', async () => {
@@ -158,6 +183,158 @@ describe('OCR tool', { timeout: 30_000 }, () => {
     expect(runs[0]?.output).toBe(
       '*a.png*\n\nText of a.png\n\n---\n\n*b.png*\n\nText of b.png\n\n---\n\n*c.png*\n\nText of c.png',
     );
+  });
+
+  it('a refused run or retry leaves every page as it was', async () => {
+    const fake = fakeStream(new Set(['b.png']));
+    t = createToolTestContext(getTool('ocr'), {
+      catalog: [MODEL],
+      modelOverride: 'test/vision',
+      api: { chatStream: fake.chatStream },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    await t.runners[0]!.trigger();
+    const snapshot = () => ({
+      pages: $$(t!.zones.output, 'ocr-page').map((item) => item.outerHTML),
+      text: $(t!.zones.output, 'output-content')?.textContent,
+    });
+    const before = snapshot();
+
+    // A declined budget confirmation, then free-only mode refusing the retry.
+    t.ctx.beginRun = vi
+      .fn()
+      .mockRejectedValueOnce(new RunCancelledError())
+      .mockRejectedValueOnce(new FreeOnlyError(['test/vision']));
+    tool.onFiles?.([png('c.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(3));
+    await t.runners[0]!.trigger();
+    expect(snapshot()).toEqual(before);
+    $(t.zones.output, 'ocr-page-retry')!.click();
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect(t.ctx.beginRun).toHaveBeenCalledTimes(2);
+    expect(snapshot()).toEqual(before);
+    expect(fake.calls).toHaveLength(2);
+    expect(await t.core.history.query({ tool: 'ocr' })).toHaveLength(1);
+  });
+
+  it('a Retry the runner cannot start is not kept for the next Run', async () => {
+    const fake = fakeStream(new Set(['b.png']));
+    t = createToolTestContext(getTool('ocr'), {
+      catalog: [MODEL],
+      modelOverride: 'test/vision',
+      api: { chatStream: fake.chatStream },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    await t.runners[0]!.trigger();
+
+    t.runners[0]!.setDisabled('Not now.');
+    const retryButton = $(t.zones.output, 'ocr-page-retry')!;
+    await vi.waitFor(() => expect(retryButton.getAttribute('aria-disabled')).toBe('true'));
+    expect(retryButton.title).toBe('Not now.');
+    retryButton.click();
+    expect(fake.calls).toHaveLength(2);
+
+    t.runners[0]!.setDisabled(null);
+    await vi.waitFor(() =>
+      expect($(t!.zones.output, 'ocr-page-retry')?.getAttribute('aria-disabled')).toBe('false'),
+    );
+    // The next Run press reads every page again, not just the page whose Retry was refused.
+    await t.runners[0]!.trigger();
+    expect(fake.calls).toHaveLength(4);
+    expect((await t.core.history.query({ tool: 'ocr' }))[0]?.title).toBe('a.png and 1 more file');
+  });
+
+  it('the toast Retry after a refused retry retries the same pages', async () => {
+    const fake = fakeStream(new Set(['b.png']));
+    t = createToolTestContext(getTool('ocr'), {
+      catalog: [MODEL],
+      modelOverride: 'test/vision',
+      api: { chatStream: fake.chatStream },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png'), png('c.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(3));
+    await t.runners[0]!.trigger();
+
+    const begin = t.ctx.beginRun.bind(t.ctx);
+    t.ctx.beginRun = vi.fn().mockRejectedValueOnce(new ApiError('Mocked refusal', 500));
+    $(t.zones.output, 'ocr-page-retry')!.click();
+    const retryToast = await vi.waitFor(() => {
+      const button = document.querySelector<HTMLElement>('[data-testid="toast-retry"]');
+      expect(button).not.toBeNull();
+      return button!;
+    });
+    expect(document.querySelectorAll('[data-testid="toast-retry"]')).toHaveLength(1);
+    t.ctx.beginRun = begin;
+    retryToast.click();
+    await vi.waitFor(() => expect(fake.calls).toHaveLength(4));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect(fake.calls.at(-1)?.messages[1]?.content).toContainEqual(
+      expect.objectContaining({ image_url: { url: 'data:image/png;base64,b.png' } }),
+    );
+    expect((await t.core.history.query({ tool: 'ocr' }))[0]?.title).toBe('Retry: b.png');
+  });
+
+  it('a retry whose pages all fail again fails, even when other pages were read before', async () => {
+    const fake = fakeStream(new Set(['b.png']));
+    t = createToolTestContext(getTool('ocr'), {
+      catalog: [MODEL],
+      modelOverride: 'test/vision',
+      api: { chatStream: fake.chatStream },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    await t.runners[0]!.trigger();
+    fake.failing.add('b.png');
+    $(t.zones.output, 'ocr-page-retry')!.click();
+    await vi.waitFor(async () =>
+      expect(await t!.core.history.query({ tool: 'ocr' })).toHaveLength(2),
+    );
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    const runs = await t.core.history.query({ tool: 'ocr' });
+    expect(runs[0]).toMatchObject({ title: 'Retry: b.png', status: 'error' });
+  });
+
+  it('shows a page’s text in the page list while it streams, redrawing only that page', async () => {
+    const finish = new Map<string, () => void>();
+    const chatStream = vi.fn(
+      (body: ChatRequest, opts: { onEvent: (event: ChatStreamEvent) => void }) =>
+        new Promise<ChatStreamResult>((resolve) => {
+          const name = /“(.+?)”/.exec(JSON.stringify(body.messages[1]?.content))?.[1] ?? '?';
+          opts.onEvent({ type: 'text', text: `${name} first` });
+          finish.set(name, () => {
+            opts.onEvent({ type: 'text', text: ', second' });
+            resolve(streamResult(`${name} first, second`));
+          });
+        }),
+    );
+    t = createToolTestContext(getTool('ocr'), {
+      catalog: [MODEL],
+      modelOverride: 'test/vision',
+      api: { chatStream },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    const running = t.runners[0]!.trigger();
+    const texts = () => $$(t!.zones.output, 'ocr-page-text').map((item) => item.textContent);
+    await vi.waitFor(() => expect(texts()).toEqual(['a.png first', 'b.png first']));
+    const second = $$(t.zones.output, 'ocr-page')[1]!;
+    finish.get('a.png')!();
+    await vi.waitFor(() =>
+      expect($$(t!.zones.output, 'ocr-page')[0]?.dataset['status']).toBe('done'),
+    );
+    expect(texts()[0]).toBe('a.png first, second');
+    // Page a finishing redrew page a only.
+    expect($$(t.zones.output, 'ocr-page')[1]).toBe(second);
+    finish.get('b.png')!();
+    await running;
+    expect(texts()).toEqual(['a.png first, second', 'b.png first, second']);
   });
 
   it('stops: nothing else starts, the run is aborted with the partial text kept', async () => {

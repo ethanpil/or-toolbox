@@ -20,6 +20,11 @@ export interface ExtractedTable {
   headers: string[];
   rows: string[][];
   notes: string;
+  /**
+   * The headers as the model read them, one per column ('' for a column added by hand): renaming a header in
+   * the grid keeps them, so a repeated header row on the next page is still recognised when merging.
+   */
+  sourceHeaders?: string[];
 }
 
 /** What the model returns for one page. */
@@ -171,9 +176,88 @@ function findJson(text: string): unknown {
   return undefined;
 }
 
-/** Reads one page's answer. `{ tables }`, a bare list, or one table object are accepted. */
-export function parseTables(text: string): { tables: RawTable[] } | { problem: string } {
-  const data = findJson(text);
+/**
+ * A JSON answer cut off at the length limit, cut back to the end of its last complete array or object and closed,
+ * so it parses: the tables and rows finished before the cut are kept, a half-written row is not. Null when not
+ * even one array or object was finished.
+ */
+export function closeTruncatedJson(text: string): string | null {
+  const start = text.search(/[[{]/);
+  if (start < 0) return null;
+  const closers: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let best: string | null = null;
+  for (let i = start; i < text.length; i++) {
+    const char = text[i]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === '{') closers.push('}');
+    else if (char === '[') closers.push(']');
+    else if (char === '}' || char === ']') {
+      closers.pop();
+      best = text.slice(start, i + 1) + [...closers].reverse().join('');
+      if (closers.length === 0) return best;
+    }
+  }
+  return best;
+}
+
+const headerKey = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase();
+
+/**
+ * One table's headers and rows. Rows given as objects are matched to the headers by key (case and spacing
+ * ignored), not by the order of their values; a key no header names becomes a new column, and without headers
+ * the keys are the headers.
+ */
+function readRows(item: Record<string, unknown>): { headers: string[]; rows: string[][] } {
+  const headers = Array.isArray(item['headers']) ? item['headers'].map(cellString) : [];
+  const raw: unknown[] = Array.isArray(item['rows']) ? item['rows'] : [];
+  for (const row of raw) {
+    if (!isRecord(row)) continue;
+    for (const key of Object.keys(row)) {
+      if (!headers.some((header) => headerKey(header) === headerKey(key))) headers.push(key.trim());
+    }
+  }
+  const rows = raw.map((row) => {
+    if (Array.isArray(row)) return row.map(cellString);
+    if (!isRecord(row)) return [cellString(row)];
+    const keys = Object.keys(row);
+    return headers.map((header) => {
+      const key = keys.find((candidate) => headerKey(candidate) === headerKey(header));
+      return key === undefined ? '' : cellString(row[key]);
+    });
+  });
+  return { headers, rows };
+}
+
+/**
+ * Reads one page's answer. `{ tables }`, a bare list, or one table object are accepted. With `partial` (the answer
+ * hit the length limit) an answer that does not parse is cut back to its last complete row (`salvaged`).
+ */
+export function parseTables(
+  text: string,
+  options: { partial?: boolean } = {},
+): { tables: RawTable[]; salvaged?: boolean } | { problem: string } {
+  let data = findJson(text);
+  let salvaged = false;
+  if (data === undefined && options.partial) {
+    const closed = closeTruncatedJson(text);
+    if (closed !== null) {
+      try {
+        data = parseJsonSafe(closed);
+        salvaged = true;
+      } catch {
+        // still unreadable
+      }
+    }
+    if (data === undefined) return { tables: [], salvaged: true };
+  }
   if (data === undefined) return { problem: 'The answer was not valid JSON.' };
   const list = Array.isArray(data)
     ? data
@@ -182,20 +266,13 @@ export function parseTables(text: string): { tables: RawTable[] } | { problem: s
       : isRecord(data) && Array.isArray(data['rows'])
         ? [data]
         : null;
-  if (!list) return { problem: 'The answer had no "tables" list.' };
+  if (!list) {
+    return salvaged ? { tables: [], salvaged } : { problem: 'The answer had no "tables" list.' };
+  }
   const tables: RawTable[] = [];
   for (const item of list) {
     if (!isRecord(item)) continue;
-    const headers = Array.isArray(item['headers']) ? item['headers'].map(cellString) : [];
-    const rows = Array.isArray(item['rows'])
-      ? item['rows'].map((row) =>
-          Array.isArray(row)
-            ? row.map(cellString)
-            : isRecord(row)
-              ? Object.values(row).map(cellString)
-              : [cellString(row)],
-        )
-      : [];
+    const { headers, rows } = readRows(item);
     if (headers.length === 0 && rows.length === 0) continue;
     tables.push({
       title: cellString(item['title']),
@@ -205,7 +282,7 @@ export function parseTables(text: string): { tables: RawTable[] } | { problem: s
       notes: cellString(item['notes']),
     });
   }
-  return { tables };
+  return salvaged ? { tables, salvaged } : { tables };
 }
 
 /** `Column 3`, unless taken. */
@@ -253,6 +330,7 @@ export function toTable(
     headers,
     rows: rows.filter((row) => row.some((cell) => cell !== '')),
     notes: raw.notes,
+    sourceHeaders: headers.map((_, i) => raw.headers[i] ?? ''),
   };
 }
 
@@ -263,9 +341,11 @@ export function setCell(table: ExtractedTable, row: number, column: number, valu
   if (target && column >= 0 && column < table.headers.length) target[column] = value;
 }
 
+/** Renames a column; a blank name gets the generated one (`Column 3`), unless another column already has it. */
 export function renameHeader(table: ExtractedTable, column: number, name: string): void {
-  if (column >= 0 && column < table.headers.length)
-    table.headers[column] = name.trim() || columnName(column, table.headers);
+  if (column < 0 || column >= table.headers.length) return;
+  const others = table.headers.filter((_, i) => i !== column);
+  table.headers[column] = name.trim() || columnName(column, others);
 }
 
 export function addRow(table: ExtractedTable, at = table.rows.length): ExtractedTable {
@@ -282,13 +362,20 @@ export function removeRow(table: ExtractedTable, row: number): ExtractedTable {
   return { ...table, rows: table.rows.filter((_, i) => i !== row) };
 }
 
+/** The headers the model gave, one per column (the current ones for a table made before they were kept). */
+const sourceOf = (table: ExtractedTable): string[] =>
+  table.headers.map((header, i) => table.sourceHeaders?.[i] ?? header);
+
 export function addColumn(table: ExtractedTable, at = table.headers.length): ExtractedTable {
   const index = Math.max(0, Math.min(at, table.headers.length));
   const headers = [...table.headers];
   headers.splice(index, 0, columnName(table.headers.length, table.headers));
+  const sourceHeaders = sourceOf(table);
+  sourceHeaders.splice(index, 0, '');
   return {
     ...table,
     headers,
+    sourceHeaders,
     rows: table.rows.map((row) => {
       const next = [...row];
       next.splice(index, 0, '');
@@ -302,15 +389,14 @@ export function removeColumn(table: ExtractedTable, column: number): ExtractedTa
   return {
     ...table,
     headers: table.headers.filter((_, i) => i !== column),
+    sourceHeaders: sourceOf(table).filter((_, i) => i !== column),
     rows: table.rows.map((row) => row.filter((_, i) => i !== column)),
   };
 }
 
-const sameHeaders = (a: readonly string[], b: readonly string[]): boolean =>
-  a.length === b.length &&
-  a.every((header, i) => header.trim().toLowerCase() === (b[i] ?? '').trim().toLowerCase());
-const isGenerated = (headers: readonly string[]): boolean =>
-  headers.every((header, i) => header === columnName(i, []) || header === '');
+/** A name the grid made up (`Column 3`, `Column 3 (2)`), or none: not a header anyone printed. */
+const isGeneratedName = (header: string): boolean =>
+  header.trim() === '' || /^Column \d+(?: \(\d+\))?$/.test(header.trim());
 
 /** True when `next` continues `table` on the following page of the same file. */
 export function canMerge(table: ExtractedTable, next: ExtractedTable | undefined): boolean {
@@ -318,22 +404,79 @@ export function canMerge(table: ExtractedTable, next: ExtractedTable | undefined
 }
 
 /**
- * Appends `next` to `table`. A repeated header row is dropped; a "header" that differs is really the first data
- * row of the continuation (the page had no header), so it is kept as a row.
+ * Where each of `names` goes among `table`'s columns, matching the current header or the one the model gave
+ * (case and spacing ignored); -1 where none matches. Each column is matched once.
+ */
+function matchColumns(table: ExtractedTable, names: readonly string[]): number[] {
+  const current = table.headers.map(headerKey);
+  const source = sourceOf(table).map(headerKey);
+  const used = new Set<number>();
+  return names.map((name) => {
+    const key = headerKey(name);
+    if (isGeneratedName(name)) return -1;
+    const index = current.findIndex((header, i) => !used.has(i) && header === key);
+    const found =
+      index >= 0 ? index : source.findIndex((header, i) => !used.has(i) && header === key);
+    if (found >= 0) used.add(found);
+    return found;
+  });
+}
+
+/**
+ * Appends `next` to `table`, for a table that continues on the next page.
+ *
+ * - Next's headers repeat this table's (matched by name, case and spacing ignored, also against the headers the
+ *   model gave before a rename): that header row is dropped, and its columns are placed by name, so a
+ *   continuation with fewer, more or reordered columns lines up (extra columns are added at the end).
+ * - Next's headers are only generated or empty names: there was no header row; columns go by position.
+ * - Otherwise its "headers" are really its first data row (the page had no header row): kept as a row.
  */
 export function mergeTables(table: ExtractedTable, next: ExtractedTable): ExtractedTable {
-  const continuation =
-    sameHeaders(table.headers, next.headers) || isGenerated(next.headers) ? [] : [next.headers];
-  const nextRows = next.rows.filter((row) => !sameHeaders(row, table.headers));
-  const { headers, rows } = rectangular(table.headers, [
-    ...table.rows,
-    ...continuation,
-    ...nextRows,
-  ]);
+  const named = next.headers.filter((header) => !isGeneratedName(header));
+  const matches = matchColumns(table, next.headers);
+  const matched = matches.filter((index) => index >= 0).length;
+  const repeated = named.length > 0 && matched >= Math.ceil(named.length / 2);
+
+  const headers = [...table.headers];
+  const sourceHeaders = sourceOf(table);
+  let place: number[];
+  if (repeated) {
+    // By name; a named column this table lacks is added; a generated one takes its position if free.
+    const taken = new Set(matches.filter((index) => index >= 0));
+    place = next.headers.map((header, i) => {
+      if (matches[i]! >= 0) return matches[i]!;
+      if (isGeneratedName(header) && i < headers.length && !taken.has(i)) {
+        taken.add(i);
+        return i;
+      }
+      headers.push(header.trim() || columnName(headers.length, headers));
+      sourceHeaders.push(header);
+      return headers.length - 1;
+    });
+  } else {
+    place = next.headers.map((_, i) => i);
+  }
+  const width = Math.max(headers.length, ...place.map((index) => index + 1));
+  const placed = (row: readonly string[]): string[] => {
+    const out = Array.from({ length: width }, () => '');
+    row.forEach((cell, i) => {
+      const index = place[i] ?? i;
+      if (index < width) out[index] = cell;
+      else out.push(cell);
+    });
+    return out;
+  };
+  const headerRow = (row: readonly string[]): boolean =>
+    row.length > 0 &&
+    row.every((cell, i) => headerKey(cell) === headerKey(table.headers[i] ?? '\u0000'));
+  const continuation = repeated || named.length === 0 ? [] : [next.headers];
+  const incoming = [...continuation, ...next.rows.filter((row) => !headerRow(row))].map(placed);
+  const squared = rectangular(headers, [...table.rows, ...incoming]);
   return {
     ...table,
-    headers,
-    rows,
+    headers: squared.headers,
+    sourceHeaders: squared.headers.map((_, i) => sourceHeaders[i] ?? ''),
+    rows: squared.rows,
     lastPage: next.lastPage,
     notes: [...new Set([table.notes, next.notes].map((note) => note.trim()).filter(Boolean))].join(
       '\n',

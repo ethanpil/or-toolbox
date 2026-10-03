@@ -11,6 +11,7 @@ import {
   parseDate,
   parseNumber,
   readFields,
+  readNumber,
   toJsonSchema,
   validateSchema,
   valueText,
@@ -75,7 +76,7 @@ describe('field names', () => {
 });
 
 describe('toJsonSchema', () => {
-  it('writes a strict schema: every key required, optional ones nullable, nothing else allowed', () => {
+  it('writes a strict schema: every key listed and nullable (required ones too), nothing else allowed', () => {
     const schema = toJsonSchema(invoice) as {
       properties: Record<string, Record<string, unknown>>;
       required: string[];
@@ -83,11 +84,12 @@ describe('toJsonSchema', () => {
     };
     expect(schema.required).toEqual(invoice.map((field) => field.name));
     expect(schema.additionalProperties).toBe(false);
+    // A required field the document does not show must still be answerable (null), so it can be flagged.
     expect(schema.properties['vendor_name']).toEqual({
-      type: 'string',
+      type: ['string', 'null'],
       description: 'Business that issued the invoice or receipt.',
     });
-    expect(schema.properties['total']?.['type']).toBe('number');
+    expect(schema.properties['total']?.['type']).toEqual(['number', 'null']);
     expect(schema.properties['total']?.['description']).toMatch(/plain number/);
     expect(schema.properties['tax']?.['type']).toEqual(['number', 'null']);
     expect(schema.properties['invoice_date']?.['description']).toMatch(/YYYY-MM-DD/);
@@ -110,10 +112,12 @@ describe('toJsonSchema', () => {
     const schema = toJsonSchema([
       { name: 'tags', type: 'list', description: '', required: true },
       { name: 'paid', type: 'boolean', description: '', required: true },
+      { name: 'kind', type: 'enum', description: '', required: true, options: ['a', 'b'] },
     ]) as { properties: Record<string, unknown> };
     expect(schema.properties).toEqual({
-      tags: { type: 'array', items: { type: 'string' } },
-      paid: { type: 'boolean', description: 'true or false.' },
+      tags: { type: ['array', 'null'], items: { type: 'string' } },
+      paid: { type: ['boolean', 'null'], description: 'true or false.' },
+      kind: { type: ['string', 'null'], enum: ['a', 'b', null] },
     });
   });
 });
@@ -134,9 +138,40 @@ describe('normalisation', () => {
     ['1,234', 1234],
     ['1.234.567', 1234567],
     [42, 42],
+    // A leading zero: a decimal comma, never a thousands group.
+    ['0,123', 0.123],
+    ['0,500', 0.5],
+    // One dot and three digits, no comma: European thousands.
+    ['1.000', 1000],
+    ['€1.234', 1234],
+    // Minus written twice (in brackets and with a sign) is still negative.
+    ['(-12.00)', -12],
+    ['0.123,45', 123.45],
+    ['12,5', 12.5],
+    ['1234.567', 1234.567],
+    ['1,23,456', 123456],
   ])('reads the number %j', (text, value) => {
     expect(parseNumber(text)).toBe(value);
   });
+
+  it.each([
+    ['1.234', 1234],
+    ['€1.234', 1234],
+    ['1,234', 1234],
+    ['123,456', 123456],
+  ])('reads %j as %d, but flags it as doubtful', (text, value) => {
+    const read = readNumber(text);
+    expect(read?.value).toBe(value);
+    expect(read?.doubtful).toMatch(/could also mean/);
+    expect(normalizeValue({ type: 'number' }, text)).toEqual({ value, issue: read?.doubtful });
+  });
+
+  it.each(['0,123', '1,234.56', '1.234,56', '12,50', '1.5', '1234.567', '1.234.567', '42'])(
+    'reads %j without doubt',
+    (text) => {
+      expect(readNumber(text)?.doubtful).toBeUndefined();
+    },
+  );
 
   it.each(['abc', '', '1.2.3', '12,34,5', 'NaN', '--', '.'])('refuses %j as a number', (text) => {
     expect(parseNumber(text)).toBeNull();

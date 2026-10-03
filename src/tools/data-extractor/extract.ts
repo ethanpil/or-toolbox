@@ -3,6 +3,7 @@
  * the answer and the one repair request when it was not usable JSON.
  */
 import type { ChatRequest, ContentPart } from '../../core/api/types';
+import { ApiError } from '../../core/errors';
 import { isRecord } from '../../core/util';
 import {
   extractJson,
@@ -65,7 +66,7 @@ export function systemPrompt(
   const lines = [
     'You extract data from business documents. Read the attached page images and answer with one JSON object holding exactly these fields:',
     fieldLines(fields),
-    'Rules: use null for anything the document does not show, and never guess. Dates are YYYY-MM-DD. Amounts and numbers are plain JSON numbers without currency symbols or thousands separators. Copy names, numbers and codes exactly as printed. Tables list every row in document order.',
+    'Rules: use null for anything the document does not show (required fields too: they are expected on every document, but never invent one), and never guess. Dates are YYYY-MM-DD. Amounts and numbers are plain JSON numbers without currency symbols or thousands separators. Copy names, numbers and codes exactly as printed. Tables list every row in document order.',
   ];
   if (mode !== 'schema') {
     lines.push(
@@ -80,7 +81,17 @@ export function buildRequest(
   model: string,
   fields: readonly FieldDef[],
   document: { fileName: string; pages: readonly PageContent[] },
-  settings: { instructions: string; mode: OutputMode; textHint: boolean },
+  settings: {
+    instructions: string;
+    mode: OutputMode;
+    textHint: boolean;
+    /**
+     * The model's `supported_parameters`. With strict outputs the request asks OpenRouter to route only to
+     * endpoints that honour every parameter sent, so a parameter the model lacks (say `temperature`) would leave
+     * no endpoint at all: only supported ones are sent. Unknown (omitted): all are sent.
+     */
+    supported?: readonly string[];
+  },
 ): ChatRequest {
   const content: ContentPart[] = [
     {
@@ -106,9 +117,11 @@ export function buildRequest(
       { role: 'system', content: systemPrompt(fields, settings.instructions, settings.mode) },
       { role: 'user', content },
     ],
-    temperature: 0,
-    max_tokens: 8192,
   };
+  const supports = (parameter: string): boolean =>
+    !settings.supported || settings.supported.includes(parameter);
+  if (supports('temperature')) body.temperature = 0;
+  if (supports('max_tokens')) body.max_tokens = MAX_ANSWER_TOKENS;
   if (settings.mode === 'schema') {
     body.response_format = {
       type: 'json_schema',
@@ -120,6 +133,24 @@ export function buildRequest(
     body.response_format = { type: 'json_object' };
   }
   return body;
+}
+
+/** Output cap of one answer: a long invoice with many line items fits. */
+export const MAX_ANSWER_TOKENS = 8192;
+
+/**
+ * A strict structured-output request that no provider can serve: OpenRouter answers 404 "No endpoints found that
+ * can handle the requested parameters" (or a 400 naming the response format) when the routing constraint leaves
+ * nothing. The batch then carries on in JSON mode instead of failing every document.
+ */
+export function isUnsupportedStrict(error: unknown): boolean {
+  if (!(error instanceof ApiError) || (error.status !== 400 && error.status !== 404)) return false;
+  return /no endpoints|response_format|json_schema|structured output/i.test(error.message);
+}
+
+/** The mode after strict outputs were refused: JSON mode when the model takes `response_format`, else the prompt. */
+export function fallbackMode(supportedParameters: readonly string[]): OutputMode {
+  return supportedParameters.includes('response_format') ? 'json' : 'prompt';
 }
 
 /** The follow-up request after an answer that was not usable JSON: same conversation, plus what went wrong. */

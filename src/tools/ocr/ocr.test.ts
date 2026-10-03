@@ -3,6 +3,9 @@ import {
   combineMarkdown,
   combinePlainText,
   estimateTokens,
+  imageTokens,
+  inlineMarkdown,
+  PARSER_PAGE_FEE_USD,
   pageRequest,
   type PageResult,
   pdfRequest,
@@ -21,6 +24,7 @@ const result = (pageNumber: number, text: string, extra: Partial<PageResult> = {
   status: 'done',
   text,
   error: null,
+  truncated: false,
   ...extra,
 });
 
@@ -85,8 +89,26 @@ describe('prompts and requests', () => {
     expect(body.messages[0]?.content).toMatch(/You receive a PDF/);
   });
 
-  it('estimates per page', () => {
-    expect(estimateTokens(20)).toEqual({ promptTokens: 36_000, completionTokens: 30_000 });
+  it('estimates from the image size, the text hint and parsed pages', () => {
+    // An A4-shaped page at 1,600 px: 1,600 × 1,131 pixels / 750.
+    expect(imageTokens(1600)).toBe(2413);
+    expect(imageTokens(1024)).toBeLessThan(imageTokens(1600));
+    expect(imageTokens(2048)).toBeGreaterThan(imageTokens(1600));
+    const small = estimateTokens({ imagePages: 20, hintPages: 0, parsedPages: 0, maxSide: 1024 });
+    const large = estimateTokens({ imagePages: 20, hintPages: 0, parsedPages: 0, maxSide: 2048 });
+    expect(large.promptTokens).toBeGreaterThan(small.promptTokens);
+    expect(large.completionTokens).toBe(small.completionTokens);
+    const hinted = estimateTokens({ imagePages: 20, hintPages: 20, parsedPages: 0, maxSide: 1024 });
+    expect(hinted.promptTokens - small.promptTokens).toBe(20 * Math.ceil(TEXT_HINT_CHARS / 4));
+    const parsed = estimateTokens({ imagePages: 0, hintPages: 0, parsedPages: 10, maxSide: 1600 });
+    expect(parsed.promptTokens).toBeGreaterThan(0);
+    expect(parsed.completionTokens).toBe(small.completionTokens / 2);
+  });
+
+  it('knows which parser bills per page', () => {
+    expect(PARSER_PAGE_FEE_USD['mistral-ocr']).toBeGreaterThan(0);
+    expect(PARSER_PAGE_FEE_USD['cloudflare-ai']).toBe(0);
+    expect(PARSER_PAGE_FEE_USD.native).toBe(0);
   });
 });
 
@@ -113,6 +135,47 @@ describe('combined output', () => {
     expect(text).not.toContain('page 3');
   });
 
+  it('never leaves an empty block for a page that was not read, and marks what is missing', () => {
+    const pages = [
+      result(1, 'One'),
+      result(2, '', { status: 'stopped' }),
+      result(3, 'Half of three', { status: 'failed', error: 'Connection lost' }),
+    ];
+    expect(combineMarkdown(pages)).toBe(
+      [
+        '*report.pdf · page 1 of 3*\n\nOne',
+        '*report.pdf · page 2 of 3*\n\n*[report.pdf · page 2 of 3 was not read]*',
+        '*report.pdf · page 3 of 3*\n\nHalf of three\n\n*[report.pdf · page 3 of 3 is incomplete: Connection lost]*',
+      ].join('\n\n---\n\n'),
+    );
+    // Without separators the marker still says which page it is.
+    expect(combineMarkdown(pages, false)).toBe(
+      'One\n\n*[report.pdf · page 2 of 3 was not read]*\n\nHalf of three\n\n*[report.pdf · page 3 of 3 is incomplete: Connection lost]*',
+    );
+    // A page still being read with no text yet is not shown at all.
+    expect(combineMarkdown([result(1, 'One'), result(2, '', { status: 'running' })])).toBe(
+      '*report.pdf · page 1 of 3*\n\nOne',
+    );
+  });
+
+  it('marks a page cut off at the length limit, and a blank page', () => {
+    const text = combineMarkdown([result(1, 'Long page', { truncated: true }), result(2, '   ')]);
+    expect(text).toContain(
+      'Long page\n\n*[report.pdf · page 1 of 3 is cut off: the answer reached the length limit]*',
+    );
+    expect(text).toContain('*[No text on report.pdf · page 2 of 3]*');
+  });
+
+  it('escapes Markdown in page labels and notes', () => {
+    expect(inlineMarkdown('a*b_c #1 | [x]\nnext')).toBe('a\\*b\\_c \\#1 \\| \\[x\\] next');
+    const text = combineMarkdown([
+      result(1, 'One', { fileName: '*draft*.pdf' }),
+      result(2, '', { fileName: '*draft*.pdf', status: 'failed', error: 'Bad | answer' }),
+    ]);
+    expect(text).toContain('*\\*draft\\*.pdf · page 1 of 3*');
+    expect(text).toContain('could not be read: Bad \\| answer]*');
+  });
+
   it('gives a single page no separator, and a whole-PDF read its own label', () => {
     expect(combineMarkdown([result(1, 'Only', { pageCount: 1, fileName: 'a.png' })])).toBe('Only');
     expect(
@@ -129,8 +192,35 @@ describe('combined output', () => {
     );
   });
 
+  it('says in plain text which pages are missing, at the top and in place', () => {
+    const text = combinePlainText([
+      result(1, 'One'),
+      result(2, '', { status: 'failed', error: 'Mocked error 400' }),
+      result(3, 'Three', { truncated: true }),
+    ]);
+    expect(text.split('\n\n')[0]).toBe(
+      '[Not read in full: report.pdf · page 2 of 3; report.pdf · page 3 of 3]',
+    );
+    expect(text).toContain(
+      '--- report.pdf · page 2 of 3 ---\n\n[report.pdf · page 2 of 3 could not be read: Mocked error 400]',
+    );
+    expect(text).toContain(
+      'Three\n\n[report.pdf · page 3 of 3 is cut off: the answer reached the length limit]',
+    );
+    expect(combinePlainText([result(1, 'One'), result(2, 'Two')])).not.toContain('Not read');
+  });
+
   it('unwraps only a fence around the whole answer', () => {
     expect(unwrapFence('```\nabc\n```')).toBe('abc');
+    expect(unwrapFence('  ```markdown\n# Title\n\nText\n```  ')).toBe('# Title\n\nText');
     expect(unwrapFence('text\n```js\ncode\n```')).toBe('text\n```js\ncode\n```');
+    // Several blocks on one page: the outer fences are not one wrapper.
+    const blocks = '```\nfirst block\n```\n\nSome text\n\n```python\nprint(1)\n```';
+    expect(unwrapFence(blocks)).toBe(blocks);
+    const nested = '```markdown\nIntro\n```js\ncode\n```\n```';
+    expect(unwrapFence(nested)).toBe(nested);
+    // The closing fence must match the opening one.
+    expect(unwrapFence('````\nabc\n```')).toBe('````\nabc\n```');
+    expect(unwrapFence('````md\nabc\n````')).toBe('abc');
   });
 });

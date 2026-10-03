@@ -88,4 +88,53 @@ describe('Table extractor exports', () => {
     expect(workbook).toContain('<sheet name="Revenue_ _draft_ _ 2025 — a ver" sheetId="2"');
     expect(strFromU8(files['xl/worksheets/sheet1.xml']!)).toContain('<c r="B2"><v>1200</v></c>');
   });
+
+  it('never turns identifier-like values into numbers in the workbook', () => {
+    const ids = table({
+      headers: ['Code'],
+      rows: [
+        ['007'],
+        ['02134'],
+        ['12345678901234567890'],
+        ['+15551234567'],
+        ['1.50'],
+        ['$1.50'],
+        ['(4.00)'],
+        ['$007'],
+        ['42'],
+        ['1,200'],
+        ['$12'],
+        ['(4)'],
+      ],
+    });
+    const [sheet] = xlsxSheets([ids]);
+    expect(sheet?.rows.map((row) => row['c0'])).toEqual([
+      // Plain digits go to the core writer as text; its canonical check decides (007 stays text there).
+      '007',
+      '02134',
+      '12345678901234567890',
+      '+15551234567',
+      '1.50',
+      // Formatted values: a number only when nothing written is lost (no trailing or leading zeros).
+      '$1.50',
+      '(4.00)',
+      '$007',
+      '42',
+      1200,
+      12,
+      -4,
+    ]);
+  });
+
+  it('escapes titles, file names and notes in Markdown, and names untitled tables', () => {
+    const markdown = tablesMarkdown([
+      table({ title: 'Revenue\n# by *region* | 2025', fileName: 'q*1*|draft.pdf' }),
+      table({ title: '', notes: '# not a heading\n| not a row' }),
+    ]);
+    expect(markdown).toContain(
+      '## Revenue \\# by \\*region\\* \\| 2025\n\n*q\\*1\\*\\|draft.pdf, page 2*',
+    );
+    expect(markdown).toContain('## Table 2\n\n');
+    expect(markdown).toContain('\\# not a heading\n\\| not a row');
+  });
 });
