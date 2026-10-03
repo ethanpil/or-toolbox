@@ -68,6 +68,7 @@ All notable changes to this project are documented here. The format follows
 
 - Stage 1 review: orphaned runs, double-booked and lost spend, retried paid POSTs, OAuth while locked, stale unlock sessions, non-atomic backup import, CSV formula injection, invalid XLSX/DOCX output, WAV/MP3/video edge cases.
 - Stage 2 review, shared parts: orphans that sent nothing no longer book their reservation, Undo never restores a running run (5072110); duplicate budget and add-key dialogs, offcanvas focus trap lost under a dialog (1db3bfd); accent contrast on cards and canvas, weak dark-mode focus border (9f3d343); stalled streaming, leaking result buttons, waveform memory, stray drops leaving the page (9760b10); inaccurate privacy copy, stale Home state (9f0ce68).
+- Stage 3 review, Chat: Undo of a deleted branch restored a stale snapshot; tabs overwrote each other's threads; PDFs were uploaded and parsed again on every turn; Mistral OCR ran in free-only mode; `max_tokens` and oversized messages were not checked against the model; "via" hid dated snapshots; the estimate ignored dearer fallbacks; Enter and Escape fired during IME composition; the conversation was a live region rebuilt on every update and lost focus; attachment bytes were never released (d330934).
 
 ### Removed
 
