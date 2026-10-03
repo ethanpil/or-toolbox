@@ -92,7 +92,10 @@ export interface Settings {
     recordRecentPrompts: boolean;
   };
   security: {
-    /** Auto-lock after this many minutes without activity when the passphrase lock is on. Default 15. */
+    /**
+     * Auto-lock after this many minutes without activity when the passphrase lock is on. Default 15; 0 = never
+     * (the unlocked key still ends with the tab session); at most 1440.
+     */
     autoLockMinutes: number;
   };
   models: {

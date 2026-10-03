@@ -189,7 +189,8 @@ export function normalizeSettings(input: unknown): Settings {
     },
     security: {
       autoLockMinutes: Math.round(
-        clamped(security['autoLockMinutes'], 1, MAX_AUTO_LOCK_MINUTES, d.security.autoLockMinutes),
+        // 0 = never auto-lock (the unlocked key still ends with the tab session).
+        clamped(security['autoLockMinutes'], 0, MAX_AUTO_LOCK_MINUTES, d.security.autoLockMinutes),
       ),
     },
     models: {

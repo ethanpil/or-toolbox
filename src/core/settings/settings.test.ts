@@ -115,11 +115,11 @@ describe('defaults and validation', () => {
     const low = clamp(
       { perRunUsd: -5, monthlyUsd: -1, perKeyMonthlyUsd: { k: -3 } },
       { retentionDays: 0 },
-      { autoLockMinutes: 0 },
+      { autoLockMinutes: -5 },
     );
     expect(low.budgets).toMatchObject({ perRunUsd: 0, monthlyUsd: 0, perKeyMonthlyUsd: { k: 0 } });
     expect(low.data.retentionDays).toBe(1);
-    expect(low.security.autoLockMinutes).toBe(1);
+    expect(low.security.autoLockMinutes).toBe(0); // 0 = never auto-lock
 
     const high = clamp(
       { perRunUsd: 1e12, monthlyUsd: 1e12, perKeyMonthlyUsd: { k: 1e12 } },
