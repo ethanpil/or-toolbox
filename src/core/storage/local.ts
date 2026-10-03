@@ -3,6 +3,9 @@
  * page; sessionStorage holds per-tab secrets (unlocked key material, the OAuth verifier).
  */
 
+import { StorageFullError } from '../errors';
+import { parseJsonSafe } from '../util';
+
 export const LS_KEYS = {
   /** `Settings` JSON (no secrets). */
   settings: 'ortoolbox:settings',
@@ -19,15 +22,28 @@ export const SS_KEYS = {
   unlocked: 'ortoolbox:unlocked',
   /** PKCE verifier + returnTo during the OAuth round trip. */
   oauth: 'ortoolbox:oauth',
-  /** One-time reload guard for cross-origin isolation. */
-  coiReload: 'ortoolbox:coi-reload',
+  /** One-time reload guard for cross-origin isolation (src/core/sw-register.ts). */
+  isolationReload: 'ortoolbox:isolation-reload',
 } as const;
 
-/** Parse JSON from storage; returns null when missing, unparsable, or storage is unavailable. */
-export function readJson<T>(storage: Storage | undefined, key: string): T | null {
+/** The raw stored string, or null when missing or storage is unavailable. */
+export function readRaw(storage: Storage | undefined, key: string): string | null {
   try {
-    const raw = storage?.getItem(key);
-    return raw == null ? null : (JSON.parse(raw) as T);
+    return storage?.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse JSON from storage (prototype-safe, see `parseJsonSafe`); returns null when missing, unparsable, or
+ * storage is unavailable. The shape is NOT validated: callers must validate before trusting it.
+ */
+export function readJson<T>(storage: Storage | undefined, key: string): T | null {
+  const raw = readRaw(storage, key);
+  if (raw == null) return null;
+  try {
+    return parseJsonSafe(raw) as T;
   } catch {
     return null;
   }
@@ -75,9 +91,4 @@ export function session(): Storage | undefined {
   }
 }
 
-export class StorageFullError extends Error {
-  override readonly name = 'StorageFullError';
-  constructor(message = 'Browser storage is full. Delete some history in Settings → Data.') {
-    super(message);
-  }
-}
+export { StorageFullError };

@@ -22,7 +22,7 @@ import { createRunsService } from './runs';
 import { createSettingsService } from './settings';
 import { createStatsService } from './stats';
 import { createToolStateStore } from './tool-state';
-import type { CoreServices, ToolId, ToolStateStore } from './types';
+import type { CoreServices } from './types';
 
 let instance: CoreServices | null = null;
 
@@ -47,15 +47,7 @@ export function getCore(): CoreServices {
   core.backup = createBackupService(core);
   core.data = createDataService(core);
 
-  const stores = new Map<ToolId, ToolStateStore>();
-  core.toolState = (tool) => {
-    let store = stores.get(tool);
-    if (!store) {
-      store = createToolStateStore(tool);
-      stores.set(tool, store);
-    }
-    return store;
-  };
+  core.toolState = createToolStateStore; // stateless: a key-prefix closure per call
 
   instance = core;
   return core;

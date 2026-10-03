@@ -20,9 +20,10 @@
  * with real headers instead) are all normal.
  */
 import { url } from './paths';
+import { SS_KEYS } from './storage/local';
 
 /** sessionStorage key set just before the isolation reload. */
-const RELOAD_GUARD_KEY = 'ortoolbox:isolation-reload';
+const RELOAD_GUARD_KEY = SS_KEYS.isolationReload;
 
 export interface RegisterOptions {
   /** Reload once, at page start, if the page is not yet cross-origin isolated. */

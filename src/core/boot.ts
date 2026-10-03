@@ -6,7 +6,6 @@
  * settings migrations and the cross-tab bus) are created on first use of
  * `getCore()`.
  */
-import { getCore } from './index';
 import { registerServiceWorker } from './sw-register';
 
 export interface BootOptions {
@@ -23,11 +22,15 @@ export function boot(options: BootOptions = {}): void {
   registerServiceWorker(options);
   // Retention pruning is cheap and runs at most once a day (history service bookkeeping); keep it off the
   // critical path. Job polling is resumed by the tool page once its handlers are registered.
+  // The core is imported lazily so pages that never touch it (Privacy, Diagnostics) don't pay for it eagerly.
   const idle = globalThis.requestIdleCallback ?? ((fn: () => void) => setTimeout(fn, 2000));
-  idle(
-    () =>
-      void getCore()
-        .history.prune()
-        .catch(() => undefined),
-  );
+  idle(() => {
+    import('./index')
+      .then(({ getCore }) =>
+        getCore()
+          .runs.sweep()
+          .then(() => getCore().history.prune()),
+      )
+      .catch(() => undefined);
+  });
 }

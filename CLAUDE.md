@@ -22,8 +22,9 @@ Browser-only toolbox of 14 AI tools on top of OpenRouter. No server, no accounts
 index.html, settings/, models/, history/, stats/, privacy/, diagnostics/,  platform pages (tiny HTML entry each:
 auth/callback/                                                             <title>, <div id="app">, one module script)
 tools/<id>/index.html                                                     one page per tool
-src/core/        api, settings, keys, models, budgets, history, prompts, jobs, stats, media, backup, bus
-                 (today: boot.ts, paths.ts, sw-register.ts, media/ffmpeg.ts)
+src/core/        one folder per service (api, keys, oauth, models, settings, runs, budgets, history, prompts,
+                 jobs, stats, results, tool-state, backup, data, bus), media/, export/, storage/; contract in
+                 types.ts, errors in errors.ts, shared helpers in util.ts, composition root in index.ts
 src/ui/          dom helpers, shell (navbar, theme, palette, toasts, modals), shared components, tool-page
                  (today: dom.ts, markdown.ts, stub.ts — the Stage 0 placeholder frame, delete in Stage 2)
 src/tools/<id>/  manifest.json + main.ts (+ tool-local modules and tests); registry.ts + types.ts beside them
@@ -59,6 +60,7 @@ Capabilities (keys for default models): `text`, `vision`, `image`, `tts`, `stt`,
 ## Conventions
 
 - TypeScript strict; ES modules; no `any` without a comment explaining why.
+- Errors the user can act on are `OrError` subclasses from `src/core/errors.ts` (each has a `code`; the shell switches on `errorCode()`); never throw bare `Error`s for them. Small shared helpers (abort/sleep, type guards, prototype-safe JSON, UTC days) live in `src/core/util.ts`: import them instead of writing local copies. Data parsed from storage, files or the network goes through `parseJsonSafe`/`readJson` and is validated before use.
 - Build DOM with the `h()` helper in `src/ui/dom.ts` (its header lists the rules: prop order, handlers, URL props limited to http(s)/mailto/tel/blob/relative, refused tags and props). Never put model output, file names or any other untrusted string into `innerHTML`. Markdown from models goes through `renderMarkdown()` (marked + DOMPurify), which also turns remote images into links so rendering never contacts another host.
 - No inline scripts or inline event-handler attributes (CSP is `script-src 'self'`). No inline `style=""` attributes in HTML strings; set styles through CSSOM or classes.
 - Internal links and asset URLs go through `url()` in `src/core/paths.ts`, because the site is served from `/or-toolbox/` on GitHub Pages.
@@ -98,8 +100,9 @@ Capabilities (keys for default models): `text`, `vision`, `image`, `tts`, `stt`,
   - The mock serves SSE bodies in one piece (`route.fulfill` cannot stream), so event parsing is tested but pacing is not.
 - **Fixtures named `*.documented.json` were written from the docs, not recorded**, because development had no API key. Replace them with recordings when a key is available.
 - **Core state services** (`src/core/{bus,settings,runs,budgets,stats,history,prompts,jobs,results,tool-state,backup,data}`). Each is `createXService(core)` and reads other services from `core` only at call time, so the composition root can fill one object in any order. `src/core/testing/state-fakes.ts` wires them the same way for tests.
-  - **Budgets read the local ledger** (`stats` rows, written when a run finishes), never OpenRouter's lagging `/key` usage. In-flight runs are not counted, so parallel runs are each checked without the others' estimates. "Delete all prompts and history" clears stats too (contract), which resets this month's spend.
-  - **pagehide aborts active runs** and records them `aborted`, except runs that an open job references (video): those stay `running` for `runs.reattach()` after a reload. A tool whose run continues in a job must not `fail()` it on that abort.
+  - **Budgets read the local ledger** (`stats` rows, written when a run finishes), never OpenRouter's lagging `/key` usage, plus the `reservedUsd` of every `running` run (all tabs), so parallel runs see each other. Stats survive "Delete all prompts and history"; only "Reset everything" clears them.
+  - **Unknown cost is never free:** a run whose cost could not be determined books `max(actual, reservedUsd)`.
+  - **Run lifecycle:** pagehide only aborts; it does no IndexedDB work (the page may be gone). Orphans are finalized by `runs.sweep()` at the next page start (boot). Runs continued by a job call `run.handOff(jobId)` and are finished by the job's completion handler via `runs.reattach()`.
   - **Jobs** poll under the Web Lock `ortoolbox:job:<id>` (`ifAvailable`); other tabs retry at the poll interval and take over when the holder closes. Poll results are written read-modify-write and dropped once the job is final, so a cancel from another tab wins. `attempts` counts failed polls.
   - **Backups** wrap the exact `ortoolbox:keys` JSON in a passphrase envelope. Replace wipes keys only when the backup carries keys; merge skips keys when the two sides use different passphrase locks; `defaultKeyId` follows the backup only when its keys are taken. No passphrase: everything but keys is imported. Wrong passphrase: nothing is.
   - **Settings** `reset()` keeps `defaultKeyId` (keys are not affected). An older tab drops fields of a newer schema version on its next write.

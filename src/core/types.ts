@@ -203,6 +203,16 @@ export interface KeysService {
   status(id: string, opts?: { force?: boolean }): Promise<KeyStatus>;
   readonly lock: KeyLock;
   subscribe(fn: () => void): () => void;
+  /** Backup only: the validated keys file exactly as stored (secrets plain or encrypted, as configured). */
+  exportFile(): StoredKeysFile;
+  /**
+   * Backup only: replace the whole keys file. Validates `next`; refuses with KeysChangedError when the stored file
+   * no longer equals `expected` (another tab wrote meanwhile); drops this tab's unlocked session when the lock
+   * changes; broadcasts `keys-changed`.
+   */
+  replaceFile(next: StoredKeysFile, opts?: { expected?: StoredKeysFile }): void;
+  /** Data reset only: remove every key, the lock and this tab's unlocked session. */
+  clear(): void;
 }
 
 export interface OAuthService {
@@ -318,10 +328,15 @@ export interface Usage {
   promptTokens: number;
   completionTokens: number;
   reasoningTokens?: number;
-  /** `usage.cost` from the response (0 on free models). */
+  /** `usage.cost` from the response (0 on free models), or the client's estimate when `costEstimated`. */
   costUsd: number;
   /** True when the cost was estimated from catalog pricing because the response carries none (TTS, video content). */
   costEstimated: boolean;
+  /**
+   * True when no cost could be determined at all (no `usage` in the response and no estimate). `costUsd` is then
+   * 0, and the run books its pre-run reservation instead (see `RunRecord.reservedUsd`), so unknown never means free.
+   */
+  costUnknown?: boolean;
   latencyMs: number;
   generationId?: string;
 }
@@ -336,6 +351,8 @@ export interface ModelUsageTotals {
 
 export interface UsageTotals extends ModelUsageTotals {
   costEstimated: boolean;
+  /** Sticky: some request's cost was unknown (see `Usage.costUnknown`). */
+  costUnknown: boolean;
   byModel: Record<string, ModelUsageTotals>;
 }
 
@@ -385,6 +402,11 @@ export interface RunHandle {
   finish(result?: RunResult): Promise<RunRecord>;
   /** AbortError → status 'aborted'; anything else → 'error' with a user-safe message. */
   fail(error: unknown): Promise<RunRecord>;
+  /**
+   * The run continues as a persisted job (video): from now on, page unload and aborts do not finalize it; the
+   * job's completion handler calls `runs.reattach(id)` and finishes it. Call right after the job is queued.
+   */
+  handOff(jobId: string): void;
 }
 
 /** Asked by `runs.begin` when a budget rule wants confirmation; the shell registers a modal implementation. */
@@ -393,8 +415,10 @@ export type BudgetConfirmHandler = (check: BudgetCheck, spec: RunSpec) => Promis
 export interface RunsService {
   /**
    * Gatekeeper for every model call. In order: resolve key (NoKeyError), ensure unlocked (KeyLockedError),
-   * free-only check on all models (FreeOnlyError), budget check (BudgetBlockedError, or confirm → RunCancelledError
-   * when declined), then create a `running` history record, add the prompt to Recent, and return the handle.
+   * free-only check on all models (FreeOnlyError), budget check against finished spend PLUS the reservations of
+   * running runs in every tab (BudgetBlockedError, or confirm → RunCancelledError when declined), then create a
+   * `running` record holding `reservedUsd = estimateUsd ?? 0`, add the prompt to Recent, and return the handle.
+   * History/prompt write failures must not block the run (storage full is not a reason to refuse a model call).
    */
   begin(spec: RunSpec): Promise<RunHandle>;
   /** Re-attach to a persisted run after a reload (video jobs). Null when the run is unknown or already final. */
@@ -402,6 +426,12 @@ export interface RunsService {
   setConfirmHandler(fn: BudgetConfirmHandler): void;
   /** Runs started in this page that have not finished. */
   active(): RunHandle[];
+  /**
+   * Finalize orphaned runs: `running` records whose page is gone (no live owner lock) and that were not handed
+   * off to an open job become `aborted`, booking their checkpointed usage (or reservation) to stats. Called at
+   * page start by boot(). Idempotent and safe to run in several tabs at once.
+   */
+  sweep(): Promise<number>;
 }
 
 export interface CallOptions {
@@ -508,6 +538,13 @@ export interface RunRecord {
   output: string | null;
   error: string | null;
   usage: UsageTotals;
+  /**
+   * The pre-run estimate held against budgets while the run is `running` (0 when unknown). When the run is
+   * final and its cost was unknown, `max(usage.costUsd, reservedUsd)` is what stats book.
+   */
+  reservedUsd: number;
+  /** Job id after `handOff()`; such runs are finalized by the job, never by unload or the sweep. */
+  jobId: string | null;
   meta: Record<string, unknown>;
   starred: boolean;
   groupId: string | null;

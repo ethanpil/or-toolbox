@@ -1,9 +1,41 @@
 /**
- * Error types shared by the core, the shell and the tools. Throw these (not bare Errors) so the shell can
- * show the right message and action: "Add a key", "Unlock", "Turn off free-only", "Retry", …
+ * Every error the core throws on purpose. All extend `OrError` and carry a stable `code`, so the shell can
+ * map any failure to the right message and action ("Add a key", "Unlock", "Turn off free-only", "Retry"…)
+ * by switching on `errorCode(error)` instead of importing classes from many modules. Throw these, never bare
+ * Errors, for anything the user can act on. Modules that historically defined their own classes re-export
+ * them from here.
  */
 
 import type { BudgetCheck } from './types';
+
+export type ErrorCode =
+  | 'api'
+  | 'rate-limited'
+  | 'network'
+  | 'no-key'
+  | 'locked'
+  | 'wrong-passphrase'
+  | 'keys-changed'
+  | 'invalid-key'
+  | 'free-only'
+  | 'budget-blocked'
+  | 'cancelled'
+  | 'oauth'
+  | 'backup'
+  | 'storage-full'
+  | 'not-json-safe'
+  | 'invalid-input';
+
+/** Base class: `message` is always safe to show to the user. */
+export class OrError extends Error {
+  override readonly name: string = 'OrError';
+  readonly code: ErrorCode;
+
+  constructor(code: ErrorCode, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.code = code;
+  }
+}
 
 export interface ApiErrorDetail {
   /** `error.code` from the body when present (usually equals the HTTP status). */
@@ -20,14 +52,19 @@ export interface ApiErrorDetail {
   midStream?: boolean;
 }
 
-/** Any non-2xx response, or an error chunk inside a 200 stream. `message` is safe to show the user. */
-export class ApiError extends Error {
+/** Any non-2xx response, or an error chunk inside a 200 stream. */
+export class ApiError extends OrError {
   override readonly name: string = 'ApiError';
   readonly status: number;
   readonly detail: ApiErrorDetail;
 
-  constructor(message: string, status: number, detail: ApiErrorDetail = {}) {
-    super(message);
+  constructor(
+    message: string,
+    status: number,
+    detail: ApiErrorDetail = {},
+    code: ErrorCode = 'api',
+  ) {
+    super(code, message);
     this.status = status;
     this.detail = detail;
   }
@@ -42,36 +79,68 @@ export class ApiError extends Error {
 
 export class RateLimitError extends ApiError {
   override readonly name = 'RateLimitError';
+  constructor(message: string, status = 429, detail: ApiErrorDetail = {}) {
+    super(message, status, detail, 'rate-limited');
+  }
 }
 
-/** fetch() rejected without an HTTP response (offline, DNS, CORS). */
-export class NetworkError extends Error {
+/** fetch() rejected, or a response body could not be read, without a usable HTTP answer. */
+export class NetworkError extends OrError {
   override readonly name = 'NetworkError';
+  constructor(
+    message = 'Network error. Check your connection and try again.',
+    options?: { cause?: unknown },
+  ) {
+    super('network', message, options);
+  }
 }
 
 /** No key is configured for this tool. The shell offers "Add a key" / "Connect with OpenRouter". */
-export class NoKeyError extends Error {
+export class NoKeyError extends OrError {
   override readonly name = 'NoKeyError';
   constructor(message = 'Add an OpenRouter key to run this tool.') {
-    super(message);
+    super('no-key', message);
   }
 }
 
 /** The passphrase lock is on and this tab has not unlocked it. The shell shows the unlock dialog. */
-export class KeyLockedError extends Error {
+export class KeyLockedError extends OrError {
   override readonly name = 'KeyLockedError';
   constructor(message = 'Your keys are locked. Enter your passphrase to continue.') {
-    super(message);
+    super('locked', message);
+  }
+}
+
+export class WrongPassphraseError extends OrError {
+  override readonly name = 'WrongPassphraseError';
+  constructor(message = 'Wrong passphrase.') {
+    super('wrong-passphrase', message);
+  }
+}
+
+/** Another tab changed the keys file between our read and write; nothing was written. */
+export class KeysChangedError extends OrError {
+  override readonly name = 'KeysChangedError';
+  constructor(message = 'Your keys changed in another tab. Try again.') {
+    super('keys-changed', message);
+  }
+}
+
+export class InvalidKeyError extends OrError {
+  override readonly name = 'InvalidKeyError';
+  constructor(message = 'That does not look like an OpenRouter key (they start with sk-or-).') {
+    super('invalid-key', message);
   }
 }
 
 /** Free-only mode is on and the run would use a paid model. */
-export class FreeOnlyError extends Error {
+export class FreeOnlyError extends OrError {
   override readonly name = 'FreeOnlyError';
   readonly models: string[];
 
   constructor(models: string[]) {
     super(
+      'free-only',
       `Free-only mode is on, and ${models.join(', ')} ${models.length === 1 ? 'is' : 'are'} not free.`,
     );
     this.models = models;
@@ -79,21 +148,62 @@ export class FreeOnlyError extends Error {
 }
 
 /** A hard-stop budget rule blocks the run. */
-export class BudgetBlockedError extends Error {
+export class BudgetBlockedError extends OrError {
   override readonly name = 'BudgetBlockedError';
   readonly check: BudgetCheck;
 
   constructor(check: BudgetCheck) {
-    super(check.reasons.map((r) => r.message).join(' ') || 'This run would exceed your budget.');
+    super(
+      'budget-blocked',
+      check.reasons.map((r) => r.message).join(' ') || 'This run would exceed your budget.',
+    );
     this.check = check;
   }
 }
 
 /** The user declined a budget confirmation. Not an error worth reporting; tools just stop quietly. */
-export class RunCancelledError extends Error {
+export class RunCancelledError extends OrError {
   override readonly name = 'RunCancelledError';
   constructor(message = 'Run cancelled.') {
-    super(message);
+    super('cancelled', message);
+  }
+}
+
+export class OAuthError extends OrError {
+  override readonly name = 'OAuthError';
+  constructor(message: string, options?: { cause?: unknown }) {
+    super('oauth', message, options);
+  }
+}
+
+/** A backup file is unreadable, invalid, or its passphrase is wrong; nothing was imported. */
+export class BackupError extends OrError {
+  override readonly name = 'BackupError';
+  constructor(message: string, options?: { cause?: unknown }) {
+    super('backup', message, options);
+  }
+}
+
+export class StorageFullError extends OrError {
+  override readonly name = 'StorageFullError';
+  constructor(message = 'Browser storage is full. Delete some history in Settings → Data.') {
+    super('storage-full', message);
+  }
+}
+
+/** A value that must be JSON-safe (tool state, settings) contained a Blob, ArrayBuffer, function… */
+export class NotJsonSafeError extends OrError {
+  override readonly name = 'NotJsonSafeError';
+  constructor(message: string) {
+    super('not-json-safe', message);
+  }
+}
+
+/** A caller passed something the operation cannot accept (unsupported option, empty input, bad file). */
+export class InvalidInputError extends OrError {
+  override readonly name = 'InvalidInputError';
+  constructor(message: string, options?: { cause?: unknown }) {
+    super('invalid-input', message, options);
   }
 }
 
@@ -103,6 +213,12 @@ export function isAbortError(error: unknown): boolean {
       (error.name === 'AbortError' || error.name === 'TimeoutError')) ||
     (error instanceof Error && error.name === 'AbortError')
   );
+}
+
+/** The code of an OrError, `'aborted'` for aborts, or `'unknown'`. */
+export function errorCode(error: unknown): ErrorCode | 'aborted' | 'unknown' {
+  if (isAbortError(error)) return 'aborted';
+  return error instanceof OrError ? error.code : 'unknown';
 }
 
 /** A message that is safe and useful to show in the UI for any thrown value. */
@@ -115,7 +231,7 @@ export function userMessage(error: unknown): string {
       return 'Rate limited. Free models allow 20 requests a minute; try again shortly.';
     return error.message || `OpenRouter returned an error (${error.status}).`;
   }
-  if (error instanceof NetworkError) return 'Network error. Check your connection and try again.';
-  if (error instanceof Error && error.message) return error.message;
-  return 'Something went wrong.';
+  if (error instanceof OrError) return error.message;
+  // Anything else is unexpected: never echo raw engine messages ("Cannot read properties of undefined").
+  return 'Something went wrong. Try again, and if it keeps happening reload the page.';
 }
