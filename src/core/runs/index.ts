@@ -199,6 +199,7 @@ export function createRunsService(core: CoreServices): RunsService {
     fields: Partial<RunRecord>,
     fallback: RunRecord,
     valid: () => boolean = () => true,
+    book = true,
   ): Promise<{ record: RunRecord; booked: boolean }> => {
     const db = await getDb();
     const tx = db.transaction(['runs', 'stats', 'kv'], 'readwrite');
@@ -218,7 +219,7 @@ export function createRunsService(core: CoreServices): RunsService {
       // A record deleted while running (history cleared) is not recreated, but its spend is booked.
       const record: RunRecord = { ...(stored ?? fallback), ...fields };
       if (stored) await runs.put(record);
-      await addRunToStats(tx.objectStore('stats'), record, isFree);
+      if (book) await addRunToStats(tx.objectStore('stats'), record, isFree);
       await tx.objectStore('kv').delete(heartbeatKey(id));
       await done;
       return { record, booked: true };
@@ -405,6 +406,9 @@ export function createRunsService(core: CoreServices): RunsService {
       get totals() {
         return structuredClone(totals);
       },
+      get jobId() {
+        return jobId;
+      },
       onUsage(fn) {
         usageListeners.add(fn);
         return () => {
@@ -453,9 +457,15 @@ export function createRunsService(core: CoreServices): RunsService {
     return handle;
   };
 
-  /** Finalizes an orphaned `running` record; false when it is gone or already final. */
+  /**
+   * Finalizes an orphaned `running` record; false when it is gone or already final. An orphan that recorded a
+   * request books max(its usage, its reservation): what happened after the last write is unknown. One that never
+   * recorded a request (the page closed during the budget confirmation, say) sent nothing, so it books nothing
+   * and its reservation is simply released.
+   */
   const finalizeOrphan = async (run: RunRecord): Promise<boolean> => {
     const finishedAt = Math.max(Date.now(), run.startedAt);
+    const sent = (run.usage?.requests ?? 0) > 0;
     const { booked } = await writeFinal(
       run.id,
       {
@@ -463,12 +473,16 @@ export function createRunsService(core: CoreServices): RunsService {
         error: 'The page was closed before the run finished.',
         finishedAt,
         latencyMs: finishedAt - run.startedAt,
-        // Whatever happened after the last write is unknown: book at least the reservation.
-        usage: { ...emptyTotals(), ...run.usage, costUnknown: true },
+        usage: sent
+          ? { ...emptyTotals(), ...run.usage, costUnknown: true }
+          : { ...emptyTotals(), ...run.usage },
+        ...(sent ? {} : { reservedUsd: 0 }),
       },
       run,
+      () => true,
+      sent,
     );
-    return booked;
+    return booked; // finalized now (with or without stats rows)
   };
 
   return {

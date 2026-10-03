@@ -160,6 +160,17 @@ describe('changes', () => {
     expect(events).toHaveLength(1);
   });
 
+  it('never restores a run as running, and never books stats', async () => {
+    const live = { ...run(9), status: 'running' as const, finishedAt: null };
+    const before = Date.now();
+    await core.history.restore([live]);
+    const back = await core.history.get(live.id);
+    expect(back?.status).toBe('aborted');
+    expect(back?.finishedAt).toBeGreaterThanOrEqual(before);
+    expect(back?.error).toBeTruthy();
+    expect(await (await getDb()).count('stats')).toBe(0);
+  });
+
   it('clears one tool or everything and reports how many', async () => {
     expect(await core.history.count()).toBe(3);
     expect(await core.history.count({ tool: 'chat' })).toBe(2);

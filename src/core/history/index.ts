@@ -100,9 +100,23 @@ export function createHistoryService(core: CoreServices): HistoryService {
 
     async restore(runs) {
       if (runs.length === 0) return;
+      const now = Date.now();
+      // A restored run never comes back `running`: no page owns it, and a running record would hold a budget
+      // reservation and be finalized (and booked again) by the sweep. Stats are never touched here.
+      const records = runs.map((run): RunRecord =>
+        run.status === 'running'
+          ? {
+              ...run,
+              status: 'aborted',
+              finishedAt: Math.max(now, run.startedAt),
+              latencyMs: Math.max(now, run.startedAt) - run.startedAt,
+              error: run.error ?? 'The run was interrupted.',
+            }
+          : run,
+      );
       const db = await getDb();
       const tx = db.transaction('runs', 'readwrite');
-      await Promise.all([...runs.map((run) => tx.store.put(run)), tx.done]);
+      await Promise.all([...records.map((run) => tx.store.put(run)), tx.done]);
       changed(runs.map((run) => run.id));
     },
 
