@@ -259,8 +259,42 @@ describe('exportMenu', () => {
       filename: 'x',
       formats: [{ label: 'Text', extension: 'txt', build: () => new Blob([]) }],
     });
-    expect(menu.tagName).toBe('BUTTON');
+    expect($(menu, 'export-menu')?.tagName).toBe('BUTTON');
     expect(menu.textContent).toBe('Download .txt');
+  });
+
+  it('updates in place, so an open menu stays open', async () => {
+    const format = (extension: string) => ({
+      label: extension.toUpperCase(),
+      extension,
+      build: () => new Blob([extension]),
+    });
+    const menu = exportMenu({ filename: 'x', formats: [format('csv'), format('json')] });
+    document.body.append(menu);
+    const toggle = $<HTMLButtonElement>(menu, 'export-menu')!;
+    const list = menu.querySelector('.dropdown-menu')!;
+    toggle.click();
+    await vi.waitFor(() => expect(list.classList.contains('show')).toBe(true));
+    $<HTMLButtonElement>(menu, 'export-json')!.focus();
+
+    menu.update([format('csv'), format('json'), format('xlsx')]);
+    expect($(menu, 'export-menu')).toBe(toggle);
+    expect(menu.querySelector('.dropdown-menu')).toBe(list);
+    expect(list.classList.contains('show')).toBe(true);
+    expect([...list.querySelectorAll('.dropdown-item')].map((item) => item.textContent)).toEqual([
+      'CSV.csv',
+      'JSON.json',
+      'XLSX.xlsx',
+    ]);
+    expect(document.activeElement?.getAttribute('data-testid')).toBe('export-json');
+
+    menu.update({ disabled: true });
+    expect(toggle.disabled).toBe(true);
+    await vi.waitFor(() => expect(list.classList.contains('show')).toBe(false));
+
+    menu.update({ formats: [format('txt')], disabled: false });
+    expect($(menu, 'export-menu')?.textContent).toBe('Download .txt');
+    expect($<HTMLButtonElement>(menu, 'export-menu')!.disabled).toBe(false);
   });
 });
 

@@ -222,28 +222,71 @@ export function onReplaceRemove(hook: RemovalHook): () => void {
   };
 }
 
+/** Elements that can take keyboard focus (the disabled and hidden ones are filtered out by `canFocus`). */
+const FOCUSABLE =
+  'a[href], button, input:not([type=hidden]), select, textarea, summary, [tabindex]:not([tabindex="-1"])';
+
+/** Connected, not disabled, not inside a `hidden` subtree. */
+function canFocus(element: HTMLElement): boolean {
+  return (
+    element.isConnected &&
+    !(element as HTMLButtonElement).disabled &&
+    element.closest('[hidden], [inert]') === null
+  );
+}
+
+/** The `data-focus-key` of the control inside `root` that has focus (or contains it), or null. */
+export function focusedKey(root: ParentNode): string | null {
+  const active = document.activeElement;
+  if (!active || !(root as Node).contains(active)) return null;
+  const keyed = active.closest(`[${FOCUS_KEY}]`);
+  return keyed && (root as Node).contains(keyed) ? keyed.getAttribute(FOCUS_KEY) : null;
+}
+
+/**
+ * Focuses the element with `data-focus-key` = `key` inside `root` (compared as text, so any key is safe); returns
+ * false when there is none or it cannot take focus. For single-node swaps:
+ * `const key = focusedKey(card); card.replaceWith(next); if (key) focusKey(next, key);`
+ */
+export function focusKey(root: ParentNode, key: string): boolean {
+  const target = [...root.querySelectorAll<HTMLElement>(`[${FOCUS_KEY}]`)].find(
+    (candidate) => candidate.getAttribute(FOCUS_KEY) === key,
+  );
+  if (!target || !canFocus(target)) return false;
+  target.focus();
+  return document.activeElement === target;
+}
+
 /**
  * Replaces every child of `el` with `children`; same rules as `h()` (rule 1), so `null`/`false` are skipped.
  *
  * Re-rendering is focus-safe: when focus is inside `el` on (or within) an element with `data-focus-key`, the new
  * element with the same key gets focus back, so a keyboard user does not drop to `<body>` when a list or menu
- * re-renders. Give re-rendered controls a stable key (`h('button', { 'data-focus-key': `star-${id}` })`); never
- * rely on test ids. Removal hooks run for the dropped children (Bootstrap instances are disposed).
+ * re-renders. When that successor is gone or disabled, focus goes to the nearest keyed control that can take it
+ * (the next one in the old order first, then the previous one), else to the first focusable element in `el`.
+ * Give re-rendered controls a stable key (`h('button', { 'data-focus-key': `star-${id}` })`); never rely on test
+ * ids. Removal hooks run for the dropped children (Bootstrap instances are disposed).
  */
 export function replace(el: Element, ...children: Child[]): void {
-  const active = document.activeElement;
-  const keyed = active && el.contains(active) ? active.closest(`[${FOCUS_KEY}]`) : null;
-  const key = keyed && el.contains(keyed) ? keyed.getAttribute(FOCUS_KEY) : null;
+  const key = focusedKey(el);
+  const oldKeys =
+    key === null
+      ? []
+      : [...el.querySelectorAll(`[${FOCUS_KEY}]`)].map((node) => node.getAttribute(FOCUS_KEY)!);
   if (removalHooks.size > 0) {
     for (const child of el.children) for (const hook of removalHooks) hook(child);
   }
   el.replaceChildren();
   appendChildren(el, children);
   if (key === null) return;
-  const successor = [...el.querySelectorAll<HTMLElement>(`[${FOCUS_KEY}]`)].find(
-    (candidate) => candidate.getAttribute(FOCUS_KEY) === key,
-  );
-  successor?.focus();
+  if (focusKey(el, key)) return;
+
+  // The same control is gone or disabled: the nearest one that is left, following ones first.
+  const at = oldKeys.indexOf(key);
+  const order = [...oldKeys.slice(at + 1), ...oldKeys.slice(0, Math.max(0, at)).reverse()];
+  for (const candidate of order) if (candidate !== key && focusKey(el, candidate)) return;
+  const first = [...el.querySelectorAll<HTMLElement>(FOCUSABLE)].find(canFocus);
+  first?.focus();
 }
 
 /**

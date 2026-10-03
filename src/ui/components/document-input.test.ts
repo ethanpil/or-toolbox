@@ -121,14 +121,19 @@ describe('documentInput', () => {
     expect(tiles.every((tile) => tile.getAttribute('aria-pressed') === 'true')).toBe(true);
     expect(tiles[2]?.getAttribute('aria-label')).toBe('Page 3');
 
+    const card = $$(input.element, 'doc-file')[0];
     tiles[2]!.focus();
     tiles[2]!.click();
     expect(input.selection().map((ref) => ref.pageNumber)).toEqual([1, 2, 4, 5]);
-    const redrawn = $$(input.element, 'doc-page');
-    expect(redrawn[2]?.getAttribute('aria-pressed')).toBe('false');
-    // Focus survives the redraw.
-    expect(document.activeElement).toBe(redrawn[2]);
+    // Only that tile changes: no card rebuild (so no scroll jump), the same nodes keep focus.
+    expect($$(input.element, 'doc-file')[0]).toBe(card);
+    expect($$(input.element, 'doc-page')[2]).toBe(tiles[2]);
+    expect(tiles[2]?.getAttribute('aria-pressed')).toBe('false');
+    expect(tiles[2]?.querySelector('.bi-circle')).not.toBeNull();
+    expect(tiles[1]?.getAttribute('aria-pressed')).toBe('true');
+    expect(document.activeElement).toBe(tiles[2]);
     expect(($$(input.element, 'doc-pages-input')[0] as HTMLInputElement).value).toBe('1-2, 4-5');
+    expect($$(input.element, 'doc-count')[0]?.textContent).toContain('4 of 5 pages');
 
     $$(input.element, 'doc-pages-none')[0]!.click();
     expect(input.selection()).toEqual([]);
@@ -149,6 +154,23 @@ describe('documentInput', () => {
     const photo = await input.loadPage(input.selection()[3]!);
     expect(photo.imageDataUrl).toBe('data:image/png;base64,max1200-3');
     expect(photo.text).toBeUndefined();
+  });
+
+  it('opens each added PDF once, for its page count and first thumbnail together', async () => {
+    await input.add([pdf('one', 2), pdf('two', 2), pdf('three', 2), pdf('four', 2)]);
+    await vi.waitFor(() => expect(createUrl).toHaveBeenCalledTimes(4));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect([...opened].sort()).toEqual([
+      'four?pages=2',
+      'one?pages=2',
+      'three?pages=2',
+      'two?pages=2',
+    ]);
+    expect(
+      $$(input.element, 'doc-file').map(
+        (card) => card.querySelector<HTMLImageElement>('.or-doc-thumb')?.src,
+      ),
+    ).toEqual(['blob:thumb-1', 'blob:thumb-2', 'blob:thumb-3', 'blob:thumb-4']);
   });
 
   it('keeps at most two PDFs open and closes the rest', async () => {

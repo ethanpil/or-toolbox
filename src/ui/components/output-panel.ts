@@ -3,10 +3,9 @@
  * skeleton placeholders until the first chunk, announces start and finish through a status line (never the
  * streamed text itself), and offers Copy, Download (format menu) and Send to….
  *
- * Streaming Markdown stays cheap and never stalls: blocks that are complete (up to the last blank line outside a
- * code fence) are rendered once and kept; only the unfinished tail is re-rendered. One render runs at a time;
- * text that arrives meanwhile is drawn as soon as it finishes, paced by how long renders take. `finish()` draws
- * the whole text once more, so the final result is exactly what `renderMarkdown` makes of it.
+ * The text is drawn by `streamMarkdown` (stream-markdown.ts): complete blocks once, the unfinished tail again,
+ * never stalling; `finish()` draws the whole text once more, exactly as `renderMarkdown` makes it. Tools that
+ * need streaming without this chrome (chat bubbles) use `streamMarkdown` directly.
  *
  * Errors follow one rule (`fail(error)`): a Stop is silent (the partial text stays, the status says "Stopped"),
  * errors that need a dialog or a setting (no key, locked, free-only, budget, storage) are left to `presentError`,
@@ -27,10 +26,10 @@ import { isStop, markPresented, needsAction } from '../feedback/errors';
 import { copyWithToast } from '../clipboard';
 import { formatInt } from '../format';
 import { icon } from '../icon';
-import { renderMarkdown } from '../markdown';
 import type { SendItem } from '../tool/types';
 import { emptyState } from './empty-state';
 import { type ExportFormat, exportMenu } from './export-menu';
+import { type MarkdownStream, streamMarkdown } from './stream-markdown';
 
 export interface OutputPanelOptions {
   format?: 'markdown' | 'text';
@@ -66,46 +65,15 @@ export interface OutputPanel {
   setStatus(text: string): void;
 }
 
-/** Pause between streaming renders: twice the last render's cost, within these bounds. */
-const MIN_RENDER_GAP_MS = 50;
-const MAX_RENDER_GAP_MS = 500;
-
-/**
- * Where the stable part of streamed Markdown ends: just after the last blank line that is not inside a code
- * fence, scanning from `from` (a position already known to be outside a fence). Returns `from` when there is
- * none yet.
- */
-export function stableBoundary(text: string, from: number): number {
-  let boundary = from;
-  let inFence = false;
-  let lineStart = from;
-  while (lineStart < text.length) {
-    const newline = text.indexOf('\n', lineStart);
-    if (newline === -1) break; // the last line is unfinished: never part of the stable prefix
-    const line = text.slice(lineStart, newline);
-    if (/^\s{0,3}(```|~~~)/.test(line)) inFence = !inFence;
-    else if (!inFence && line.trim() === '' && lineStart > from) boundary = newline + 1;
-    lineStart = newline + 1;
-  }
-  return boundary;
-}
+export { stableBoundary } from './stream-markdown';
 
 export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
   const markdown = (options.format ?? 'markdown') === 'markdown';
   let buffer = '';
-  let streaming = false;
-  /** Bumped by start()/clear(): renders of an older run never touch the panel. */
-  let generation = 0;
   /** The error line shown after the (partial) text, kept across re-renders. */
   let errorLine: HTMLElement | null = null;
-  // Streaming Markdown: blocks up to `stableUpTo` are rendered once into `stableEl`; the rest goes to `tailEl`.
-  let stableUpTo = 0;
-  const stableEl = h('div', { class: 'or-output-stable' });
-  const tailEl = h('div', { class: 'or-output-tail' });
-  let loop: Promise<void> | null = null;
-  let loopGeneration = -1;
-  let dirty = false;
-  let lastCost = 0;
+  /** Draws the current run's text into `content`; a new run (or clear) disposes it, so old renders never land. */
+  let stream: MarkdownStream | null = null;
 
   const content = h('div', {
     class: ['or-output-content', markdown ? 'or-markdown' : 'or-plain-text'],
@@ -165,7 +133,12 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
             build: () => new Blob([buffer], { type: 'text/plain' }),
           },
         ]);
-  const download = h('span', { class: 'd-inline-block' });
+  const download = exportMenu({
+    formats,
+    filename: stem,
+    disabled: true,
+    testId: 'output-download',
+  });
   const sendButton = options.sendTo
     ? h(
         'button',
@@ -192,9 +165,7 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
   const setActionsEnabled = (enabled: boolean): void => {
     copyButton.disabled = !enabled;
     if (sendButton) sendButton.disabled = !enabled;
-    download.replaceChildren(
-      exportMenu({ formats, filename: stem, disabled: !enabled, testId: 'output-download' }),
-    );
+    download.update({ disabled: !enabled });
   };
 
   const element = h(
@@ -230,83 +201,21 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
       ),
     );
 
-  const caret = (): HTMLElement | null =>
-    streaming ? h('span', { class: 'or-caret', 'aria-hidden': 'true' }) : null;
-
-  /** Draws what has arrived: new stable blocks once, the tail again. */
-  const renderOnce = async (gen: number): Promise<void> => {
-    if (!markdown) {
-      content.replaceChildren(buffer, caret() ?? '', errorLine ?? '');
-      return;
-    }
-    if (!stableEl.isConnected) content.replaceChildren(stableEl, tailEl);
-    const boundary = stableBoundary(buffer, stableUpTo);
-    if (boundary > stableUpTo) {
-      const fragment = await renderMarkdown(buffer.slice(stableUpTo, boundary));
-      if (gen !== generation) return;
-      stableEl.append(fragment);
-      stableUpTo = boundary;
-    }
-    const tail = await renderMarkdown(buffer.slice(stableUpTo));
-    if (gen !== generation) return;
-    tailEl.replaceChildren(tail, caret() ?? '');
-    if (errorLine) content.append(errorLine);
+  /** A fresh stream for a new text; the previous one stops drawing. */
+  const newStream = (): MarkdownStream => {
+    stream?.dispose();
+    stream = streamMarkdown(content, {
+      format: markdown ? 'markdown' : 'text',
+      after: () => errorLine,
+    });
+    return stream;
   };
 
-  /** Runs renders back to back while text keeps arriving; one at a time, paced by their cost. */
-  const scheduleRender = (): void => {
-    dirty = true;
-    if (loop && loopGeneration === generation) return;
-    const gen = generation;
-    const previous = loop; // a loop of an older run ends at its next check; start after it
-    loopGeneration = gen;
-    loop = (async () => {
-      await previous;
-      try {
-        while (dirty && gen === generation) {
-          dirty = false;
-          const started = performance.now();
-          try {
-            await renderOnce(gen);
-          } catch {
-            if (gen === generation) content.replaceChildren(buffer, errorLine ?? '');
-          }
-          lastCost = performance.now() - started;
-          if (dirty && streaming) {
-            const gap = Math.min(MAX_RENDER_GAP_MS, Math.max(MIN_RENDER_GAP_MS, lastCost * 2));
-            await new Promise((resolve) => setTimeout(resolve, gap));
-          }
-        }
-      } finally {
-        if (loopGeneration === gen) loop = null;
-      }
-    })();
-  };
-
-  /** The whole text in one render: what the result finally looks like. */
-  const renderFinal = async (gen: number): Promise<void> => {
-    await loop;
-    if (gen !== generation) return;
-    if (!markdown) {
-      content.replaceChildren(buffer, errorLine ?? '');
-      return;
-    }
-    try {
-      const fragment = await renderMarkdown(buffer);
-      if (gen !== generation) return;
-      content.replaceChildren(fragment, errorLine ?? '');
-    } catch {
-      if (gen === generation) content.replaceChildren(buffer, errorLine ?? '');
-    }
-  };
-
-  const reset = (): void => {
-    generation++;
-    dirty = false;
-    stableUpTo = 0;
-    stableEl.replaceChildren();
-    tailEl.replaceChildren();
-    errorLine = null;
+  /** The final draw of what is there (also when the text never streamed, e.g. a failure before any chunk). */
+  const finalDraw = (): void => {
+    const current = stream ?? newStream();
+    if (current.text() !== buffer) current.set(buffer);
+    void current.finish();
   };
 
   const setStatus = (text: string): void => {
@@ -321,9 +230,9 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
   return {
     element,
     start(status = 'Generating…') {
-      reset();
+      newStream();
+      errorLine = null;
       buffer = '';
-      streaming = true;
       content.setAttribute('aria-busy', 'true');
       content.replaceChildren(skeleton());
       setActionsEnabled(false);
@@ -333,20 +242,16 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
     append(chunk) {
       if (!chunk) return;
       buffer += chunk;
-      scheduleRender();
+      (stream ?? newStream()).append(chunk);
     },
     setText(text) {
-      // A replaced text may differ anywhere: draw it from scratch.
-      const keepError = errorLine;
-      reset();
-      errorLine = keepError;
+      // A replaced text may differ anywhere: the stream draws it from scratch (the error line stays).
       buffer = text;
-      scheduleRender();
+      (stream ?? newStream()).set(text);
     },
     finish(status) {
-      streaming = false;
       content.setAttribute('aria-busy', 'false');
-      void renderFinal(generation);
+      finalDraw();
       const done =
         status ??
         (buffer ? `Done · ${formatInt(words())} words` : 'Done, but the model returned no text.');
@@ -355,7 +260,6 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
       setActionsEnabled(buffer.length > 0);
     },
     fail(error) {
-      streaming = false;
       content.setAttribute('aria-busy', 'false');
       const kept = buffer.length > 0;
       if (typeof error !== 'string' && isStop(error)) {
@@ -380,13 +284,14 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
         );
         setStatus(kept ? 'Stopped with an error; the partial result is kept.' : 'Failed.');
       }
-      void renderFinal(generation);
+      finalDraw();
       setActionsEnabled(kept);
     },
     clear() {
-      reset();
+      stream?.dispose();
+      stream = null;
+      errorLine = null;
       buffer = '';
-      streaming = false;
       content.setAttribute('aria-busy', 'false');
       showEmpty();
       setStatus('');
