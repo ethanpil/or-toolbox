@@ -6,6 +6,7 @@
 import { SHIPPED_DEFAULTS } from '../../core/models/defaults';
 import { isFreeModelId } from '../../core/models/free';
 import type { Capability, KeyStatus, Settings, ToolManifest } from '../../core/types';
+import { getTool } from '../../tools/registry';
 import { formatBytes, formatUsd } from '../../ui/format';
 import { SETTINGS_SECTIONS, type SettingsSection } from '../../ui/shell/links';
 
@@ -131,8 +132,11 @@ export function freeOnlyModel(
   capability: Capability,
   tool?: ToolManifest['id'],
 ): string | null {
+  // A tool's pinned model applies to its primary capability only (ModelsService.resolve does the same).
+  const pinned =
+    tool && getTool(tool).capabilities[0] === capability ? settings.tools[tool]?.model : undefined;
   const candidates = [
-    tool ? settings.tools[tool]?.model : undefined,
+    pinned,
     settings.defaultModels[capability],
     SHIPPED_DEFAULTS[capability].paid,
   ];
