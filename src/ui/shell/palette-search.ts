@@ -61,19 +61,34 @@ export function scoreWord(word: string, text: string, fuzzy = true): number {
   return Math.max(1, Math.min(300, 100 + score - spread));
 }
 
-/** Score of an item for a query: 0 when any query word matches nothing. Empty query → 1 (everything matches). */
-export function scoreItem(query: string, item: SearchItem): number {
-  const words = normalize(query).split(' ').filter(Boolean);
+/** The words of a query, normalised once per search (not once per item). */
+export function queryWords(query: string): string[] {
+  return normalize(query).split(' ').filter(Boolean);
+}
+
+/** An item's searchable fields, already normalised. */
+interface Prepared {
+  label: string;
+  detail: string;
+  keywords: string;
+}
+
+function prepare(item: SearchItem): Prepared {
+  return {
+    label: normalize(item.label),
+    detail: item.detail ? normalize(item.detail) : '',
+    keywords: item.keywords ? normalize(item.keywords) : '',
+  };
+}
+
+function scorePrepared(words: readonly string[], item: Prepared): number {
   if (words.length === 0) return 1;
-  const label = normalize(item.label);
-  const detail = item.detail ? normalize(item.detail) : '';
-  const keywords = item.keywords ? normalize(item.keywords) : '';
   let total = 0;
   for (const word of words) {
     const best = Math.max(
-      scoreWord(word, label),
-      scoreWord(word, detail, false) * 0.6,
-      scoreWord(word, keywords, false) * 0.5,
+      scoreWord(word, item.label),
+      scoreWord(word, item.detail, false) * 0.6,
+      scoreWord(word, item.keywords, false) * 0.5,
     );
     if (best <= 0) return 0;
     total += best;
@@ -81,11 +96,54 @@ export function scoreItem(query: string, item: SearchItem): number {
   return total;
 }
 
-/** Items that match `query`, best first; ties keep their original order. */
-export function rank<T extends SearchItem>(items: readonly T[], query: string): T[] {
-  return items
-    .map((item, index) => ({ item, index, score: scoreItem(query, item) }))
+/** Score of an item for a query: 0 when any query word matches nothing. Empty query → 1 (everything matches). */
+export function scoreItem(query: string, item: SearchItem): number {
+  const words = queryWords(query);
+  return words.length === 0 ? 1 : scorePrepared(words, prepare(item));
+}
+
+function sortByScore<T>(scored: { item: T; index: number; score: number }[]): T[] {
+  return scored
     .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score || a.index - b.index)
     .map((entry) => entry.item);
+}
+
+/** Items that match `query`, best first; ties keep their original order. */
+export function rank<T extends SearchItem>(items: readonly T[], query: string): T[] {
+  const words = queryWords(query);
+  return sortByScore(
+    items.map((item, index) => ({
+      item,
+      index,
+      score: words.length === 0 ? 1 : scorePrepared(words, prepare(item)),
+    })),
+  );
+}
+
+/** Normalised fields of long-lived objects (a model of the catalog), per `describe` function. */
+const preparedCaches = new WeakMap<object, WeakMap<object, Prepared>>();
+
+/**
+ * `rank` for objects that stay the same between searches, like the entries of the model catalog (about 650, each
+ * searched on every keystroke): what `describe` returns is normalised once per object and remembered, so a
+ * search normalises only the query. `describe` must be one stable function per kind of list and give the same
+ * text for the same object; the cache disappears with the objects (and with the catalog array that held them).
+ */
+export function rankBy<T extends object>(
+  items: readonly T[],
+  query: string,
+  describe: (item: T) => SearchItem,
+): T[] {
+  const words = queryWords(query);
+  let cache = preparedCaches.get(describe);
+  if (!cache) preparedCaches.set(describe, (cache = new WeakMap()));
+  return sortByScore(
+    items.map((item, index) => {
+      if (words.length === 0) return { item, index, score: 1 };
+      let fields = cache.get(item);
+      if (!fields) cache.set(item, (fields = prepare(describe(item))));
+      return { item, index, score: scorePrepared(words, fields) };
+    }),
+  );
 }

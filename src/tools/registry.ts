@@ -100,6 +100,11 @@ export function getTool(id: ToolId): ToolManifest {
   return manifest;
 }
 
+/** Safe lookup for ids read from storage (history, stats, settings), where the tool may no longer exist. */
+export function findTool(id: string): ToolManifest | undefined {
+  return byId.get(id);
+}
+
 /** Every tool, in the canonical order of `TOOL_IDS`. */
 export const tools: readonly ToolManifest[] = TOOL_IDS.map(getTool);
 

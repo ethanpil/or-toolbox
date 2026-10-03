@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { normalize, rank, scoreItem, scoreWord } from './palette-search';
+import { describe, expect, it, vi } from 'vitest';
+import { normalize, rank, rankBy, scoreItem, scoreWord } from './palette-search';
 
 describe('normalize', () => {
   it('lower-cases, strips accents and collapses whitespace', () => {
@@ -66,5 +66,42 @@ describe('scoreItem and rank', () => {
   it('keeps the original order for ties', () => {
     const same = [{ label: 'Alpha one' }, { label: 'Alpha two' }];
     expect(rank(same, 'alpha').map((item) => item.label)).toEqual(['Alpha one', 'Alpha two']);
+  });
+});
+
+describe('rankBy', () => {
+  interface Model {
+    name: string;
+    id: string;
+  }
+  const catalog: Model[] = [
+    { name: 'GPT Luna', id: 'openai/gpt-6-luna' },
+    { name: 'Gemini Flash', id: 'google/gemini-3.1-flash' },
+    { name: 'Qwen Plus', id: 'qwen/qwen3.8-plus' },
+  ];
+
+  it('ranks like rank() does', () => {
+    const describe = (model: Model) => ({ label: model.name, detail: model.id });
+    const expected = rank(
+      catalog.map((model) => ({ ...describe(model), model })),
+      'flash',
+    ).map((entry) => entry.model);
+    expect(rankBy(catalog, 'flash', describe)).toEqual(expected);
+    expect(rankBy(catalog, '  ', describe)).toEqual(catalog);
+  });
+
+  it('describes and normalises each object once, however many searches follow', () => {
+    const describe = vi.fn((model: Model) => ({ label: model.name, detail: model.id }));
+    rankBy(catalog, 'gpt', describe);
+    rankBy(catalog, 'luna', describe);
+    rankBy(catalog.slice(1), 'qwen', describe);
+    expect(describe).toHaveBeenCalledTimes(catalog.length);
+  });
+
+  it('keeps separate caches for different describe functions', () => {
+    const byName = (model: Model) => ({ label: model.name });
+    const byId = (model: Model) => ({ label: model.id });
+    expect(rankBy(catalog, 'qwen3', byName)).toEqual([]);
+    expect(rankBy(catalog, 'qwen3', byId)).toEqual([catalog[2]]);
   });
 });
