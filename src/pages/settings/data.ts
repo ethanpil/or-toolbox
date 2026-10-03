@@ -233,6 +233,8 @@ export function dataSection(core: CoreServices): SectionView {
           ),
         );
       }),
+      // A row's Delete is disabled once its data is gone: focus lands on this card's heading instead.
+      { fallback: () => tableBody.closest('.card')?.querySelector<HTMLElement>('h3') },
     );
     totals.replaceChildren(
       h(
@@ -279,6 +281,7 @@ export function dataSection(core: CoreServices): SectionView {
   };
 
   const resetAll = async (): Promise<void> => {
+    let toBackup = false;
     const confirmed = await typedConfirm({
       title: 'Reset everything?',
       message: h(
@@ -295,7 +298,23 @@ export function dataSection(core: CoreServices): SectionView {
           'p',
           null,
           'Want a way back? ',
-          h('a', { href: settingsUrl('backup') }, 'Download a backup'),
+          // Closes the dialog first (through its own Close button), then opens Backup below. Not
+          // `data-bs-dismiss` on the link: Bootstrap would take the href's #backup as the modal to hide.
+          h(
+            'a',
+            {
+              href: settingsUrl('backup'),
+              onclick: (event: MouseEvent) => {
+                event.preventDefault();
+                toBackup = true;
+                (event.currentTarget as HTMLElement)
+                  .closest('.modal')
+                  ?.querySelector<HTMLElement>('[data-bs-dismiss="modal"]')
+                  ?.click();
+              },
+            },
+            'Download a backup',
+          ),
           ' first (with keys, if you want them back too).',
         ),
       ),
@@ -303,6 +322,7 @@ export function dataSection(core: CoreServices): SectionView {
       confirmLabel: 'Reset everything',
       testId: 'reset-dialog',
     });
+    if (toBackup) location.hash = '#backup';
     if (!confirmed) return;
     try {
       await core.data.resetEverything();

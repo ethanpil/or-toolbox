@@ -70,6 +70,7 @@ export function budgetsSection(core: CoreServices): SectionView {
         draft.budgets.mode = value;
       });
       if (saved) announce(`Budget mode: ${MODE_LABELS[value]}.`);
+      else mode.set(core.settings.get().budgets.mode); // not saved: show what is in force
     },
   });
 
@@ -85,31 +86,29 @@ export function budgetsSection(core: CoreServices): SectionView {
 
   const perRun = numberField<number | null>({
     label: 'Per-run threshold',
-    help: 'A single run estimated above this asks first (Warn and Hard stop). Default $0.10.',
+    help: 'A single run estimated above this asks first (Warn and Hard stop); 0 asks before every paid run. Default $0.10.',
     prefix: '$',
     testId: 'budget-per-run',
     className: 'or-field-narrow',
     parse: (text) => parseUsd(text, { max: MAX_PER_RUN_USD }),
-    onCommit: (value) => {
-      if (value === null) return;
+    onCommit: (value) =>
+      value !== null &&
       saveSettings(core, (draft) => {
         draft.budgets.perRunUsd = value;
-      });
-    },
+      }),
   });
 
   const monthly = numberField<number | null>({
     label: 'Monthly limit for the whole app',
-    help: 'Leave empty for no limit. Counts every key, per calendar month (UTC).',
+    help: 'Counts every key, per calendar month (UTC). 0 blocks all paid runs (Warn asks instead); leave empty for no limit.',
     prefix: '$',
     placeholder: 'No limit',
     testId: 'budget-monthly',
     parse: (text) => parseUsd(text, { max: MAX_MONTHLY_USD, optional: true }),
-    onCommit: (value) => {
+    onCommit: (value) =>
       saveSettings(core, (draft) => {
         draft.budgets.monthlyUsd = value;
-      });
-    },
+      }),
   });
   const monthlyMeter = h('div', { class: 'mt-2' });
 
@@ -131,29 +130,29 @@ export function budgetsSection(core: CoreServices): SectionView {
     return meter({ percent: m.percent, tone: m.tone, label, text: m.text, testId });
   };
 
+  const keyLabel = (key: KeyInfo): HTMLElement =>
+    h('span', { class: 'd-inline-flex align-items-center gap-2' }, keyDot(key), key.name);
+
+  /** The field of one key, kept across re-renders (typing is never interrupted); its label follows renames. */
   const keyField = (key: KeyInfo): Field => {
     let field = keyFields.get(key.id);
     if (!field) {
       field = numberField<number | null>({
-        label: h(
-          'span',
-          { class: 'd-inline-flex align-items-center gap-2' },
-          keyDot(key),
-          key.name,
-        ),
+        label: keyLabel(key),
         prefix: '$',
         placeholder: 'No limit',
         testId: 'budget-key-limit',
         parse: (text) => parseUsd(text, { max: MAX_MONTHLY_USD, optional: true }),
-        onCommit: (value) => {
+        onCommit: (value) =>
           saveSettings(core, (draft) => {
             if (value === null) delete draft.budgets.perKeyMonthlyUsd[key.id];
             else draft.budgets.perKeyMonthlyUsd[key.id] = value;
-          });
-        },
+          }),
       });
       field.input.dataset.focus = `budget:${key.id}`;
       keyFields.set(key.id, field);
+    } else {
+      field.setLabel(keyLabel(key));
     }
     return field;
   };
@@ -226,6 +225,8 @@ export function budgetsSection(core: CoreServices): SectionView {
               );
             }),
           ),
+      // The key whose field had focus was removed: land on this card's heading.
+      { fallback: () => perKeyCard.querySelector('h3') },
     );
     renderMeters();
   };
@@ -262,6 +263,15 @@ export function budgetsSection(core: CoreServices): SectionView {
   };
 
   let shown = false;
+  const perKeyCard = card(
+    {
+      title: 'Monthly limit per key',
+      icon: 'key',
+      text: 'Optional: a limit for one key, on top of the app-wide one. 0 blocks all paid runs with that key; leave empty for no limit.',
+      testId: 'budget-per-key',
+    },
+    perKeyList,
+  );
   const element = h(
     'div',
     null,
@@ -285,15 +295,7 @@ export function budgetsSection(core: CoreServices): SectionView {
         h('div', { class: 'or-field-narrow' }, monthly.element, monthlyMeter),
       ),
     ),
-    card(
-      {
-        title: 'Monthly limit per key',
-        icon: 'key',
-        text: 'Optional: a limit for one key, on top of the app-wide one. Empty means no limit.',
-        testId: 'budget-per-key',
-      },
-      perKeyList,
-    ),
+    perKeyCard,
   );
 
   core.settings.subscribe((next, prev) => {

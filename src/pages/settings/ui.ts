@@ -5,6 +5,7 @@
  */
 import type { CoreServices, Settings } from '../../core/types';
 import { type Child, h, replace } from '../../ui/dom';
+import { announce } from '../../ui/feedback/announce';
 import { presentError } from '../../ui/feedback/errors';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
@@ -38,23 +39,43 @@ export function attempt(action: () => void): boolean {
   }
 }
 
+export interface RerenderOptions {
+  /**
+   * Where focus goes when the control that had it is gone or cannot take focus any more (now disabled). Gets
+   * that control's `data-focus` key (null without one).
+   */
+  fallback?: (lostKey: string | null) => HTMLElement | null | undefined;
+}
+
 /**
  * Replaces the children of `container` and gives focus back to the element that had it, matched by
- * `data-focus` (or else `data-testid`), so live re-renders never throw keyboard users back to the top.
+ * `data-focus` (or else `data-testid`), or else to `options.fallback`, so live re-renders never throw keyboard
+ * users back to the top of the page.
  */
-export function rerender(container: HTMLElement, ...children: Child[]): void {
+export function rerender(
+  container: HTMLElement,
+  content?: Child,
+  options: RerenderOptions = {},
+): void {
   const active = document.activeElement;
-  let selector: string | null = null;
-  if (active instanceof HTMLElement && container.contains(active)) {
-    const key = active.dataset.focus ?? active.dataset.testid;
-    if (key) {
-      selector = active.dataset.focus
-        ? `[data-focus="${CSS.escape(key)}"]`
-        : `[data-testid="${CSS.escape(key)}"]`;
-    }
-  }
-  replace(container, ...children);
-  if (selector) container.querySelector<HTMLElement>(selector)?.focus();
+  const hadFocus = active instanceof HTMLElement && container.contains(active);
+  const byFocusKey = hadFocus && active.dataset.focus !== undefined;
+  const key = hadFocus ? (active.dataset.focus ?? active.dataset.testid ?? null) : null;
+  replace(container, content);
+  if (!hadFocus) return;
+  const target = key
+    ? container.querySelector<HTMLElement>(
+        `[${byFocusKey ? 'data-focus' : 'data-testid'}="${CSS.escape(key)}"]`,
+      )
+    : null;
+  target?.focus();
+  if (target && document.activeElement === target) return;
+  options.fallback?.(byFocusKey ? key : null)?.focus();
+}
+
+/** Focuses a Settings section's heading (`#<section>-title`, focusable by script). */
+export function focusSectionHeading(section: string): void {
+  document.getElementById(`${section}-title`)?.focus();
 }
 
 export interface CardOptions {
@@ -67,7 +88,10 @@ export interface CardOptions {
   testId?: string;
 }
 
-/** A settings card: an `<h3>` with an icon tile, a muted lead, then the body. */
+/**
+ * A settings card: an `<h3>` with an icon tile, a muted lead, then the body. The heading takes focus from
+ * script (`tabIndex -1`), as the place to land when the control that had focus disappears.
+ */
 export function card(options: CardOptions, ...body: Child[]): HTMLElement {
   const titleId = uid('card-title');
   return h(
@@ -84,7 +108,7 @@ export function card(options: CardOptions, ...body: Child[]): HTMLElement {
           { class: 'flex-grow-1 min-w-0' },
           h(
             'h3',
-            { id: titleId, class: 'h5 d-flex align-items-center gap-2 mb-1' },
+            { id: titleId, class: 'h5 d-flex align-items-center gap-2 mb-1', tabIndex: -1 },
             options.icon &&
               h(
                 'span',
@@ -160,20 +184,29 @@ export interface FieldOptions<T> {
   /** Extra classes on the wrapper (e.g. a max width). */
   className?: string;
   parse: (text: string) => Parsed<T>;
-  /** Called with a valid value when the field is committed (change: blur or Enter). */
-  onCommit: (value: T) => void;
+  /**
+   * Called with a valid value when the field is committed (change: blur or Enter). Return false when it could
+   * not be saved: the field then keeps what the user typed.
+   */
+  onCommit: (value: T) => boolean | void;
 }
 
 export interface Field {
   element: HTMLElement;
   input: HTMLInputElement;
-  /** Shows a stored value unless the user is editing the field. */
+  /**
+   * Shows a stored value, unless the user is editing the field or left text in it that was not saved (invalid,
+   * or the save failed): that is never silently replaced.
+   */
   sync(text: string): void;
+  /** Replaces the label's content (e.g. a key's name and colour after a rename). */
+  setLabel(label: Child): void;
 }
 
 /**
- * A text field for numbers with Bootstrap validation: invalid input is marked (`is-invalid`, the message in
- * `invalid-feedback`, `aria-invalid`) and never saved; a valid value is committed on change.
+ * A text field for numbers with Bootstrap validation, checked as the user types: invalid input is marked
+ * (`is-invalid`, the message in `invalid-feedback`, `aria-invalid`), the message is announced once each time it
+ * changes, and nothing invalid is saved; a valid value is committed on change.
  */
 export function numberField<T>(options: FieldOptions<T>): Field {
   const id = uid('field');
@@ -199,18 +232,29 @@ export function numberField<T>(options: FieldOptions<T>): Field {
     feedback.textContent = message ?? '';
   };
 
-  input.addEventListener('change', () => {
+  /** Text the user typed that is not saved yet. */
+  let dirty = false;
+  let announced: string | null = null;
+  const validate = (): Parsed<T> => {
     const parsed = options.parse(input.value);
-    if (!parsed.ok) {
+    if (parsed.ok) {
+      setInvalid(null);
+      announced = null;
+    } else {
       setInvalid(parsed.error);
-      return;
+      if (announced !== parsed.error) announce(parsed.error, { assertive: true });
+      announced = parsed.error;
     }
-    setInvalid(null);
-    options.onCommit(parsed.value);
-  });
-  // Clear the error as soon as the text is valid again.
+    return parsed;
+  };
+
   input.addEventListener('input', () => {
-    if (input.classList.contains('is-invalid') && options.parse(input.value).ok) setInvalid(null);
+    dirty = true;
+    validate();
+  });
+  input.addEventListener('change', () => {
+    const parsed = validate();
+    if (parsed.ok && options.onCommit(parsed.value) !== false) dirty = false;
   });
 
   const control =
@@ -225,10 +269,11 @@ export function numberField<T>(options: FieldOptions<T>): Field {
         )
       : [input, feedback];
 
+  const label = h('label', { class: 'form-label fw-semibold', htmlFor: id }, options.label);
   const element = h(
     'div',
     { class: options.className },
-    h('label', { class: 'form-label fw-semibold', htmlFor: id }, options.label),
+    label,
     control,
     helpId && h('div', { id: helpId, class: 'form-text' }, options.help),
   );
@@ -237,9 +282,13 @@ export function numberField<T>(options: FieldOptions<T>): Field {
     element,
     input,
     sync(text) {
-      if (document.activeElement === input) return;
+      if (document.activeElement === input || dirty) return;
       input.value = text;
       setInvalid(null);
+      announced = null;
+    },
+    setLabel(content) {
+      replace(label, content);
     },
   };
 }
@@ -407,7 +456,7 @@ export function meter(options: {
     h(
       'div',
       {
-        class: 'progress or-meter',
+        class: 'progress or-settings-meter',
         role: 'progressbar',
         'aria-label': options.label,
         'aria-valuenow': options.percent,
@@ -435,6 +484,8 @@ export interface PassphraseInput {
   element: HTMLElement;
   input: HTMLInputElement;
   invalid(message: string | null): void;
+  /** Empties the field, its error and its strength meter. */
+  clear(): void;
 }
 
 /** A password field for a passphrase, optionally with a strength meter (logic.ts `passphraseStrength`). */
@@ -503,6 +554,11 @@ export function passphraseInput(options: {
     ),
     input,
     invalid,
+    clear() {
+      input.value = '';
+      invalid(null);
+      if (options.strength) updateStrength();
+    },
   };
 }
 
@@ -521,9 +577,13 @@ export function validNewPassphrase(next: PassphraseInput, confirm: PassphraseInp
   return true;
 }
 
-/** A button's busy state while `work` runs (PBKDF2 takes a moment on purpose; imports read files). */
+/**
+ * A button's busy state while `work` runs (PBKDF2 takes a moment on purpose; imports read files). Disabling
+ * drops the button's focus, so it gets focus back afterwards unless `work` moved it elsewhere.
+ */
 export async function busy(button: HTMLButtonElement, work: () => Promise<void>): Promise<void> {
   const label = [...button.childNodes];
+  const hadFocus = document.activeElement === button;
   button.disabled = true;
   button.replaceChildren(
     h('span', { class: 'spinner-border spinner-border-sm me-2', 'aria-hidden': 'true' }),
@@ -534,6 +594,8 @@ export async function busy(button: HTMLButtonElement, work: () => Promise<void>)
   } finally {
     button.disabled = false;
     button.replaceChildren(...label);
+    const lost = document.activeElement === null || document.activeElement === document.body;
+    if (hadFocus && lost && button.isConnected) button.focus();
   }
 }
 

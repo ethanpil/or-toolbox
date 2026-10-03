@@ -16,6 +16,7 @@ import { parseWhole } from './logic';
 import {
   busy,
   card,
+  focusSectionHeading,
   numberField,
   passphraseInput,
   rerender,
@@ -58,6 +59,9 @@ export function securitySection(core: CoreServices): SectionView {
           void busy(submit, async () => {
             try {
               await lock.enable(next.input.value);
+              // This form is replaced by the lock's status: focus moves to its Lock now button.
+              render();
+              focusToggle();
               toast({
                 message: 'Passphrase lock is on. Your keys are encrypted.',
                 variant: 'success',
@@ -130,6 +134,8 @@ export function securitySection(core: CoreServices): SectionView {
               type: 'button',
               class: 'btn btn-outline-primary',
               'data-testid': 'lock-now',
+              // Lock now and Unlock replace each other; focus follows from one to the other.
+              'data-focus': 'lock:toggle',
               onclick: () => {
                 lock.lockNow();
                 toast({ message: 'Keys locked in this tab.', variant: 'success' });
@@ -144,8 +150,16 @@ export function securitySection(core: CoreServices): SectionView {
               type: 'button',
               class: 'btn btn-primary',
               'data-testid': 'lock-unlock',
+              'data-focus': 'lock:toggle',
               onclick: () =>
-                void unlockDialog().catch((error: unknown) => void presentError(error)),
+                void unlockDialog()
+                  .then((ok) => {
+                    // The dialog returned focus to this button, which unlocking replaced.
+                    if (!ok) return;
+                    render();
+                    focusToggle();
+                  })
+                  .catch((error: unknown) => void presentError(error)),
             },
             icon('unlock', 'me-2'),
             'Unlock',
@@ -194,7 +208,7 @@ export function securitySection(core: CoreServices): SectionView {
               try {
                 await lock.changePassphrase(current.input.value, next.input.value);
                 toast({ message: 'Passphrase changed.', variant: 'success' });
-                for (const field of [current, next, confirm]) field.input.value = '';
+                for (const field of [current, next, confirm]) field.clear();
               } catch (error) {
                 if (errorCode(error) === 'wrong-passphrase') {
                   current.invalid('Wrong passphrase.');
@@ -247,6 +261,9 @@ export function securitySection(core: CoreServices): SectionView {
             void busy(submit, async () => {
               try {
                 await lock.disable(current.input.value);
+                // These cards are replaced by the "turn on" form: focus goes to the section heading.
+                render();
+                focusSectionHeading('security');
                 toast({ message: 'Passphrase lock is off.', variant: 'success' });
               } catch (error) {
                 if (errorCode(error) === 'wrong-passphrase') {
@@ -273,22 +290,26 @@ export function securitySection(core: CoreServices): SectionView {
     testId: 'auto-lock-minutes',
     className: 'or-field-narrow',
     parse: (text) => parseWhole(text, { min: 0, max: MAX_AUTO_LOCK_MINUTES }),
-    onCommit: (value) => {
+    onCommit: (value) =>
       saveSettings(core, (draft) => {
         draft.security.autoLockMinutes = value;
-      });
-    },
+      }),
   });
 
   let state = '';
-  const render = (): void => {
+  /** Rebuilds the cards when the lock state changes (here, in another tab, or by auto-lock). */
+  function render(): void {
     const enabled = lock.enabled();
     const next = `${enabled}|${enabled && lock.unlocked()}`;
     if (next === state) return;
     state = next;
     const cards: Child[] = enabled ? [statusCard(), changeCard(), disableCard()] : [enableCard()];
-    rerender(body, cards);
-  };
+    rerender(body, cards, { fallback: () => document.getElementById('security-title') });
+  }
+
+  function focusToggle(): void {
+    body.querySelector<HTMLElement>('[data-focus="lock:toggle"]')?.focus();
+  }
 
   const element = h(
     'div',

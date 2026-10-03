@@ -51,7 +51,8 @@
   }
 }
 
-.or-meter {
+// Settings-specific names: the Stats page has its own `.or-meter` and `.or-swatch` (src/styles/_pages.scss).
+.or-settings-meter {
   height: 0.5rem;
 }
 
@@ -74,9 +75,10 @@
   background-color: var(--or-inset);
 }
 
-// Accent presets: round colour buttons; the chosen one shows a check.
-.or-swatch {
+// Accent presets: round colour buttons (32 px, above the 24 px target size); the chosen one shows a check.
+.or-accent-preset {
   display: grid;
+  flex-shrink: 0;
   place-items: center;
   width: 2rem;
   height: 2rem;

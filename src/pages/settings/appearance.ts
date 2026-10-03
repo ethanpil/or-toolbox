@@ -30,12 +30,15 @@ type Density = Settings['appearance']['density'];
 export function appearanceSection(core: CoreServices): SectionView {
   const appearance = (): Settings['appearance'] => core.settings.get().appearance;
 
-  const setAccent = (hex: string | null): void => {
+  /** Saves the accent; when that fails, the controls go back to the colour in force. */
+  const setAccent = (hex: string | null): boolean => {
     const value = hex === null || hex.toLowerCase() === DEFAULT_ACCENT ? null : hex.toLowerCase();
-    if (value !== null && !parseHex(value)) return;
-    saveSettings(core, (draft) => {
+    if (value !== null && !parseHex(value)) return false;
+    const saved = saveSettings(core, (draft) => {
       draft.appearance.accent = value;
     });
+    if (!saved) sync();
+    return saved;
   };
 
   const theme = segmented<ThemeMode>({
@@ -47,9 +50,10 @@ export function appearanceSection(core: CoreServices): SectionView {
       { value: 'system', label: 'System', icon: 'circle-half', testId: 'theme-option-system' },
     ],
     onChange: (value) => {
-      saveSettings(core, (draft) => {
+      const saved = saveSettings(core, (draft) => {
         draft.appearance.theme = value;
       });
+      if (!saved) theme.set(appearance().theme);
     },
   });
 
@@ -76,15 +80,14 @@ export function appearanceSection(core: CoreServices): SectionView {
       'button',
       {
         type: 'button',
-        class: 'or-swatch',
+        class: 'or-accent-preset',
         style: { backgroundColor: preset.hex },
         title: preset.name,
         'aria-label': preset.hex === DEFAULT_ACCENT ? `${preset.name} (default)` : preset.name,
         'data-testid': `accent-preset-${preset.name.toLowerCase()}`,
         dataset: { hex: preset.hex },
         onclick: () => {
-          setAccent(preset.hex);
-          announce(`Accent colour: ${preset.name}.`);
+          if (setAccent(preset.hex)) announce(`Accent colour: ${preset.name}.`);
         },
       },
       icon('check-lg'),
@@ -97,8 +100,7 @@ export function appearanceSection(core: CoreServices): SectionView {
       class: 'btn btn-sm btn-outline-secondary',
       'data-testid': 'accent-reset',
       onclick: () => {
-        setAccent(null);
-        announce('Accent colour reset to the default indigo.');
+        if (setAccent(null)) announce('Accent colour reset to the default indigo.');
       },
     },
     icon('arrow-counterclockwise', 'me-1'),
@@ -119,9 +121,10 @@ export function appearanceSection(core: CoreServices): SectionView {
       { value: 'compact', label: 'Compact', icon: 'arrows-collapse', testId: 'density-compact' },
     ],
     onChange: (value) => {
-      saveSettings(core, (draft) => {
+      const saved = saveSettings(core, (draft) => {
         draft.appearance.density = value;
       });
+      if (!saved) density.set(appearance().density);
     },
   });
 
