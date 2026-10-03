@@ -32,6 +32,10 @@ All notable changes to this project are documented here. The format follows
 - Tool framework `mountTool()`: header chips, three-zone layout, Run/Stop, URL state, drop and paste, Send to…; all 14 tools mount through it (0e06dde).
 - Home with search, favourites, recent runs and first-run onboarding; Privacy page (39fd198).
 - Tool authoring guide and Stage 2 e2e specs (4c42391).
+- Models page: searchable, filterable and sortable catalog as cards or table, favourites, recently used, your own stats per model, expiry warnings, comparison of 2 to 4 models, refresh (cb1e30a).
+- History page: timeline by day with search and filters, run detail drawer (reopen, re-run with another model, star, copy, export, delete with Undo), bulk export and delete, live updates, `?tool=` and `?run=` links (d7fdb94).
+- Stats page: KPI tiles, spend, requests and tokens charts (Chart.js, loaded on demand, light and dark, table view for each), breakdowns by tool, model and key, budget burn-down, key balances and free requests today (1f5ecd7).
+- `HistoryService.restore()` for Undo (d7fdb94).
 
 ### Changed
 
