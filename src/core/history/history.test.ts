@@ -148,6 +148,18 @@ describe('changes', () => {
     expect(events).toEqual([{ type: 'history-changed', ids: ['r1', 'r3'] }]);
   });
 
+  it('restores removed runs (Undo) and announces it', async () => {
+    const removed = (await core.history.query()).filter((r) => r.id === 'r1' || r.id === 'r3');
+    await core.history.remove(['r1', 'r3']);
+    const events: unknown[] = [];
+    core.bus.on('history-changed', (e) => events.push(e));
+    await core.history.restore(removed);
+    expect(ids(await core.history.query())).toEqual(['r3', 'r2', 'r1']);
+    expect(events).toEqual([{ type: 'history-changed', ids: ['r3', 'r1'] }]);
+    await core.history.restore([]);
+    expect(events).toHaveLength(1);
+  });
+
   it('clears one tool or everything and reports how many', async () => {
     expect(await core.history.count()).toBe(3);
     expect(await core.history.count({ tool: 'chat' })).toBe(2);

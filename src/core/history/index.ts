@@ -98,6 +98,14 @@ export function createHistoryService(core: CoreServices): HistoryService {
       changed(ids);
     },
 
+    async restore(runs) {
+      if (runs.length === 0) return;
+      const db = await getDb();
+      const tx = db.transaction('runs', 'readwrite');
+      await Promise.all([...runs.map((run) => tx.store.put(run)), tx.done]);
+      changed(runs.map((run) => run.id));
+    },
+
     async clear(scope = {}) {
       const db = await getDb();
       const tx = db.transaction('runs', 'readwrite');
