@@ -228,6 +228,7 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 | Component | Use it for |
 | --- | --- |
 | `dropZone(options)` | File input target (drag, keyboard, accept filter). |
+| `documentInput(options)` | Images and PDFs with thumbnails and page choice (`1-3, 7`, tile toggles); `selection()` lists pages, `loadPage(ref)` renders one for upload (`{ fileName, pageNumber, imageDataUrl, text? }`), `pageImage`/`reveal` show the source. Pair with `runPool()` (`src/core/pool.ts`) for per-page requests. |
 | `modelPicker(ctx, { capability, selected })` → `Promise<string \| null>` | Extra model choices (arena contenders, bot B, a secondary capability). The header chip covers the primary capability only. |
 | `keyPicker({ keys, value, onChange, focusKey? })` | A key choice beyond the header's. |
 | `costBadge(usd?, note?)` | An estimate pill for a sub-part (e.g. per sequence step). |

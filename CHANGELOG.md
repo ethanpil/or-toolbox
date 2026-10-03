@@ -37,6 +37,11 @@ All notable changes to this project are documented here. The format follows
 - History page: timeline by day with search and filters, run detail drawer (reopen, re-run with another model, star, copy, export, delete with Undo), bulk export and delete, live updates, `?tool=` and `?run=` links (d7fdb94).
 - Stats page: KPI tiles, spend, requests and tokens charts (Chart.js, loaded on demand, light and dark, table view for each), breakdowns by tool, model and key, budget burn-down, key balances and free requests today (1f5ecd7).
 - `HistoryService.restore()` for Undo (d7fdb94).
+- Shared `documentInput()` for images and PDFs (lazy thumbnails, page ranges like `1-3, 7`, pages loaded one at a time for upload) and `runPool()` (6d07e24).
+- OCR: printed, handwriting, math and layout modes, pages read three at a time with streaming, per-page retry and Stop, OpenRouter's PDF parser as an option, Markdown/text/Word exports (7e24c06).
+- Data extractor: visual schema builder with five presets and saved schemas, batch extraction with strict structured outputs (JSON mode and one repair otherwise), editable review grid, JSON, CSV and XLSX exports (a83381c).
+- Table extractor: tables and charts per page into editable grids with merge across pages; CSV, ZIP, XLSX and Markdown exports, copy as TSV (25d06e2).
+- Stage 3 e2e gates for the document tools, a 20-page PDF fixture with its generator, and `mock.respond()` for request-dependent mocks.
 
 ### Changed
 
@@ -49,6 +54,7 @@ All notable changes to this project are documented here. The format follows
 - `models.resolve`: `?model=` and tool bindings apply to a tool's primary capability only (5072110).
 - Tool framework: `ToolInstance.estimate()` with `ui.refreshEstimate()`, one error rule through `output.fail(error)`, `createToolTestContext()`, `data-testid="tool-prompt"` convention (9760b10).
 - One modal at a time (queued), toasts with actions never auto-hide, `setFieldError()` for field errors (1db3bfd); re-renders keep focus through `data-focus-key` (20bdddc).
+- `exportMenu` formats may set their own file name (6d07e24).
 
 ### Fixed
 
