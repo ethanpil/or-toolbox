@@ -1,6 +1,5 @@
-import { boot } from '../../core/boot';
-import { renderToolStub } from '../../ui/stub';
+import { comingSoon } from '../../ui/tool/coming-soon';
+import { mountTool } from '../../ui/tool/index';
 import { getTool } from '../registry';
 
-boot({ isolation: 'required' });
-renderToolStub(getTool('video-studio'));
+mountTool(getTool('video-studio'), comingSoon, { isolation: 'required' });
