@@ -560,13 +560,35 @@ describe('sweep', () => {
     expect(await core.stats.monthSpend()).toBeCloseTo(0.05);
   });
 
+  it('books nothing for an orphan that never sent a request, and frees its reservation', async () => {
+    // E.g. the page closed while the budget confirmation was open.
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    locks.release(`ortoolbox:run:${run.id}`);
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect(await stored(run.id)).toMatchObject({ status: 'aborted' });
+    expect(await core.stats.monthSpend()).toBe(0);
+    expect(await core.stats.modelSummary('openai/gpt-x')).toMatchObject({ runs: 0 });
+    expect(await core.budgets.check({ keyId: 'k1', estimateUsd: 0 })).toMatchObject({
+      verdict: 'ok',
+    });
+  });
+
   it('is idempotent across tabs', async () => {
     const run = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    run.addUsage(usage({ costUsd: 0.01 }));
+    await settle();
     locks.release(`ortoolbox:run:${run.id}`);
     const counts = await Promise.all([1, 2, 3].map(() => createTestCore().core.runs.sweep()));
     expect(counts.reduce((a, b) => a + b, 0)).toBe(1);
     expect(await core.stats.monthSpend()).toBeCloseTo(0.05);
     expect(await core.stats.modelSummary('openai/gpt-x')).toMatchObject({ runs: 1 });
+  });
+
+  it('exposes the job a run was handed off to', async () => {
+    const run = await core.runs.begin({ ...spec, tool: 'video-studio' });
+    expect(run.jobId).toBeNull();
+    run.handOff('job-1');
+    expect(run.jobId).toBe('job-1');
   });
 
   it('leaves handed-off runs to their job until the job is final', async () => {

@@ -38,15 +38,39 @@
     color: var(--or-accent-contrast) !important;
   }
 
-  .form-check-input:checked {
+  .form-check-input:checked,
+  .form-check-input[type='checkbox']:indeterminate {
     background-color: var(--bs-primary);
     border-color: var(--bs-primary);
   }
 
+  // Bootstrap draws the tick, dot and knob as SVGs with a fixed white; these are the same SVGs in the colour
+  // that contrasts with the accent (black on a light accent), built in accent.ts.
+  .form-check-input:checked[type='checkbox'] {
+    --bs-form-check-bg-image: var(--or-check-tick);
+  }
+
+  .form-check-input[type='checkbox']:indeterminate {
+    --bs-form-check-bg-image: var(--or-check-dash);
+  }
+
+  .form-check-input:checked[type='radio'] {
+    --bs-form-check-bg-image: var(--or-radio-dot);
+  }
+
+  .form-switch .form-check-input:checked {
+    --bs-form-switch-bg: var(--or-switch-knob);
+  }
+
+  .form-switch .form-check-input:focus:not(:checked) {
+    --bs-form-switch-bg: var(--or-switch-knob-focus);
+  }
+
+  // A focused field's border stays more visible than its resting border in both themes (3:1 on the surface).
   .form-control:focus,
   .form-select:focus,
   .form-check-input:focus {
-    border-color: var(--bs-primary-border-subtle);
+    border-color: var(--or-focus-border);
     box-shadow: 0 0 0 0.25rem var(--bs-focus-ring-color);
   }
 

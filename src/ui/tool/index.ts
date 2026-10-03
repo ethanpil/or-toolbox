@@ -17,7 +17,6 @@
  * keeps the free-only notice and the Run button's availability in step with the settings.
  * docs/tool-authoring.md is the full guide.
  */
-import { InvalidInputError } from '../../core/errors';
 import type { Capability, CoreServices, ResolvedModel, ToolManifest } from '../../core/types';
 import { getTool } from '../../tools/registry';
 import { Offcanvas, showOffcanvas } from '../bootstrap';
@@ -28,25 +27,20 @@ import { promptsPanel, type PromptsPanel } from '../components/prompts-panel';
 import { h, replace } from '../dom';
 import { announce } from '../feedback/announce';
 import { presentError } from '../feedback/errors';
-import { openModal } from '../feedback/modal';
+import { modalOpen, openModal } from '../feedback/modal';
 import { toast } from '../feedback/toast';
 import { formatModelPrice, formatRelativeTime, plural } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
 import { mountPage } from '../shell/index';
 import { historyUrl, settingsUrl } from '../shell/links';
+import { createToolContext, resolveFor } from './context';
+import { createEstimateTracker } from './estimate';
 import { installFileDrop } from './file-drop';
+import { resultHandle } from './results';
 import { createRunner, type RunnerInternals } from './runner';
 import { acceptedItems, receiveItems, sendItems, sendTargets } from './send-to';
-import type {
-  ResultHandle,
-  SendItem,
-  ToolContext,
-  ToolInstance,
-  ToolOptions,
-  ToolSetup,
-  ToolUi,
-} from './types';
+import type { SendItem, ToolContext, ToolInstance, ToolSetup, ToolUi } from './types';
 
 export type * from './types';
 
@@ -86,6 +80,16 @@ async function buildTool(
   const primary: Capability = manifest.capabilities[0]!;
   let instance: ToolInstance | null = null;
   const runners: RunnerInternals[] = [];
+
+  // First thing: a file dropped anywhere must never navigate away, even before the tool is set up.
+  installFileDrop({
+    accept: manifest.accepts,
+    toolName: manifest.name,
+    handler: () => {
+      const current = instance;
+      return current?.onFiles ? (files) => current.onFiles?.(files) : null;
+    },
+  });
 
   // --- zones ------------------------------------------------------------------------------------------
   const inputId = uid('tool-input');
@@ -139,6 +143,11 @@ async function buildTool(
 
   // --- header -----------------------------------------------------------------------------------------
   const estimate = costBadge(null);
+  const estimates = createEstimateTracker({
+    compute: (model) => instance?.estimate?.(model) ?? null,
+    model: () => resolveModel().model,
+    show: (usd, note) => estimate.set(usd, note),
+  });
   const chips = h('div', {
     class: 'd-flex flex-wrap align-items-center gap-2 mt-3',
     'data-testid': 'tool-chips',
@@ -239,7 +248,7 @@ async function buildTool(
 
   // --- model and key chips, free-only notice ----------------------------------------------------------
   const resolveModel = (capability: Capability = primary): ResolvedModel =>
-    core.models.resolve(manifest.id, capability, modelOverride ?? undefined);
+    resolveFor(core, manifest, modelOverride, capability);
 
   const chooseModel = async (): Promise<void> => {
     const current = resolveModel();
@@ -259,9 +268,15 @@ async function buildTool(
   };
 
   let chipsGeneration = 0;
+  /** The model the estimate was last asked for; a different one (chip, settings, free-only) asks again. */
+  let estimatedFor: string | null | undefined;
   const renderChips = (): void => {
     const resolved = resolveModel();
     const mine = ++chipsGeneration;
+    if (instance && resolved.model !== estimatedFor) {
+      estimatedFor = resolved.model;
+      void estimates.refresh();
+    }
     const name = h(
       'span',
       { class: 'text-truncate', 'data-testid': 'model-chip-name' },
@@ -274,6 +289,7 @@ async function buildTool(
         type: 'button',
         class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-2 or-chip',
         'aria-label': `Model: ${resolved.model ?? 'none'}. Change model`,
+        'data-focus-key': 'model-chip',
         'data-testid': 'model-chip',
         onclick: () => void chooseModel().catch((error: unknown) => void presentError(error)),
       },
@@ -388,7 +404,11 @@ async function buildTool(
     }
   });
   core.keys.subscribe(renderChips);
-  core.bus.on('models-refreshed', renderChips);
+  core.bus.on('models-refreshed', () => {
+    renderChips();
+    // New prices: the same model may cost something else now.
+    if (instance) void estimates.refresh();
+  });
 
   // --- ui ---------------------------------------------------------------------------------------------
   const ui: ToolUi = {
@@ -438,8 +458,9 @@ async function buildTool(
       );
       return runner;
     },
+    refreshEstimate: () => estimates.refresh(),
     setEstimate(usd, note) {
-      estimate.set(usd, note);
+      estimates.set(usd, note);
     },
     status(text) {
       statusLine.textContent = text;
@@ -455,60 +476,20 @@ async function buildTool(
   };
 
   // --- context ----------------------------------------------------------------------------------------
-  const toolOptions: ToolOptions = {
-    get: () => core.settings.toolOptions(manifest),
-    set(patch) {
-      const saved = core.settings.get().tools[manifest.id]?.options ?? {};
-      core.settings.setToolOptions(manifest.id, { ...saved, ...patch });
-    },
-    reset() {
-      core.settings.setToolOptions(manifest.id, {});
-    },
-  };
-
-  const ctx: ToolContext = {
-    ...core,
+  const ctx: ToolContext = createToolContext({
+    core,
     manifest,
-    state: core.toolState(manifest.id),
-    options: toolOptions,
     ui,
-    model: resolveModel,
-    get modelOverride() {
-      return modelOverride;
-    },
-    async beginRun(spec, signal) {
-      if (signal?.aborted)
-        throw signal.reason instanceof Error
-          ? signal.reason
-          : new DOMException('Stopped.', 'AbortError');
-      const resolved = resolveModel();
-      const model = spec.model ?? resolved.model;
-      if (!model)
-        throw new InvalidInputError(resolved.note ?? 'No model is available for this tool.');
-      const snapshot = instance?.getState();
-      const prompt = spec.prompt ?? snapshot?.prompt;
-      const settings = spec.settings ?? snapshot?.settings;
-      const handle = await core.runs.begin({
-        ...spec,
-        tool: spec.tool ?? manifest.id,
-        model,
-        ...(prompt !== undefined ? { prompt } : {}),
-        ...(settings !== undefined ? { settings } : {}),
-      });
-      if (signal) {
-        if (signal.aborted) handle.abort('Stopped by the user.');
-        else
-          signal.addEventListener('abort', () => handle.abort('Stopped by the user.'), {
-            once: true,
-          });
-      }
-      return handle;
-    },
-  };
+    estimates,
+    modelOverride: () => modelOverride,
+    instance: () => instance,
+  });
 
   // --- setup ------------------------------------------------------------------------------------------
   instance = await setup(ctx);
   const ready = instance;
+  estimatedFor = resolveModel().model;
+  void estimates.refresh();
   prompts = promptsPanel(core, {
     tool: manifest.id,
     getState: () => ready.getState(),
@@ -517,10 +498,6 @@ async function buildTool(
   core.jobs.resume();
 
   installShortcut(runners);
-  if (ready.onFiles && manifest.accepts.length > 0) {
-    const onFiles = ready.onFiles.bind(ready);
-    installFileDrop({ accept: manifest.accepts, toolName: manifest.name, onFiles });
-  }
 
   await applyUrlState(core, manifest, ready, params);
 }
@@ -529,7 +506,7 @@ async function buildTool(
 function installShortcut(runners: readonly RunnerInternals[]): void {
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || !(event.ctrlKey || event.metaKey) || event.altKey) return;
-    if (document.querySelector('.modal.show')) return;
+    if (modalOpen()) return;
     const runner = runners[0];
     if (!runner) return;
     event.preventDefault();
@@ -599,56 +576,6 @@ async function applyUrlState(
       void presentError(error);
     }
   }
-}
-
-function resultHandle(
-  core: CoreServices,
-  result: ReturnType<CoreServices['results']['add']>,
-): ResultHandle {
-  const download = (): void => {
-    try {
-      core.results.download(result.id);
-    } catch (error) {
-      void presentError(error);
-    }
-  };
-  return {
-    result,
-    download,
-    remove: () => core.results.remove(result.id),
-    button(label = 'Download') {
-      const text = h('span', null, label);
-      const glyph = icon('download');
-      const button = h(
-        'button',
-        {
-          type: 'button',
-          class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
-          'data-testid': 'result-download',
-          onclick: download,
-        },
-        glyph,
-        text,
-      );
-      const sync = (): void => {
-        const done = result.downloaded;
-        button.classList.toggle('btn-outline-primary', !done);
-        button.classList.toggle('btn-outline-success', done);
-        glyph.className = done ? 'bi bi-check2' : 'bi bi-download';
-        text.textContent = done ? 'Downloaded' : label;
-        button.setAttribute(
-          'aria-label',
-          done ? `${result.name}, downloaded. Download again` : `Download ${result.name}`,
-        );
-      };
-      sync();
-      const off = core.results.subscribe(() => {
-        if (!button.isConnected && result.downloaded) off();
-        sync();
-      });
-      return button;
-    },
-  };
 }
 
 /** The "Send to…" chooser. */

@@ -9,6 +9,7 @@
  */
 import { type Child, h } from '../dom';
 import { uid } from '../id';
+import { setFieldError } from './field-error';
 import { openModal, type Tone } from './modal';
 
 export interface ConfirmOptions {
@@ -169,6 +170,10 @@ export function promptDialog(options: PromptOptions): Promise<string | null> {
     'data-testid': 'prompt-input',
     value: options.value ?? '',
   });
+  const feedback = h('div', { class: 'invalid-feedback' });
+  input.addEventListener('input', () => {
+    if (input.classList.contains('is-invalid')) setFieldError(input, feedback, null);
+  });
   const formId = uid('prompt-form');
   const form = h(
     'form',
@@ -179,7 +184,7 @@ export function promptDialog(options: PromptOptions): Promise<string | null> {
         event.preventDefault();
         const value = input.value.trim();
         if (options.required !== false && !value) {
-          input.classList.add('is-invalid');
+          setFieldError(input, feedback, 'Enter a value.');
           input.focus();
           return;
         }
@@ -189,7 +194,7 @@ export function promptDialog(options: PromptOptions): Promise<string | null> {
     },
     h('label', { class: 'form-label', htmlFor: inputId }, options.label),
     input,
-    h('div', { class: 'invalid-feedback' }, 'Enter a value.'),
+    feedback,
     options.help && h('div', { class: 'form-text', id: helpId }, options.help),
   );
   const save = h(

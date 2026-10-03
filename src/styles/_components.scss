@@ -28,7 +28,7 @@
     outline: none;
 
     &::after {
-      outline: 3px solid rgba(var(--bs-primary-rgb), 0.5);
+      outline: 3px solid var(--or-focus-color);
       outline-offset: 2px;
       border-radius: var(--bs-card-border-radius);
     }
@@ -159,7 +159,7 @@
   overflow: hidden;
 
   .modal-body > div:first-child:focus-within {
-    box-shadow: inset 0 -2px 0 var(--bs-primary);
+    box-shadow: inset 0 -2px 0 var(--or-focus-color);
   }
 }
 
@@ -244,7 +244,7 @@
 
   &:focus-visible {
     border-radius: 0.25rem;
-    outline: 2px solid var(--bs-primary);
+    outline: 2px solid var(--or-focus-color);
     outline-offset: 4px;
   }
 }
@@ -338,7 +338,7 @@
   }
 
   &:focus-visible {
-    outline: 2px solid var(--bs-primary);
+    outline: 2px solid var(--or-focus-color);
     outline-offset: 2px;
   }
 }

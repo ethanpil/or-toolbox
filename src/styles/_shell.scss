@@ -4,6 +4,8 @@
 // surface (white cards on light grey; lighter grey cards on the dark body).
 :root,
 [data-bs-theme='light'] {
+  // Custom focus outlines: at least 3:1 on the theme's surfaces (a custom accent overrides it, same rule).
+  --or-focus-color: var(--bs-primary);
   --or-canvas: var(--bs-tertiary-bg);
   --or-surface: var(--bs-body-bg);
   // Recessed areas inside a card (drop zones).
@@ -11,6 +13,7 @@
 }
 
 [data-bs-theme='dark'] {
+  --or-focus-color: var(--bs-primary-text-emphasis);
   --or-canvas: var(--bs-body-bg);
   --or-surface: var(--bs-tertiary-bg);
   --or-inset: var(--bs-body-bg);
@@ -80,7 +83,7 @@ section,
   z-index: 1100;
   padding: 0.5rem 1rem;
   background: var(--bs-body-bg);
-  border: 2px solid var(--bs-primary);
+  border: 2px solid var(--or-focus-color);
   border-radius: var(--bs-border-radius);
 }
 

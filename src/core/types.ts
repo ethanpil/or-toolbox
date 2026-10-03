@@ -284,7 +284,11 @@ export interface ModelsService {
   isFree(id: string): boolean;
   /** Shipped defaults: cheap and fast paid model, and the best free model or null. */
   shippedDefault(cap: Capability): { paid: string; free: string | null };
-  /** Cascade: run override → tool binding → user capability default → shipped default; free-only applied. */
+  /**
+   * Cascade: run override → tool binding → user capability default → shipped default; free-only applied. The run
+   * override and the tool binding apply only to the tool's primary capability (`manifest.capabilities[0]`);
+   * other capabilities start at their capability default.
+   */
   resolve(tool: ToolId, cap: Capability, runOverride?: string): ResolvedModel;
   /** `GET /images/models` (cached like the catalog). */
   imageModels(opts?: { refresh?: boolean }): Promise<RawImageModel[]>;
@@ -408,6 +412,8 @@ export interface RunHandle {
   /** Called by the API client for every response; tools call it only for costs they estimate themselves. */
   addUsage(usage: Usage): void;
   readonly totals: UsageTotals;
+  /** The job this run was handed off to (`handOff`), or null. A handed-off run is no longer the page's to lose. */
+  readonly jobId: string | null;
   onUsage(fn: (totals: UsageTotals) => void): () => void;
   /** Persist partial text output during long runs (bot transcripts, batches). */
   checkpoint(partial: RunResult): Promise<void>;
@@ -436,7 +442,7 @@ export interface RunsService {
   /** Re-attach to a persisted run after a reload (video jobs). Null when the run is unknown or already final. */
   reattach(runId: string): Promise<RunHandle | null>;
   setConfirmHandler(fn: BudgetConfirmHandler): void;
-  /** Runs started in this page that have not finished. */
+  /** Runs started in this page that have not finished (including handed-off ones; see `RunHandle.jobId`). */
   active(): RunHandle[];
   /**
    * Finalize orphaned runs: `running` records whose page is gone (no live owner lock) and that were not handed
@@ -585,7 +591,10 @@ export interface HistoryService {
   get(id: string): Promise<RunRecord | undefined>;
   setStarred(id: string, starred: boolean): Promise<void>;
   remove(ids: string[]): Promise<void>;
-  /** Puts runs back that `remove` deleted (Undo); an existing id is overwritten. Stats are never touched. */
+  /**
+   * Puts runs back that `remove` deleted (Undo); an existing id is overwritten. A run removed while `running`
+   * comes back `aborted` (with `finishedAt`), never running. Stats are never touched.
+   */
   restore(runs: RunRecord[]): Promise<void>;
   /** Removes all runs, or all runs of one tool; returns how many were removed. */
   clear(scope?: { tool?: ToolId }): Promise<number>;

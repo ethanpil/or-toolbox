@@ -286,6 +286,27 @@ describe('resolve', () => {
     });
   });
 
+  it('applies the tool binding and the run override only to the tool’s primary capability', () => {
+    // Chat's primary capability is text; pinning a text-only model must not take over image input (vision).
+    const models = withSettings((d) => {
+      d.tools.chat = { model: 'x/text-only' };
+      d.defaultModels.vision = 'google/gemini-3.1-flash-lite';
+    });
+    expect(models.resolve('chat', 'text')).toMatchObject({ model: 'x/text-only', source: 'tool' });
+    expect(models.resolve('chat', 'vision')).toMatchObject({
+      model: 'google/gemini-3.1-flash-lite',
+      source: 'capability',
+    });
+    expect(models.resolve('chat', 'vision', 'x/run-model')).toMatchObject({
+      model: 'google/gemini-3.1-flash-lite',
+      source: 'capability',
+    });
+    expect(models.resolve('chat', 'text', 'x/run-model')).toMatchObject({
+      model: 'x/run-model',
+      source: 'run',
+    });
+  });
+
   it('in free-only mode keeps free choices and swaps paid ones, with a note', () => {
     const models = withSettings((d) => {
       d.freeOnly = true;

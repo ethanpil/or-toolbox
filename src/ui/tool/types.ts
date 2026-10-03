@@ -40,6 +40,12 @@ export interface ToolInstance {
   onReceive?(items: SendItem[]): void;
   /** Fills the form with a ready-to-run example (`?sample=1`, onboarding's "Try a sample"). */
   sample?(): void | Promise<void>;
+  /**
+   * The cost of running the current input on `model`, in USD (usually `ctx.models.estimate(…)`), or null when it
+   * cannot be estimated. The framework asks when the model changes and when the tool calls `ui.refreshEstimate()`,
+   * shows the newest answer in the header and books it with `ctx.beginRun` when the spec has no `estimateUsd`.
+   */
+  estimate?(model: string): Promise<number | null>;
 }
 
 /** The tool's saved options: `manifest.defaults` merged with `settings.tools[id].options`. */
@@ -105,7 +111,12 @@ export interface ToolUi {
   advanced: (title: string) => HTMLElement;
   /** Creates the primary Run/Stop bar (the first runner also gets Ctrl/Cmd+Enter). */
   runner: (options: RunnerOptions) => Runner;
-  /** The header's estimate badge: number, 0 (Free) or null (Unknown). */
+  /** Recomputes the estimate through `ToolInstance.estimate` (call it when the input changes); resolves with it. */
+  refreshEstimate: () => Promise<number | null>;
+  /**
+   * Sets the header's estimate badge directly: number, 0 (Free) or null (Unknown). Prefer `estimate` +
+   * `refreshEstimate`; a value set here is what `beginRun` books until the next refresh.
+   */
   setEstimate: (usd: number | null, note?: string) => void;
   /** Short status text, announced politely (e.g. "Page 3 of 20"). Empty string clears it. */
   status: (text: string) => void;
@@ -125,15 +136,18 @@ export interface ToolContext extends CoreServices {
   readonly options: ToolOptions;
   readonly ui: ToolUi;
   /**
-   * The model for a capability (default: the primary one), through the cascade run override (`?model=`) → the
-   * header's choice (tool binding) → capability default → shipped default, with free-only applied.
+   * The model for a capability (default: the primary one). For the primary capability the cascade is run
+   * override (`?model=`) → the header's choice (tool binding) → capability default → shipped default; any other
+   * capability starts at its capability default (a text model pinned on Chat does not read images). Free-only
+   * mode applies to both.
    */
   model: (capability?: Capability) => ResolvedModel;
   /** `?model=` from the URL ("re-run with another model"), or null. */
   readonly modelOverride: string | null;
   /**
    * `runs.begin` for this tool: fills `tool`, defaults `model` to `ctx.model().model`, `prompt`/`settings` to the
-   * instance's `getState()`, and aborts the run when `signal` (the runner's) aborts.
+   * instance's `getState()`, `estimateUsd` to the framework's current estimate (recomputed first when stale), and
+   * aborts the run when `signal` (the runner's) aborts.
    */
   beginRun: (
     spec: Omit<RunSpec, 'tool' | 'model'> & { model?: string; tool?: ToolId },

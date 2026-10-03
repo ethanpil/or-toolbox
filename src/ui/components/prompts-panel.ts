@@ -11,7 +11,7 @@ import type { CoreServices, PromptEntry, ToolId } from '../../core/types';
 import { getTool } from '../../tools/registry';
 import { Offcanvas, showOffcanvas } from '../bootstrap';
 import { copyText } from '../clipboard';
-import { h } from '../dom';
+import { h, replace } from '../dom';
 import { confirmDialog, promptDialog } from '../feedback/dialogs';
 import { presentError } from '../feedback/errors';
 import { toast } from '../feedback/toast';
@@ -258,6 +258,7 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
   // --- rendering ----------------------------------------------------------------------------------------
 
   const actionButton = (
+    entry: PromptEntry,
     label: string,
     iconName: string,
     testId: string,
@@ -270,6 +271,8 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
         class: 'btn btn-sm btn-outline-secondary',
         'aria-label': label,
         title: label,
+        // A rename or another tab's change re-renders the list; focus stays on the same button.
+        'data-focus-key': `${entry.id}:${label}`,
         'data-testid': testId,
         onclick: onClick,
       },
@@ -307,16 +310,17 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
           {
             type: 'button',
             class: 'btn btn-sm btn-primary',
+            'data-focus-key': `${entry.id}:Use`,
             'data-testid': 'prompt-use',
             onclick: () => use(entry),
           },
           'Use',
         ),
         entry.kind === 'recent'
-          ? actionButton('Save', 'bookmark-plus', 'prompt-save', () => saveRecent(entry))
-          : actionButton('Rename', 'pencil', 'prompt-rename', () => rename(entry)),
-        actionButton('Copy', 'clipboard', 'prompt-copy', () => copy(entry)),
-        actionButton('Delete', 'trash', 'prompt-delete', () => remove(entry)),
+          ? actionButton(entry, 'Save', 'bookmark-plus', 'prompt-save', () => saveRecent(entry))
+          : actionButton(entry, 'Rename', 'pencil', 'prompt-rename', () => rename(entry)),
+        actionButton(entry, 'Copy', 'clipboard', 'prompt-copy', () => copy(entry)),
+        actionButton(entry, 'Delete', 'trash', 'prompt-delete', () => remove(entry)),
       ),
     );
   };
@@ -348,7 +352,8 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
     );
     const note = kind === 'recent' ? recordingNote() : null;
     if (!loaded) {
-      panes[kind].replaceChildren(
+      replace(
+        panes[kind],
         h(
           'div',
           { class: 'placeholder-glow py-3', 'aria-hidden': 'true' },
@@ -359,7 +364,8 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
       return;
     }
     if (entries.length === 0) {
-      panes[kind].replaceChildren(
+      replace(
+        panes[kind],
         note ?? '',
         emptyState(
           kind === 'recent'
@@ -381,7 +387,8 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
       );
       return;
     }
-    panes[kind].replaceChildren(
+    replace(
+      panes[kind],
       note ?? '',
       h('ul', { class: 'list-group list-group-flush' }, entries.map(card)),
     );
@@ -402,7 +409,8 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
         if (mine !== generation) return;
         loaded = true;
         for (const kind of ['recent', 'saved'] as const) {
-          panes[kind].replaceChildren(
+          replace(
+            panes[kind],
             emptyState({
               icon: 'exclamation-triangle',
               title: 'Prompts could not be loaded',

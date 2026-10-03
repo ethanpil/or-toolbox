@@ -22,6 +22,7 @@ import {
 } from './estimate';
 import { isFreeModelId } from './free';
 import { normalizeModel } from './normalize';
+import { getTool } from '../../tools/registry';
 
 export const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** After a failed refresh, the next automatic attempt waits this long. */
@@ -339,9 +340,12 @@ export function createModelsService(
 
     resolve(tool, cap, runOverride) {
       const settings = core.settings.get();
+      // The tool's model choice (header chip, `?model=`) is for its primary capability only: a text model pinned
+      // on Chat must not take over its image input, which uses the vision default.
+      const primary = getTool(tool).capabilities[0] === cap;
       const candidates: Array<[ResolvedModel['source'], string | undefined]> = [
-        ['run', runOverride],
-        ['tool', settings.tools[tool]?.model],
+        ['run', primary ? runOverride : undefined],
+        ['tool', primary ? settings.tools[tool]?.model : undefined],
         ['capability', settings.defaultModels[cap]],
         ['shipped', SHIPPED_DEFAULTS[cap].paid],
       ];

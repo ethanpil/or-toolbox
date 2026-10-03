@@ -1,8 +1,8 @@
 /**
  * `audioPlayer()`: the browser's own audio controls (fully keyboard and screen-reader accessible) with a
  * waveform drawn above them from `peaks` (src/core/media/audio.ts `peaks()`). Without `peaks`, a Blob under
- * 64 MB is decoded lazily to draw one. Clicking the waveform seeks; the played part is drawn in the accent
- * colour.
+ * 64 MB and 30 minutes is decoded lazily (8 kHz, mono) to draw one. Clicking the waveform seeks; the played
+ * part is drawn in the accent colour.
  */
 import { h } from '../dom';
 
@@ -24,6 +24,10 @@ export interface AudioPlayer {
 }
 
 const MAX_DECODE_BYTES = 64 * 1024 * 1024;
+/** Longer recordings get no waveform (the controls still work). */
+const MAX_WAVEFORM_SECONDS = 30 * 60;
+/** Enough for 240 bars, at a fraction of the memory of a full-rate decode. */
+const WAVEFORM_SAMPLE_RATE = 8000;
 const BUCKETS = 240;
 
 export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
@@ -84,9 +88,20 @@ export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
 
   if (!peaks && options.blob && options.blob.size <= MAX_DECODE_BYTES) {
     const blob = options.blob;
+    // A waveform needs little detail: decode at a low rate, in mono, and skip it for long recordings (a full
+    // decode of an hour of audio would hold hundreds of megabytes of samples).
     void import('../../core/media/audio')
-      .then(async (media) => media.peaks(await media.decodeAudio(blob), BUCKETS))
+      .then(async (media) => {
+        const seconds = await media.getAudioDuration(blob).catch(() => Number.NaN);
+        if (!(seconds > 0) || seconds > MAX_WAVEFORM_SECONDS) return null;
+        const decoded = await media.decodeAudio(blob, {
+          sampleRate: WAVEFORM_SAMPLE_RATE,
+          mono: true,
+        });
+        return media.peaks(decoded, BUCKETS);
+      })
       .then((computed) => {
+        if (!computed) return;
         peaks = computed;
         draw();
       })

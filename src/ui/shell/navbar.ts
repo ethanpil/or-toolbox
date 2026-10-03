@@ -183,6 +183,7 @@ function freeOnlyBadge(): HTMLElement {
         'badge rounded-pill text-bg-success text-decoration-none d-inline-flex align-items-center gap-1',
       href: settingsUrl('models'),
       title: 'Free-only mode is on: only free models can run',
+      'data-focus-key': 'free-only',
       'data-testid': 'free-only-badge',
     },
     icon('gift'),
@@ -198,6 +199,7 @@ function keyChip(core: CoreServices): HTMLElement {
       {
         class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
         href: settingsUrl('keys'),
+        'data-focus-key': 'key-chip',
         'data-testid': 'key-chip',
       },
       icon('key'),
@@ -258,6 +260,7 @@ function keyChip(core: CoreServices): HTMLElement {
       'data-bs-toggle': 'dropdown',
       'aria-expanded': 'false',
       'aria-label': `Key: ${key.name}`,
+      'data-focus-key': 'key-chip',
       'data-testid': 'key-chip',
     },
     keyDot(key),
@@ -311,6 +314,7 @@ function lockButton(core: CoreServices): HTMLElement {
       class: 'btn btn-sm btn-outline-secondary',
       'aria-label': unlocked ? 'Lock keys now' : 'Unlock keys',
       title: unlocked ? 'Lock keys now' : 'Unlock keys',
+      'data-focus-key': 'lock',
       'data-testid': 'lock-button',
       onclick: () => {
         if (core.keys.lock.unlocked()) {
@@ -338,6 +342,7 @@ function themeMenu(core: CoreServices): HTMLElement {
           type: 'button',
           class: ['dropdown-item d-flex align-items-center gap-2', theme.mode === mode && 'active'],
           'aria-current': theme.mode === mode ? 'true' : null,
+          'data-focus-key': 'theme-menu',
           'data-testid': `theme-${theme.mode}`,
           onclick: () => {
             try {
@@ -367,6 +372,7 @@ function themeMenu(core: CoreServices): HTMLElement {
         'data-bs-toggle': 'dropdown',
         'aria-expanded': 'false',
         'aria-label': `Theme: ${currentTheme.label}`,
+        'data-focus-key': 'theme-menu',
         'data-testid': 'theme-menu',
       },
       icon(currentTheme.icon),

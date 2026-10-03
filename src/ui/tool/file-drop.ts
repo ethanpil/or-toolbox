@@ -1,8 +1,12 @@
 /**
- * Page-wide file drop and paste for tool pages. Dragging files anywhere over the page shows a full-page overlay
- * naming the tool and what it accepts; dropping (or pasting files with Ctrl/Cmd+V) hands the accepted files to
- * the tool and names the skipped ones in a toast. A paste into a text field that also carries text is left to
- * the field. Drop zones inside the page handle their own drops first.
+ * Page-wide file drop and paste for tool pages, installed before the tool's own setup runs so that a stray drop
+ * can never make the browser open the file and leave the page (taking any unsaved results with it).
+ *
+ * - Every file drag over the page is accepted by the page (the browser's default would navigate to the file).
+ * - While the tool takes files (`onFiles` and a non-empty `accepts`), a full-page overlay names the tool and what
+ *   it accepts; a drop or a paste hands the accepted files to it and names the skipped ones in a toast.
+ * - Otherwise a drop says "This tool doesn't take files". A paste into a text field that also carries text is
+ *   left to the field. Drop zones inside the page handle their own drops first.
  */
 import { h } from '../dom';
 import { toast } from '../feedback/toast';
@@ -13,7 +17,8 @@ import { describeAccept, partitionFiles } from '../components/file-types';
 export interface FileDropOptions {
   accept: readonly string[];
   toolName: string;
-  onFiles: (files: File[]) => void;
+  /** The tool's file handler once it has one (null before setup, or for tools that take no files). */
+  handler: () => ((files: File[]) => void) | null;
 }
 
 const hasFiles = (event: DragEvent): boolean =>
@@ -27,6 +32,9 @@ const isEditable = (target: EventTarget | null): boolean =>
       !['checkbox', 'radio', 'button', 'file'].includes(target.type)));
 
 export function installFileDrop(options: FileDropOptions): void {
+  const takesFiles = (): ((files: File[]) => void) | null =>
+    options.accept.length > 0 ? options.handler() : null;
+
   const overlay = h(
     'div',
     {
@@ -47,8 +55,13 @@ export function installFileDrop(options: FileDropOptions): void {
 
   const deliver = (files: File[]): void => {
     if (files.length === 0) return;
+    const handler = takesFiles();
+    if (!handler) {
+      toast({ variant: 'warning', message: `${options.toolName} doesn't take files.` });
+      return;
+    }
     const { accepted, rejected } = partitionFiles(files, options.accept);
-    if (accepted.length > 0) options.onFiles(accepted);
+    if (accepted.length > 0) handler(accepted);
     if (rejected.length > 0) {
       toast({
         variant: 'warning',
@@ -66,10 +79,12 @@ export function installFileDrop(options: FileDropOptions): void {
     if (!hasFiles(event)) return;
     event.preventDefault();
     depth++;
-    overlay.hidden = false;
+    if (takesFiles()) overlay.hidden = false;
   });
   window.addEventListener('dragover', (event) => {
     if (!hasFiles(event)) return;
+    // Always: without it the browser opens the dropped file in place of the page. The drop is allowed even when
+    // the tool takes no files, so it can say so instead of silently refusing.
     event.preventDefault();
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
   });

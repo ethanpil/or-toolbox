@@ -3,9 +3,11 @@
  * true when unlocked (immediately if the lock is off or already open), false when the user gives up. One dialog
  * at a time: concurrent callers share it.
  */
+import { userMessage } from '../../core/errors';
 import { getCore } from '../../core/index';
 import { h } from '../dom';
 import { uid } from '../id';
+import { setFieldError } from './field-error';
 import { openModal } from './modal';
 
 let pending: Promise<boolean> | null = null;
@@ -31,7 +33,6 @@ function show(): Promise<boolean> {
     class: 'form-control',
     autocomplete: 'current-password',
     required: true,
-    'aria-describedby': errorId,
     'data-testid': 'unlock-passphrase',
   });
   const error = h('div', { id: errorId, class: 'invalid-feedback', 'data-testid': 'unlock-error' });
@@ -64,20 +65,28 @@ function show(): Promise<boolean> {
 
   const attempt = async (): Promise<void> => {
     if (!input.value) {
+      setFieldError(input, error, 'Enter your passphrase.');
       input.focus();
       return;
     }
     submit.disabled = true;
-    input.classList.remove('is-invalid');
-    const ok = await lock.unlock(input.value).catch(() => false);
+    setFieldError(input, error, null);
+    let ok: boolean;
+    try {
+      ok = await lock.unlock(input.value);
+    } catch (failure) {
+      // Not a wrong passphrase: storage, crypto or a keys file changed in another tab.
+      submit.disabled = false;
+      setFieldError(input, error, `Could not unlock: ${userMessage(failure)}`);
+      return;
+    }
     submit.disabled = false;
     if (ok) {
       result = true;
       modal.hide();
       return;
     }
-    error.textContent = 'Wrong passphrase. Try again.';
-    input.classList.add('is-invalid');
+    setFieldError(input, error, 'Wrong passphrase. Try again.');
     input.select();
   };
 

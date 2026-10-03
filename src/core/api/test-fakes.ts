@@ -58,6 +58,7 @@ export function fakeRun(
     addUsage: (usage) => {
       usages.push(usage);
     },
+    jobId: null,
     get totals() {
       return totals;
     },

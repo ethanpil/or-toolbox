@@ -56,7 +56,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
           h(
             'p',
             { class: 'text-body-secondary mb-0' },
-            'About a minute. Everything stays in this browser.',
+            'About a minute. Your key stays in this browser and is sent only to OpenRouter.',
           ),
         ),
         h(
@@ -77,7 +77,8 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
 
   const savedStep = core.settings.get().ui[STEP_KEY];
   let step = savedStep === 2 || savedStep === 3 ? savedStep : 1;
-  const picked = new Set<ToolId>(core.settings.get().favouriteTools);
+  /** The favourites being picked; read from the settings each time step 2 opens (they may have changed). */
+  let picked = new Set<ToolId>();
 
   const persistStep = (next: number): void => {
     try {
@@ -123,6 +124,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
   const footer = (...buttons: Child[]): HTMLElement =>
     h('div', { class: 'd-flex flex-wrap gap-2 mt-4' }, buttons);
 
+  let nextButton: HTMLButtonElement | null = null;
   const stepConnect = (): Child[] => {
     const key = core.keys.resolve();
     const switchId = uid('free-only');
@@ -165,7 +167,16 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
         : h(
             'div',
             { class: 'or-connect' },
-            connectKey({ returnTo: url(), onAdded: () => setTimeout(render, 600) }),
+            connectKey({
+              returnTo: url(),
+              // connectKey announces the result; then show the connected state and move on to Next, so
+              // focus does not drop to the page when the form is replaced.
+              onAdded: () =>
+                setTimeout(() => {
+                  render();
+                  nextButton?.focus();
+                }, 600),
+            }),
           ),
       h(
         'div',
@@ -183,7 +194,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
         ),
       ),
       footer(
-        h(
+        (nextButton = h(
           'button',
           {
             type: 'button',
@@ -193,12 +204,13 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
           },
           key ? 'Next' : 'Continue without a key',
           icon('arrow-right', 'ms-2'),
-        ),
+        )),
       ),
     ];
   };
 
   const stepFavourites = (): Child[] => {
+    picked = new Set<ToolId>(core.settings.get().favouriteTools);
     const count = h('span', { class: 'text-body-secondary small', role: 'status' });
     const updateCount = (): void => {
       count.textContent = `${picked.size} picked`;

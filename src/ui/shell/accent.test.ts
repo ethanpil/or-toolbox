@@ -77,6 +77,71 @@ describe('accentProperties', () => {
     },
   );
 
+  // A spread of hues and lightnesses, including the awkward ones (yellow, cyan, white, black, mid grey).
+  const SAMPLE = [
+    '#4f46e5',
+    '#facc15',
+    '#22d3ee',
+    '#0f766e',
+    '#1e1b4b',
+    '#ec4899',
+    '#ffffff',
+    '#000000',
+    '#808080',
+    '#ff0000',
+    '#00ff00',
+    '#0000ff',
+    '#a3e635',
+    '#f97316',
+    '#7c3aed',
+    '#94a3b8',
+  ];
+  const SURFACES = {
+    light: [
+      [255, 255, 255],
+      [248, 249, 250],
+    ] as const,
+    dark: [
+      [33, 37, 41],
+      [43, 48, 53],
+    ] as const,
+  };
+
+  it.each(SAMPLE)('meets contrast on the real surfaces of both themes for %s', (hex) => {
+    for (const theme of ['light', 'dark'] as const) {
+      const props = accentProperties(hex, theme)!;
+      for (const surface of SURFACES[theme]) {
+        const bg = [...surface] as [number, number, number];
+        // Links and outline-button text: AA text on cards and canvas.
+        expect(contrast(parseHex(props['--bs-link-color']!)!, bg)).toBeGreaterThanOrEqual(4.5);
+        expect(contrast(parseHex(props['--or-accent-text']!)!, bg)).toBeGreaterThanOrEqual(4.5);
+        // Focus outlines and the focused field border: 3:1 non-text contrast.
+        expect(contrast(parseHex(props['--or-focus-color']!)!, bg)).toBeGreaterThanOrEqual(3);
+        expect(contrast(parseHex(props['--or-focus-border']!)!, bg)).toBeGreaterThanOrEqual(3);
+      }
+      // The focused border is more visible than the resting one (#dee2e6 light, #495057 dark).
+      const resting: [number, number, number] = theme === 'light' ? [222, 226, 230] : [73, 80, 87];
+      const surface = [...SURFACES[theme][1]] as [number, number, number];
+      expect(contrast(parseHex(props['--or-focus-border']!)!, surface)).toBeGreaterThan(
+        contrast(resting, surface),
+      );
+    }
+  });
+
+  it('draws ticks, dots and knobs in the colour that contrasts with the accent', () => {
+    const yellow = accentProperties('#facc15', 'light')!;
+    expect(yellow['--or-accent-contrast']).toBe('#000000');
+    expect(yellow['--or-check-tick']).toContain("stroke='%23000000'");
+    expect(yellow['--or-radio-dot']).toContain("fill='%23000000'");
+    expect(yellow['--or-switch-knob']).toContain("fill='%23000000'");
+    const indigo = accentProperties('#4f46e5', 'dark')!;
+    expect(indigo['--or-check-tick']).toContain("stroke='%23ffffff'");
+    expect(indigo['--or-switch-knob-focus']).toContain(
+      `fill='%23${indigo['--or-focus-color']!.slice(1)}'`,
+    );
+    expect(indigo['--or-check-tick']).toMatch(/^url\("data:image\/svg\+xml,%3csvg /);
+  });
+
   it('exposes the accent as an RGB list for Bootstrap’s rgba() utilities', () => {
     expect(accentProperties('#4f46e5', 'light')!['--bs-primary-rgb']).toBe('79, 70, 229');
   });

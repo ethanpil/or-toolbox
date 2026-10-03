@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { append, clear, h, isSafeUrl, on, replace, type Props } from './dom';
+import { append, clear, h, isSafeUrl, on, onReplaceRemove, replace, type Props } from './dom';
 
 /** Calls h() with props the types forbid, to test the runtime guards. */
 const unsafe = (tag: string, props: Record<string, unknown>) =>
@@ -230,6 +230,48 @@ describe('replace', () => {
     replace(el, null, 'a', false, [h('b', null, 'b')], undefined, 0);
     expect(el.childNodes).toHaveLength(3);
     expect(el.textContent).toBe('ab0');
+  });
+
+  it('gives focus back to the successor with the same data-focus-key', () => {
+    const list = (pressed: boolean) => [
+      h('button', { type: 'button', 'data-focus-key': 'a' }, 'A'),
+      h(
+        'button',
+        { type: 'button', 'data-focus-key': 'b', 'aria-pressed': String(pressed) },
+        h('i', { tabIndex: -1 }),
+      ),
+    ];
+    const el = h('div', null, list(false));
+    document.body.append(el);
+    (el.querySelector('[data-focus-key="b"] i') as HTMLElement).focus(); // focus inside a keyed control counts
+    replace(el, list(true));
+    expect(document.activeElement?.getAttribute('data-focus-key')).toBe('b');
+    expect(document.activeElement?.getAttribute('aria-pressed')).toBe('true');
+    el.remove();
+  });
+
+  it('leaves focus alone when it is outside or unkeyed, and never matches test ids', () => {
+    const outside = h('input');
+    const el = h('div', null, h('button', { type: 'button', 'data-testid': 'x' }, 'X'));
+    document.body.append(outside, el);
+    (el.firstElementChild as HTMLElement).focus();
+    replace(el, h('button', { type: 'button', 'data-testid': 'x' }, 'X'));
+    expect(document.activeElement).toBe(document.body);
+    outside.focus();
+    replace(el, h('button', { type: 'button', 'data-focus-key': 'x' }, 'X'));
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
+    el.remove();
+  });
+
+  it('runs removal hooks for every dropped child', () => {
+    const removed: string[] = [];
+    const off = onReplaceRemove((node) => removed.push(node.textContent ?? ''));
+    const el = h('div', null, h('p', null, 'one'), h('p', null, 'two'));
+    replace(el, h('p', null, 'three'));
+    off();
+    replace(el, h('p', null, 'four'));
+    expect(removed).toEqual(['one', 'two']);
   });
 });
 

@@ -1,8 +1,16 @@
 /**
- * `outputPanel()`: where a text-producing tool shows its result. Streams text or Markdown as it arrives
- * (Markdown re-rendered through `renderMarkdown`, throttled), shows skeleton placeholders until the first chunk,
- * announces start and finish through a status line (never the streamed text itself), and offers Copy,
- * Download (format menu) and Send to….
+ * `outputPanel()`: where a text-producing tool shows its result. Streams text or Markdown as it arrives, shows
+ * skeleton placeholders until the first chunk, announces start and finish through a status line (never the
+ * streamed text itself), and offers Copy, Download (format menu) and Send to….
+ *
+ * Streaming Markdown stays cheap and never stalls: blocks that are complete (up to the last blank line outside a
+ * code fence) are rendered once and kept; only the unfinished tail is re-rendered. One render runs at a time;
+ * text that arrives meanwhile is drawn as soon as it finishes, paced by how long renders take. `finish()` draws
+ * the whole text once more, so the final result is exactly what `renderMarkdown` makes of it.
+ *
+ * Errors follow one rule (`fail(error)`): a Stop is silent (the partial text stays, the status says "Stopped"),
+ * errors that need a dialog or a setting (no key, locked, free-only, budget, storage) are left to `presentError`,
+ * and every other error is shown once, inline, and marked so the runner does not show it again.
  *
  * ```ts
  * const out = outputPanel({ format: 'markdown', filename: 'answer', sendTo: ctx.ui.sendTo });
@@ -13,7 +21,9 @@
  * ```
  */
 import { h } from '../dom';
+import { userMessage } from '../../core/errors';
 import { announce } from '../feedback/announce';
+import { isStop, markPresented, needsAction } from '../feedback/errors';
 import { toast } from '../feedback/toast';
 import { copyText } from '../clipboard';
 import { icon } from '../icon';
@@ -45,24 +55,57 @@ export interface OutputPanel {
   setText(text: string): void;
   /** Final render; enables the actions. */
   finish(status?: string): void;
-  /** Keeps any partial text and shows `message` as an error line. */
-  fail(message: string): void;
+  /**
+   * Ends a failed or stopped run, keeping any partial text. A Stop shows only a neutral status; errors that need
+   * an action are left to `presentError`; others are shown inline once (and not again by the runner).
+   */
+  fail(error: unknown): void;
   /** Back to the empty state. */
   clear(): void;
   text(): string;
   setStatus(text: string): void;
 }
 
-const RENDER_INTERVAL_MS = 100;
+/** Pause between streaming renders: twice the last render's cost, within these bounds. */
+const MIN_RENDER_GAP_MS = 50;
+const MAX_RENDER_GAP_MS = 500;
+
+/**
+ * Where the stable part of streamed Markdown ends: just after the last blank line that is not inside a code
+ * fence, scanning from `from` (a position already known to be outside a fence). Returns `from` when there is
+ * none yet.
+ */
+export function stableBoundary(text: string, from: number): number {
+  let boundary = from;
+  let inFence = false;
+  let lineStart = from;
+  while (lineStart < text.length) {
+    const newline = text.indexOf('\n', lineStart);
+    if (newline === -1) break; // the last line is unfinished: never part of the stable prefix
+    const line = text.slice(lineStart, newline);
+    if (/^\s{0,3}(```|~~~)/.test(line)) inFence = !inFence;
+    else if (!inFence && line.trim() === '' && lineStart > from) boundary = newline + 1;
+    lineStart = newline + 1;
+  }
+  return boundary;
+}
 
 export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
   const markdown = (options.format ?? 'markdown') === 'markdown';
   let buffer = '';
   let streaming = false;
-  let renderTimer: ReturnType<typeof setTimeout> | undefined;
-  let renderSeq = 0;
+  /** Bumped by start()/clear(): renders of an older run never touch the panel. */
+  let generation = 0;
   /** The error line shown after the (partial) text, kept across re-renders. */
   let errorLine: HTMLElement | null = null;
+  // Streaming Markdown: blocks up to `stableUpTo` are rendered once into `stableEl`; the rest goes to `tailEl`.
+  let stableUpTo = 0;
+  const stableEl = h('div', { class: 'or-output-stable' });
+  const tailEl = h('div', { class: 'or-output-tail' });
+  let loop: Promise<void> | null = null;
+  let loopGeneration = -1;
+  let dirty = false;
+  let lastCost = 0;
 
   const content = h('div', {
     class: ['or-output-content', markdown ? 'or-markdown' : 'or-plain-text'],
@@ -195,25 +238,83 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
       ),
     );
 
-  const renderNow = async (): Promise<void> => {
-    renderTimer = undefined;
-    const seq = ++renderSeq;
-    const caret = streaming ? h('span', { class: 'or-caret', 'aria-hidden': 'true' }) : null;
+  const caret = (): HTMLElement | null =>
+    streaming ? h('span', { class: 'or-caret', 'aria-hidden': 'true' }) : null;
+
+  /** Draws what has arrived: new stable blocks once, the tail again. */
+  const renderOnce = async (gen: number): Promise<void> => {
     if (!markdown) {
-      content.replaceChildren(buffer, caret ?? '', errorLine ?? '');
+      content.replaceChildren(buffer, caret() ?? '', errorLine ?? '');
+      return;
+    }
+    if (!stableEl.isConnected) content.replaceChildren(stableEl, tailEl);
+    const boundary = stableBoundary(buffer, stableUpTo);
+    if (boundary > stableUpTo) {
+      const fragment = await renderMarkdown(buffer.slice(stableUpTo, boundary));
+      if (gen !== generation) return;
+      stableEl.append(fragment);
+      stableUpTo = boundary;
+    }
+    const tail = await renderMarkdown(buffer.slice(stableUpTo));
+    if (gen !== generation) return;
+    tailEl.replaceChildren(tail, caret() ?? '');
+    if (errorLine) content.append(errorLine);
+  };
+
+  /** Runs renders back to back while text keeps arriving; one at a time, paced by their cost. */
+  const scheduleRender = (): void => {
+    dirty = true;
+    if (loop && loopGeneration === generation) return;
+    const gen = generation;
+    const previous = loop; // a loop of an older run ends at its next check; start after it
+    loopGeneration = gen;
+    loop = (async () => {
+      await previous;
+      try {
+        while (dirty && gen === generation) {
+          dirty = false;
+          const started = performance.now();
+          try {
+            await renderOnce(gen);
+          } catch {
+            if (gen === generation) content.replaceChildren(buffer, errorLine ?? '');
+          }
+          lastCost = performance.now() - started;
+          if (dirty && streaming) {
+            const gap = Math.min(MAX_RENDER_GAP_MS, Math.max(MIN_RENDER_GAP_MS, lastCost * 2));
+            await new Promise((resolve) => setTimeout(resolve, gap));
+          }
+        }
+      } finally {
+        if (loopGeneration === gen) loop = null;
+      }
+    })();
+  };
+
+  /** The whole text in one render: what the result finally looks like. */
+  const renderFinal = async (gen: number): Promise<void> => {
+    await loop;
+    if (gen !== generation) return;
+    if (!markdown) {
+      content.replaceChildren(buffer, errorLine ?? '');
       return;
     }
     try {
       const fragment = await renderMarkdown(buffer);
-      if (seq !== renderSeq) return; // a newer render started meanwhile
-      content.replaceChildren(fragment, caret ?? '', errorLine ?? '');
+      if (gen !== generation) return;
+      content.replaceChildren(fragment, errorLine ?? '');
     } catch {
-      if (seq === renderSeq) content.replaceChildren(buffer, errorLine ?? '');
+      if (gen === generation) content.replaceChildren(buffer, errorLine ?? '');
     }
   };
 
-  const scheduleRender = (): void => {
-    renderTimer ??= setTimeout(() => void renderNow(), RENDER_INTERVAL_MS);
+  const reset = (): void => {
+    generation++;
+    dirty = false;
+    stableUpTo = 0;
+    stableEl.replaceChildren();
+    tailEl.replaceChildren();
+    errorLine = null;
   };
 
   const setStatus = (text: string): void => {
@@ -228,12 +329,9 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
   return {
     element,
     start(status = 'Generating…') {
+      reset();
       buffer = '';
-      errorLine = null;
       streaming = true;
-      clearTimeout(renderTimer);
-      renderTimer = undefined;
-      renderSeq++;
       content.setAttribute('aria-busy', 'true');
       content.replaceChildren(skeleton());
       setActionsEnabled(false);
@@ -246,14 +344,17 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
       scheduleRender();
     },
     setText(text) {
+      // A replaced text may differ anywhere: draw it from scratch.
+      const keepError = errorLine;
+      reset();
+      errorLine = keepError;
       buffer = text;
       scheduleRender();
     },
     finish(status) {
       streaming = false;
-      clearTimeout(renderTimer);
-      void renderNow();
       content.setAttribute('aria-busy', 'false');
+      void renderFinal(generation);
       const done =
         status ??
         (buffer
@@ -263,27 +364,39 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
       announce(done);
       setActionsEnabled(buffer.length > 0);
     },
-    fail(message) {
+    fail(error) {
       streaming = false;
-      clearTimeout(renderTimer);
       content.setAttribute('aria-busy', 'false');
-      errorLine = h(
-        'div',
-        { class: 'alert alert-danger d-flex gap-2 mt-3 mb-0', 'data-testid': 'output-error' },
-        icon('exclamation-octagon'),
-        h('div', null, message),
-      );
-      void renderNow();
-      announce(message, { assertive: true });
-      setStatus(buffer ? 'Stopped with an error; the partial result is kept.' : 'Failed.');
-      setActionsEnabled(buffer.length > 0);
+      const kept = buffer.length > 0;
+      if (typeof error !== 'string' && isStop(error)) {
+        setStatus(kept ? 'Stopped. The partial result is kept.' : 'Stopped.');
+        announce('Stopped.');
+        markPresented(error);
+      } else if (typeof error !== 'string' && needsAction(error)) {
+        // presentError shows it with its action (unlock, add a key, budgets…); nothing inline.
+        setStatus(kept ? 'Not finished. The partial result is kept.' : 'Not run.');
+      } else {
+        const message = typeof error === 'string' ? error : userMessage(error);
+        if (typeof error !== 'string') markPresented(error);
+        errorLine = h(
+          'div',
+          {
+            class: 'alert alert-danger d-flex gap-2 mt-3 mb-0',
+            role: 'alert',
+            'data-testid': 'output-error',
+          },
+          icon('exclamation-octagon'),
+          h('div', null, message),
+        );
+        setStatus(kept ? 'Stopped with an error; the partial result is kept.' : 'Failed.');
+      }
+      void renderFinal(generation);
+      setActionsEnabled(kept);
     },
     clear() {
+      reset();
       buffer = '';
-      errorLine = null;
       streaming = false;
-      clearTimeout(renderTimer);
-      renderSeq++;
       content.setAttribute('aria-busy', 'false');
       showEmpty();
       setStatus('');
