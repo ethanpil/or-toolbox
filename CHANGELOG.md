@@ -16,6 +16,9 @@ All notable changes to this project are documented here. The format follows
 - Self-hosted ffmpeg.wasm loader and a diagnostics page with an ffmpeg smoke test (a76487c).
 - Mocked OpenRouter, Stage 0 gate tests and GitHub Actions workflows (a76487c).
 - OpenRouter API reference and recorded fixtures from paid probes (b5596a4).
+- Core state: cross-tab bus, validated settings with migrations and cross-tab sync, tool state, session results with leave-page guard (73f1342).
+- Core state: run gatekeeper and handles, budgets on a local spend ledger, stats rollups, text history, prompts, persistent jobs, encrypted backup/restore, data management (6bbe169).
+- Unit and Stage 1 gate tests for the core state services (c2bc3fe).
 
 ### Changed
 
