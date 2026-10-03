@@ -725,12 +725,22 @@ export interface StatsRow {
   model: string;
   keyId: string;
   free: boolean;
+  /**
+   * Runs whose primary model (`RunRecord.model`) this is. A run that called several models counts once, on its
+   * primary one, so the sum over rows is the number of runs; the other models only gain requests, tokens and cost.
+   */
   runs: number;
+  /** Failed runs, counted on the primary model like `runs`, so `errors / runs` is a real error rate. */
   errors: number;
   requests: number;
   promptTokens: number;
   completionTokens: number;
   costUsd: number;
+  /**
+   * The part of `costUsd` that is not what OpenRouter reported: costs estimated from catalog prices (the whole
+   * run's cost when `usage.costEstimated`) plus reservations booked for unknown costs. Always <= `costUsd`.
+   */
+  estimatedUsd: number;
   latencyMsTotal: number;
 }
 
@@ -741,6 +751,7 @@ export interface StatsService {
   monthSpend(opts?: { keyId?: string }): Promise<number>;
   /** Requests made to `:free` models today (UTC), counted locally. */
   freeRequestsToday(): Promise<number>;
+  /** `runs` counts runs whose primary model this is (see `StatsRow.runs`). */
   modelSummary(
     model: string,
   ): Promise<{ runs: number; avgLatencyMs: number | null; costUsd: number }>;

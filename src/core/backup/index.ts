@@ -311,8 +311,12 @@ const STATS_NUMBERS = [
   'promptTokens',
   'completionTokens',
   'costUsd',
+  'estimatedUsd',
   'latencyMsTotal',
 ] as const;
+
+/** Fields a backup written before they existed may lack; they import as 0. */
+const STATS_OPTIONAL = new Set<string>(['estimatedUsd']);
 
 function toStatsRow(value: unknown): StoredStatsRow | null {
   if (!isPlainObject(value)) return null;
@@ -324,13 +328,15 @@ function toStatsRow(value: unknown): StoredStatsRow | null {
     !isString(model) ||
     !isString(keyId) ||
     typeof free !== 'boolean' ||
-    !STATS_NUMBERS.every((field) => isCount(value[field])) ||
+    !STATS_NUMBERS.every(
+      (field) => isCount(value[field]) || (STATS_OPTIONAL.has(field) && value[field] === undefined),
+    ) ||
     key !== statsKey({ day, tool, model, keyId })
   ) {
     return null;
   }
   const row = { key, day, tool, model, keyId, free } as StoredStatsRow;
-  for (const field of STATS_NUMBERS) row[field] = value[field] as number;
+  for (const field of STATS_NUMBERS) row[field] = (value[field] as number | undefined) ?? 0;
   return row;
 }
 
@@ -716,7 +722,7 @@ export function createBackupService(core: CoreServices): BackupService {
         (incoming, local) => {
           const merged = { ...local };
           for (const field of STATS_NUMBERS)
-            merged[field] = Math.max(local[field], incoming[field]);
+            merged[field] = Math.max(local[field] ?? 0, incoming[field]);
           return merged;
         },
         puts.stats,

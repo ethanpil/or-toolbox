@@ -215,6 +215,7 @@ function statsRow(partial: Partial<StatsRow> = {}): StatsRow & { key: string } {
     promptTokens: 1,
     completionTokens: 1,
     costUsd: 0.1,
+    estimatedUsd: 0,
     latencyMsTotal: 10,
     ...partial,
   };
@@ -599,6 +600,25 @@ describe('merge details', () => {
     expect(preview.changes).toContain('Skip 1 stats row (invalid records)');
     expect(await (await getDb()).getAll('stats')).toEqual([
       { ...local, requests: 7, runs: 9, costUsd: 0.5 },
+    ]);
+  });
+
+  it('imports stats rows without the estimated part as 0, and keeps the larger estimated part', async () => {
+    const local = statsRow({ costUsd: 0.5, estimatedUsd: 0.2 });
+    await (await getDb()).put('stats', local);
+    const old: Record<string, unknown> = { ...statsRow({ day: '2026-10-02' }) };
+    delete old['estimatedUsd'];
+    const blob = backupBlob({
+      stats: [
+        statsRow({ costUsd: 0.5, estimatedUsd: 0.4 }),
+        old as unknown as StatsRow & { key: string },
+      ],
+    });
+    await core.backup.import(blob, { mode: 'merge' });
+    const rows = await (await getDb()).getAll('stats');
+    expect(rows.map((r) => [r.day, r.estimatedUsd])).toEqual([
+      ['2026-10-01', 0.4],
+      ['2026-10-02', 0],
     ]);
   });
 
