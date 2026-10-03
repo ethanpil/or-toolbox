@@ -9,11 +9,14 @@
     "image/png",
     "image/jpeg",
     "image/webp",
+    "image/gif",
     "application/pdf",
-    "text/plain",
-    "text/markdown"
+    "text/*",
+    "application/json",
+    "application/xml",
+    "audio/*"
   ],
-  "produces": ["text/markdown"],
+  "produces": ["text/markdown", "application/json"],
   "usesJobs": false,
   "lazyLibs": ["marked", "dompurify"],
   "defaults": {}

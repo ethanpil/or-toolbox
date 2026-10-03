@@ -42,6 +42,7 @@ All notable changes to this project are documented here. The format follows
 - Data extractor: visual schema builder with five presets and saved schemas, batch extraction with strict structured outputs (JSON mode and one repair otherwise), editable review grid, JSON, CSV and XLSX exports (a83381c).
 - Table extractor: tables and charts per page into editable grids with merge across pages; CSV, ZIP, XLSX and Markdown exports, copy as TSV (25d06e2).
 - Stage 3 e2e gates for the document tools, a 20-page PDF fixture with its generator, and `mock.respond()` for request-dependent mocks.
+- Chat tool: branching threads (edit and regenerate keep the old branch, ‹ 1/3 ›), per-chat model switch, fallback models, image/PDF/audio/text attachments, system prompt presets, reasoning effort, streamed Markdown replies with tokens, cost and latency, context trimming, Markdown and JSON export, thread search, rename and delete with Undo (b820a75, 90fa95b, fef8d74).
 
 ### Changed
 
@@ -56,6 +57,7 @@ All notable changes to this project are documented here. The format follows
 - One modal at a time (queued), toasts with actions never auto-hide, `setFieldError()` for field errors (1db3bfd); re-renders keep focus through `data-focus-key` (20bdddc).
 - Platform pages share small helpers instead of per-page copies (star button, data table, key balance view, `loadInto`, `copyWithToast`, `saveSettings`, `formatInt`/`formatDate`, `debounce`, one `CAPABILITY_INFO`); Settings builds a section when first shown; model search is debounced with cached normalised fields; `/` and Ctrl/Cmd+K respect dialogs and fields (b4948b5, 240f925, 78749a9).
 - `exportMenu` formats may set their own file name (6d07e24).
+- File types: untyped source files (`.py`, `.yaml`, `.js`…) get `text/x-*` types, so `text/*` tools take them (5afda1e).
 
 ### Fixed
 

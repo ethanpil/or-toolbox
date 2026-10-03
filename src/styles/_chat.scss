@@ -1,0 +1,160 @@
+// Chat (src/tools/chat): the conversation log, messages, attachments and the thread list.
+
+.or-chat-log {
+  min-height: 16rem;
+  max-height: 70vh;
+  padding: 0.25rem;
+  margin: -0.25rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+
+  &:focus-visible {
+    border-radius: var(--bs-border-radius);
+    outline: 2px solid var(--or-focus-color);
+    outline-offset: 2px;
+  }
+}
+
+.or-chat-msg {
+  padding: 0.75rem 1rem 0.5rem;
+  overflow-wrap: anywhere;
+  border-radius: var(--bs-border-radius-lg);
+
+  & + & {
+    margin-top: 0.75rem;
+  }
+}
+
+.or-chat-msg-user {
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color-translucent);
+}
+
+.or-chat-msg-reply {
+  border: 1px solid transparent;
+}
+
+.or-chat-author {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.or-chat-body {
+  margin-top: 0.375rem;
+
+  // Headings in a reply structure the reply; they should not outshout the page.
+  :is(h1, h2, h3, h4, h5, h6) {
+    margin-top: 1rem;
+    font-weight: 600;
+
+    &:first-child {
+      margin-top: 0;
+    }
+  }
+
+  h1 {
+    font-size: 1.25rem;
+  }
+
+  h2 {
+    font-size: 1.125rem;
+  }
+
+  :is(h3, h4, h5, h6) {
+    font-size: 1rem;
+  }
+}
+
+.or-chat-msg-foot {
+  min-height: 2rem;
+  margin-top: 0.25rem;
+}
+
+// Icon buttons in messages and lists: at least 24 × 24 px (WCAG 2.2 target size).
+.or-chat-action {
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0.25rem;
+  color: var(--bs-secondary-color);
+  text-decoration: none;
+
+  &:hover,
+  &:focus-visible {
+    color: var(--bs-emphasis-color);
+  }
+}
+
+.or-chat-reasoning {
+  margin-top: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  background-color: var(--or-inset);
+  border-radius: var(--bs-border-radius);
+
+  > summary {
+    color: var(--bs-secondary-color);
+    cursor: pointer;
+  }
+
+  > div {
+    max-height: 16rem;
+    margin-top: 0.375rem;
+    overflow-y: auto;
+  }
+}
+
+// Attachment chips (composer and sent messages).
+.or-chat-attachment {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  max-width: 16rem;
+  padding: 0.25rem 0.5rem;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius);
+
+  > .bi {
+    font-size: 1.25rem;
+    color: var(--bs-secondary-color);
+  }
+
+  &.is-missing {
+    border-style: dashed;
+  }
+}
+
+.or-chat-thumb {
+  flex-shrink: 0;
+  width: 2.5rem;
+  height: 2.5rem;
+  object-fit: cover;
+  border-radius: calc(var(--bs-border-radius) - 2px);
+}
+
+// Code blocks in replies carry a Copy button.
+.or-code-block {
+  position: relative;
+
+  > pre {
+    padding-right: 3rem;
+  }
+}
+
+.or-code-copy {
+  position: absolute;
+  top: 0.375rem;
+  right: 0.375rem;
+  background-color: var(--or-surface);
+}
+
+.or-thread-list {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.or-thread-option {
+  --bs-btn-hover-bg: var(--bs-tertiary-bg);
+  --bs-btn-active-bg: var(--bs-secondary-bg);
+  border: 0;
+  border-radius: 0;
+}
