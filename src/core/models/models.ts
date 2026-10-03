@@ -124,7 +124,7 @@ export function createModelsService(
   core: CoreServices,
   options: ModelsServiceOptions = {},
 ): ModelsService {
-  const now = options.now ?? Date.now;
+  const now = options.now ?? (() => Date.now());
   const maxAgeMs = options.maxAgeMs ?? CATALOG_MAX_AGE_MS;
   let emitting = false;
   let listening = false;

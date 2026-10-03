@@ -36,7 +36,7 @@ export class FreeModelThrottle {
     this.limit = options.limit ?? 20;
     this.windowMs = options.windowMs ?? 60_000;
     this.storage = options.storage ?? local;
-    this.now = options.now ?? Date.now;
+    this.now = options.now ?? (() => Date.now());
   }
 
   /** Waits until a request slot is free, then records the request. Rejects with AbortError on abort. */
