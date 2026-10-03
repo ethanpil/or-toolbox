@@ -10,3 +10,4 @@ blob-report/
 Thumbs.db
 .env
 .env.*
+.claude/worktrees/

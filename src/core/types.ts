@@ -777,7 +777,7 @@ export interface DataService {
   storage(): Promise<{ usedBytes: number | null; quotaBytes: number | null }>;
   /** History + prompts for one tool. */
   deleteToolData(tool: ToolId): Promise<void>;
-  /** All prompts, history, jobs, tool state and stats; keys and settings untouched. */
+  /** All prompts, history, jobs and tool state; keys, settings and stats (the budget ledger) untouched. */
   deleteAllPromptsAndHistory(): Promise<void>;
   /** Everything, including keys and settings. */
   resetEverything(): Promise<void>;

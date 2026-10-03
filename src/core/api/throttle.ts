@@ -5,14 +5,11 @@
  * or two; OpenRouter's own 429 handling covers that). Without localStorage the window is per tab.
  */
 
-import { local } from '../storage/local';
+import { LS_KEYS, local } from '../storage/local';
 import { sleep, throwIfAborted } from './retry';
 
-/**
- * localStorage key holding the shared request timestamps (JSON number[]). Not secret, safe to delete.
- * Move into `LS_KEYS` (src/core/storage/local.ts) at integration.
- */
-export const FREE_THROTTLE_STORAGE_KEY = 'ortoolbox:free-requests';
+/** localStorage key holding the shared request timestamps (JSON number[]). Not secret, safe to delete. */
+export const FREE_THROTTLE_STORAGE_KEY = LS_KEYS.freeRequests;
 
 export interface FreeThrottleOptions {
   limit?: number;

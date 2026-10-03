@@ -83,18 +83,18 @@ describe('deletion', () => {
     expect((await counts()).stats).toBe(2); // stats rows survive
   });
 
-  it('deletes all prompts, history, jobs, tool state and stats, keeping keys and settings', async () => {
+  it('deletes all prompts, history, jobs and tool state, keeping keys, settings and stats', async () => {
     await core.data.deleteAllPromptsAndHistory();
     expect(await counts()).toEqual({
       runs: 0,
       prompts: 0,
       jobs: 0,
-      stats: 0,
+      stats: 2, // the budget ledger survives
       kv: ['meta:lastPrune', 'models:catalog'],
     });
     expect(core.settings.get().freeOnly).toBe(true);
     expect(localStorage.getItem(LS_KEYS.keys)).not.toBeNull();
-    expect(events).toEqual(['history-changed', 'prompts-changed', 'stats-changed', 'jobs-changed']);
+    expect(events).toEqual(['history-changed', 'prompts-changed', 'jobs-changed']);
   });
 
   it('resets everything, including keys, settings and session secrets', async () => {

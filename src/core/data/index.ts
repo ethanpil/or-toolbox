@@ -26,20 +26,20 @@ export function createDataService(core: CoreServices): DataService {
     },
 
     async deleteAllPromptsAndHistory() {
+      // Stats rollups hold no prompt text (tool, model, tokens, cost) and are the budget ledger, so they
+      // survive this; otherwise clearing history for privacy would silently reset this month's spend.
       const db = await getDb();
-      const tx = db.transaction(['runs', 'prompts', 'jobs', 'stats', 'kv'], 'readwrite');
+      const tx = db.transaction(['runs', 'prompts', 'jobs', 'kv'], 'readwrite');
       const jobIds = await tx.objectStore('jobs').getAllKeys();
       await Promise.all([
         tx.objectStore('runs').clear(),
         tx.objectStore('prompts').clear(),
         tx.objectStore('jobs').clear(),
-        tx.objectStore('stats').clear(),
         tx.objectStore('kv').delete(prefixRange(TOOL_STATE_PREFIX)),
         tx.done,
       ]);
       core.bus.emit({ type: 'history-changed' });
       core.bus.emit({ type: 'prompts-changed', tool: 'all' });
-      core.bus.emit({ type: 'stats-changed' });
       for (const id of jobIds) core.bus.emit({ type: 'jobs-changed', id });
     },
 
@@ -54,7 +54,9 @@ export function createDataService(core: CoreServices): DataService {
         tx.objectStore('kv').clear(),
         tx.done,
       ]);
-      for (const key of [LS_KEYS.settings, LS_KEYS.keys, LS_KEYS.bus]) removeItem(local(), key);
+      for (const key of [LS_KEYS.settings, LS_KEYS.keys, LS_KEYS.bus, LS_KEYS.freeRequests]) {
+        removeItem(local(), key);
+      }
       for (const key of [SS_KEYS.unlocked, SS_KEYS.oauth]) removeItem(session(), key);
       core.bus.emit({ type: 'settings-changed' });
       core.bus.emit({ type: 'keys-changed' });

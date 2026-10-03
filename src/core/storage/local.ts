@@ -10,6 +10,8 @@ export const LS_KEYS = {
   keys: 'ortoolbox:keys',
   /** Fallback channel for cross-tab events when BroadcastChannel is unavailable. */
   bus: 'ortoolbox:bus',
+  /** Timestamps of recent `:free` requests, shared by tabs for the 20/min client throttle. */
+  freeRequests: 'ortoolbox:free-requests',
 } as const;
 
 export const SS_KEYS = {

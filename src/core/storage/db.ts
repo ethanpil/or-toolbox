@@ -14,7 +14,7 @@ export type StoredStatsRow = StatsRow & { key: string };
 
 /**
  * `kv` keys in use: `tool:<toolId>:<key>` (ToolStateStore), `models:catalog`, `models:images`, `models:videos`,
- * `meta:<name>` (bookkeeping such as the last prune time).
+ * `models:endpoints:<modelId>`, `meta:<name>` (bookkeeping such as the last prune time).
  */
 export interface KvEntry {
   key: string;

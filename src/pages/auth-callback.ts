@@ -7,8 +7,9 @@
  */
 import { boot } from '../core/boot';
 import { userMessage } from '../core/errors';
+import { getCore } from '../core/index';
 import { url } from '../core/paths';
-import type { CoreServices, OAuthService } from '../core/types';
+import type { OAuthService } from '../core/types';
 import { h } from '../ui/dom';
 import { renderStubPage } from '../ui/stub';
 
@@ -81,29 +82,14 @@ export async function mountAuthCallback(status: HTMLElement, env: AuthCallbackEn
   }
 }
 
-/**
- * INTEGRATION POINT: return the shared core from the composition root (e.g. `return getCore();`). Until it
- * exists the page renders its frame and says sign-in is unavailable, without errors.
- */
-function pageCore(): Pick<CoreServices, 'oauth'> | null {
-  return null;
-}
-
 if (document.getElementById('app')) {
   boot();
   const status = h('div', { role: 'status', 'aria-live': 'polite', 'data-testid': 'auth-status' });
   renderStubPage('Signing in', status);
-  const core = pageCore();
-  if (core) {
-    void mountAuthCallback(status, {
-      oauth: core.oauth,
-      search: location.search,
-      clearQuery: () => history.replaceState(history.state, '', location.pathname),
-      redirect: (path) => location.replace(path),
-    });
-  } else {
-    status.replaceChildren(
-      h('p', { class: 'text-body-secondary' }, 'Sign-in is not available in this build yet.'),
-    );
-  }
+  void mountAuthCallback(status, {
+    oauth: getCore().oauth,
+    search: location.search,
+    clearQuery: () => history.replaceState(history.state, '', location.pathname),
+    redirect: (path) => location.replace(path),
+  });
 }
