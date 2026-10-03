@@ -2,6 +2,8 @@
  * Privacy: what ORtoolbox stores, where, and what leaves the browser, in plain language. Keep it in step with
  * CLAUDE.md ("Shared origin", storage rules) and the CSP when either changes.
  */
+import { dataTable } from '../ui/components/data-table';
+import { externalLink } from '../ui/components/external-link';
 import { type Child, h } from '../ui/dom';
 import { icon } from '../ui/icon';
 import { mountPage } from '../ui/shell/index';
@@ -11,14 +13,6 @@ import {
   OPENROUTER_ZDR_URL,
   settingsUrl,
 } from '../ui/shell/links';
-
-const external = (href: string, text: string): HTMLElement =>
-  h(
-    'a',
-    { href, target: '_blank', rel: 'noopener noreferrer' },
-    text,
-    h('span', { class: 'visually-hidden' }, ' (opens in a new tab)'),
-  );
 
 const section = (id: string, iconName: string, title: string, ...body: Child[]): HTMLElement =>
   h(
@@ -105,63 +99,29 @@ mountPage(
         'privacy-storage',
         'database',
         'What is stored where',
-        h(
-          'div',
-          { class: 'table-responsive position-relative' },
-          h(
-            'table',
-            { class: 'table align-middle mb-0' },
-            h(
-              'thead',
-              null,
-              h('tr', null, h('th', { scope: 'col' }, 'Where'), h('th', { scope: 'col' }, 'What')),
-            ),
-            h(
-              'tbody',
-              null,
-              h(
-                'tr',
-                null,
-                h('th', { scope: 'row' }, 'Local storage'),
-                h(
-                  'td',
-                  null,
-                  'Settings, favourites and your API keys (keys encrypted when the passphrase lock is on).',
-                ),
-              ),
-              h(
-                'tr',
-                null,
-                h('th', { scope: 'row' }, 'IndexedDB'),
-                h(
-                  'td',
-                  null,
-                  'Text-only history of runs (prompts, settings and text results), recent and saved prompts, each tool’s own saved work (such as a video sequence), the video job queue, the cached model list and spending stats.',
-                ),
-              ),
-              h(
-                'tr',
-                null,
-                h('th', { scope: 'row' }, 'Session storage'),
-                h(
-                  'td',
-                  null,
-                  'The unlocked key while the passphrase lock is open, and the short-lived sign-in state of “Connect with OpenRouter”. Cleared when the tab closes.',
-                ),
-              ),
-              h(
-                'tr',
-                null,
-                h('th', { scope: 'row' }, 'Memory only'),
-                h(
-                  'td',
-                  null,
-                  'Images, audio, video and files you upload or generate. They are never written to disk by the site; download them before you leave the page.',
-                ),
-              ),
-            ),
-          ),
-        ),
+        dataTable({
+          scrollerLabel: 'What is stored where',
+          head: ['Where', 'What'],
+          rowHeaderClass: '',
+          rows: [
+            [
+              'Local storage',
+              'Settings, favourites and your API keys (keys encrypted when the passphrase lock is on).',
+            ],
+            [
+              'IndexedDB',
+              'Text-only history of runs (prompts, settings and text results), recent and saved prompts, each tool’s own saved work (such as a video sequence), the video job queue, the cached model list and spending stats.',
+            ],
+            [
+              'Session storage',
+              'The unlocked key while the passphrase lock is open, and the short-lived sign-in state of “Connect with OpenRouter”. Cleared when the tab closes.',
+            ],
+            [
+              'Memory only',
+              'Images, audio, video and files you upload or generate. They are never written to disk by the site; download them before you leave the page.',
+            ],
+          ],
+        }),
         h(
           'p',
           { class: 'mt-3' },
@@ -203,7 +163,7 @@ mountPage(
             'li',
             null,
             'Safest of all: give each key a credit limit in ',
-            external(OPENROUTER_KEYS_URL, 'your OpenRouter key list'),
+            externalLink(OPENROUTER_KEYS_URL, 'your OpenRouter key list'),
             ', so a leaked key can only spend that much.',
           ),
         ),
@@ -251,11 +211,11 @@ mountPage(
         h(
           'ul',
           { class: 'mb-0' },
-          h('li', null, external(OPENROUTER_PRIVACY_URL, 'OpenRouter privacy policy')),
+          h('li', null, externalLink(OPENROUTER_PRIVACY_URL, 'OpenRouter privacy policy')),
           h(
             'li',
             null,
-            external(OPENROUTER_ZDR_URL, 'Zero data retention'),
+            externalLink(OPENROUTER_ZDR_URL, 'Zero data retention'),
             ': how OpenRouter limits requests to providers that keep nothing.',
           ),
         ),

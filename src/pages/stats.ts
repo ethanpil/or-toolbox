@@ -10,20 +10,21 @@
  * - Breakdown tables by tool, model (with tokens, latency and error rate) and key.
  * - Budget burn-down for the month, free requests today, and each key's balance and spend.
  */
-import { errorCode, userMessage } from '../core/errors';
-import { DAY_MS, MAX_TIMEOUT_MS, utcDay } from '../core/util';
+import { userMessage } from '../core/errors';
+import { DAY_MS, debounce, MAX_TIMEOUT_MS, utcDay } from '../core/util';
 import { url } from '../core/paths';
 import type { CoreServices, KeyInfo, KeyStatus, StatsRow } from '../core/types';
-import { getTool } from '../tools/registry';
-import type { ToolId } from '../tools/types';
+import { findTool } from '../tools/registry';
+import { dataTable } from '../ui/components/data-table';
 import { emptyState } from '../ui/components/empty-state';
+import { accountFreeDaily, keyBalanceView } from '../ui/components/key-balance';
 import { keyDot } from '../ui/components/key-picker';
 import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
-import { unlockDialog } from '../ui/feedback/unlock';
-import { formatCount, formatMs, formatUsd, plural } from '../ui/format';
+import { formatCount, formatDate, formatInt, formatMs, formatUsd, plural } from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
+import { saveSettings } from '../ui/settings-actions';
 import { mountPage } from '../ui/shell/index';
 import { settingsUrl } from '../ui/shell/links';
 import type * as StatsCharts from './stats-charts';
@@ -95,12 +96,6 @@ const approximately = (text: string, estimatedUsd: number): Child =>
   estimatedUsd > 0
     ? [h('span', { class: 'or-kpi-approx', title: 'Includes estimated costs' }, '≈'), ' ', text]
     : text;
-
-const dayFull = (day: string): string =>
-  new Date(`${day}T00:00:00Z`).toLocaleDateString('en-US', {
-    dateStyle: 'medium',
-    timeZone: 'UTC',
-  });
 
 // --- chart card -----------------------------------------------------------------------------------------------
 
@@ -288,50 +283,16 @@ class ChartCard {
 
   private renderTable(data: CardData): void {
     this.tableHost.replaceChildren(
-      h(
-        'div',
-        {
-          class: 'or-data-table',
-          role: 'region',
-          tabIndex: 0,
-          'aria-label': `${this.options.title}, table view`,
-        },
-        h(
-          'table',
-          { class: 'table table-sm mb-0', 'data-testid': `${this.options.testId}-table` },
-          h(
-            'caption',
-            { class: 'visually-hidden' },
-            `${this.options.title}, one row per day with data`,
-          ),
-          h(
-            'thead',
-            null,
-            h(
-              'tr',
-              null,
-              data.table.head.map((label, index) =>
-                h('th', { scope: 'col', class: index > 0 ? 'text-end' : '' }, label),
-              ),
-            ),
-          ),
-          h(
-            'tbody',
-            null,
-            data.table.body.map((cells) =>
-              h(
-                'tr',
-                null,
-                cells.map((cell, index) =>
-                  index === 0
-                    ? h('th', { scope: 'row', class: 'fw-normal' }, cell)
-                    : h('td', { class: 'text-end' }, cell),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
+      dataTable({
+        scrollerLabel: `${this.options.title}, table view`,
+        scrollerClass: 'or-data-table',
+        caption: `${this.options.title}, one row per day with data`,
+        class: 'table table-sm mb-0',
+        testId: `${this.options.testId}-table`,
+        head: data.table.head,
+        numericFrom: 1,
+        rows: data.table.body,
+      }),
     );
   }
 
@@ -397,7 +358,7 @@ class StatsPage {
   private allRows: StatsRow[] = [];
   private dimension: SeriesDimension = 'tool';
   private generation = 0;
-  private reloadTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly reloadSoon = debounce(() => void this.reload(), 250);
   private budgetGeneration = 0;
 
   private readonly presetButtons = new Map<RangePreset, HTMLButtonElement>();
@@ -522,7 +483,7 @@ class StatsPage {
     this.renderBudget();
     void this.reload();
 
-    this.core.stats.subscribe(() => this.scheduleReload());
+    this.core.stats.subscribe(() => this.reloadSoon());
     // A page left open (or a tab brought back) on a new UTC day shows the new day's ranges.
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && utcDay() !== this.loadedDay) void this.reload();
@@ -600,13 +561,14 @@ class StatsPage {
     this.customError.hidden = true;
     this.fromInput.value = this.range.from;
     this.toInput.value = this.range.to;
-    try {
-      this.core.settings.update((draft) => {
+    // Not remembered when storage is full; the range still applies.
+    saveSettings(
+      this.core,
+      (draft) => {
         draft.ui[RANGE_KEY] = preset;
-      });
-    } catch {
-      // Not remembered; the range still applies.
-    }
+      },
+      { onError: () => undefined },
+    );
     this.syncRangeControls();
     if (this.ledgerReady) this.showRange(true);
     else void this.reload(true);
@@ -639,11 +601,6 @@ class StatsPage {
   }
 
   // --- data ----------------------------------------------------------------------------------------------
-
-  private scheduleReload(): void {
-    clearTimeout(this.reloadTimer);
-    this.reloadTimer = setTimeout(() => void this.reload(), 250);
-  }
 
   /** Reloads at the next UTC midnight (a little after), so the relative ranges and "this month" roll over. */
   private scheduleRollover(): void {
@@ -891,14 +848,14 @@ class StatsPage {
       this.tile({
         id: 'requests',
         label: 'Requests',
-        value: totals.requests.toLocaleString('en-US'),
+        value: formatInt(totals.requests),
         note: this.deltaNote(totals.requests, before.requests),
         columns: small,
       }),
       this.tile({
         id: 'runs',
         label: 'Runs',
-        value: totals.runs.toLocaleString('en-US'),
+        value: formatInt(totals.runs),
         note: this.deltaNote(totals.runs, before.runs),
         columns: small,
       }),
@@ -921,7 +878,7 @@ class StatsPage {
         id: 'free',
         label: 'Free vs paid',
         value: share === null ? '—' : `${formatPercent(share)} free`,
-        note: `${totals.freeRequests.toLocaleString('en-US')} free · ${totals.paidRequests.toLocaleString('en-US')} paid requests`,
+        note: `${formatInt(totals.freeRequests)} free · ${formatInt(totals.paidRequests)} paid requests`,
         columns: small,
         extra:
           share === null
@@ -955,13 +912,7 @@ class StatsPage {
 
   private entityLabel(id: string): string {
     if (id === OTHER) return 'Other';
-    if (this.dimension === 'tool') {
-      try {
-        return getTool(id as ToolId).name;
-      } catch {
-        return id;
-      }
-    }
+    if (this.dimension === 'tool') return findTool(id)?.name ?? id;
     return id;
   }
 
@@ -978,7 +929,7 @@ class StatsPage {
     return {
       input: {
         labels: days.map(shortDay),
-        titles: days.map(dayFull),
+        titles: days.map((day) => formatDate(day)),
         series: series.map((s) => ({
           id: s.id,
           label: label(s.id),
@@ -1048,9 +999,9 @@ class StatsPage {
         head: ['Model', 'Tokens in', 'Tokens out', 'Total'],
         body: bars.map((bar) => [
           bar.model,
-          bar.promptTokens.toLocaleString('en-US'),
-          bar.completionTokens.toLocaleString('en-US'),
-          (bar.promptTokens + bar.completionTokens).toLocaleString('en-US'),
+          formatInt(bar.promptTokens),
+          formatInt(bar.completionTokens),
+          formatInt(bar.promptTokens + bar.completionTokens),
         ]),
       },
       summary: `Tokens in and out for ${plural(bars.length, 'model')}. Busiest: ${busiest.model} with ${formatCount(busiest.promptTokens + busiest.completionTokens)} tokens. The table view lists every value.`,
@@ -1076,49 +1027,19 @@ class StatsPage {
         h('h3', { class: 'h6 mb-3' }, options.title),
         options.groups.length === 0
           ? h('p', { class: 'text-body-secondary mb-0' }, 'Nothing in this period.')
-          : h(
-              'div',
-              {
-                class: 'table-responsive position-relative',
-                role: 'region',
-                tabIndex: 0,
-                'aria-label': `${options.title}, table`,
-              },
-              h(
-                'table',
-                { class: 'table table-sm align-middle mb-0 or-breakdown-table' },
-                h(
-                  'thead',
-                  null,
-                  h(
-                    'tr',
-                    null,
-                    h('th', { scope: 'col' }, options.first),
-                    options.columns.map((column) =>
-                      h('th', { scope: 'col', class: 'text-end' }, column.label),
-                    ),
-                  ),
-                ),
-                h(
-                  'tbody',
-                  null,
-                  options.groups.map((group) =>
-                    h(
-                      'tr',
-                      { 'data-testid': `${options.testId}-row` },
-                      h(
-                        'th',
-                        { scope: 'row', class: 'fw-normal text-break' },
-                        options.label(group),
-                      ),
-                      options.columns.map((column) =>
-                        h('td', { class: 'text-end text-nowrap' }, column.cell(group)),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
+          : dataTable({
+              scrollerLabel: `${options.title}, table`,
+              class: 'table table-sm align-middle mb-0 or-breakdown-table',
+              head: [options.first, ...options.columns.map((column) => column.label)],
+              numericFrom: 1,
+              rowTestId: `${options.testId}-row`,
+              rowHeaderClass: 'fw-normal text-break',
+              cellClass: 'text-nowrap',
+              rows: options.groups.map((group) => [
+                options.label(group),
+                ...options.columns.map((column) => column.cell(group)),
+              ]),
+            }),
       ),
     );
   }
@@ -1165,7 +1086,7 @@ class StatsPage {
 
   private renderBreakdowns(): void {
     const total = totalsOf(this.rows);
-    const requests = (group: Group): string => group.requests.toLocaleString('en-US');
+    const requests = (group: Group): string => formatInt(group.requests);
 
     this.toolTableHost.replaceChildren(
       this.breakdownTable({
@@ -1174,16 +1095,12 @@ class StatsPage {
         first: 'Tool',
         groups: groupBy(this.rows, 'tool'),
         label: (group) => {
-          try {
-            const tool = getTool(group.id as ToolId);
-            return [icon(tool.icon, 'me-2 text-body-secondary'), tool.name];
-          } catch {
-            // A tool that no longer exists keeps its id.
-            return group.id;
-          }
+          const tool = findTool(group.id);
+          // A tool that no longer exists keeps its id.
+          return tool ? [icon(tool.icon, 'me-2 text-body-secondary'), tool.name] : group.id;
         },
         columns: [
-          { label: 'Runs', cell: (group) => group.runs.toLocaleString('en-US') },
+          { label: 'Runs', cell: (group) => formatInt(group.runs) },
           { label: 'Requests', cell: requests },
           { label: 'Spend', cell: (group) => this.spendCell(group, total.costUsd) },
         ],
@@ -1197,7 +1114,7 @@ class StatsPage {
       groups: groupBy(this.rows, 'model'),
       label: (group) => group.id,
       columns: [
-        { label: 'Runs', cell: (group) => group.runs.toLocaleString('en-US') },
+        { label: 'Runs', cell: (group) => formatInt(group.runs) },
         { label: 'Requests', cell: requests },
         { label: 'Spend', cell: (group) => this.spendCell(group, total.costUsd) },
         { label: 'Tokens in', cell: (group) => formatCount(group.promptTokens) },
@@ -1296,18 +1213,10 @@ class StatsPage {
     );
     monthCard.replaceChildren(this.monthCard(totalsOf(month), settings.budgets));
 
-    const statuses = new Map<string, KeyStatus | Error>();
-    const statusLoads = keys.map(async (key) => {
-      try {
-        statuses.set(key.id, await this.core.keys.status(key.id));
-      } catch (error) {
-        statuses.set(key.id, error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-    void Promise.all(statusLoads).then(() => {
+    keysCard.replaceChildren(this.keysCard(keys, monthByKey, settings.budgets));
+    void accountFreeDaily(this.core).then((remote) => {
       if (mine !== this.budgetGeneration) return;
-      freeCard.replaceChildren(this.freeCard(freeToday, [...statuses.values()]));
-      keysCard.replaceChildren(this.keysCard(keys, statuses, monthByKey, settings.budgets));
+      freeCard.replaceChildren(this.freeCard(freeToday, remote));
     });
   }
 
@@ -1433,10 +1342,7 @@ class StatsPage {
     );
   }
 
-  private freeCard(today: number, statuses: (KeyStatus | Error)[]): HTMLElement {
-    const remote = statuses.find(
-      (status): status is KeyStatus => !(status instanceof Error) && status.freeDaily !== null,
-    )?.freeDaily;
+  private freeCard(today: number, remote: KeyStatus['freeDaily']): HTMLElement {
     return h(
       'section',
       {
@@ -1448,11 +1354,7 @@ class StatsPage {
         'div',
         { class: 'card-body' },
         h('h3', { class: 'h6 mb-2' }, 'Free requests today'),
-        h(
-          'div',
-          { class: 'or-kpi-value mb-1', 'data-testid': 'free-today' },
-          today.toLocaleString('en-US'),
-        ),
+        h('div', { class: 'or-kpi-value mb-1', 'data-testid': 'free-today' }, formatInt(today)),
         h(
           'div',
           { class: 'or-kpi-note mb-2' },
@@ -1488,7 +1390,6 @@ class StatsPage {
 
   private keysCard(
     keys: KeyInfo[],
-    statuses: Map<string, KeyStatus | Error>,
     monthByKey: Map<string, Totals>,
     budgets: { perKeyMonthlyUsd: Record<string, number | null> },
   ): HTMLElement {
@@ -1510,53 +1411,6 @@ class StatsPage {
         }),
       );
     }
-    const balance = (key: KeyInfo): Child => {
-      const status = statuses.get(key.id);
-      if (!status) return '—';
-      if (status instanceof Error) {
-        if (errorCode(status) === 'locked') {
-          return h(
-            'button',
-            {
-              type: 'button',
-              class: 'btn btn-sm btn-outline-secondary',
-              'data-testid': 'balance-unlock',
-              onclick: () => void unlockDialog().then((ok) => ok && this.renderBudget()),
-            },
-            icon('unlock', 'me-1'),
-            'Unlock to see',
-          );
-        }
-        return h(
-          'span',
-          {
-            class: 'text-body-secondary',
-            title: userMessage(status),
-            'data-testid': 'balance-error',
-          },
-          'Unavailable',
-        );
-      }
-      if (status.limitUsd !== null) {
-        const left = status.limitRemainingUsd ?? Math.max(0, status.limitUsd - status.usageUsd);
-        return h(
-          'span',
-          { 'data-testid': 'balance' },
-          `${formatUsd(left)} left`,
-          h('span', { class: 'text-body-secondary' }, ` of ${formatUsd(status.limitUsd)}`),
-        );
-      }
-      return h(
-        'span',
-        { 'data-testid': 'balance' },
-        `${formatUsd(status.usageUsd)} used`,
-        h(
-          'span',
-          { class: 'text-body-secondary' },
-          status.isFreeTier ? ' · free tier' : ' · no limit',
-        ),
-      );
-    };
     const monthly = (key: KeyInfo): Child => {
       const totals = monthByKey.get(key.id);
       const spend = totals?.costUsd ?? 0;
@@ -1586,6 +1440,27 @@ class StatsPage {
         ),
       );
     };
+    const row = (key: KeyInfo): HTMLElement => {
+      const balance = keyBalanceView(this.core, key, { compact: true });
+      balance.load();
+      return h(
+        'tr',
+        { 'data-testid': 'budget-key-row' },
+        h(
+          'th',
+          { scope: 'row', class: 'fw-normal' },
+          h(
+            'span',
+            { class: 'd-inline-flex align-items-center gap-2' },
+            keyDot(key),
+            key.name,
+            h('span', { class: 'small text-body-secondary' }, key.masked),
+          ),
+        ),
+        h('td', { class: 'text-end text-nowrap' }, balance.element),
+        h('td', { class: 'text-end' }, monthly(key)),
+      );
+    };
     return h(
       'section',
       { class: 'card shadow-sm', 'aria-label': 'Keys', 'data-testid': 'budget-keys' },
@@ -1593,53 +1468,13 @@ class StatsPage {
         'div',
         { class: 'card-body' },
         h('h3', { class: 'h6 mb-3' }, 'Keys'),
-        h(
-          'div',
-          {
-            class: 'table-responsive position-relative',
-            role: 'region',
-            tabIndex: 0,
-            'aria-label': 'Keys, table',
-          },
-          h(
-            'table',
-            { class: 'table table-sm align-middle mb-0' },
-            h(
-              'thead',
-              null,
-              h(
-                'tr',
-                null,
-                h('th', { scope: 'col' }, 'Key'),
-                h('th', { scope: 'col', class: 'text-end' }, 'Balance at OpenRouter'),
-                h('th', { scope: 'col', class: 'text-end' }, 'Spent this month here'),
-              ),
-            ),
-            h(
-              'tbody',
-              null,
-              keys.map((key) =>
-                h(
-                  'tr',
-                  { 'data-testid': 'budget-key-row' },
-                  h(
-                    'th',
-                    { scope: 'row', class: 'fw-normal' },
-                    h(
-                      'span',
-                      { class: 'd-inline-flex align-items-center gap-2' },
-                      keyDot(key),
-                      key.name,
-                      h('span', { class: 'small text-body-secondary' }, key.masked),
-                    ),
-                  ),
-                  h('td', { class: 'text-end text-nowrap' }, balance(key)),
-                  h('td', { class: 'text-end' }, monthly(key)),
-                ),
-              ),
-            ),
-          ),
-        ),
+        dataTable({
+          scrollerLabel: 'Keys, table',
+          class: 'table table-sm align-middle mb-0',
+          head: ['Key', 'Balance at OpenRouter', 'Spent this month here'],
+          numericFrom: 1,
+          rows: keys.map(row),
+        }),
       ),
     );
   }

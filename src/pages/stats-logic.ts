@@ -5,9 +5,8 @@
  * covers the numbers; stats.ts draws them and stats-charts.ts hands them to Chart.js.
  */
 import type { StatsRow } from '../core/types';
-import { utcDay, utcMonthStart } from '../core/util';
-
-const DAY_MS = 86_400_000;
+import { DAY_MS, utcDay, utcMonthStart } from '../core/util';
+import { formatDate } from '../ui/format';
 
 // --- ranges -----------------------------------------------------------------------------------------------
 
@@ -106,26 +105,15 @@ export function daysOf(range: DateRange): string[] {
 
 /** `Sep 4 to Oct 3, 2026` (UTC days). */
 export function rangeLabel(range: DateRange): string {
-  const format = (day: string, year: boolean): string =>
-    new Date(`${day}T00:00:00Z`).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      ...(year ? { year: 'numeric' } : {}),
-      timeZone: 'UTC',
-    });
   const sameYear = range.from.slice(0, 4) === range.to.slice(0, 4);
   return range.from === range.to
-    ? format(range.to, true)
-    : `${format(range.from, !sameYear)} to ${format(range.to, true)}`;
+    ? formatDate(range.to)
+    : `${formatDate(range.from, { year: !sameYear })} to ${formatDate(range.to)}`;
 }
 
 /** `Oct 3` for chart axes and tables (UTC). */
 export function shortDay(day: string): string {
-  return new Date(`${day}T00:00:00Z`).toLocaleDateString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'UTC',
-  });
+  return formatDate(day, { year: false });
 }
 
 // --- totals and groups ------------------------------------------------------------------------------------

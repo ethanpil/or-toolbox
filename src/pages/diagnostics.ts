@@ -10,6 +10,7 @@ import { type FfmpegDownloadProgress, loadFfmpeg } from '../core/media/ffmpeg';
 import { url } from '../core/paths';
 import { getServiceWorkerReport, type ServiceWorkerReport } from '../core/sw-register';
 import { clear, h } from '../ui/dom';
+import { formatBytes, formatInt } from '../ui/format';
 import { mountPage } from '../ui/shell/index';
 
 // --- environment ------------------------------------------------------------
@@ -23,10 +24,6 @@ interface Row {
   text?: string;
   /** Colours the value: true = good, false = bad, undefined = neutral. */
   ok?: boolean;
-}
-
-function megabytes(bytes: number): string {
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function serviceWorkerText(report: ServiceWorkerReport): string {
@@ -53,7 +50,7 @@ async function storageRow(): Promise<Row> {
   try {
     const { usage, quota } = await navigator.storage.estimate();
     if (usage === undefined || quota === undefined) throw new Error('no estimate');
-    return { ...row, value: String(usage), text: `${megabytes(usage)} of ${megabytes(quota)}` };
+    return { ...row, value: String(usage), text: `${formatBytes(usage)} of ${formatBytes(quota)}` };
   } catch {
     return { ...row, value: 'unknown', text: 'Not reported by this browser' };
   }
@@ -248,7 +245,7 @@ function ffmpegPanel(): HTMLElement {
 
       const elapsed = Math.round(performance.now() - loaded);
       setValue(runTime, String(elapsed), `${elapsed} ms`);
-      setValue(output, String(data.byteLength), `MP4, ${data.byteLength.toLocaleString()} bytes`);
+      setValue(output, String(data.byteLength), `MP4, ${formatInt(data.byteLength)} bytes`);
       previewUrl = URL.createObjectURL(new Blob([new Uint8Array(data)], { type: 'video/mp4' }));
       preview.append(
         h('video', {
