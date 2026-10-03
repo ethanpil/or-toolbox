@@ -343,7 +343,6 @@ describe('poll failures', () => {
     await until(() => handler.poll.mock.calls.length === 1);
     await settle();
 
-
     // eslint-disable-next-line @typescript-eslint/unbound-method -- re-applied with the right `this` below
     const original = IDBObjectStore.prototype.get;
     let failures = 1;

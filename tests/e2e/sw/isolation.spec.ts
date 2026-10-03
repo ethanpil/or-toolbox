@@ -9,11 +9,16 @@ import type { Page } from '@playwright/test';
 import { expect, test } from '../../mock/index.ts';
 import { waitUntilControlled, waitUntilIsolated, watchForProblems } from '../support.ts';
 
-/** Counts documents loaded in the main frame: 1 for the first load, +1 per reload or navigation. */
+/**
+ * Counts documents requested by the main frame: 1 for the first load, +1 per reload or navigation. Counts
+ * navigation requests rather than `framenavigated`, which also fires for same-document history changes (the
+ * OAuth callback removes its single-use code from the address bar with `history.replaceState`), and rather
+ * than `load`, which a reload at page start can pre-empt.
+ */
 function countDocuments(page: Page): () => number {
   let documents = 0;
-  page.on('framenavigated', (frame) => {
-    if (frame === page.mainFrame()) documents += 1;
+  page.on('request', (request) => {
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) documents += 1;
   });
   return () => documents;
 }
@@ -56,7 +61,10 @@ test('the OAuth callback never reloads, even on a first visit', async ({ page })
   await page.waitForTimeout(2000);
 
   expect(documents()).toBe(1);
-  expect(page.url()).toContain(callback);
+  const navigation = await page.evaluate(
+    () => (performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming).type,
+  );
+  expect(navigation).toBe('navigate');
 });
 
 test('the isolation reload happens at most once per tab', async ({ page, context }) => {

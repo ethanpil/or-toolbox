@@ -65,7 +65,7 @@ function showError(status: HTMLElement, env: AuthCallbackEnv, error: unknown): v
       'div',
       { class: 'd-flex gap-2' },
       retry,
-      h('a', { class: 'btn btn-outline-secondary', href: url('settings/') }, 'Back to Settings'),
+      h('a', { class: 'btn btn-secondary', href: url('settings/') }, 'Back to Settings'),
     ),
   );
 }

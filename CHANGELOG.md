@@ -16,10 +16,29 @@ All notable changes to this project are documented here. The format follows
 - Self-hosted ffmpeg.wasm loader and a diagnostics page with an ffmpeg smoke test (a76487c).
 - Mocked OpenRouter, Stage 0 gate tests and GitHub Actions workflows (a76487c).
 - OpenRouter API reference and recorded fixtures from paid probes (b5596a4).
-- Core state: cross-tab bus, validated settings with migrations and cross-tab sync, tool state, session results with leave-page guard (73f1342).
-- Core state: run gatekeeper and handles, budgets on a local spend ledger, stats rollups, text history, prompts, persistent jobs, encrypted backup/restore, data management (6bbe169).
-- Unit and Stage 1 gate tests for the core state services (c2bc3fe).
+- Core contract: typed service interfaces, storage schema, passphrase crypto (0bc775e).
+- OpenRouter API client with streaming, retries and a free-model throttle (bedd06f).
+- Model catalog with offline cache, shipped defaults and cost estimates (3388801).
+- API keys with passphrase lock, and Connect with OpenRouter (PKCE) (60532b6).
+- Core state: cross-tab bus, settings, tool state, session results with leave-page guard (73f1342).
+- Core state: runs, budgets, stats, history, prompts, jobs, backup/restore, data management (6bbe169).
+- Media processing: image isolation pipeline, frame capture, audio decode/split, ffmpeg join/trim/transcode, PDF rendering (bb2d9f6).
+- Exporters: CSV, TSV, XLSX, DOCX, SRT, VTT, ZIP (55a35a4).
+- Composition root `getCore()` (c8da141).
+- Gapless audio stitching and an off-main-thread image pipeline (Stage 1 review).
 
 ### Changed
 
-- Stage 0 review fixes: COEP `require-corp` only, isolation reload limited to pages that need threads, manifest-based offline shell with pruned shared asset cache, hardened `h()` and Markdown sanitising, dev-server CSP and isolation, TypeScript 6, single gated CI pipeline.
+- Stage 0 review fixes: COEP `require-corp` only, isolation reload limited to pages that need threads, manifest-based offline shell, hardened `h()` and Markdown sanitising, dev-server CSP and isolation, TypeScript 6, single gated CI pipeline (cb1cc69).
+- Errors share one `OrError` base with codes; shared helpers moved to `util.ts` (6b469ef).
+- Budgets count reservations of running runs; unknown costs book the reservation (Stage 1 review).
+- Stats survive "Delete all prompts and history" (c8da141).
+- Auto-lock 0 means never (82808cd).
+
+### Fixed
+
+- Stage 1 review: orphaned runs, double-booked and lost spend, retried paid POSTs, OAuth while locked, stale unlock sessions, non-atomic backup import, CSV formula injection, invalid XLSX/DOCX output, WAV/MP3/video edge cases.
+
+### Removed
+
+- `write-excel-file` dependency; XLSX is written directly (472888c).

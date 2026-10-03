@@ -1,5 +1,5 @@
 import { defineConfig } from '@playwright/test';
-import gate, { projects } from './playwright.config.ts';
+import gate, { projects, SW_SPECS } from './playwright.config.ts';
 import { basePath, DEV_PORT } from './vite-plugins/site.ts';
 
 /**
@@ -19,7 +19,10 @@ export default defineConfig({
   ...gate,
   metadata: { server: 'dev' },
   use: { ...gate.use, baseURL },
-  projects: projects.filter((project) => !project.name?.startsWith('sw-')),
+  // The dev server also runs the media specs, which the gate (production build) ignores.
+  projects: projects
+    .filter((project) => !project.name?.startsWith('sw-'))
+    .map((project) => ({ ...project, testIgnore: SW_SPECS })),
   webServer: {
     command: 'npm run dev',
     url: baseURL,

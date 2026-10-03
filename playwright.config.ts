@@ -21,7 +21,12 @@ import { basePath, PREVIEW_PORT } from './vite-plugins/site.ts';
  * For day-to-day work use `npm run e2e:dev` (playwright.dev.config.ts).
  */
 
-const SW_SPECS = '**/sw/**';
+export const SW_SPECS = '**/sw/**';
+/**
+ * tests/e2e/media/ imports TypeScript modules straight from /src inside the page, which only the dev server
+ * serves, so those specs run in `npm run e2e:dev` (and the CI media job), never against the build.
+ */
+export const DEV_ONLY_SPECS = '**/media/**';
 
 const BROWSERS = [
   { name: 'chromium', device: devices['Desktop Chrome'] },
@@ -38,7 +43,7 @@ const skipped = new Set(
 
 export const projects: Project[] = BROWSERS.filter(({ name }) => !skipped.has(name)).flatMap(
   ({ name, device }) => [
-    { name, use: { ...device }, testIgnore: SW_SPECS },
+    { name, use: { ...device }, testIgnore: [SW_SPECS, DEV_ONLY_SPECS] },
     { name: `sw-${name}`, use: { ...device, serviceWorkers: 'allow' }, testMatch: SW_SPECS },
   ],
 );
