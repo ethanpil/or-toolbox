@@ -7,6 +7,7 @@ import {
   classifyFile,
   PARSED_LIMIT,
   parsedFiles,
+  pdfPages,
   readAttachment,
   SIZE_LIMITS,
   TEXT_TOTAL_LIMIT,
@@ -65,6 +66,23 @@ describe('readAttachment', () => {
     const text = await readAttachment(new File(['print(1)'], 'main.py'));
     expect(text.ref).toMatchObject({ kind: 'text', type: 'text/plain', text: 'print(1)' });
     expect(text.data).toBeUndefined();
+  });
+
+  it('counts the pages of a PDF for the parser’s price, else guesses high from its size', async () => {
+    const invoice = readFileSync(join(process.cwd(), 'tests/fixtures/media/invoice.pdf'));
+    const read = await readAttachment(
+      new File([invoice], 'invoice.pdf', { type: 'application/pdf' }),
+    );
+    expect(read.ref.pages).toBe(1);
+    expect(pdfPages(read.ref)).toBe(1);
+
+    const three =
+      '%PDF-1.4\n1 0 obj<</Type /Pages /Count 3>>\n' + '2 0 obj<</Type/Page>>\n'.repeat(3);
+    expect((await readAttachment(new File([three], 'a.pdf'))).ref.pages).toBe(3);
+    // Page objects in compressed streams cannot be counted: about a page per 30 KB, rounded up.
+    const packed = await readAttachment(new File(['%PDF-1.5 ' + 'x'.repeat(70_000)], 'b.pdf'));
+    expect(packed.ref.pages).toBeUndefined();
+    expect(pdfPages(packed.ref)).toBe(3);
   });
 
   it('refuses files over the limit, unknown kinds and binary files posing as text', async () => {

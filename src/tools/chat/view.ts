@@ -4,10 +4,10 @@
  * DOM building; every decision about what an action does lives in chat.ts.
  *
  * chat.ts redraws a message only when its `messageSignature` changed, so a conversation is never rebuilt as a
- * whole. Whether a run is in progress does not rebuild anything either: `applyBusy` switches the buttons that
- * a run turns off. Buttons are turned off with `aria-disabled` (they keep focus), and their focus keys name the
- * place, not the message (`regen:<parent>`), so focus stays put when a sibling, a regenerated reply or a retry
- * takes the message's place.
+ * whole. The runner's state does not rebuild anything either: `applyRunState` (fed by `runner.subscribe`) turns
+ * off the buttons that start a run while it is busy or cannot run, and those that change the thread while busy.
+ * Buttons are turned off with `aria-disabled` (they keep focus), and their focus keys name the place, not the
+ * message (`regen:<parent>`), so focus stays put when a sibling, a regenerated reply or a retry takes its place.
  */
 import { h } from '../../ui/dom';
 import { formatBytes, formatCount, formatMs, formatUsd } from '../../ui/format';
@@ -33,10 +33,17 @@ export interface MessageActions {
   sibling(node: ChatNode, delta: -1 | 1): void;
 }
 
+/** The runner's state as the message buttons see it. */
+export interface RunState {
+  /** A run is in progress: nothing may start one or change the thread. */
+  busy: boolean;
+  /** Run cannot start (no model, …): nothing may start one. */
+  blocked: boolean;
+}
+
 export interface MessageContext {
   thread: Thread;
-  /** A run is in progress: actions that start one, or change the tree, are disabled. */
-  busy: boolean;
+  run: RunState;
   streamingId: string | null;
   editingId: string | null;
   showReasoning: boolean;
@@ -96,14 +103,17 @@ function setOff(button: HTMLElement, off: boolean): void {
   button.classList.toggle('disabled', off);
 }
 
+/** What a button needs from the runner: `run` (it starts one), `idle` (it changes the thread). */
+type Needs = 'run' | 'idle';
+
 /**
- * A button that `applyBusy` turns off during a run (`busy`), and that may be off for a reason of its own
+ * A button that `applyRunState` turns off as its `needs` say, and that may be off for a reason of its own
  * (`off`). The handler runs only while the button is on.
  */
 function guardedButton(
   attrs: Record<string, unknown>,
   onclick: () => void,
-  state: { off?: boolean; busy?: boolean },
+  state: { off?: boolean; needs?: Needs },
   ...children: (Node | string)[]
 ): HTMLButtonElement {
   const button = h(
@@ -112,7 +122,7 @@ function guardedButton(
       ...attrs,
       type: 'button',
       'data-off': state.off ? 'true' : null,
-      'data-busy': state.busy ? 'off' : null,
+      'data-needs': state.needs ?? null,
       onclick: () => {
         if (button.getAttribute('aria-disabled') !== 'true') onclick();
       },
@@ -123,10 +133,12 @@ function guardedButton(
   return button;
 }
 
-/** Turns the buttons a run turns off (`data-busy`) off or back on, inside `root`. */
-export function applyBusy(root: ParentNode, busy: boolean): void {
-  for (const button of root.querySelectorAll<HTMLElement>('[data-busy]')) {
-    setOff(button, busy || button.dataset['off'] === 'true');
+/** Turns the buttons inside `root` that depend on the runner off or back on. */
+export function applyRunState(root: ParentNode, run: RunState): void {
+  for (const button of root.querySelectorAll<HTMLElement>('[data-needs]')) {
+    const needs = button.dataset['needs'] as Needs;
+    const off = run.busy || (needs === 'run' && run.blocked);
+    setOff(button, off || button.dataset['off'] === 'true');
   }
 }
 
@@ -135,7 +147,7 @@ const actionButton = (
   iconName: string,
   focusKey: string,
   onclick: () => void,
-  options: { off?: boolean; busy?: boolean; testId: string },
+  options: { off?: boolean; needs?: Needs; testId: string },
 ): HTMLButtonElement =>
   guardedButton(
     {
@@ -204,7 +216,7 @@ function siblingNav(node: ChatNode, ctx: MessageContext): HTMLElement | null {
       'chevron-left',
       `prev:${place(node)}`,
       () => ctx.actions.sibling(node, -1),
-      { off: index === 0, busy: true, testId: 'sibling-prev' },
+      { off: index === 0, needs: 'idle', testId: 'sibling-prev' },
     ),
     h(
       'span',
@@ -217,7 +229,7 @@ function siblingNav(node: ChatNode, ctx: MessageContext): HTMLElement | null {
       'chevron-right',
       `next:${place(node)}`,
       () => ctx.actions.sibling(node, 1),
-      { off: index === count - 1, busy: true, testId: 'sibling-next' },
+      { off: index === count - 1, needs: 'idle', testId: 'sibling-next' },
     ),
   );
 }
@@ -263,7 +275,7 @@ function editor(node: ChatNode, ctx: MessageContext): HTMLElement {
       guardedButton(
         { class: 'btn btn-sm btn-primary', 'data-testid': 'edit-save' },
         submit,
-        { busy: true },
+        { needs: 'run' },
         'Save and send',
       ),
       h(
@@ -360,7 +372,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
     if (user) {
       actions.push(
         actionButton('Edit message', 'pencil', `edit-button:${at}`, () => ctx.actions.edit(node), {
-          busy: true,
+          needs: 'run',
           testId: 'message-edit',
         }),
       );
@@ -371,7 +383,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
           'arrow-repeat',
           `regen:${at}`,
           () => ctx.actions.regenerate(node),
-          { busy: true, testId: 'message-regenerate' },
+          { needs: 'run', testId: 'message-regenerate' },
         ),
       );
     }
@@ -381,7 +393,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
         'trash',
         `delete:${at}`,
         () => ctx.actions.remove(node),
-        { busy: true, testId: 'message-delete' },
+        { needs: 'idle', testId: 'message-delete' },
       ),
     );
   }
@@ -441,7 +453,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
               'data-testid': 'message-retry',
             },
             () => ctx.actions.regenerate(node),
-            { busy: true },
+            { needs: 'run' },
             'Retry',
           ),
           guardedButton(
@@ -451,7 +463,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
               'data-testid': 'message-retry-with',
             },
             () => ctx.actions.retryWith(node),
-            { busy: true },
+            { needs: 'run' },
             'Retry with another model',
           ),
         )
@@ -478,6 +490,6 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
           actions,
         ),
   );
-  applyBusy(element, ctx.busy);
+  applyRunState(element, ctx.run);
   return { element, body, reasoning };
 }

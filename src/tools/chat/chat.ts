@@ -4,15 +4,17 @@
  * Layout (the three-zone tool layout): the composer and the thread list on the left (input), the conversation on
  * the right (output), sampling/reasoning/system prompt in the Settings drawer, fallbacks and the PDF engine under
  * Advanced. Every send, edit or regenerate is one run (`ctx.beginRun` with an estimate for exactly what is sent,
- * on the dearest of the model and its fallbacks, then `api.chatStream`); the reply records its model, tokens, cost
- * and latency. A turn that sends a PDF to the parser for the first time is not streamed (`api.chat`): only the
- * whole response carries the parser's `annotations`, whose text later turns send instead of the file.
+ * on the dearest of the model and its fallbacks, then `api.chatStream` drawn by `streamMarkdown`); the reply
+ * records its model, tokens, cost and latency. The runner takes the action as its argument, so the error toast's
+ * Retry repeats exactly that send, edit or regenerate. A PDF sent to the paid parser is a run add-on (`addons()`):
+ * free-only mode and budgets see it. The parser's `annotations` come back with the stream; later turns send their
+ * text instead of the file.
  *
  * Threads live in the tool's state (`thread:<id>`, `current`); attachment bytes only in memory (`session`), and
- * only while a message still refers to them. Each stored change bumps the thread's `rev` and is announced on
- * BroadcastChannel `ortoolbox:chat`: other tabs merge it in, and a tab that finds a newer `rev` than its own
- * base when writing merges first (thread.ts `mergeInto`) instead of writing over it. Looking around (‹ ›, opening
- * a thread) writes nothing.
+ * only while a message still refers to them. Each stored change bumps the thread's `rev`; the store announces it
+ * on the bus (`tool-state-changed`), other tabs merge it in, and a tab that finds a newer `rev` than its own base
+ * when writing merges first (thread.ts `mergeInto`) instead of writing over it. Looking around (‹ ›, opening a
+ * thread) writes nothing.
  *
  * The conversation is a labelled region, not a live region: streamed text is never announced. "Reply started",
  * "Reply complete" and "Stopped" go through `ui.status`. Messages are redrawn one by one, only when what they show
@@ -22,15 +24,23 @@
  * from History fills the composer.
  */
 import { isFreeModelId } from '../../core/models/free';
-import type { ModelInfo, RunHandle, UsageTotals } from '../../core/types';
+import {
+  isPdfEngineId,
+  PDF_ENGINES,
+  pdfEngine,
+  pdfEngineAddon,
+  type PdfEngineId,
+} from '../../core/models/pdf-engines';
+import type { ModelInfo, RunAddon, RunHandle, UsageTotals } from '../../core/types';
 import { InvalidInputError, userMessage } from '../../core/errors';
-import { debounce, isFiniteNumber, isPlainObject, isString } from '../../core/util';
+import { debounce, isFiniteNumber, isString } from '../../core/util';
 import { copyWithToast } from '../../ui/clipboard';
 import { emptyState } from '../../ui/components/empty-state';
 import { exportMenu } from '../../ui/components/export-menu';
 import { modelPicker } from '../../ui/components/model-picker';
+import { type MarkdownStream, streamMarkdown } from '../../ui/components/stream-markdown';
 import { switchField } from '../../ui/components/switch-field';
-import { h, replace } from '../../ui/dom';
+import { focusedKey, focusKey, h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog, promptDialog } from '../../ui/feedback/dialogs';
 import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
@@ -53,12 +63,13 @@ import {
   checkText,
   MAX_ATTACHMENTS,
   parsedFiles,
+  pdfPages,
   readAttachment,
   SIZE_LIMITS,
   textAttachment,
 } from './attachments';
 import { toJson, toMarkdown } from './export';
-import { codeOf, renderReply, streamingView, type StreamingView } from './markdown-view';
+import { addCodeCopyButtons, codeOf, renderReply } from './markdown-view';
 import {
   type BuiltRequest,
   buildRequest,
@@ -90,7 +101,7 @@ import {
   threadTotals,
 } from './thread';
 import {
-  applyBusy,
+  applyRunState,
   composing,
   KIND_ICONS,
   type MessageActions,
@@ -98,10 +109,9 @@ import {
   messageSignature,
   type MessageView,
   messageView,
+  type RunState,
 } from './view';
 
-export const PDF_ENGINES = ['cloudflare-ai', 'mistral-ocr', 'native'] as const;
-export type PdfEngine = (typeof PDF_ENGINES)[number];
 export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 
 /** Parameters kept in the tool's options (the system prompt here is the default for new threads). */
@@ -111,7 +121,7 @@ export interface ChatParams {
   /** '' = the model's default. */
   reasoningEffort: string;
   fallbacks: string[];
-  pdfEngine: PdfEngine;
+  pdfEngine: PdfEngineId;
   showReasoning: boolean;
   enterSends: boolean;
   system: string;
@@ -120,8 +130,6 @@ export interface ChatParams {
 const STATE_THREAD = 'thread:';
 const STATE_CURRENT = 'current';
 const UI_THREADS_OPEN = 'chat.threadsOpen';
-/** Tabs tell each other about stored thread changes here. */
-export const CHAT_CHANNEL = 'ortoolbox:chat';
 
 export const SYSTEM_PRESETS: readonly { label: string; text: string }[] = [
   {
@@ -164,9 +172,7 @@ export function paramsFrom(options: Record<string, unknown>): ChatParams {
         ? options['reasoningEffort']
         : '',
     fallbacks: Array.isArray(fallbacks) ? fallbacks.filter(isString).slice(0, 5) : [],
-    pdfEngine: (PDF_ENGINES as readonly unknown[]).includes(options['pdfEngine'])
-      ? (options['pdfEngine'] as PdfEngine)
-      : 'cloudflare-ai',
+    pdfEngine: isPdfEngineId(options['pdfEngine']) ? options['pdfEngine'] : 'cloudflare-ai',
     showReasoning: options['showReasoning'] !== false,
     enterSends: options['enterSends'] !== false,
     system: isString(options['system']) ? options['system'] : '',
@@ -194,7 +200,8 @@ type Action =
 interface LiveReply {
   thread: Thread;
   node: ChatNode;
-  view: StreamingView | null;
+  /** Draws the reply into its message while it arrives (replaced when the message is redrawn). */
+  stream: MarkdownStream | null;
   reasoning: HTMLElement | null;
 }
 
@@ -204,34 +211,11 @@ interface Drawn {
   signature: string;
 }
 
-/** What one tab tells the others on CHAT_CHANNEL. */
-type Notice = { type: 'thread'; id: string; rev: number } | { type: 'deleted'; id: string };
-
-const isNotice = (value: unknown): value is Notice =>
-  isPlainObject(value) &&
-  isString(value['id']) &&
-  (value['type'] === 'deleted' || (value['type'] === 'thread' && isFiniteNumber(value['rev'])));
-
-/** The reply as it ended, from a stream or from a whole response. */
-interface Answer {
-  text: string;
-  reasoning: string;
-  model: string;
-  finishReason: string | null;
-}
-
 const MISSING_INPUT: Readonly<Record<'image' | 'audio' | 'file', (name: string) => string>> = {
   image: (name) => `${name} can't read images. Choose a model with image input for this message.`,
   audio: (name) => `${name} doesn't take audio. Choose a model with audio input for this message.`,
   file: (name) =>
     `${name} can't read PDF files itself. Choose another PDF reader under Fallbacks and PDFs in Settings, or a model with file input.`,
-};
-
-const byFocusKey = (root: ParentNode, key: string): HTMLElement | null => {
-  for (const element of root.querySelectorAll<HTMLElement>('[data-focus-key]')) {
-    if (element.dataset['focusKey'] === key) return element;
-  }
-  return null;
 };
 
 export async function setup(ctx: ToolContext): Promise<ToolInstance> {
@@ -248,8 +232,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   let pending: AttachmentRef[] = [];
   let editing: { id: string; text: string } | null = null;
   let live: LiveReply | null = null;
-  /** A send, edit or regenerate is in progress (from its start until its reply ended). */
-  let active = false;
+  /** The runner's state (`runner.subscribe`): what the message buttons may do. */
+  let runState: RunState = { busy: false, blocked: false };
   /** Work waiting for the run to end (Undo pressed during a reply). */
   let afterRun: (() => void)[] = [];
   let words: string[] = [];
@@ -277,16 +261,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     (!fromLink && storedCurrent ? threads.get(storedCurrent) : undefined) ??
     createThread({ system: params.system });
 
-  const channel =
-    typeof BroadcastChannel === 'function' ? new BroadcastChannel(CHAT_CHANNEL) : null;
-  const tell = (notice: Notice): void => {
-    try {
-      channel?.postMessage(notice);
-    } catch {
-      // Other tabs pick the change up on their next write.
-    }
-  };
-
   let writes: Promise<void> = Promise.resolve();
   const queueWrite = (write: () => Promise<void>): void => {
     writes = writes.then(write).catch((error: unknown) => void presentError(error));
@@ -311,7 +285,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     thread.rev = Math.max(thread.rev, stored?.rev ?? 0) + 1;
     await ctx.state.set(key, thread);
     bases.set(thread.id, baseOf(thread));
-    tell({ type: 'thread', id: thread.id, rev: thread.rev });
   }
 
   /** Stores a thread after a change (drafts are stored once they have a message). */
@@ -407,14 +380,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     releaseUnused();
   }
 
-  if (channel) {
-    channel.onmessage = (event: MessageEvent) => {
-      const notice: unknown = event.data;
-      if (!isNotice(notice)) return;
-      if (notice.type === 'thread' && notice.rev <= (bases.get(notice.id)?.rev ?? -1)) return;
-      refresh(notice.id);
-    };
-  }
+  // Stored threads change here and in other tabs: read them again (our own writes compare equal and stop there).
+  ctx.bus.on('tool-state-changed', (event) => {
+    if (event.tool === ctx.manifest.id && event.key.startsWith(STATE_THREAD)) {
+      refresh(event.key.slice(STATE_THREAD.length));
+    }
+  });
 
   // --- models -------------------------------------------------------------------------------------------
   const defaultModel = (): string | null => ctx.model().model;
@@ -864,16 +835,21 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       id: drawerIds.engine,
       class: 'form-select',
       'data-testid': 'chat-pdf-engine',
+      'aria-describedby': `${drawerIds.engine}-hint`,
       onchange: () => {
-        params.pdfEngine = engineSelect.value as PdfEngine;
+        params.pdfEngine = isPdfEngineId(engineSelect.value) ? engineSelect.value : 'cloudflare-ai';
         saveOptions({ pdfEngine: params.pdfEngine });
+        renderEngineHint();
         renderWarnings();
+        void ui.refreshEstimate();
       },
     },
-    h('option', { value: 'cloudflare-ai' }, 'Cloudflare AI (free)'),
-    h('option', { value: 'mistral-ocr' }, 'Mistral OCR (paid, best for scans)'),
-    h('option', { value: 'native' }, "The model's own file input"),
+    PDF_ENGINES.map((engine) => h('option', { value: engine.id }, engine.label)),
   );
+  const engineHint = h('div', { id: `${drawerIds.engine}-hint`, class: 'form-text' });
+  const renderEngineHint = (): void => {
+    engineHint.textContent = `${pdfEngine(params.pdfEngine).hint} A PDF is read once; later messages send its text.`;
+  };
   const advanced = ui.advanced('Fallbacks and PDFs');
   advanced.append(
     h(
@@ -903,11 +879,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       null,
       h('label', { class: 'form-label', htmlFor: drawerIds.engine }, 'PDF reader'),
       engineSelect,
-      h(
-        'div',
-        { class: 'form-text' },
-        'Cloudflare AI is free. Mistral OCR reads scans best and is billed per 1,000 pages (not in free-only mode). The model’s own file input is billed as input tokens and works only on models that read files. A PDF is read once; later messages send its text.',
-      ),
+      engineHint,
     ),
   );
 
@@ -926,6 +898,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     showReasoning.input.checked = params.showReasoning;
     enterSends.input.checked = params.enterSends;
     engineSelect.value = params.pdfEngine;
+    renderEngineHint();
     renderKeyHint();
   };
 
@@ -1190,15 +1163,15 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   const messageActions: MessageActions = {
     copy: (node) => void copyWithToast(node.content, 'Message copied.'),
     edit: (node) => {
-      if (active) return;
+      if (runState.busy) return;
       editing = { id: node.id, text: node.content };
       renderLog();
-      byFocusKey(log, `edit:${node.id}`)?.focus();
+      focusKey(log, `edit:${node.id}`);
     },
     cancelEdit: (node) => {
       editing = null;
       renderLog();
-      byFocusKey(log, `edit-button:${node.parent ?? 'root'}`)?.focus();
+      focusKey(log, `edit-button:${node.parent ?? 'root'}`);
       refreshStale();
     },
     submitEdit: (node, text) => {
@@ -1207,24 +1180,23 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         return;
       }
       editing = { id: node.id, text };
-      void trigger({ kind: 'edit', id: node.id, text: text.trim() });
+      void runner.trigger({ kind: 'edit', id: node.id, text: text.trim() });
     },
-    regenerate: (node) => {
-      if (!active) void trigger({ kind: 'regenerate', id: node.id });
-    },
+    // Ignored while the runner cannot start (busy, no model): `trigger` answers `.started === false`.
+    regenerate: (node) => void runner.trigger({ kind: 'regenerate', id: node.id }),
     retryWith: (node) => {
-      if (active) return;
+      if (runState.busy || runState.blocked) return;
       void modelPicker(ctx, {
         capability: 'text',
         selected: node.model ?? effectiveModel(),
         title: 'Retry with another model',
       }).then((model) => {
-        if (model) void trigger({ kind: 'regenerate', id: node.id, model });
+        if (model) void runner.trigger({ kind: 'regenerate', id: node.id, model });
       });
     },
     remove: (node) => void removeBranch(node),
     sibling: (node, delta) => {
-      if (active) return;
+      if (runState.busy) return;
       // Looking at another version changes nothing worth storing (and nothing other tabs need).
       const next = selectSibling(current, node.id, delta);
       if (!next) return;
@@ -1247,11 +1219,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   const refocus = (key: string): void => {
     const at = key.slice(key.indexOf(':') + 1);
     for (const candidate of [key, `regen:${at}`, `edit-button:${at}`, `copy:${at}`]) {
-      const element = byFocusKey(log, candidate);
-      if (element) {
-        element.focus();
-        return;
-      }
+      if (focusKey(log, candidate)) return;
     }
     log.focus();
   };
@@ -1262,11 +1230,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
 
   /** Draws the active path, redrawing only messages whose signature changed. */
   const renderLog = (): void => {
-    const focused = document.activeElement;
-    const focusKey =
-      focused && focused !== log && log.contains(focused)
-        ? (focused.closest<HTMLElement>('[data-focus-key]')?.dataset['focusKey'] ?? null)
-        : null;
+    const lostKey = focusedKey(log);
     const path = activePath(current);
     const streamingHere = live?.thread === current ? live : null;
     log.setAttribute('aria-busy', String(streamingHere !== null));
@@ -1291,7 +1255,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     if (editing && !current.nodes[editing.id]) editing = null;
     const mctx: MessageContext = {
       thread: current,
-      busy: active,
+      run: runState,
       streamingId: streamingHere?.node.id ?? null,
       editingId: editing?.id ?? null,
       showReasoning: params.showReasoning,
@@ -1329,16 +1293,25 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       drawn.delete(id);
     }
     while (previous?.nextElementSibling) previous.nextElementSibling.remove();
-    applyBusy(log, active);
-    if (streamingHere && (streamingDrawn || !streamingHere.view)) {
+    applyRunState(log, runState);
+    if (streamingHere && (streamingDrawn || !streamingHere.stream)) {
       const entry = drawn.get(streamingHere.node.id);
-      streamingHere.view?.close();
-      streamingHere.view = entry ? streamingView(entry.view.body) : null;
+      streamingHere.stream?.dispose();
+      streamingHere.stream = entry ? replyStream(entry.view.body) : null;
       streamingHere.reasoning = entry?.view.reasoning ?? null;
-      streamingHere.view?.update(streamingHere.node.content);
+      if (streamingHere.node.content) streamingHere.stream?.set(streamingHere.node.content);
     }
-    if (focusKey && !log.contains(document.activeElement)) refocus(focusKey);
+    if (lostKey && !log.contains(document.activeElement)) refocus(lostKey);
   };
+
+  /** The shared streaming renderer for a reply that is arriving, with Copy buttons on its code blocks. */
+  const replyStream = (body: HTMLElement): MarkdownStream =>
+    streamMarkdown(body, {
+      onRender: () => {
+        addCodeCopyButtons(body);
+        follow();
+      },
+    });
 
   /** The message editor keeps what was typed across redraws. */
   const wireEditor = (element: HTMLElement, state: { text: string }): void => {
@@ -1557,20 +1530,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       tone: 'danger',
     });
     if (!ok || live?.thread === thread) return;
-    // Focus goes to the thread that takes its place in the list, else the one before, else the heading.
-    const listed = [...threads.values()]
-      .filter((other) => matchesQuery(other, words))
-      .sort((a, b) => b.updatedAt - a.updatedAt);
-    const at = listed.indexOf(thread);
-    const neighbour = listed[at + 1] ?? listed[at - 1];
     if (systemTyped === thread) flushSystem();
     const held = holdData(Object.values(thread.nodes));
     threads.delete(thread.id);
     bases.delete(thread.id);
-    queueWrite(async () => {
-      await ctx.state.delete(`${STATE_THREAD}${thread.id}`);
-      tell({ type: 'deleted', id: thread.id });
-    });
+    queueWrite(() => ctx.state.delete(`${STATE_THREAD}${thread.id}`));
     if (current === thread) {
       const next = [...threads.values()].sort((a, b) => b.updatedAt - a.updatedAt)[0];
       current = next ?? createThread({ system: params.system });
@@ -1579,7 +1543,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       showThread();
     } else renderThreads();
     releaseUnused();
-    ((neighbour ? byFocusKey(threadList, `open:${neighbour.id}`) : null) ?? threadsHeading).focus();
+    // The list's redraw moved focus to the nearest thread left (replace()); with none left, to the heading.
+    if (!threadList.contains(document.activeElement)) threadsHeading.focus();
     toast({
       message: 'Thread deleted.',
       action: {
@@ -1597,7 +1562,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   }
 
   async function removeBranch(node: ChatNode): Promise<void> {
-    if (active) return;
+    if (runState.busy) return;
     const thread = current;
     const count = (() => {
       let total = 0;
@@ -1619,7 +1584,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       confirmLabel: 'Delete',
       tone: 'danger',
     });
-    if (!ok || active || !thread.nodes[node.id]) return;
+    if (!ok || runState.busy || !thread.nodes[node.id]) return;
     const removed = deleteBranch(thread, node.id);
     if (!removed) return;
     const held = holdData(removed.nodes);
@@ -1634,7 +1599,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         label: 'Undo',
         testId: 'toast-undo',
         onClick: () => {
-          if (active) {
+          if (runState.busy) {
             // Never change a thread under a reply that is arriving: put the messages back after it.
             afterRun.push(() => undoRemove(thread.id, removed, held));
             ui.status('The messages come back when the reply has finished.');
@@ -1806,11 +1771,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     if (missing) throw new InvalidInputError(MISSING_INPUT[missing](name));
     const data = (id: string): string | undefined => session.get(id);
     const toParse = params.pdfEngine === 'native' ? [] : unparsedPdfs(path, data);
-    if (toParse.length > 0 && params.pdfEngine === 'mistral-ocr' && ctx.settings.get().freeOnly) {
-      throw new InvalidInputError(
-        'Free-only mode is on, and the Mistral OCR PDF reader is paid. Choose Cloudflare AI (free) under Fallbacks and PDFs in Settings.',
-      );
-    }
     const built = buildRequest(path, requestOptions(thread, model, info), data);
     if (built.tooLong) {
       throw new InvalidInputError(
@@ -1818,8 +1778,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       );
     }
 
-    active = true;
-    applyBusy(log, true);
     try {
       const estimateUsd = await estimateFor(built);
       const prompt = newUser?.content ?? (answers ? (thread.nodes[answers]?.content ?? '') : '');
@@ -1829,6 +1787,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           model,
           models: [model, ...(built.body.models ?? [])],
           estimateUsd,
+          // What this request parses (an edit or regenerate may differ from the composer's `addons()`).
+          addons: parserAddons(toParse),
           prompt,
           settings: { ...snapshot().settings, model },
         },
@@ -1860,7 +1820,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         ...(built.trimmed > 0 ? { trimmed: built.trimmed } : {}),
       });
       persist(thread);
-      const mine: LiveReply = { thread, node: reply, view: null, reasoning: null };
+      const mine: LiveReply = { thread, node: reply, stream: null, reasoning: null };
       live = mine;
       if (current === thread) {
         renderAll();
@@ -1874,40 +1834,24 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       );
 
       try {
-        let answer: Answer;
-        if (toParse.length > 0) {
-          // Only a whole response carries the parser's annotations: this turn is not streamed.
-          const response = await ctx.api.chat(built.body, { run });
-          const choice = response.choices[0];
-          answer = {
-            text: choice?.message.content ?? '',
-            reasoning: choice?.message.reasoning ?? '',
-            model: response.model,
-            finishReason: choice?.finish_reason ?? null,
-          };
-          keepParsed(toParse, choice?.message.annotations);
-        } else {
-          answer = await ctx.api.chatStream(built.body, {
-            run,
-            onEvent: (event) => {
-              const shown = current === thread && live === mine;
-              if (event.type === 'text') {
-                reply.content += event.text;
-                if (shown) {
-                  mine.view?.update(reply.content);
-                  follow();
-                }
-              } else if (event.type === 'reasoning') {
-                const first = !reply.reasoning;
-                reply.reasoning = (reply.reasoning ?? '') + event.text;
-                if (shown && first) renderLog();
-                else if (shown && mine.reasoning) mine.reasoning.textContent = reply.reasoning;
-              } else if (event.type === 'meta' && event.model) {
-                reply.servedModel = event.model;
-              }
-            },
-          });
-        }
+        const answer = await ctx.api.chatStream(built.body, {
+          run,
+          onEvent: (event) => {
+            const shown = current === thread && live === mine;
+            if (event.type === 'text') {
+              reply.content += event.text;
+              if (shown) mine.stream?.append(event.text);
+            } else if (event.type === 'reasoning') {
+              const first = !reply.reasoning;
+              reply.reasoning = (reply.reasoning ?? '') + event.text;
+              if (shown && first) renderLog();
+              else if (shown && mine.reasoning) mine.reasoning.textContent = reply.reasoning;
+            } else if (event.type === 'meta' && event.model) {
+              reply.servedModel = event.model;
+            }
+          },
+        });
+        keepParsed(toParse, answer.annotations);
         reply.content = answer.text || reply.content;
         if (answer.reasoning) reply.reasoning = answer.reasoning;
         if (answer.model) reply.servedModel = answer.model;
@@ -1926,14 +1870,16 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         if (isStop(error)) {
           reply.status = 'stopped';
           ui.status(reply.content ? 'Stopped. The partial reply is kept.' : 'Stopped.');
+          markPresented(error); // announced here; the runner adds nothing
         } else {
           reply.status = 'error';
           reply.error = userMessage(error);
           ui.status(`The reply failed: ${reply.error}`);
           if (needsAction(error)) {
             // A dialog or a setting helps here; once it has, try this reply again.
+            // The runner's own Retry would repeat the send (a second message): retry this reply instead.
             void presentError(error, {
-              retry: () => void trigger({ kind: 'regenerate', id: reply.id }),
+              retry: () => void runner.trigger({ kind: 'regenerate', id: reply.id }),
             });
           } else {
             markPresented(error); // shown inline on the reply, with Retry
@@ -1942,7 +1888,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         await run.fail(error);
         throw error;
       } finally {
-        mine.view?.close();
+        mine.stream?.dispose();
         if (live === mine) live = null;
         persist(thread);
         releaseUnused();
@@ -1950,7 +1896,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         if (reply.content) await renderReply(reply.id, reply.content).catch(() => undefined);
       }
     } finally {
-      active = false;
       if (current === thread) {
         renderAll();
         follow();
@@ -1962,27 +1907,18 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     }
   }
 
-  let queued: Action | null = null;
-  const runner = ui.runner({
+  // The action is the runner's argument: a refused run's Retry (no key, budget, free-only…) repeats exactly it.
+  // Ctrl/Cmd+Enter and the Send button pass none: a send.
+  const runner = ui.runner<Action>({
     label: 'Send',
     icon: 'send',
     container: runnerHost,
-    run: (signal) => {
-      const action: Action = queued ?? { kind: 'send' };
-      queued = null;
-      return perform(action, signal).catch((error: unknown) => {
-        // Errors before the run began (no key, budget, free-only…) retry this same action.
-        if (!isStop(error)) void presentError(error, { retry: () => void trigger(action) });
-        throw error;
-      });
-    },
+    run: (signal, action) => perform(action ?? { kind: 'send' }, signal),
   });
-  function trigger(action: Action): Promise<void> {
-    queued = action;
-    const done = runner.trigger();
-    queued = null;
-    return done;
-  }
+  runner.subscribe(({ busy, disabledReason }) => {
+    runState = { busy, blocked: disabledReason !== null };
+    applyRunState(log, runState);
+  });
 
   // --- keyboard -----------------------------------------------------------------------------------------
   composer.addEventListener('keydown', (event) => {
@@ -1996,12 +1932,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       !event.metaKey
     ) {
       event.preventDefault();
-      void trigger({ kind: 'send' });
+      void runner.trigger({ kind: 'send' });
     } else if (
       event.key === 'ArrowUp' &&
       composer.value === '' &&
       pending.length === 0 &&
-      !active
+      !runState.busy
     ) {
       const last = [...activePath(current)].reverse().find((node) => node.role === 'user');
       if (last) {
@@ -2104,8 +2040,21 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   renderAll();
   loadCatalog();
 
+  /** The paid PDF parser for these PDFs, as run add-ons (none for the free engines). */
+  function parserAddons(pdfs: readonly AttachmentRef[]): RunAddon[] {
+    const pages = pdfs.reduce((sum, ref) => sum + pdfPages(ref), 0);
+    const addon = pdfEngineAddon(params.pdfEngine, pages);
+    return addon ? [addon] : [];
+  }
+
   return {
     getState: snapshot,
+    // Sending the composer now: the PDFs it would parse (its own and earlier unread ones).
+    addons: () => {
+      if (params.pdfEngine === 'native') return [];
+      const path = [...activePath(current), draftNode(null, '', pending)];
+      return parserAddons(unparsedPdfs(path, (id) => session.get(id)));
+    },
     applyState,
     // The cost of sending the composer now, on this chat's model (the header's unless the chat chose another),
     // or on the dearest fallback.

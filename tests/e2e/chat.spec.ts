@@ -17,12 +17,12 @@ import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 const CHAT = '/api/v1/chat/completions';
 const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'openrouter');
 const RECORDED_STREAM = readFileSync(join(FIXTURES, 'chat-stream.recorded.sse.txt'), 'utf8');
-/** A recorded answer about tests/fixtures/media/invoice.pdf, with the parser's annotations. */
-const PDF_RESPONSE = (
+/** The parser's annotations of a recorded answer about tests/fixtures/media/invoice.pdf. */
+const PDF_ANNOTATIONS = (
   JSON.parse(readFileSync(join(FIXTURES, 'chat-completion-pdf.recorded.json'), 'utf8')) as {
     response: { choices: { message: { annotations: unknown[] } }[] };
   }
-).response;
+).response.choices[0]!.message.annotations;
 
 /** A streamed reply: one content chunk, the finish chunk and the usage chunk (the shape in docs §2.3). */
 function reply(text: string, model = 'test/text-model', cost = 0.00042): unknown[] {
@@ -45,6 +45,19 @@ function reply(text: string, model = 'test/text-model', cost = 0.00042): unknown
       usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17, cost },
     },
   ];
+}
+
+/** A streamed reply that also brings the PDF parser's annotations (in a delta, before the finish). */
+function replyWithAnnotations(text: string): unknown[] {
+  const [first, ...rest] = reply(text);
+  const chunk = {
+    id: 'gen-e2e',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model: 'test/text-model',
+    choices: [{ index: 0, delta: { annotations: PDF_ANNOTATIONS }, finish_reason: null }],
+  };
+  return [first, chunk, ...rest];
 }
 
 const body = (call: RecordedCall | undefined): Record<string, unknown> =>
@@ -240,8 +253,7 @@ test('an image attachment goes as an image_url part', async ({ page, mock }) => 
 });
 
 test('a pasted PDF is read once; later messages send the parser text', async ({ page, mock }) => {
-  // Only a whole response carries the parser's annotations, so the first turn is not streamed.
-  mock.json('POST', CHAT, PDF_RESPONSE);
+  mock.sse(CHAT, replyWithAnnotations('Invoice number: 4711 / Total: 128.50 EUR'));
   await openChat(page);
   const pdf = readFileSync(join(MEDIA_FIXTURES_DIR, 'invoice.pdf')).toString('base64');
   // Paste a file (no text) onto the page: the framework hands it to the tool.
@@ -263,7 +275,7 @@ test('a pasted PDF is read once; later messages send the parser text', async ({ 
     type: 'file',
     file: { filename: 'invoice.pdf', file_data: `data:application/pdf;base64,${pdf}` },
   });
-  expect(body(call)['stream']).toBe(false);
+  expect(body(call)['stream']).toBe(true);
   expect(body(call)['plugins']).toEqual([{ id: 'file-parser', pdf: { engine: 'cloudflare-ai' } }]);
 
   // The next turn streams, and sends the parser's text instead of uploading the PDF again.
@@ -422,23 +434,10 @@ test('an API error shows on the reply with Retry', async ({ page, mock }) => {
 
 test('a conversation passes axe in light and dark', async ({ page, mock }) => {
   await page.emulateMedia({ colorScheme: 'light' });
-  // The PDF's first turn is not streamed (its annotations come with the whole response).
-  mock.json('POST', CHAT, {
-    id: 'gen-axe',
-    model: 'test/text-model',
-    choices: [
-      {
-        index: 0,
-        finish_reason: 'stop',
-        message: {
-          role: 'assistant',
-          content: '# Plan\n\n- **Day 1:** sights\n- Day 2: food\n\n```py\nprint("hi")\n```',
-          annotations: PDF_RESPONSE.choices[0]?.message.annotations,
-        },
-      },
-    ],
-    usage: { prompt_tokens: 12, completion_tokens: 20, cost: 0.0001 },
-  });
+  mock.sse(
+    CHAT,
+    replyWithAnnotations('# Plan\n\n- **Day 1:** sights\n- Day 2: food\n\n```py\nprint("hi")\n```'),
+  );
   await openChat(page);
   await page.getByTestId('composer-file').setInputFiles(join(MEDIA_FIXTURES_DIR, 'invoice.pdf'));
   await send(page, 'Plan a trip');

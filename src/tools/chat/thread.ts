@@ -33,6 +33,8 @@ export interface AttachmentRef {
    * (docs/openrouter-api.md §2.5). Later turns send this text instead of uploading and parsing the file again.
    */
   parsed?: string;
+  /** PDFs only, this session: pages counted when attached (prices the paid PDF parser). Not read back. */
+  pages?: number;
 }
 
 export interface ReplyUsage {
