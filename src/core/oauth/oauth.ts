@@ -2,24 +2,28 @@
  * "Connect with OpenRouter": OAuth PKCE (S256) in two page loads (docs/openrouter-api.md §11).
  *
  * `start()` keeps `{verifier, state, returnTo, keyLabel}` in sessionStorage `ortoolbox:oauth` and navigates to
- * openrouter.ai/auth. The callback page calls `complete()`, which removes that entry before anything else, so a
+ * openrouter.ai/auth. The callback page calls `complete()`, which removes that entry before the exchange, so a
  * reload of the callback URL can never exchange a code twice (codes are single-use anyway, and expire after
  * 10 minutes). The exchange needs no key; the returned key is stored with source `oauth`.
+ *
+ * Both refuse with KeyLockedError while the passphrase lock is on and this tab is locked: the new key could not
+ * be stored (it must be encrypted), and a consumed code cannot be exchanged again. `complete()` checks before it
+ * touches anything, so after unlocking the caller retries with the same params.
  */
 
+import { KeyLockedError, OAuthError } from '../errors';
 import { url } from '../paths';
 import { SS_KEYS, readJson, removeItem, session, writeJson } from '../storage/local';
 import type { CoreServices, KeyInfo, OAuthService } from '../types';
+import { isFiniteNumber, isRecord, isString } from '../util';
 import { challengeS256, createState, createVerifier } from './pkce';
+
+// Historical import path (the class lives in errors.ts).
+export { OAuthError } from '../errors';
 
 export const OPENROUTER_AUTH_URL = 'https://openrouter.ai/auth';
 /** Pending sign-ins older than this are refused (OpenRouter's codes expire after 10 minutes). */
 const PENDING_MAX_AGE_MS = 30 * 60_000;
-
-/** A sign-in that cannot complete. `message` is safe to show. */
-export class OAuthError extends Error {
-  override readonly name = 'OAuthError';
-}
 
 interface PendingSignIn {
   verifier: string;
@@ -33,6 +37,20 @@ export interface OAuthServiceOptions {
   /** Top-level navigation; defaults to `location.assign`. */
   navigate?: (href: string) => void;
   now?: () => number;
+}
+
+function readPending(): PendingSignIn | null {
+  const value = readJson<unknown>(session(), SS_KEYS.oauth);
+  if (!isRecord(value)) return null;
+  const { verifier, state, returnTo, keyLabel, createdAt } = value;
+  if (!isString(verifier) || !isString(state) || !isFiniteNumber(createdAt)) return null;
+  return {
+    verifier,
+    state,
+    returnTo: isString(returnTo) ? returnTo : null,
+    keyLabel: isString(keyLabel) ? keyLabel : null,
+    createdAt,
+  };
 }
 
 /** The page OpenRouter sends the browser back to. */
@@ -66,6 +84,7 @@ export function createOAuthService(
 
   return {
     async start(opts) {
+      if (!core.keys.lock.unlocked()) throw new KeyLockedError();
       const verifier = createVerifier();
       const state = createState();
       const keyLabel = opts?.keyLabel?.trim().slice(0, 100) || null;
@@ -88,7 +107,9 @@ export function createOAuthService(
     },
 
     async complete(params) {
-      const pending = readJson<PendingSignIn>(session(), SS_KEYS.oauth);
+      // Before anything is consumed: a locked tab could not store the key.
+      if (!core.keys.lock.unlocked()) throw new KeyLockedError();
+      const pending = readPending();
       // Single use: gone before the exchange starts, whatever happens next.
       removeItem(session(), SS_KEYS.oauth);
 
@@ -96,7 +117,7 @@ export function createOAuthService(
       if (denied) throw new OAuthError('The sign-in was cancelled or refused on OpenRouter.');
       const code = params.get('code');
       if (!code) throw new OAuthError('This page has no sign-in code. Start the connection again.');
-      if (!pending || typeof pending.verifier !== 'string') {
+      if (!pending) {
         throw new OAuthError(
           'This sign-in was already used or started in another tab. Start the connection again.',
         );

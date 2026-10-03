@@ -2,17 +2,20 @@
  * API keys and the optional passphrase lock.
  *
  * Storage: `StoredKeysFile` JSON in localStorage `ortoolbox:keys` (never in settings, so settings exports hold no
- * secrets). Lock off: `secret` holds the key. Lock on: every key has `enc` (AES-GCM under a PBKDF2-derived key)
- * and the file has `lock.verifier`, an encrypted constant that proves a passphrase right. Every lock change
- * rewrites the whole file with one `setItem`, so a crash never leaves a half-migrated file, and is refused if
- * another tab changed the file meanwhile.
+ * secrets), validated on every read. Lock off: `secret` holds the key. Lock on: every key has `enc` (AES-GCM under
+ * a PBKDF2-derived key) and the file has `lock.verifier`, an encrypted constant that proves a passphrase right.
+ * Every lock change rewrites the whole file with one `setItem`, so a crash never leaves a half-migrated file, and
+ * is refused (KeysChangedError) if another tab changed the file meanwhile. Backup and data reset go through
+ * `exportFile`/`replaceFile`/`clear`, never through localStorage directly.
  *
  * Unlocking is per tab: sessionStorage `ortoolbox:unlocked` holds `{key, at}`, the raw AES key (base64) and the
  * time of the last `touch()`. It survives navigation between the site's pages in that tab and dies with the
- * tab. After `settings.security.autoLockMinutes` without `touch()` the entry is deleted (0 disables auto-lock).
+ * tab. A session key that no longer opens the file (passphrase changed elsewhere) is dropped at page start and
+ * before it encrypts anything. After `settings.security.autoLockMinutes` (capped at 24 h; 0 disables it)
+ * without `touch()` the entry is deleted.
  *
- * The default key is `settings.defaultKeyId`; when that is null or stale (e.g. after a settings reset) the first
- * key acts as default, so a user with keys is never told to add one.
+ * The default key is `settings.defaultKeyId`, set when the first key is added; when it is null or stale (e.g.
+ * after a settings reset) the first key acts as default, so a user with keys is never told to add one.
  */
 
 import {
@@ -26,12 +29,20 @@ import {
   randomBytes,
   toBase64,
 } from '../crypto';
-import { KeyLockedError, NoKeyError } from '../errors';
+import {
+  InvalidInputError,
+  InvalidKeyError,
+  KeyLockedError,
+  KeysChangedError,
+  NoKeyError,
+  WrongPassphraseError,
+} from '../errors';
 import {
   LS_KEYS,
   SS_KEYS,
   local,
   readJson,
+  readRaw,
   removeItem,
   session,
   writeJson,
@@ -43,32 +54,23 @@ import type {
   KeyLock,
   KeyStatus,
   KeysService,
+  Settings,
   StoredKey,
   StoredKeysFile,
 } from '../types';
-import { InvalidKeyError, keyFormatProblem, maskKey, normalizeKeyInput } from './format';
+import { MAX_TIMEOUT_MS, MINUTE_MS, isFiniteNumber, isRecord, isString } from '../util';
+import { keyFormatProblem, maskKey, normalizeKeyInput } from './format';
+
+// Historical import path for these errors (they live in errors.ts).
+export { KeysChangedError, WrongPassphraseError } from '../errors';
 
 /** Plaintext of `lock.verifier`. */
 const VERIFIER_TEXT = 'ortoolbox-key-lock-v1';
 const STATUS_TTL_MS = 60_000;
 /** `touch()` writes the activity time at most this often. */
 const TOUCH_WRITE_INTERVAL_MS = 5_000;
-
-/** A lock operation was given the wrong passphrase. */
-export class WrongPassphraseError extends Error {
-  override readonly name = 'WrongPassphraseError';
-  constructor(message = 'Wrong passphrase.') {
-    super(message);
-  }
-}
-
-/** Another tab changed the keys while a lock operation was running; nothing was written. */
-export class KeysChangedError extends Error {
-  override readonly name = 'KeysChangedError';
-  constructor(message = 'Your keys changed in another tab. Try again.') {
-    super(message);
-  }
-}
+/** Longest auto-lock delay honoured; larger settings are clamped (setTimeout overflows above ~24.8 days). */
+const MAX_AUTO_LOCK_MINUTES = 24 * 60;
 
 interface UnlockedSession {
   key: string;
@@ -81,20 +83,90 @@ export interface KeysServiceOptions {
   now?: () => number;
 }
 
-function readFile(): StoredKeysFile {
-  const file = readJson<StoredKeysFile>(local(), LS_KEYS.keys);
-  if (!file || file.version !== 1 || !Array.isArray(file.keys)) {
-    return { version: 1, keys: [], lock: null };
+// --- validation ------------------------------------------------------------------------------------
+
+/** The blob, null when absent, undefined when malformed. */
+function parseEnc(value: unknown): EncryptedBlob | null | undefined {
+  if (value == null) return null;
+  return isRecord(value) && isString(value['iv']) && isString(value['ct'])
+    ? { iv: value['iv'], ct: value['ct'] }
+    : undefined;
+}
+
+function parseKey(value: unknown): StoredKey | null {
+  if (!isRecord(value)) return null;
+  const { id, name, colour, masked, source, createdAt, noRetention, secret, enc } = value;
+  if (!isString(id) || !id || !isString(name) || !isString(masked)) return null;
+  if (source !== 'pasted' && source !== 'oauth') return null;
+  if (!isFiniteNumber(createdAt)) return null;
+  if (colour != null && !isString(colour)) return null;
+  if (secret != null && !isString(secret)) return null;
+  const parsedEnc = parseEnc(enc);
+  if (parsedEnc === undefined) return null;
+  return {
+    id,
+    name,
+    colour: isString(colour) ? colour : null,
+    masked,
+    source,
+    createdAt,
+    noRetention: noRetention === true,
+    secret: isString(secret) ? secret : null,
+    enc: parsedEnc,
+  };
+}
+
+function parseLock(value: unknown): StoredKeysFile['lock'] | undefined {
+  if (!isRecord(value)) return undefined;
+  const { salt, iterations, verifier } = value;
+  const parsedVerifier = parseEnc(verifier);
+  if (!isString(salt) || !isFiniteNumber(iterations) || iterations < 1 || !parsedVerifier) {
+    return undefined;
   }
-  return { version: 1, keys: file.keys, lock: file.lock ?? null };
+  return { salt, iterations, verifier: parsedVerifier };
+}
+
+/**
+ * Validates a keys file. `strict` (replaceFile) rejects anything off: a malformed or duplicate key, a malformed
+ * lock, or a key whose secret does not match the lock state. Lenient (reading storage) drops malformed and
+ * duplicate keys and a malformed lock, keeping what can still be used.
+ */
+export function parseKeysFile(value: unknown, strict: boolean): StoredKeysFile | null {
+  if (!isRecord(value) || value['version'] !== 1 || !Array.isArray(value['keys'])) return null;
+  let lock: StoredKeysFile['lock'] = null;
+  if (value['lock'] != null) {
+    const parsed = parseLock(value['lock']);
+    if (parsed === undefined && strict) return null;
+    lock = parsed ?? null;
+  }
+  const keys: StoredKey[] = [];
+  const ids = new Set<string>();
+  for (const item of value['keys'] as unknown[]) {
+    const key = parseKey(item);
+    if (!key || ids.has(key.id)) {
+      if (strict) return null;
+      continue;
+    }
+    const consistent = lock ? key.enc !== null && key.secret === null : key.secret !== null;
+    if (strict && !consistent) return null;
+    keys.push(key);
+    ids.add(key.id);
+  }
+  return { version: 1, keys, lock };
+}
+
+function readFile(): StoredKeysFile {
+  return (
+    parseKeysFile(readJson<unknown>(local(), LS_KEYS.keys), false) ?? {
+      version: 1,
+      keys: [],
+      lock: null,
+    }
+  );
 }
 
 function rawFile(): string | null {
-  try {
-    return local()?.getItem(LS_KEYS.keys) ?? null;
-  } catch {
-    return null;
-  }
+  return readRaw(local(), LS_KEYS.keys);
 }
 
 function writeFile(file: StoredKeysFile): void {
@@ -102,8 +174,10 @@ function writeFile(file: StoredKeysFile): void {
 }
 
 function readSession(): UnlockedSession | null {
-  const value = readJson<UnlockedSession>(session(), SS_KEYS.unlocked);
-  return value && typeof value.key === 'string' && typeof value.at === 'number' ? value : null;
+  const value = readJson<unknown>(session(), SS_KEYS.unlocked);
+  return isRecord(value) && isString(value['key']) && isFiniteNumber(value['at'])
+    ? { key: value['key'], at: value['at'] }
+    : null;
 }
 
 function toInfo(key: StoredKey, defaultId: string | null): KeyInfo {
@@ -119,8 +193,17 @@ function toInfo(key: StoredKey, defaultId: string | null): KeyInfo {
   };
 }
 
+/** Tool → pinned key id, as a comparable string. */
+function keyBindings(settings: Readonly<Settings>): string {
+  return JSON.stringify(
+    Object.entries(settings.tools)
+      .map(([tool, binding]) => [tool, binding?.keyId ?? null])
+      .filter(([, keyId]) => keyId !== null),
+  );
+}
+
 function assertPassphrase(passphrase: string): void {
-  if (!passphrase) throw new Error('Enter a passphrase.');
+  if (!passphrase) throw new InvalidInputError('Enter a passphrase.');
 }
 
 export function createKeysService(
@@ -144,14 +227,61 @@ export function createKeysService(
     core.bus.emit({ type: 'keys-changed' });
   }
 
-  /** Subscribes to the bus on first use (never in the factory body, so the composition root can wire freely). */
+  /**
+   * Subscribes to the bus and settings and checks a session left by an earlier page, on first use (never in the
+   * factory body, so the composition root can wire freely).
+   */
   function wire(): void {
     if (wired) return;
     wired = true;
     core.bus.on('keys-changed', () => {
       void reconcileSession().finally(notify);
     });
-    if (readSession()) scheduleAutoLock();
+    core.bus.on('data-reset', () => {
+      statusCache.clear();
+      statusInflight.clear();
+      imported = null;
+      void reconcileSession().finally(notify);
+    });
+    // Local and other-tab settings changes: the auto-lock delay and which key is default or pinned.
+    core.settings.subscribe((next, prev) => {
+      if (next.security.autoLockMinutes !== prev.security.autoLockMinutes) {
+        const unlocked = readSession();
+        if (unlocked && expired(unlocked)) lockLocal();
+        else scheduleAutoLock();
+      }
+      if (next.defaultKeyId !== prev.defaultKeyId || keyBindings(next) !== keyBindings(prev)) {
+        notify();
+      }
+    });
+    if (readSession()) {
+      scheduleAutoLock();
+      void reconcileSession();
+    }
+  }
+
+  /**
+   * Removes settings that point at keys that no longer exist: the default (reassigned to the first remaining
+   * key), tool bindings (the tool then uses the default) and per-key budgets. Done before the keys file is
+   * written, so a failed settings write changes nothing; a capped tool never silently keeps a stale binding.
+   */
+  function forgetKeys(removed: Set<string>, remaining: StoredKey[]): void {
+    if (removed.size === 0) return;
+    const settings = core.settings.get();
+    const stale =
+      (settings.defaultKeyId !== null && removed.has(settings.defaultKeyId)) ||
+      Object.values(settings.tools).some((b) => b?.keyId !== undefined && removed.has(b.keyId)) ||
+      Object.keys(settings.budgets.perKeyMonthlyUsd).some((id) => removed.has(id));
+    if (!stale) return;
+    core.settings.update((draft) => {
+      if (draft.defaultKeyId !== null && removed.has(draft.defaultKeyId)) {
+        draft.defaultKeyId = remaining[0]?.id ?? null;
+      }
+      for (const binding of Object.values(draft.tools)) {
+        if (binding?.keyId !== undefined && removed.has(binding.keyId)) delete binding.keyId;
+      }
+      for (const id of removed) delete draft.budgets.perKeyMonthlyUsd[id];
+    });
   }
 
   function defaultId(file: StoredKeysFile): string | null {
@@ -161,7 +291,8 @@ export function createKeysService(
 
   function autoLockMs(): number | null {
     const minutes = core.settings.get().security.autoLockMinutes;
-    return minutes > 0 ? minutes * 60_000 : null;
+    if (!isFiniteNumber(minutes) || minutes <= 0) return null;
+    return Math.min(minutes, MAX_AUTO_LOCK_MINUTES) * MINUTE_MS;
   }
 
   function expired(unlocked: UnlockedSession): boolean {
@@ -183,21 +314,20 @@ export function createKeysService(
     if (had) notify();
   }
 
+  /** One timer for the next possible expiry; re-armed only when activity moved it. */
   function scheduleAutoLock(): void {
     clearTimer();
     const unlocked = readSession();
     const ms = autoLockMs();
     if (!unlocked || ms === null) return;
-    timer = setTimeout(
-      () => {
-        timer = null;
-        const current = readSession();
-        if (!current) return;
-        if (expired(current)) lockLocal();
-        else scheduleAutoLock();
-      },
-      Math.max(0, unlocked.at + ms - now()),
-    );
+    const delay = Math.min(Math.max(0, unlocked.at + ms - now()), MAX_TIMEOUT_MS);
+    timer = setTimeout(() => {
+      timer = null;
+      const current = readSession();
+      if (!current) return;
+      if (expired(current)) lockLocal();
+      else scheduleAutoLock();
+    }, delay);
   }
 
   /** The unlocked session when the lock is on and this tab holds a live one; locks on expiry. */
@@ -218,6 +348,20 @@ export function createKeysService(
     return key;
   }
 
+  /** This tab's session key, proven against `lock.verifier`; a stale one is dropped (KeyLockedError). */
+  async function verifiedSessionKey(lock: NonNullable<StoredKeysFile['lock']>): Promise<CryptoKey> {
+    const unlocked = activeSession();
+    if (!unlocked) throw new KeyLockedError();
+    try {
+      const key = await sessionCryptoKey(unlocked);
+      await decryptString(key, lock.verifier);
+      return key;
+    } catch {
+      lockLocal();
+      throw new KeyLockedError();
+    }
+  }
+
   function startSession(raw: string): void {
     const value: UnlockedSession = { key: raw, at: now() };
     writeJson(session(), SS_KEYS.unlocked, value);
@@ -225,20 +369,15 @@ export function createKeysService(
     scheduleAutoLock();
   }
 
-  /** After a change elsewhere: drop a session key that no longer opens the file (lock off or passphrase changed). */
+  /** Drop a session key that no longer opens the file (lock off, or passphrase changed in another tab). */
   async function reconcileSession(): Promise<void> {
-    const unlocked = readSession();
-    if (!unlocked) return;
+    if (!readSession()) return;
     const lock = readFile().lock;
     if (!lock) {
       lockLocal();
       return;
     }
-    try {
-      await decryptString(await sessionCryptoKey(unlocked), lock.verifier);
-    } catch {
-      lockLocal();
-    }
+    await verifiedSessionKey(lock).catch(() => undefined);
   }
 
   /** Derives the key for `lock` and proves it against the verifier. */
@@ -290,7 +429,7 @@ export function createKeysService(
       assertPassphrase(passphrase);
       const before = rawFile();
       const file = readFile();
-      if (file.lock) throw new Error('The passphrase lock is already on.');
+      if (file.lock) throw new InvalidInputError('The passphrase lock is already on.');
       const salt = randomBytes(16);
       const iterations = options.pbkdf2Iterations ?? PBKDF2_ITERATIONS;
       const key = await deriveKey(passphrase, salt, iterations, true);
@@ -299,7 +438,7 @@ export function createKeysService(
         file.keys.map((k) => k.secret ?? ''),
         file,
       );
-      const verifier: EncryptedBlob = await encryptString(key, VERIFIER_TEXT);
+      const verifier = await encryptString(key, VERIFIER_TEXT);
       const raw = await exportRawKey(key);
       commit(before, { version: 1, keys, lock: { salt: toBase64(salt), iterations, verifier } });
       startSession(raw);
@@ -349,7 +488,7 @@ export function createKeysService(
       assertPassphrase(newPassphrase);
       const before = rawFile();
       const file = readFile();
-      if (!file.lock) throw new Error('The passphrase lock is off.');
+      if (!file.lock) throw new InvalidInputError('The passphrase lock is off.');
       const oldKey = await verifiedKey(oldPassphrase, file.lock);
       const secrets = await Promise.all(
         file.keys.map((k) =>
@@ -418,9 +557,7 @@ export function createKeysService(
         enc: null,
       };
       if (before.lock) {
-        const unlocked = activeSession();
-        if (!unlocked) throw new KeyLockedError();
-        stored.enc = await encryptString(await sessionCryptoKey(unlocked), secret);
+        stored.enc = await encryptString(await verifiedSessionKey(before.lock), secret);
       } else {
         stored.secret = secret;
       }
@@ -429,8 +566,8 @@ export function createKeysService(
       if (JSON.stringify(file.lock) !== JSON.stringify(before.lock)) throw new KeysChangedError();
       file.keys.push(stored);
       writeFile(file);
-      const settings = core.settings.get();
-      if (!file.keys.some((k) => k.id === settings.defaultKeyId)) {
+      // Only the first key becomes default; a stale default id is covered by the first-key fallback.
+      if (file.keys.length === 1) {
         core.settings.update((draft) => {
           draft.defaultKeyId = stored.id;
         });
@@ -456,13 +593,9 @@ export function createKeysService(
       const file = readFile();
       const keys = file.keys.filter((k) => k.id !== id);
       if (keys.length === file.keys.length) return;
+      forgetKeys(new Set([id]), keys);
       writeFile({ ...file, keys });
       statusCache.delete(id);
-      if (core.settings.get().defaultKeyId === id) {
-        core.settings.update((draft) => {
-          draft.defaultKeyId = keys[0]?.id ?? null;
-        });
-      }
       changed();
     },
 
@@ -541,6 +674,38 @@ export function createKeysService(
       wire();
       listeners.add(fn);
       return () => listeners.delete(fn);
+    },
+
+    exportFile() {
+      return structuredClone(readFile());
+    },
+
+    replaceFile(next, opts) {
+      wire();
+      const valid = parseKeysFile(next, true);
+      if (!valid)
+        throw new InvalidInputError('The keys in this file are invalid; nothing was changed.');
+      const current = readFile();
+      if (opts?.expected !== undefined) {
+        const expected = parseKeysFile(opts.expected, false);
+        if (JSON.stringify(expected) !== JSON.stringify(current)) throw new KeysChangedError();
+      }
+      const kept = new Set(valid.keys.map((k) => k.id));
+      forgetKeys(new Set(current.keys.map((k) => k.id).filter((id) => !kept.has(id))), valid.keys);
+      writeFile(valid);
+      statusCache.clear();
+      // A session key from another lock cannot open the new file.
+      if (JSON.stringify(current.lock) !== JSON.stringify(valid.lock)) lockLocal();
+      changed();
+    },
+
+    clear() {
+      wire();
+      forgetKeys(new Set(readFile().keys.map((k) => k.id)), []);
+      removeItem(local(), LS_KEYS.keys);
+      statusCache.clear();
+      lockLocal();
+      changed();
     },
   };
 
