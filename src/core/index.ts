@@ -47,7 +47,8 @@ export function getCore(): CoreServices {
   core.backup = createBackupService(core);
   core.data = createDataService(core);
 
-  core.toolState = createToolStateStore; // stateless: a key-prefix closure per call
+  // Stateless: a key-prefix closure per call, telling the bus about changes.
+  core.toolState = (tool) => createToolStateStore(tool, core.bus);
 
   instance = core;
   return core;

@@ -905,7 +905,9 @@ export type BusEvent =
   | { type: 'run-finished'; id: string; tool: ToolId; status: RunStatus }
   | { type: 'stats-changed' }
   | { type: 'models-refreshed' }
-  | { type: 'data-reset' };
+  | { type: 'data-reset' }
+  /** A tool's state store wrote or deleted `key` (in this tab or another): re-read it if you show it. */
+  | { type: 'tool-state-changed'; tool: ToolId; key: string };
 
 export interface Bus {
   /** Delivers to listeners in this tab and in other tabs on the origin. */
