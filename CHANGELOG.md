@@ -46,10 +46,14 @@ All notable changes to this project are documented here. The format follows
 - Stats survive "Delete all prompts and history" (c8da141).
 - Auto-lock 0 means never (82808cd).
 - OAuth callback, Diagnostics, Settings, Models, History and Stats render on the shell (39fd198).
+- `models.resolve`: `?model=` and tool bindings apply to a tool's primary capability only (5072110).
+- Tool framework: `ToolInstance.estimate()` with `ui.refreshEstimate()`, one error rule through `output.fail(error)`, `createToolTestContext()`, `data-testid="tool-prompt"` convention (9760b10).
+- One modal at a time (queued), toasts with actions never auto-hide, `setFieldError()` for field errors (1db3bfd); re-renders keep focus through `data-focus-key` (20bdddc).
 
 ### Fixed
 
 - Stage 1 review: orphaned runs, double-booked and lost spend, retried paid POSTs, OAuth while locked, stale unlock sessions, non-atomic backup import, CSV formula injection, invalid XLSX/DOCX output, WAV/MP3/video edge cases.
+- Stage 2 review, shared parts: orphans that sent nothing no longer book their reservation, Undo never restores a running run (5072110); duplicate budget and add-key dialogs, offcanvas focus trap lost under a dialog (1db3bfd); accent contrast on cards and canvas, weak dark-mode focus border (9f3d343); stalled streaming, leaking result buttons, waveform memory, stray drops leaving the page (9760b10); inaccurate privacy copy, stale Home state (9f0ce68).
 
 ### Removed
 

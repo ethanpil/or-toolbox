@@ -5,7 +5,7 @@ How to build one of the 14 tools on the Stage 2 shell. Read [CLAUDE.md](../CLAUD
 ## The contract in one screen
 
 ```text
-src/tools/<id>/manifest.json   static half: name, icon, category, capabilities (first = primary), accepts, produces, defaults
+src/tools/<id>/manifest.json   static half: name, icon, category, capabilities (first = primary), accepts, produces, lazyLibs, defaults
 src/tools/<id>/main.ts         mountTool(getTool('<id>'), setup)          ← the only line that must stay
 src/tools/<id>/*.ts            your pipeline, UI pieces and *.test.ts (never import another tool's folder)
 ```
@@ -15,28 +15,30 @@ mountTool(manifest: ToolManifest, setup: ToolSetup, options?: { isolation?: 'req
 type ToolSetup = (ctx: ToolContext) => ToolInstance | Promise<ToolInstance>;
 
 interface ToolInstance {
-  getState(): ToolSnapshot;                  // { prompt: string; settings: Record<string, unknown> }
-  applyState(state: ToolSnapshot): void;      // must reproduce exactly what getState() returned
-  onFiles?(files: File[]): void;              // page-wide drop and paste, filtered by manifest.accepts
-  onReceive?(items: SendItem[]): void;        // "Send to…" from another tool, filtered by manifest.accepts
-  sample?(): void | Promise<void>;            // ?sample=1 and onboarding's "Try a sample"
+  getState(): ToolSnapshot;                     // { prompt: string; settings: Record<string, unknown> }
+  applyState(state: ToolSnapshot): void;         // must reproduce exactly what getState() returned
+  estimate?(model: string): Promise<number | null>; // cost of the current input on `model` (see Cost estimates)
+  onFiles?(files: File[]): void;                 // page-wide drop and paste, filtered by manifest.accepts
+  onReceive?(items: SendItem[]): void;           // "Send to…" from another tool, filtered by manifest.accepts
+  sample?(): void | Promise<void>;               // ?sample=1 and onboarding's "Try a sample"
 }
 ```
 
 All types live in `src/ui/tool/types.ts` and are re-exported from `src/ui/tool/index.ts`.
 
-`mountTool` renders the page shell (navbar, palette, toasts, leave guard, budget confirmation), the tool header (icon, name, description, model chip, key chip when there are several keys, cost estimate, Prompts, Settings, History) and three empty zones, builds the context, awaits `setup`, then:
+`mountTool` installs the page-wide drop/paste guard first (so a file dropped while the page is still loading never makes the browser open it and leave), renders the page shell (navbar, palette, toasts, leave guard, budget confirmation), the tool header (icon, name, description, model chip, key chip when there are several keys, cost estimate, Prompts, Settings, History) and three empty zones, builds the context, awaits `setup`, then:
 
 1. creates the Prompts panel around your `getState`/`applyState`;
 2. calls `ctx.jobs.resume()` (register job handlers **inside** `setup`);
-3. wires page-wide drag-and-drop and paste to `onFiles` (only if you provide it and `accepts` is not empty);
-4. applies the URL: `?run=<id>` (History → `applyState`), `?prompt=<id>` (a saved or recent prompt), `?sample=1` (`sample()`), `?receive=<id>` (Send to… hand-over → `onReceive`); these are removed from the address bar afterwards. `?model=<id>` stays and overrides the model for this visit ("re-run with another model").
+3. routes dropped and pasted files to `onFiles` (only accepted ones; see Files in and out);
+4. computes the first estimate (`estimate`, if you provide it);
+5. applies the URL: `?run=<id>` (History → `applyState`), `?prompt=<id>` (a saved or recent prompt), `?sample=1` (`sample()`), `?receive=<id>` (Send to… hand-over → `onReceive`); these are removed from the address bar afterwards. `?model=<id>` stays and overrides the primary model for this visit ("re-run with another model").
 
 Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No other tool does.
 
 ## The context
 
-`ToolContext` is every core service (`ctx.api`, `ctx.runs`, `ctx.models`, `ctx.history`, `ctx.prompts`, `ctx.jobs`, `ctx.results`, `ctx.settings`, `ctx.keys`, …; see `src/core/types.ts`) plus:
+`ToolContext` is every core service (`ctx.api`, `ctx.runs`, `ctx.models`, `ctx.history`, `ctx.prompts`, `ctx.jobs`, `ctx.results`, `ctx.settings`, `ctx.keys`, …; see `src/core/types.ts`) plus the members below. Use `ctx` everywhere; a tool never calls `getCore()`.
 
 | Member | What it is |
 | --- | --- |
@@ -44,9 +46,13 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `state` | `ToolStateStore` for this tool (IndexedDB `kv`): JSON-safe, persistent, e.g. saved deciders or a video sequence. Never binaries. |
 | `options` | `{ get(), set(patch), reset() }`: `manifest.defaults` merged with the user's saved options (`settings.tools[id].options`). `set` stores only what you pass. |
 | `ui` | The zones and helpers below. |
-| `model(cap?)` | `ResolvedModel` for a capability (default: the primary one) through the cascade `?model=` → the header's choice (tool binding) → capability default → shipped default, with free-only applied. `model === null` means nothing may run; the framework already shows the notice and disables Run. |
+| `model(cap?)` | `ResolvedModel` for a capability (default: the primary one, `capabilities[0]`), with free-only applied. `model === null` means nothing may run; for the primary capability the framework already shows the notice and disables Run. See Models per capability. |
 | `modelOverride` | `?model=` or null. |
-| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (from `ctx.model()`), `prompt` and `settings` (from your `getState()`), and aborts the run when `signal` aborts. |
+| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (default `ctx.model().model`), `prompt` and `settings` (from your `getState()`), `estimateUsd` (default: the header's current estimate, recomputed first if the input changed since), and aborts the run when `signal` aborts. |
+
+### Models per capability
+
+`ctx.model()` (the primary capability) runs the cascade `?model=` → the header's choice (the tool binding, `settings.tools[id].model`) → the capability default (Settings → Models) → the shipped default. **Every other capability skips the first two**: `ctx.model('vision')` on Chat starts at the vision default, because a text model pinned in the header may not read images. To let users choose a secondary model, give it its own control (`modelPicker(ctx, { capability: 'vision' })`) and keep the choice in `ctx.options`.
 
 `ctx.ui`:
 
@@ -56,28 +62,41 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `drawer` | Body of the Settings offcanvas. Put everyday options here. |
 | `advanced(title)` | Adds a collapsed accordion section at the end of the drawer and returns its body. |
 | `runner({ label, icon, run, hint, container })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter. Returns `Runner` (`trigger`, `stop`, `setDisabled(reason)`, `busy`). |
-| `setEstimate(usd \| null, note?)` | The header's estimate badge: `≈ $0.0012`, `Free` (0) or `Unknown` (null). |
+| `refreshEstimate()` | Recomputes the estimate through `ToolInstance.estimate` and shows it; resolves with the value. Call it when the input changes. |
+| `setEstimate(usd \| null, note?)` | Sets the badge directly (`≈ $0.0012`, `Free` for 0, `Unknown` for null), for tools without `estimate`. |
 | `status(text)` | A short, politely announced status in the output header ("Page 3 of 20"). |
 | `addResult({ kind, name, blob })` | Registers an in-memory binary result (leave guard) and returns `{ result, button(label?), download(), remove() }`. |
 | `sendTo(items)` | Opens the "Send to…" chooser for these items. |
 | `openPrompts()`, `openDrawer()` | What the header buttons do. |
+
+`ctx.ui` members are plain function properties, so `sendTo: ctx.ui.sendTo` works.
 
 ## Running something
 
 Every model call belongs to a run (rule 2). The pattern, inside the runner's `run(signal)`:
 
 ```ts
-const run = await ctx.beginRun({ estimateUsd: estimate, title: 'Optional history title' }, signal);
+const run = await ctx.beginRun({ title: 'Optional history title' }, signal); // estimate from your `estimate` hook
 try {
   const result = await ctx.api.chat({ model: run.model, messages }, { run });   // pass { run } to every call
   await run.finish({ output: result.choices[0]?.message.content ?? '' });     // text only, never binaries
 } catch (error) {
+  output.fail(error);      // if you have an output panel (below)
   await run.fail(error);   // AbortError → 'aborted', anything else → 'error'
-  throw error;             // the runner shows it through presentError (with Retry); Stop is silent
+  throw error;             // the runner reports it, once
 }
 ```
 
-`beginRun` (via `runs.begin`) refuses before anything is sent: no key (`no-key`: the error dialog offers Connect / paste a key, then retries), locked keys (`locked`: the unlock dialog, then retries), free-only with a paid model (`free-only`), a hard budget (`budget-blocked`). In Warn mode, or above the per-run threshold, the shell's **budget confirmation** opens by itself; Cancel throws `RunCancelledError`, which the runner treats as a quiet stop. You never handle any of this yourself: throw, and `presentError` maps `errorCode()` to the right message and action.
+**One error rule.** Whatever the tool catches, it rethrows, and the runner decides what the user sees:
+
+- **Stop** (an `AbortError`, or Cancel in the budget confirmation, `RunCancelledError`) is not an error: nothing is shown but a neutral "Stopped" status; partial output stays.
+- An error the output panel already showed inline (`output.fail(error)` marks it) is not shown again.
+- Errors that need an action (no key → Connect / paste a key, locked → unlock, free-only, budget blocked, storage full) always go to `presentError`, which opens the right dialog and retries.
+- Anything else is shown once: inline by the output panel, or by `presentError` (a toast with Retry) when there is no panel.
+
+Outside the runner (reading a dropped file, an export, a button of your own), catch and call `presentError(error)` yourself; never show the same error twice and never `console.error` it away.
+
+`beginRun` (via `runs.begin`) refuses before anything is sent: no key (`no-key`), locked keys (`locked`), free-only with a paid model (`free-only`), a hard budget (`budget-blocked`). In Warn mode, or above the per-run threshold, the shell's **budget confirmation** opens by itself (one dialog for parallel runs of one `groupId`); Cancel throws `RunCancelledError`. You never handle any of this yourself: throw, and the rule above applies.
 
 Long runs: `run.checkpoint({ output })` persists partial text (bot transcripts, batches). Parallel runs of one action share a `groupId` (arena contenders). A run that calls several models lists them in `models` so free-only checks them all.
 
@@ -91,18 +110,25 @@ output.start();                                    // skeleton until the first c
 await ctx.api.chatStream(body, {
   run,
   onEvent: (event) => {
-    if (event.type === 'text') output.append(event.text);   // re-rendered (throttled), sanitised Markdown
+    if (event.type === 'text') output.append(event.text);   // sanitised Markdown, drawn progressively
   },
 });
 output.finish();                                   // final render, "Done · 245 words", Copy/Download/Send to… enabled
-// on error: output.fail(userMessage(error)) keeps the partial text and shows the error line
+// on error: output.fail(error) — the error object, not a message (see the error rule)
 ```
 
-The streamed text itself is never a live region (it would read every token); start and finish are announced.
+Streaming stays cheap on long answers: blocks that are complete (up to the last blank line outside a code fence) are rendered once; only the unfinished tail is re-rendered, paced by how long rendering takes. The streamed text itself is never a live region (it would read every token); start, finish and Stop are announced.
 
 ## Cost estimates
 
-Call `ctx.models.estimate(input)` whenever the input changes and show the result with `ctx.ui.setEstimate()`; pass the same number as `estimateUsd` to `beginRun` (budgets reserve it). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
+Give the instance an `estimate(model)` hook and call `ctx.ui.refreshEstimate()` whenever the input changes:
+
+```ts
+estimate: (model) =>
+  ctx.models.estimate({ kind: 'tokens', model, promptTokens: approxTokens(text.value), completionTokens: maxTokens }),
+```
+
+The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it) and books it: `ctx.beginRun` without `estimateUsd` uses it, recomputing first if the input changed since. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
 
 ## Results, downloads and the leave guard
 
@@ -113,7 +139,9 @@ const handle = ctx.ui.addResult({ kind: 'image', name: 'product-1.png', blob });
 card.append(imageViewer({ src: ctx.results.objectUrl(handle.result.id), alt: 'Product 1' }).element, handle.button());
 ```
 
-`handle.button()` downloads and turns into "Downloaded". Until a result is downloaded, leaving through a link asks first (listing "3 images and 1 video not downloaded", with Download all), and reloading or closing the tab triggers the browser's own prompt. For text and table exports use `exportMenu({ filename, formats, resultIds })`: each format's Blob is built only when chosen (`toCsv`, `toXlsx`, `toDocx`, `zipFiles`, `toSrt`… from `src/core/export`), and `resultIds` marks the covered results downloaded.
+`handle.button()` downloads and turns into "Downloaded"; it stops listening when it leaves the page or the result is removed, so re-rendering a list of results leaks nothing. Until a result is downloaded, leaving through a link asks first (listing "3 images and 1 video not downloaded", with Download all), and reloading or closing the tab triggers the browser's own prompt. Call `handle.remove()` when the user discards a result.
+
+For text and table exports use `exportMenu({ filename, formats, resultIds })`, where `resultIds: () => readonly string[]` is read at click time: each format's Blob is built only when chosen (`toCsv`, `toXlsx`, `toDocx`, `zipFiles`, `toSrt`… from `src/core/export`), and the listed results are marked downloaded.
 
 ## Jobs (long remote work)
 
@@ -132,40 +160,51 @@ ctx.jobs.register<VideoPayload, VideoResult>('video', {
 });
 
 // starting one, inside run():
-const run = await ctx.beginRun({ estimateUsd }, signal);
-const submitted = await ctx.api.videos.submit(body, { run });
-const job = await ctx.jobs.add<VideoPayload, VideoResult>({
-  tool: ctx.manifest.id,
-  type: 'video',
-  payload,
-  keyId: run.keyId,
-  remoteId: submitted.id,
-  runId: run.id,
-});
-run.handOff(job.id); // from now on unload and Stop do not finalise the run
+const run = await ctx.beginRun({}, signal);
+try {
+  const submitted = await ctx.api.videos.submit(body, { run });
+  const job = await ctx.jobs.add<VideoPayload, VideoResult>({
+    tool: ctx.manifest.id,
+    type: 'video',
+    payload,
+    keyId: run.keyId,
+    remoteId: submitted.id,
+    runId: run.id,
+  });
+  run.handOff(job.id); // from now on unload and Stop do not finalise the run, and leaving the page is safe
+} catch (error) {
+  await run.fail(error); // the submit (or storing the job) failed: the run ends here
+  throw error;
+}
 
-// finishing it, wherever you observe completion (also after a reload, or in another tab):
+// ending it, wherever you observe the outcome (also after a reload, or in another tab):
 ctx.jobs.subscribe((record) => {
   const job = record as JobRecord<VideoPayload, VideoResult>;
-  if (job.state !== 'succeeded' || !job.runId || !job.result) return;
+  if (!job.runId || job.removed) return;
+  if (job.state !== 'succeeded' && job.state !== 'failed' && job.state !== 'cancelled') return;
   void ctx.runs.reattach(job.runId).then(async (run) => {
     if (!run) return; // already final
-    // Video cost arrives only on the completed status read; the run books it.
-    run.addUsage({
-      model: run.model,
-      promptTokens: 0,
-      completionTokens: 0,
-      costUsd: job.result!.costUsd ?? 0,
-      costEstimated: false,
-      costUnknown: job.result!.costUsd === null,
-      latencyMs: job.updatedAt - job.createdAt,
-    });
-    await run.finish({ meta: { videoJobIds: [job.remoteId] } });
+    if (job.state === 'succeeded' && job.result) {
+      // Video cost arrives only on the completed status read; the run books it.
+      run.addUsage({
+        model: run.model,
+        promptTokens: 0,
+        completionTokens: 0,
+        costUsd: job.result.costUsd ?? 0,
+        costEstimated: false,
+        costUnknown: job.result.costUsd === null,
+        latencyMs: job.updatedAt - job.createdAt,
+      });
+      await run.finish({ meta: { videoJobIds: [job.remoteId] } });
+    } else {
+      // A handed-off run ignores AbortErrors, so end it with a plain error carrying the reason.
+      await run.fail(new Error(job.state === 'cancelled' ? 'The video job was cancelled.' : (job.error ?? 'The video job failed.')));
+    }
   });
 });
 ```
 
-Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`.
+Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`. Handed-off runs do not count for the leave guard: the job carries on without the page.
 
 ## Prompts, History and the form state
 
@@ -179,7 +218,8 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 
 ## Files in and out
 
-- **Drop and paste:** implement `onFiles(files)`; the framework shows a page-wide overlay while files are dragged over the page, filters by `manifest.accepts` (wildcards and extension fallback) and names skipped files in a toast. A paste into a text field that carries text is left to the field.
+- **Drop and paste:** implement `onFiles(files)`. From the moment the page starts, every file drag over it is caught (a stray drop never opens the file and leaves the page). While your tool takes files (`onFiles` and a non-empty `accepts`), a page-wide overlay shows during the drag; only files matching `manifest.accepts` (wildcards and extension fallback) reach `onFiles`, and skipped ones are named in a toast. A tool without `onFiles` answers a drop with "<Tool> doesn't take files." A paste into a text field that carries text is left to the field.
+- **Handle files by type.** `accepts` can mix text, images and PDFs: branch on `file.type` (with the extension as fallback). `readAsText` only for text; images go to the model as data URLs (`readAsDataUrl`); PDFs through `openPdf` (dynamic import, see Media). Never read a binary file as text.
 - **Drop zone:** `dropZone({ accept, multiple, onFiles })` for an explicit target with a keyboard-reachable "Choose files" button.
 - **Send to…:** `ctx.ui.sendTo([{ kind: 'text', text, type: 'text/markdown' }, { kind: 'file', blob, name }])` lists tools whose `accepts` match and opens the chosen one in a new tab; the items travel in memory over a BroadcastChannel handshake (nothing is stored). The target receives them in `onReceive`. `outputPanel({ sendTo: ctx.ui.sendTo })` wires its own button.
 
@@ -188,19 +228,30 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 | Component | Use it for |
 | --- | --- |
 | `dropZone(options)` | File input target (drag, keyboard, accept filter). |
-| `modelPicker(core, { capability, selected })` → `Promise<string \| null>` | Extra model choices (arena contenders, bot B). The header chip already covers the primary capability. |
-| `keyPicker({ keys, value, onChange })` | A key choice beyond the header's. |
-| `costBadge(usd?)` | An estimate pill for a sub-part (e.g. per sequence step). |
+| `modelPicker(ctx, { capability, selected })` → `Promise<string \| null>` | Extra model choices (arena contenders, bot B, a secondary capability). The header chip covers the primary capability only. |
+| `keyPicker({ keys, value, onChange, focusKey? })` | A key choice beyond the header's. |
+| `costBadge(usd?, note?)` | An estimate pill for a sub-part (e.g. per sequence step). |
 | `outputPanel(options)` | Streaming text or Markdown with Copy, Download, Send to…. |
 | `exportMenu({ filename, formats, resultIds })` | Lazily built downloads in several formats. |
 | `imageViewer({ src \| blob, alt })` | Fit/zoom, checkerboard behind transparency. |
-| `audioPlayer({ src \| blob, peaks?, label })` | Native controls plus a waveform (`peaks()` from `src/core/media/audio`, or decoded lazily). |
+| `audioPlayer({ src \| blob, peaks?, label })` | Native controls plus a waveform (`peaks()` from `src/core/media/audio`, or decoded lazily at 8 kHz mono; none beyond 30 minutes). |
 | `videoPlayer({ src \| blob, label })` | Native controls in a letterboxed frame. |
 | `jobList(options)` + `bindJobList(...)` | Persistent jobs with progress. |
 | `emptyState({ icon, title, text, action, compact, inline })` | Every "nothing yet" place. |
 | `connectKey(options)` | Connect with OpenRouter / paste a key (onboarding, the no-key dialog). |
 
-Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })`, `confirmDialog`, `typedConfirm({ phrase })` (destructive data actions), `promptDialog`, `unlockDialog()`, `presentError(error, { retry })`, `announce(text)`, and `openModal(options)` for anything custom (one modal at a time; await `closed`). Formatting: `src/ui/format.ts` (`formatUsd`, `formatEstimate`, `formatTokens`, `formatMs`, `formatBytes`, `formatDuration`, `formatRelativeTime`, `formatModelPrice`, `plural`). Links: `src/ui/shell/links.ts` (`toolUrl`, `settingsUrl(section)`, `historyUrl`, `modelsUrl`).
+Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` (a toast with an action stays until dismissed), `confirmDialog`, `typedConfirm({ phrase })` (destructive data actions), `promptDialog`, `unlockDialog()`, `presentError(error, { retry })`, `announce(text)`, `setFieldError(input, feedback, message | null)` (field validation: `is-invalid`, `aria-invalid`, `aria-describedby`, announced), and `openModal(options)` for anything custom (one modal at a time, later ones queue; await `closed`). Formatting: `src/ui/format.ts` (`formatUsd`, `formatEstimate`, `formatTokens`, `formatMs`, `formatBytes`, `formatDuration`, `formatRelativeTime`, `formatModelPrice`, `plural`). Links: `src/ui/shell/links.ts` (`toolUrl`, `settingsUrl(section)`, `historyUrl`, `modelsUrl`).
+
+**Re-rendering a list** (results, saved items, chips): give each focusable control a stable `data-focus-key` (for example `` `remove:${item.id}` ``) and swap the children with `replace(container, ...children)` from `src/ui/dom.ts`. Focus moves to the new element with the same key, and Bootstrap dropdowns, collapses and toasts inside the old children are disposed. Never key focus on `data-testid`.
+
+## Media and heavy libraries
+
+- **Lazy only.** Anything heavy loads with `import()` when first needed, and the manifest lists it in `lazyLibs` (a unit test checks they are dependencies). Budget: each tool adds at most 80 KB gzipped JS to the shell's 150 KB; check the `npm run build` output.
+- **PDF:** import `src/core/media/pdf.ts` dynamically only (`const { openPdf } = await import('../../core/media/pdf')`); it brings about 5 MB of pdf.js assets.
+- **Audio:** join TTS or audio segments with `stitchAudio(segments, 'mp3' | 'wav')` (`src/core/media/stitch.ts`: decode → PCM → encode once). Plain MP3 concatenation leaves gaps at the seams.
+- **Isolated image:** run the pipeline through `isolateImage()` (`src/core/media/image-async.ts`, a module worker with a fallback), never the raster functions on the main thread.
+- **ZIP:** `zipFiles()` from `src/core/export`, or fflate's `zipSync`. Never fflate's async API (`zip`, `unzip`, `deflate`): it starts `blob:` workers that the CSP blocks, and then never settles.
+- **ffmpeg:** go through `src/core/media/ffmpeg-ops.ts`; any `exec` of your own passes explicit `-threads` limits (multi-threaded ffmpeg crashes on H.264 encodes with the default count).
 
 ## Rules that bite
 
@@ -208,39 +259,75 @@ Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })`,
 - No `fetch` to OpenRouter and no storage access: go through `ctx`.
 - Element ids: generate them with `uid()` (`src/ui/id.ts`); a page can hold several instances.
 - `hidden` is safe on any element (a global rule beats Bootstrap's display utilities).
-- Heavy libraries load with `import()` when first needed (`src/core/media/pdf.ts`, ffmpeg, docx, xlsx).
 
 ## Accessibility
 
-Every control has a visible label (or `aria-label` for icon buttons), everything works with the keyboard (Tab order follows the layout; Ctrl/Cmd+Enter runs), focus is visible, status changes go through `ui.status()` / `announce()` rather than new live regions, and colours come from Bootstrap's variables so both themes and custom accents keep AA contrast. Do not move focus unexpectedly; dialogs return focus to their opener.
+Every control has a visible label (or `aria-label` for icon buttons), everything works with the keyboard (Tab order follows the layout; Ctrl/Cmd+Enter runs), focus is visible, status changes go through `ui.status()` / `announce()` rather than new live regions, field errors through `setFieldError`, and colours come from Bootstrap's variables so both themes and custom accents keep AA contrast. Do not move focus unexpectedly; dialogs return focus to their opener, and re-rendered controls keep it through `data-focus-key`.
 
 ## Testing
 
-- **Unit** (`src/tools/<id>/*.test.ts`, Vitest + jsdom): pipeline logic, request building, parsing, the `getState`/`applyState` round trip. `src/core/testing/state-fakes.ts` and `src/core/api/test-fakes.ts` give real services over fake IndexedDB and channels.
+- **Convention:** the tool's main prompt field (the one `getState().prompt` reads) carries `data-testid="tool-prompt"`. Shared specs (Prompts, onboarding's sample) find it there.
+- **Unit** (`src/tools/<id>/*.test.ts`, Vitest + jsdom): pipeline logic, request building, parsing, and the tool itself through `createToolTestContext` (`src/ui/tool/testing.ts`). It builds a real `ToolContext` (the same `createToolContext` as the page) over the fake core: real settings, runs, history and models services on fake IndexedDB, one fake key, and an API client whose calls throw unless you provide them.
+
+  ```ts
+  import 'fake-indexeddb/auto';
+  import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
+  import { createToolTestContext } from '../../ui/tool/testing';
+
+  beforeEach(async () => {
+    isolateChannels();
+    await resetDb();
+    localStorage.clear();
+  });
+
+  it('round-trips its state and books its estimate', async () => {
+    const t = createToolTestContext(getTool('chat'), { catalog: [model], api: { chatStream } });
+    const tool = await t.mount(setup);
+    const state = { prompt: 'Summarise this', settings: { length: 'long', temperature: 0.3 } };
+    tool.applyState(state);
+    expect(tool.getState()).toEqual(state);
+    await t.ctx.ui.refreshEstimate();
+    expect(t.estimate()).toBeGreaterThan(0);
+    await t.runners[0]!.trigger(); // runs through ctx.beginRun and your mocked chatStream
+    t.cleanup();
+  });
+  ```
+
+  Options: `catalog` (models the models service serves), `api` (calls to mock), `modelOverride` (`?model=`), `noKey`. The result also exposes `core`, `keyState`, `zones`, `sent` (Send to… items) and `status()`.
 - **E2E** (`tests/e2e/<id>.spec.ts`): import `test`/`expect` from `tests/mock/index.ts`; mock every OpenRouter call (`mock.json`, `mock.sse` for streams, `mock.file` for media, `mock.sequence` for polling), seed state with `seedApp(context, { key: true })` from `tests/e2e/app.ts`, and assert `watchForProblems(page)` is empty. Cover: a run end to end with the output, the error path (`mock.json(..., { status: 429 })`), Stop, drop/paste of an accepted file, and the prompts round trip (save current → Use restores the form). `tests/e2e/routes.spec.ts` already runs axe on your page in light and dark.
 
 ## Worked example
 
-A complete small tool, compiled and run against the shell while this guide was written (as `src/tools/chat/main.ts`). It summarises text: input, a drawer option and an advanced option, a live estimate, streaming output, drop/paste, Send to…, samples and the prompts round trip.
+A complete small tool, type-checked and unit-tested against the framework while this guide was written (as `src/tools/chat/main.ts`). It summarises text: input, a drawer option and an advanced option, an estimate through the hook, streaming output, drop/paste by file type, Send to…, a sample and the prompts round trip.
 
 ```ts
-import { userMessage } from '../../core/errors';
 import { readAsText } from '../../core/files';
 import { outputPanel } from '../../ui/components/output-panel';
 import { h } from '../../ui/dom';
+import { presentError } from '../../ui/feedback/errors';
+import { plural } from '../../ui/format';
 import { uid } from '../../ui/id';
 import { mountTool, type ToolContext, type ToolInstance } from '../../ui/tool/index';
 import { getTool } from '../registry';
 
 type Length = 'short' | 'medium' | 'long';
 const MAX_TOKENS: Record<Length, number> = { short: 200, medium: 500, long: 1200 };
-const isLength = (value: unknown): value is Length => value === 'short' || value === 'medium' || value === 'long';
+const isLength = (value: unknown): value is Length =>
+  value === 'short' || value === 'medium' || value === 'long';
+const isText = (file: File): boolean =>
+  file.type.startsWith('text/') || /\.(txt|md|markdown)$/i.test(file.name);
 
-function setup(ctx: ToolContext): ToolInstance {
+export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
   const ids = { text: uid('text'), length: uid('length'), temperature: uid('temperature') };
 
-  const text = h('textarea', { id: ids.text, class: 'form-control', rows: 10, placeholder: 'Paste text or drop a .txt file' });
+  const text = h('textarea', {
+    id: ids.text,
+    class: 'form-control',
+    rows: 10,
+    placeholder: 'Paste text or drop a .txt file',
+    'data-testid': 'tool-prompt',
+  });
   ui.input.append(h('label', { class: 'form-label fw-semibold', htmlFor: ids.text }, 'Text'), text);
 
   const length = h(
@@ -254,33 +341,33 @@ function setup(ctx: ToolContext): ToolInstance {
   length.value = isLength(savedLength) ? savedLength : 'medium';
   ui.drawer.append(h('label', { class: 'form-label', htmlFor: ids.length }, 'Length'), length);
 
-  const temperature = h('input', { id: ids.temperature, type: 'number', class: 'form-control', min: '0', max: '2', step: '0.1', value: '0.3' });
-  ui.advanced('Sampling').append(h('label', { class: 'form-label', htmlFor: ids.temperature }, 'Temperature'), temperature);
+  const temperature = h('input', {
+    id: ids.temperature,
+    type: 'number',
+    class: 'form-control',
+    min: '0',
+    max: '2',
+    step: '0.1',
+    value: '0.3',
+  });
+  ui.advanced('Sampling').append(
+    h('label', { class: 'form-label', htmlFor: ids.temperature }, 'Temperature'),
+    temperature,
+  );
 
   const output = outputPanel({ format: 'markdown', filename: 'summary', sendTo: ui.sendTo });
   ui.output.append(output.element);
 
-  const settings = () => ({ length: length.value as Length, temperature: Number(temperature.value) });
+  const settings = () => ({
+    length: isLength(length.value) ? length.value : 'medium',
+    temperature: Number(temperature.value),
+  });
 
-  let estimate: number | null = null;
-  const updateEstimate = async (): Promise<void> => {
-    const model = ctx.model().model;
-    estimate = model
-      ? await ctx.models.estimate({
-          kind: 'tokens',
-          model,
-          promptTokens: Math.ceil(text.value.length / 4) + 50,
-          completionTokens: MAX_TOKENS[settings().length],
-        })
-      : null;
-    ui.setEstimate(estimate);
-  };
-  text.addEventListener('input', () => void updateEstimate());
+  text.addEventListener('input', () => void ui.refreshEstimate());
   length.addEventListener('change', () => {
     ctx.options.set({ length: length.value });
-    void updateEstimate();
+    void ui.refreshEstimate();
   });
-  void updateEstimate();
 
   ui.runner({
     label: 'Summarise',
@@ -291,7 +378,7 @@ function setup(ctx: ToolContext): ToolInstance {
         text.focus();
         return;
       }
-      const run = await ctx.beginRun({ estimateUsd: estimate }, signal);
+      const run = await ctx.beginRun({}, signal); // books the header's estimate
       output.start();
       try {
         const result = await ctx.api.chatStream(
@@ -314,9 +401,9 @@ function setup(ctx: ToolContext): ToolInstance {
         output.finish();
         await run.finish({ output: result.text });
       } catch (error) {
-        output.fail(userMessage(error));
+        output.fail(error); // Stop: "Stopped", partial kept; other errors inline, once
         await run.fail(error);
-        throw error;
+        throw error; // the runner skips what the panel showed and handles keys, budgets…
       }
     },
   });
@@ -327,21 +414,33 @@ function setup(ctx: ToolContext): ToolInstance {
       text.value = prompt;
       if (isLength(saved['length'])) length.value = saved['length'];
       if (typeof saved['temperature'] === 'number') temperature.value = String(saved['temperature']);
-      void updateEstimate();
+      void ui.refreshEstimate();
     },
+    estimate: (model) =>
+      ctx.models.estimate({
+        kind: 'tokens',
+        model,
+        promptTokens: Math.ceil(text.value.length / 4) + 50,
+        completionTokens: MAX_TOKENS[settings().length],
+      }),
     onFiles: (files) => {
-      void Promise.all(files.map((file) => readAsText(file))).then((parts) => {
-        text.value = [text.value, ...parts].filter(Boolean).join('\n\n');
-        void updateEstimate();
-      });
+      // Chat's manifest also accepts images and PDFs; this example reads text files only.
+      const skipped = files.filter((file) => !isText(file));
+      if (skipped.length > 0) ui.status(`${plural(skipped.length, 'file')} skipped: only text files are read.`);
+      Promise.all(files.filter(isText).map((file) => readAsText(file)))
+        .then((parts) => {
+          text.value = [text.value, ...parts].filter(Boolean).join('\n\n');
+          void ui.refreshEstimate();
+        })
+        .catch((error: unknown) => void presentError(error));
     },
     onReceive: (items) => {
       for (const item of items) if (item.kind === 'text') text.value = item.text;
-      void updateEstimate();
+      void ui.refreshEstimate();
     },
     sample: () => {
       text.value = 'ORtoolbox runs in your browser. Paste one OpenRouter key and every tool works.';
-      void updateEstimate();
+      void ui.refreshEstimate();
     },
   };
 }
@@ -351,7 +450,10 @@ mountTool(getTool('chat'), setup);
 
 ## Replacing the stand-in
 
-1. Write `setup` in `src/tools/<id>/` (split into modules as it grows); keep `main.ts` to the `mountTool` call.
+1. Write `setup` in `src/tools/<id>/` (split into modules as it grows); keep `main.ts` to the `mountTool` call, and the manifest's `accepts`, `capabilities` (primary first) and `lazyLibs` true to what the tool does.
 2. Remove the `comingSoon` import from your `main.ts`. When the last tool is done, delete `src/ui/tool/coming-soon.ts`.
-3. Give the tool a `sample()` (onboarding offers it), unit tests for the pipeline and the state round trip, and an e2e spec against the mock.
-4. Check the page in both themes at 320 px and on a desktop, with the keyboard only.
+3. Main prompt field: `data-testid="tool-prompt"`. Implement `getState`/`applyState` (exact round trip), `estimate` (and call `ui.refreshEstimate()` on input changes), `sample()` (onboarding offers it), and `onFiles`/`onReceive` if the manifest accepts anything.
+4. Follow the error rule: `output.fail(error)` / `run.fail(error)` / rethrow; `presentError` outside the runner.
+5. Media: lazy imports, `stitchAudio`, `isolateImage`, `zipFiles`/`zipSync`, explicit ffmpeg `-threads`; stay inside the 80 KB budget.
+6. Tests: unit tests for the pipeline and the tool through `createToolTestContext`, and an e2e spec against the mock (run, error, Stop, files, prompts round trip).
+7. Check the page in both themes at 320 px and on a desktop, with the keyboard only.
