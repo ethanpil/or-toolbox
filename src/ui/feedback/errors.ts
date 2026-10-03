@@ -13,6 +13,9 @@
  * | `network` | the message, with Retry |
  * | `storage-full` | a link to Settings → Data |
  * | anything else | `userMessage(error)`, with Retry when given |
+ *
+ * Each error is shown once: one already presented (or marked by `markPresented`, as `outputPanel.fail` does
+ * when it shows an error inline) is ignored.
  */
 import { errorCode, userMessage } from '../../core/errors';
 import { connectKey } from '../components/connect-key';
@@ -21,6 +24,39 @@ import { settingsUrl } from '../shell/links';
 import { openModal } from './modal';
 import { type ToastAction, toast } from './toast';
 import { unlockDialog } from './unlock';
+
+/** Errors already shown to the user (inline in an output panel, say), so nothing shows them a second time. */
+const presented = new WeakSet<object>();
+
+/** Marks an error as shown; `presentError` then stays quiet about it. */
+export function markPresented(error: unknown): void {
+  if (typeof error === 'object' && error !== null) presented.add(error);
+}
+
+export function wasPresented(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && presented.has(error);
+}
+
+/**
+ * Errors only `presentError` can handle well, because they need a dialog or a link to a setting (unlock, add a
+ * key, budgets, free-only, storage). An output panel leaves these to it instead of showing them inline.
+ */
+export function needsAction(error: unknown): boolean {
+  const code = errorCode(error);
+  return (
+    code === 'no-key' ||
+    code === 'locked' ||
+    code === 'free-only' ||
+    code === 'budget-blocked' ||
+    code === 'storage-full'
+  );
+}
+
+/** Silent outcomes: the user stopped it, or declined a budget confirmation. */
+export function isStop(error: unknown): boolean {
+  const code = errorCode(error);
+  return code === 'aborted' || code === 'cancelled';
+}
 
 export interface PresentErrorOptions {
   /** Re-runs the failed action; offered as a button and called after unlocking or adding a key. */
@@ -35,6 +71,8 @@ export async function presentError(
     ? { label: 'Retry', onClick: options.retry, testId: 'toast-retry' }
     : undefined;
 
+  if (wasPresented(error)) return;
+  markPresented(error);
   switch (errorCode(error)) {
     case 'aborted':
     case 'cancelled':
@@ -103,8 +141,18 @@ export async function presentError(
   }
 }
 
+/** One "Add a key" dialog at a time: parallel runs that all lack a key share it. */
+let addKeyPending: Promise<boolean> | null = null;
+
 /** The "Add a key" dialog for `no-key`. Resolves true once a key was saved. */
-async function addKeyDialog(message: string): Promise<boolean> {
+function addKeyDialog(message: string): Promise<boolean> {
+  addKeyPending ??= showAddKeyDialog(message).finally(() => {
+    addKeyPending = null;
+  });
+  return addKeyPending;
+}
+
+async function showAddKeyDialog(message: string): Promise<boolean> {
   let added = false;
   const modal = openModal({
     title: 'Add an OpenRouter key',

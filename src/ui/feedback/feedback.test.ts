@@ -3,6 +3,7 @@ import {
   BudgetBlockedError,
   FreeOnlyError,
   NetworkError,
+  NoKeyError,
   RateLimitError,
   RunCancelledError,
   StorageFullError,
@@ -10,11 +11,14 @@ import {
 import { h } from '../dom';
 import { confirmDialog, promptDialog, typedConfirm } from './dialogs';
 import { presentError } from './errors';
-import { openModal } from './modal';
+import { setFieldError } from './field-error';
+import { modalOpen, openModal } from './modal';
 import { toast } from './toast';
 
 const $ = <T extends HTMLElement = HTMLElement>(testId: string): T | null =>
   document.querySelector<T>(`[data-testid="${testId}"]`);
+const count = (testId: string): number =>
+  document.querySelectorAll(`[data-testid="${testId}"]`).length;
 
 /** Waits until Bootstrap has finished showing the modal (it then moves focus into it). */
 const shown = (testId: string) =>
@@ -35,6 +39,27 @@ describe('toast', () => {
     expect($('toast')?.textContent).toContain('Prompt deleted.');
     $('undo')!.click();
     expect(onClick).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect($('toast')).toBeNull());
+  });
+
+  it('runs an action once, keeps a toast with actions until used, and survives a late hide', async () => {
+    const onClick = vi.fn();
+    const handle = toast({
+      message: 'Prompt deleted.',
+      action: { label: 'Undo', onClick, testId: 'undo' },
+      timeoutMs: 20,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect($('toast')).not.toBeNull(); // no timer to race (WCAG 2.2.1)
+    $('undo')!.click();
+    $('undo')?.click();
+    expect(onClick).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect($('toast')).toBeNull());
+    expect(() => handle.hide()).not.toThrow();
+  });
+
+  it('hides a plain message after its timeout', async () => {
+    toast({ message: 'Saved.', timeoutMs: 20 });
     await vi.waitFor(() => expect($('toast')).toBeNull());
   });
 
@@ -68,6 +93,61 @@ describe('openModal', () => {
     await modal.closed;
     expect($('m')).toBeNull();
     expect(document.activeElement).toBe(opener);
+  });
+});
+
+describe('openModal queue', () => {
+  it('shows one modal at a time and drops a queued one that is hidden first', async () => {
+    const first = openModal({ title: 'First', body: 'One', testId: 'm1' });
+    const second = openModal({ title: 'Second', body: 'Two', testId: 'm2' });
+    const third = openModal({ title: 'Third', body: 'Three', testId: 'm3' });
+    expect(modalOpen()).toBe(true);
+    await shown('m1');
+    expect($('m2')).toBeNull();
+    third.hide();
+    await third.closed;
+    first.hide();
+    await first.closed;
+    await shown('m2');
+    expect(count('m1') + count('m3')).toBe(0);
+    second.hide();
+    await second.closed;
+    expect($('m3')).toBeNull();
+    expect(modalOpen()).toBe(false);
+  });
+
+  it('names a dialog without a header by aria-label and adds no hidden close button', async () => {
+    const modal = openModal({
+      title: 'Search',
+      body: h('input', { type: 'search' }),
+      hideHeader: true,
+      testId: 'bare',
+    });
+    await shown('bare');
+    expect(modal.element.getAttribute('aria-label')).toBe('Search');
+    expect(modal.element.hasAttribute('aria-labelledby')).toBe(false);
+    expect(modal.element.querySelector('.btn-close')).toBeNull();
+    modal.hide();
+    await modal.closed;
+  });
+});
+
+describe('setFieldError', () => {
+  it('marks the field invalid, links the message and announces it; null clears it', async () => {
+    const input = h('input', { type: 'text', 'aria-describedby': 'help' });
+    const feedback = h('div', { class: 'invalid-feedback' });
+    document.body.append(input, feedback);
+    setFieldError(input, feedback, 'Enter a name.');
+    expect(input.classList.contains('is-invalid')).toBe(true);
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(input.getAttribute('aria-describedby')).toBe(`help ${feedback.id}`);
+    expect(feedback.textContent).toBe('Enter a name.');
+    await vi.waitFor(() => expect($('announcer-assertive')?.textContent).toBe('Enter a name.'));
+    setFieldError(input, feedback, null);
+    expect(input.classList.contains('is-invalid')).toBe(false);
+    expect(input.hasAttribute('aria-invalid')).toBe(false);
+    expect(feedback.textContent).toBe('');
+    expect(input.getAttribute('aria-describedby')).toBe(`help ${feedback.id}`);
   });
 });
 
@@ -154,6 +234,24 @@ describe('presentError', () => {
     expect($('error-toast')?.querySelector('a')?.getAttribute('href')).toBe(
       '/or-toolbox/settings/#data',
     );
+  });
+
+  it('shows an error once, however many places report it', async () => {
+    const error = new NetworkError();
+    await presentError(error);
+    await presentError(error);
+    expect(count('error-toast')).toBe(1);
+  });
+
+  it('opens one add-key dialog for parallel runs that all lack a key', async () => {
+    const first = presentError(new NoKeyError());
+    const second = presentError(new NoKeyError());
+    await shown('add-key-dialog');
+    expect(count('add-key-dialog')).toBe(1);
+    document.querySelector<HTMLButtonElement>('[data-testid="add-key-dialog"] .btn-close')!.click();
+    await Promise.all([first, second]);
+    expect($('add-key-dialog')).toBeNull();
+    expect(modalOpen()).toBe(false);
   });
 
   it('offers Retry for rate limits, network errors and the rest', async () => {

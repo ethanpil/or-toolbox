@@ -56,7 +56,8 @@ export function atStake(core: Pick<CoreServices, 'results' | 'runs'>): string[] 
   const lines: string[] = [];
   const summary = core.results.summary();
   if (summary) lines.push(summary);
-  const running = core.runs.active().length;
+  // A run handed off to a job (video) is finished by the job, also after this page is gone.
+  const running = core.runs.active().filter((run) => run.jobId === null).length;
   if (running > 0) lines.push(`${plural(running, 'run')} in progress`);
   return lines;
 }

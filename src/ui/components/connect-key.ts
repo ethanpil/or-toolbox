@@ -9,7 +9,9 @@ import { getCore } from '../../core/index';
 import { keyFormatProblem, normalizeKeyInput } from '../../core/keys/format';
 import type { KeyInfo } from '../../core/types';
 import { h } from '../dom';
+import { announce } from '../feedback/announce';
 import { presentError } from '../feedback/errors';
+import { setFieldError } from '../feedback/field-error';
 import { formatUsd } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
@@ -68,7 +70,8 @@ export function connectKey(options: ConnectKeyOptions = {}): HTMLElement {
     class: 'invalid-feedback',
     'data-testid': 'key-feedback',
   });
-  const status = h('div', { class: 'small mt-2', role: 'status', 'data-testid': 'key-status' });
+  // Not a live region: results are announced once through announce().
+  const status = h('div', { class: 'small mt-2', 'data-testid': 'key-status' });
   const save = h(
     'button',
     { type: 'submit', class: 'btn btn-outline-primary', 'data-testid': 'key-save' },
@@ -76,13 +79,12 @@ export function connectKey(options: ConnectKeyOptions = {}): HTMLElement {
   );
 
   const invalid = (message: string): void => {
-    feedback.textContent = message;
-    input.classList.add('is-invalid');
+    setFieldError(input, feedback, message);
     input.focus();
   };
 
   const saveKey = async (): Promise<void> => {
-    input.classList.remove('is-invalid');
+    setFieldError(input, feedback, null);
     status.replaceChildren();
     const secret = normalizeKeyInput(input.value);
     const problem = keyFormatProblem(secret);
@@ -108,10 +110,9 @@ export function connectKey(options: ConnectKeyOptions = {}): HTMLElement {
           keyStatus.limitRemainingUsd !== null
             ? ` ${formatUsd(keyStatus.limitRemainingUsd)} left on this key.`
             : '';
-        status.replaceChildren(
-          icon('check-circle-fill', 'text-success-emphasis me-1'),
-          `Key saved (${key.masked}).${balance}`,
-        );
+        const done = `Key saved (${key.masked}).${balance}`;
+        status.replaceChildren(icon('check-circle-fill', 'text-success-emphasis me-1'), done);
+        announce(done);
       } catch (error) {
         if (error instanceof ApiError && error.status === 401) {
           core.keys.remove(key.id);
@@ -119,10 +120,9 @@ export function connectKey(options: ConnectKeyOptions = {}): HTMLElement {
           invalid('OpenRouter rejected this key. Check that you copied all of it.');
           return;
         }
-        status.replaceChildren(
-          icon('check-circle', 'text-success-emphasis me-1'),
-          `Key saved (${key.masked}). It could not be checked right now.`,
-        );
+        const done = `Key saved (${key.masked}). It could not be checked right now.`;
+        status.replaceChildren(icon('check-circle', 'text-success-emphasis me-1'), done);
+        announce(done);
       }
       options.onAdded?.(key);
     } catch (error) {

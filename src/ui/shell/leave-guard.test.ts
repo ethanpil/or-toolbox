@@ -37,7 +37,11 @@ describe('leavesPage', () => {
   });
 });
 
-function fakeCore(pending: number, running: number): Pick<CoreServices, 'results' | 'runs'> {
+function fakeCore(
+  pending: number,
+  running: number,
+  handedOff = 0,
+): Pick<CoreServices, 'results' | 'runs'> {
   const results = Array.from({ length: pending }, (_, i) => ({ id: `r${i}` }) as SessionResult);
   return {
     results: {
@@ -47,7 +51,10 @@ function fakeCore(pending: number, running: number): Pick<CoreServices, 'results
       downloadAll: vi.fn(() => Promise.resolve()),
     } as unknown as CoreServices['results'],
     runs: {
-      active: () => Array.from({ length: running }, () => ({}) as RunHandle),
+      active: () => [
+        ...Array.from({ length: running }, () => ({ jobId: null }) as RunHandle),
+        ...Array.from({ length: handedOff }, () => ({ jobId: 'job' }) as RunHandle),
+      ],
     } as unknown as CoreServices['runs'],
   };
 }
@@ -58,6 +65,9 @@ describe('atStake', () => {
     expect(atStake(fakeCore(3, 0))).toEqual(['3 images not downloaded']);
     expect(atStake(fakeCore(0, 1))).toEqual(['1 run in progress']);
     expect(atStake(fakeCore(2, 2))).toEqual(['2 images not downloaded', '2 runs in progress']);
+    // Runs handed off to a job finish without this page.
+    expect(atStake(fakeCore(0, 0, 2))).toEqual([]);
+    expect(atStake(fakeCore(0, 1, 1))).toEqual(['1 run in progress']);
   });
 });
 

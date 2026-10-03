@@ -8,9 +8,11 @@
  * await modal.closed;
  * ```
  *
- * Bootstrap does not stack modals: open one only after the previous one closed (await `closed`).
+ * One modal at a time: a second `openModal()` waits until the first closes (it is queued, not stacked).
+ * Dialogs that may be asked for several times at once (budget confirmation, "Add a key", unlock) share one
+ * pending dialog themselves.
  */
-import { Modal } from '../bootstrap';
+import { Modal, restoreOffcanvasTrap } from '../bootstrap';
 import { type Child, h } from '../dom';
 import { icon } from '../icon';
 import { uid } from '../id';
@@ -52,18 +54,38 @@ export interface ModalHandle {
   readonly element: HTMLElement;
   readonly body: HTMLElement;
   readonly footer: HTMLElement | null;
+  /** The visible title (not in the document when `hideHeader` is set). */
   readonly titleElement: HTMLElement;
+  /** Closes it; a dialog still waiting in the queue is dropped without ever showing. */
   hide(): void;
-  /** Resolves once the modal is hidden and removed. */
+  /** Resolves once the modal is hidden and removed (or dropped from the queue). */
   readonly closed: Promise<void>;
 }
 
 const FIELD_SELECTOR =
   'input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled])';
 
+/** The modal on screen, and the ones waiting for it: Bootstrap shows one modal at a time. */
+let current: { closed: Promise<void> } | null = null;
+const waiting: { start: () => void; drop: () => void }[] = [];
+
+function next(): void {
+  current = null;
+  const upcoming = waiting.shift();
+  upcoming?.start();
+}
+
+/** True while a modal is on screen (or about to be). */
+export function modalOpen(): boolean {
+  return current !== null;
+}
+
+/**
+ * Builds a modal and shows it, or queues it until the one on screen closes (Bootstrap cannot stack modals, and a
+ * second backdrop or focus trap would break the first). The handle is usable at once either way.
+ */
 export function openModal(options: ModalOptions): ModalHandle {
   const titleId = uid('modal-title');
-  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 
   const titleElement = h(
     'h2',
@@ -74,24 +96,28 @@ export function openModal(options: ModalOptions): ModalHandle {
   const body = h('div', { class: 'modal-body' }, options.body);
   const footer =
     options.footer === undefined ? null : h('div', { class: 'modal-footer' }, options.footer);
-  const header = h(
-    'div',
-    { class: ['modal-header', options.hideHeader && 'visually-hidden'] },
-    titleElement,
-    h('button', {
-      type: 'button',
-      class: 'btn-close',
-      'data-bs-dismiss': 'modal',
-      'aria-label': 'Close',
-    }),
-  );
+  // Without a visible header there is no close button either (an invisible focusable button would be a trap for
+  // keyboard users); Escape and the dialog's own buttons close it, and aria-label names it.
+  const header = options.hideHeader
+    ? null
+    : h(
+        'div',
+        { class: 'modal-header' },
+        titleElement,
+        h('button', {
+          type: 'button',
+          class: 'btn-close',
+          'data-bs-dismiss': 'modal',
+          'aria-label': 'Close',
+        }),
+      );
 
   const element = h(
     'div',
     {
       class: ['modal', options.animate !== false && 'fade'],
       tabIndex: -1,
-      'aria-labelledby': titleId,
+      ...(options.hideHeader ? { 'aria-label': options.title } : { 'aria-labelledby': titleId }),
       'aria-hidden': 'true',
       'data-testid': options.testId,
     },
@@ -109,48 +135,75 @@ export function openModal(options: ModalOptions): ModalHandle {
       h('div', { class: ['modal-content', options.contentClass] }, header, body, footer),
     ),
   );
-  document.body.append(element);
-
-  const modal = new Modal(element, {
-    backdrop: options.staticBackdrop ? 'static' : true,
-    keyboard: options.keyboard ?? true,
-    focus: true,
-  });
 
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => {
     resolveClosed = resolve;
   });
 
-  // Bootstrap ignores hide() while the show transition runs; remember the request instead of losing it.
+  let modal: Modal | null = null;
   let shown = false;
   let hideRequested = false;
+  let dropped = false;
+
+  const start = (): void => {
+    current = { closed };
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    document.body.append(element);
+    const instance = new Modal(element, {
+      backdrop: options.staticBackdrop ? 'static' : true,
+      keyboard: options.keyboard ?? true,
+      focus: true,
+    });
+    modal = instance;
+    element.addEventListener('shown.bs.modal', () => {
+      shown = true;
+      // Bootstrap ignores hide() while the show transition runs; honour a request made meanwhile.
+      if (hideRequested) {
+        instance.hide();
+        return;
+      }
+      const target =
+        options.initialFocus ??
+        body.querySelector<HTMLElement>(FIELD_SELECTOR) ??
+        footer?.querySelector<HTMLElement>('.btn:last-child') ??
+        null;
+      target?.focus();
+    });
+    element.addEventListener('hidden.bs.modal', () => {
+      instance.dispose();
+      element.remove();
+      restoreOffcanvasTrap();
+      if (opener?.isConnected && opener !== document.body) opener.focus();
+      else if (!document.querySelector('.offcanvas.show')) document.getElementById('main')?.focus();
+      resolveClosed();
+      next();
+    });
+    instance.show();
+  };
+
+  const entry = {
+    start,
+    drop: () => {
+      dropped = true;
+      resolveClosed();
+    },
+  };
+
   const hide = (): void => {
+    if (dropped) return;
+    if (!modal) {
+      // Still queued: never show it.
+      const index = waiting.indexOf(entry);
+      if (index !== -1) waiting.splice(index, 1);
+      entry.drop();
+      return;
+    }
     if (shown) modal.hide();
     else hideRequested = true;
   };
 
-  element.addEventListener('shown.bs.modal', () => {
-    shown = true;
-    if (hideRequested) {
-      modal.hide();
-      return;
-    }
-    const target =
-      options.initialFocus ??
-      body.querySelector<HTMLElement>(FIELD_SELECTOR) ??
-      footer?.querySelector<HTMLElement>('.btn:last-child') ??
-      null;
-    target?.focus();
-  });
-  element.addEventListener('hidden.bs.modal', () => {
-    modal.dispose();
-    element.remove();
-    if (opener?.isConnected) opener.focus();
-    else document.getElementById('main')?.focus();
-    resolveClosed();
-  });
-
-  modal.show();
+  if (current) waiting.push(entry);
+  else start();
   return { element, body, footer, titleElement, hide, closed };
 }

@@ -12,7 +12,7 @@ import { url } from '../../core/paths';
 import { getTool, tools } from '../../tools/registry';
 import { h, replace } from '../dom';
 import { presentError } from '../feedback/errors';
-import { openModal, type ModalHandle } from '../feedback/modal';
+import { modalOpen, openModal, type ModalHandle } from '../feedback/modal';
 import { formatRelativeTime } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
@@ -131,8 +131,8 @@ export function togglePalette(core: CoreServices): void {
     open.hide();
     return;
   }
-  // Bootstrap does not stack modals.
-  if (document.querySelector('.modal.show')) return;
+  // One modal at a time; the palette is not worth queueing behind another dialog.
+  if (modalOpen()) return;
   open = showPalette(core);
   void open.closed.then(() => {
     open = null;
