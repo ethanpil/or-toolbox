@@ -12,7 +12,7 @@
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
   ],
   "usesJobs": false,
-  "lazyLibs": ["pdfjs-dist", "write-excel-file"],
+  "lazyLibs": ["pdfjs-dist", "fflate"],
   "defaults": {
     "preset": "invoice"
   }

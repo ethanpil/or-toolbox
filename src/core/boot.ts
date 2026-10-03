@@ -24,5 +24,10 @@ export function boot(options: BootOptions = {}): void {
   // Retention pruning is cheap and runs at most once a day (history service bookkeeping); keep it off the
   // critical path. Job polling is resumed by the tool page once its handlers are registered.
   const idle = globalThis.requestIdleCallback ?? ((fn: () => void) => setTimeout(fn, 2000));
-  idle(() => void getCore().history.prune().catch(() => undefined));
+  idle(
+    () =>
+      void getCore()
+        .history.prune()
+        .catch(() => undefined),
+  );
 }

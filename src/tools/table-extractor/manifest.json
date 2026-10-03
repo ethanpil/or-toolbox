@@ -8,6 +8,6 @@
   "accepts": ["image/png", "image/jpeg", "image/webp", "application/pdf"],
   "produces": ["text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
   "usesJobs": false,
-  "lazyLibs": ["pdfjs-dist", "write-excel-file"],
+  "lazyLibs": ["pdfjs-dist", "fflate"],
   "defaults": {}
 }

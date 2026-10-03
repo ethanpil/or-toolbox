@@ -35,8 +35,7 @@
     "fflate": "^0.8.3",
     "idb": "^8.0.3",
     "marked": "^18.0.14",
-    "pdfjs-dist": "^6.3.289",
-    "write-excel-file": "^4.1.1"
+    "pdfjs-dist": "^6.3.289"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",
