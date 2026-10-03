@@ -6,24 +6,19 @@
 import { MAX_RETENTION_DAYS } from '../../core/settings/schema';
 import type { CoreServices, ToolId, ToolManifest } from '../../core/types';
 import { tools } from '../../tools/registry';
+import { dataTable } from '../../ui/components/data-table';
+import { meter } from '../../ui/components/meter';
+import { switchField } from '../../ui/components/switch-field';
 import { h } from '../../ui/dom';
 import { confirmDialog, typedConfirm } from '../../ui/feedback/dialogs';
 import { presentError } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
-import { plural } from '../../ui/format';
+import { formatInt, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
+import { saveSettings } from '../../ui/settings-actions';
 import { historyUrl, settingsUrl } from '../../ui/shell/links';
 import { parseWhole, storageUsage } from './logic';
-import {
-  card,
-  loadingLine,
-  meter,
-  numberField,
-  rerender,
-  saveSettings,
-  type SectionView,
-  switchField,
-} from './ui';
+import { card, loadingLine, numberField, rerender, type SectionView } from './ui';
 
 interface Counts {
   recent: number;
@@ -154,7 +149,7 @@ export function dataSection(core: CoreServices): SectionView {
     h(
       'td',
       { class: ['text-end', value === 0 && 'text-body-secondary'], 'data-testid': testId },
-      value.toLocaleString('en-US'),
+      formatInt(value),
     );
 
   const renderTable = (): void => {
@@ -209,7 +204,7 @@ export function dataSection(core: CoreServices): SectionView {
                     href: historyUrl({ tool: tool.id }),
                     'aria-label': `${plural(count.runs, 'run')} of ${tool.name} in History`,
                   },
-                  count.runs.toLocaleString('en-US'),
+                  formatInt(count.runs),
                 )
               : h('span', { class: 'text-body-secondary' }, '0'),
           ),
@@ -225,7 +220,7 @@ export function dataSection(core: CoreServices): SectionView {
                 title: 'Delete prompts and history',
                 disabled: empty,
                 'data-testid': 'data-delete',
-                'data-focus': `data:${tool.id}:delete`,
+                'data-focus-key': `data:${tool.id}:delete`,
                 onclick: () => void deleteTool(tool, count),
               },
               icon('trash'),
@@ -241,9 +236,9 @@ export function dataSection(core: CoreServices): SectionView {
         'tr',
         { class: 'fw-semibold', 'data-testid': 'data-totals' },
         h('th', { scope: 'row' }, 'All tools'),
-        h('td', { class: 'text-end' }, all.recent.toLocaleString('en-US')),
-        h('td', { class: 'text-end' }, all.saved.toLocaleString('en-US')),
-        h('td', { class: 'text-end' }, all.runs.toLocaleString('en-US')),
+        h('td', { class: 'text-end' }, formatInt(all.recent)),
+        h('td', { class: 'text-end' }, formatInt(all.saved)),
+        h('td', { class: 'text-end' }, formatInt(all.runs)),
         h('td'),
       ),
     );
@@ -371,34 +366,20 @@ export function dataSection(core: CoreServices): SectionView {
         text: 'Recent and saved prompts and history runs for each tool.',
         testId: 'data-per-tool',
       },
-      h(
-        'div',
-        // Positioned, so the visually hidden header (absolute) scrolls with the table instead of widening the page.
-        { class: 'table-responsive position-relative' },
-        h(
-          'table',
-          { class: 'table align-middle mb-0', 'data-testid': 'data-table' },
-          h(
-            'thead',
-            null,
-            h(
-              'tr',
-              null,
-              h('th', { scope: 'col' }, 'Tool'),
-              h('th', { scope: 'col', class: 'text-end' }, 'Recent'),
-              h('th', { scope: 'col', class: 'text-end' }, 'Saved'),
-              h('th', { scope: 'col', class: 'text-end' }, 'Runs'),
-              h(
-                'th',
-                { scope: 'col', class: 'text-end' },
-                h('span', { class: 'visually-hidden' }, 'Delete'),
-              ),
-            ),
-          ),
-          tableBody,
-          totals,
-        ),
-      ),
+      dataTable({
+        scrollerLabel: 'Prompts and runs per tool',
+        testId: 'data-table',
+        head: [
+          'Tool',
+          'Recent',
+          'Saved',
+          'Runs',
+          h('span', { class: 'visually-hidden' }, 'Delete'),
+        ],
+        numericFrom: 1,
+        body: tableBody,
+        foot: totals,
+      }),
     ),
     card(
       { title: 'Delete data', icon: 'exclamation-octagon', testId: 'data-danger' },

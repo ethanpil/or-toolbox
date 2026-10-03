@@ -12,6 +12,7 @@ import { presentError } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
 import { unlockDialog } from '../../ui/feedback/unlock';
 import { icon } from '../../ui/icon';
+import { saveSettings } from '../../ui/settings-actions';
 import { parseWhole } from './logic';
 import {
   busy,
@@ -20,7 +21,6 @@ import {
   numberField,
   passphraseInput,
   rerender,
-  saveSettings,
   type SectionView,
   validNewPassphrase,
 } from './ui';
@@ -135,7 +135,7 @@ export function securitySection(core: CoreServices): SectionView {
               class: 'btn btn-outline-primary',
               'data-testid': 'lock-now',
               // Lock now and Unlock replace each other; focus follows from one to the other.
-              'data-focus': 'lock:toggle',
+              'data-focus-key': 'lock:toggle',
               onclick: () => {
                 lock.lockNow();
                 toast({ message: 'Keys locked in this tab.', variant: 'success' });
@@ -150,7 +150,7 @@ export function securitySection(core: CoreServices): SectionView {
               type: 'button',
               class: 'btn btn-primary',
               'data-testid': 'lock-unlock',
-              'data-focus': 'lock:toggle',
+              'data-focus-key': 'lock:toggle',
               onclick: () =>
                 void unlockDialog()
                   .then((ok) => {
@@ -308,7 +308,7 @@ export function securitySection(core: CoreServices): SectionView {
   }
 
   function focusToggle(): void {
-    body.querySelector<HTMLElement>('[data-focus="lock:toggle"]')?.focus();
+    body.querySelector<HTMLElement>('[data-focus-key="lock:toggle"]')?.focus();
   }
 
   const element = h(

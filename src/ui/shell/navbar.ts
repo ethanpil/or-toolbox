@@ -3,18 +3,21 @@
  * the free-only badge, the key chip, the lock button (when the passphrase lock is on), the theme menu and the
  * command-palette button. Everything on the right updates live from settings and keys (also other tabs).
  */
-import type { CoreServices, ThemeMode } from '../../core/types';
+import type { CoreServices } from '../../core/types';
 import { url } from '../../core/paths';
 import { tools } from '../../tools/registry';
 import { TOOL_CATEGORIES, type ToolId } from '../../tools/types';
+import { keyBalanceView } from '../components/key-balance';
 import { keyDot } from '../components/key-picker';
-import { type Child, h, replace } from '../dom';
+import { h, replace } from '../dom';
 import { presentError } from '../feedback/errors';
 import { toast } from '../feedback/toast';
 import { unlockDialog } from '../feedback/unlock';
-import { formatRelativeTime, formatShortcut, formatUsd } from '../format';
+import { formatShortcut } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
+import { setTheme } from '../settings-actions';
+import { THEME_MODES } from './appearance';
 import { CATEGORY_INFO, type NavKey, settingsUrl } from './links';
 
 export interface NavbarOptions {
@@ -23,12 +26,6 @@ export interface NavbarOptions {
   tool?: ToolId;
   onPalette: () => void;
 }
-
-const THEMES: readonly { mode: ThemeMode; label: string; icon: string }[] = [
-  { mode: 'light', label: 'Light', icon: 'sun' },
-  { mode: 'dark', label: 'Dark', icon: 'moon-stars' },
-  { mode: 'system', label: 'System', icon: 'circle-half' },
-];
 
 export function navbar(core: CoreServices, options: NavbarOptions): HTMLElement {
   const collapseId = uid('navbar-links');
@@ -207,49 +204,12 @@ function keyChip(core: CoreServices): HTMLElement {
     );
   }
 
-  const balance = h('div', { class: 'small', 'data-testid': 'key-chip-balance' });
-  const loadBalance = (): void => {
-    if (!core.keys.lock.unlocked()) {
-      balance.replaceChildren(
-        h('span', { class: 'text-body-secondary' }, 'Unlock your keys to see the balance.'),
-      );
-      return;
-    }
-    balance.replaceChildren(
-      h('span', { class: 'spinner-border spinner-border-sm me-2', 'aria-hidden': 'true' }),
-      h('span', { class: 'text-body-secondary' }, 'Checking balance…'),
-    );
-    core.keys
-      .status(key.id)
-      .then((status) => {
-        const rows: Child[] = [];
-        if (status.limitRemainingUsd !== null && status.limitUsd !== null) {
-          rows.push(
-            h(
-              'div',
-              null,
-              h('span', { class: 'fw-semibold' }, formatUsd(status.limitRemainingUsd)),
-              ` left of ${formatUsd(status.limitUsd)}`,
-            ),
-          );
-        } else {
-          rows.push(h('div', null, 'No credit limit on this key'));
-        }
-        rows.push(
-          h(
-            'div',
-            { class: 'text-body-secondary' },
-            `${formatUsd(status.usageMonthlyUsd ?? status.usageUsd)} used ${status.usageMonthlyUsd !== null ? 'this month' : 'in total'} · checked ${formatRelativeTime(status.fetchedAt)}`,
-          ),
-        );
-        replace(balance, rows);
-      })
-      .catch(() => {
-        balance.replaceChildren(
-          h('span', { class: 'text-body-secondary' }, 'Balance unavailable right now.'),
-        );
-      });
-  };
+  const balanceView = keyBalanceView(core, key, { compact: true, detail: true });
+  const balance = h(
+    'div',
+    { class: 'small', 'data-testid': 'key-chip-balance' },
+    balanceView.element,
+  );
 
   const toggle = h(
     'button',
@@ -301,7 +261,7 @@ function keyChip(core: CoreServices): HTMLElement {
       ),
     ),
   );
-  toggle.addEventListener('show.bs.dropdown', loadBalance);
+  toggle.addEventListener('show.bs.dropdown', () => balanceView.load());
   return wrapper;
 }
 
@@ -331,8 +291,8 @@ function lockButton(core: CoreServices): HTMLElement {
 
 function themeMenu(core: CoreServices): HTMLElement {
   const mode = core.settings.get().appearance.theme;
-  const currentTheme = THEMES.find((theme) => theme.mode === mode) ?? THEMES[2]!;
-  const items = THEMES.map((theme) =>
+  const currentTheme = THEME_MODES.find((theme) => theme.mode === mode) ?? THEME_MODES[2]!;
+  const items = THEME_MODES.map((theme) =>
     h(
       'li',
       null,
@@ -344,15 +304,7 @@ function themeMenu(core: CoreServices): HTMLElement {
           'aria-current': theme.mode === mode ? 'true' : null,
           'data-focus-key': 'theme-menu',
           'data-testid': `theme-${theme.mode}`,
-          onclick: () => {
-            try {
-              core.settings.update((draft) => {
-                draft.appearance.theme = theme.mode;
-              });
-            } catch (error) {
-              void presentError(error);
-            }
-          },
+          onclick: () => setTheme(core, theme.mode),
         },
         icon(theme.icon),
         theme.label,

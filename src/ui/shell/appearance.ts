@@ -22,6 +22,13 @@ const motionQuery =
     ? window.matchMedia('(prefers-reduced-motion: reduce)')
     : null;
 
+/** The theme choices, in menu order: the navbar menu, Settings → Appearance and the palette all draw from this. */
+export const THEME_MODES: readonly { mode: ThemeMode; label: string; icon: string }[] = [
+  { mode: 'light', label: 'Light', icon: 'sun' },
+  { mode: 'dark', label: 'Dark', icon: 'moon-stars' },
+  { mode: 'system', label: 'System', icon: 'circle-half' },
+];
+
 export function resolveTheme(mode: ThemeMode): 'light' | 'dark' {
   if (mode === 'system') return darkQuery?.matches ? 'dark' : 'light';
   return mode;

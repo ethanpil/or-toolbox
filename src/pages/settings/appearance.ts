@@ -4,12 +4,16 @@
  * live, here and in other tabs.
  */
 import { parseHex } from '../../ui/shell/accent';
+import { debounce } from '../../core/util';
 import type { CoreServices, Settings, ThemeMode } from '../../core/types';
+import { switchField } from '../../ui/components/switch-field';
 import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import { card, saveSettings, type SectionView, segmented, switchField } from './ui';
+import { saveSettings } from '../../ui/settings-actions';
+import { THEME_MODES } from '../../ui/shell/appearance';
+import { card, type SectionView, segmented } from './ui';
 
 /** The shipped primary colour (src/styles/_variables.scss). */
 export const DEFAULT_ACCENT = '#4f46e5';
@@ -44,11 +48,12 @@ export function appearanceSection(core: CoreServices): SectionView {
   const theme = segmented<ThemeMode>({
     legend: 'Theme',
     value: appearance().theme,
-    options: [
-      { value: 'light', label: 'Light', icon: 'sun', testId: 'theme-option-light' },
-      { value: 'dark', label: 'Dark', icon: 'moon-stars', testId: 'theme-option-dark' },
-      { value: 'system', label: 'System', icon: 'circle-half', testId: 'theme-option-system' },
-    ],
+    options: THEME_MODES.map(({ mode, label, icon: iconName }) => ({
+      value: mode,
+      label,
+      icon: iconName,
+      testId: `theme-option-${mode}`,
+    })),
     onChange: (value) => {
       const saved = saveSettings(core, (draft) => {
         draft.appearance.theme = value;
@@ -58,7 +63,7 @@ export function appearanceSection(core: CoreServices): SectionView {
   });
 
   // Accent: the colour input writes while it is dragged (debounced), presets and Reset at once.
-  let accentTimer: ReturnType<typeof setTimeout> | null = null;
+  const writeAccent = debounce(() => setAccent(accentInput.value), 120);
   const accentId = uid('accent');
   const accentInput = h('input', {
     type: 'color',
@@ -66,12 +71,9 @@ export function appearanceSection(core: CoreServices): SectionView {
     class: 'form-control form-control-color',
     value: appearance().accent ?? DEFAULT_ACCENT,
     'data-testid': 'accent-input',
-    oninput: () => {
-      if (accentTimer !== null) clearTimeout(accentTimer);
-      accentTimer = setTimeout(() => setAccent(accentInput.value), 120);
-    },
+    oninput: () => writeAccent(),
     onchange: () => {
-      if (accentTimer !== null) clearTimeout(accentTimer);
+      writeAccent.cancel();
       setAccent(accentInput.value);
     },
   });

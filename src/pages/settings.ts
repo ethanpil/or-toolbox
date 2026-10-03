@@ -2,8 +2,10 @@
  * Settings: keys, default models, tool bindings, budgets, appearance, passphrase lock, data, and backup. One
  * panel per `SETTINGS_SECTIONS` entry, each a `<section>` whose id is the section id, chosen from the side
  * navigation or the URL hash (`settings/#budgets`; the palette, error messages and onboarding link there). A
- * hash change focuses the section's heading, so screen readers announce it. Sections load their numbers when
- * first shown and follow changes from other tabs. The section modules live in src/pages/settings/.
+ * hash change focuses the section's heading, so screen readers announce it. A section is built when it is first
+ * shown (a visit to `#keys` never loads the model catalog, subscribes the other sections or reads their data),
+ * loads its numbers then, and follows changes from other tabs from there on. The section modules live in
+ * src/pages/settings/.
  */
 import { h } from '../ui/dom';
 import { icon } from '../ui/icon';
@@ -51,7 +53,7 @@ mountPage(
     };
 
     const sections = SETTINGS_SECTIONS.map((info) => {
-      const view = builders[info.id]();
+      let view: SectionView | null = null;
       const headingId = `${info.id}-title`;
       const heading = h('h2', { id: headingId, class: 'h4 mb-1', tabIndex: -1 }, info.label);
       const panel = h(
@@ -78,7 +80,6 @@ mountPage(
             h('p', { class: 'text-body-secondary mb-0' }, LEADS[info.id]),
           ),
         ),
-        view.element,
       );
       const link = h(
         'a',
@@ -97,7 +98,20 @@ mountPage(
         icon(info.icon, 'or-settings-nav-icon'),
         info.label,
       );
-      return { info, view, heading, panel, link };
+      return {
+        info,
+        heading,
+        panel,
+        link,
+        /** The section's content, built on first use. */
+        content(): SectionView {
+          if (!view) {
+            view = builders[info.id]();
+            panel.append(view.element);
+          }
+          return view;
+        },
+      };
     });
 
     function show(id: SettingsSection, focus: boolean): void {
@@ -109,7 +123,7 @@ mountPage(
         else section.link.removeAttribute('aria-current');
       }
       const section = sections.find((entry) => entry.info.id === id)!;
-      section.view.onShow?.();
+      section.content().onShow?.();
       if (focus) section.heading.focus();
     }
 

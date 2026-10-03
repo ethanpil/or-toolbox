@@ -5,7 +5,7 @@
  */
 import type { HistoryQuery, RunRecord, RunStatus } from '../core/types';
 import { TOOL_IDS, type ToolId } from '../tools/types';
-import { formatCount, formatMs, formatUsd } from '../ui/format';
+import { formatCount, formatDate, formatMs, formatUsd } from '../ui/format';
 
 export interface HistoryFilters {
   text: string;
@@ -89,14 +89,8 @@ export function dayLabel(time: number, now: number = Date.now()): string {
   const yesterday = new Date(now);
   yesterday.setDate(yesterday.getDate() - 1);
   if (key === dayKey(yesterday.getTime())) return 'Yesterday';
-  const date = new Date(time);
-  const sameYear = date.getFullYear() === new Date(now).getFullYear();
-  return date.toLocaleDateString('en-US', {
-    weekday: sameYear ? 'short' : undefined,
-    month: 'short',
-    day: 'numeric',
-    year: sameYear ? undefined : 'numeric',
-  });
+  const sameYear = new Date(time).getFullYear() === new Date(now).getFullYear();
+  return formatDate(time, { weekday: sameYear, year: !sameYear });
 }
 
 export interface DayGroup {

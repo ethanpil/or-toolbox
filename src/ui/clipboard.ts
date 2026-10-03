@@ -1,3 +1,5 @@
+import { toast } from './feedback/toast';
+
 /**
  * Copies text to the clipboard. Uses the async Clipboard API; where that is refused (no permission, insecure
  * context, an old browser) it falls back to a temporary selection and `execCommand('copy')`. Resolves false
@@ -26,4 +28,15 @@ export async function copyText(text: string): Promise<boolean> {
     active?.focus();
     return ok;
   }
+}
+
+/** Copies `text` and says so: a success toast with `okMessage`, or a warning when the browser blocked it. */
+export async function copyWithToast(text: string, okMessage: string): Promise<boolean> {
+  const ok = await copyText(text);
+  toast(
+    ok
+      ? { message: okMessage, variant: 'success' }
+      : { message: 'Copying was blocked by the browser.', variant: 'warning' },
+  );
+  return ok;
 }

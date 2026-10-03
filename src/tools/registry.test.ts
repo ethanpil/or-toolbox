@@ -1,7 +1,7 @@
 import iconNames from 'bootstrap-icons/font/bootstrap-icons.json?raw';
 import { describe, expect, it } from 'vitest';
 import pkg from '../../package.json';
-import { getTool, tools, toolsInCategory, validateManifest } from './registry';
+import { findTool, getTool, tools, toolsInCategory, validateManifest } from './registry';
 import { TOOL_CATEGORIES, TOOL_IDS } from './types';
 
 const VALID = getTool('ocr');
@@ -15,6 +15,12 @@ describe('tool registry', () => {
   it('looks tools up by id', () => {
     expect(getTool('ocr').name).toBe('OCR');
     expect(getTool('video-studio').usesJobs).toBe(true);
+  });
+
+  it('finds a tool by an id that may not exist', () => {
+    expect(findTool('ocr')).toBe(getTool('ocr'));
+    expect(findTool('gone')).toBeUndefined();
+    expect(findTool('constructor')).toBeUndefined();
   });
 
   it('groups tools into the five categories', () => {

@@ -49,6 +49,7 @@ All notable changes to this project are documented here. The format follows
 - `models.resolve`: `?model=` and tool bindings apply to a tool's primary capability only (5072110).
 - Tool framework: `ToolInstance.estimate()` with `ui.refreshEstimate()`, one error rule through `output.fail(error)`, `createToolTestContext()`, `data-testid="tool-prompt"` convention (9760b10).
 - One modal at a time (queued), toasts with actions never auto-hide, `setFieldError()` for field errors (1db3bfd); re-renders keep focus through `data-focus-key` (20bdddc).
+- Platform pages share small helpers instead of per-page copies (star button, data table, key balance view, `loadInto`, `copyWithToast`, `saveSettings`, `formatInt`/`formatDate`, `debounce`, one `CAPABILITY_INFO`); Settings builds a section when first shown; model search is debounced with cached normalised fields; `/` and Ctrl/Cmd+K respect dialogs and fields (b4948b5, 240f925, 78749a9).
 
 ### Fixed
 

@@ -4,6 +4,8 @@
  * from src/core/files (re-exported here so UI code has one import).
  */
 
+import type { KeyStatus } from '../core/types';
+import { DAY_MS, HOUR_MS, MINUTE_MS } from '../core/util';
 import { describePrice, modelPrice, type PriceModel } from './model-price';
 
 export { formatBytes, formatDuration } from '../core/files';
@@ -47,9 +49,14 @@ export function formatCount(n: number): string {
   return String(Math.round(n));
 }
 
+/** A whole number with thousands separators: `1,234`. Not finite → `—`. */
+export function formatInt(n: number): string {
+  return Number.isFinite(n) ? n.toLocaleString('en-US', { maximumFractionDigits: 0 }) : '—';
+}
+
 /** `1,234 tokens` / `1 token`. */
 export function formatTokens(n: number): string {
-  return `${Math.round(n).toLocaleString('en-US')} ${Math.round(n) === 1 ? 'token' : 'tokens'}`;
+  return `${formatInt(n)} ${Math.round(n) === 1 ? 'token' : 'tokens'}`;
 }
 
 /** Latencies and elapsed times: `850 ms`, `1.2 s`, `42 s`, `3 min 5 s`, `1 h 2 min`. */
@@ -86,9 +93,6 @@ export function formatModelPrice(model: PriceModel): string {
 }
 
 const RELATIVE = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
-const MINUTE = 60_000;
-const HOUR = 60 * MINUTE;
-const DAY = 24 * HOUR;
 
 /**
  * `just now`, `5 minutes ago`, `3 hours ago`, `yesterday`, `4 days ago`, then a date (`Mar 4`, or
@@ -98,23 +102,41 @@ export function formatRelativeTime(time: number, now: number = Date.now()): stri
   const diff = time - now;
   const abs = Math.abs(diff);
   if (abs < 45_000) return 'just now';
-  if (abs < HOUR) return RELATIVE.format(Math.round(diff / MINUTE), 'minute');
-  if (abs < DAY) return RELATIVE.format(Math.round(diff / HOUR), 'hour');
-  if (abs < 7 * DAY) {
+  if (abs < HOUR_MS) return RELATIVE.format(Math.round(diff / MINUTE_MS), 'minute');
+  if (abs < DAY_MS) return RELATIVE.format(Math.round(diff / HOUR_MS), 'hour');
+  if (abs < 7 * DAY_MS) {
     // Calendar days, so "yesterday" means the previous date, not "24 to 48 hours ago".
     const startOf = (t: number): number => {
       const d = new Date(t);
       d.setHours(0, 0, 0, 0);
       return d.getTime();
     };
-    return RELATIVE.format(Math.round((startOf(time) - startOf(now)) / DAY), 'day');
+    return RELATIVE.format(Math.round((startOf(time) - startOf(now)) / DAY_MS), 'day');
   }
-  const date = new Date(time);
-  const sameYear = date.getFullYear() === new Date(now).getFullYear();
-  return date.toLocaleDateString('en-US', {
+  const sameYear = new Date(time).getFullYear() === new Date(now).getFullYear();
+  return formatDate(time, { year: !sameYear });
+}
+
+export interface DateOptions {
+  /** Include the year (default true). */
+  year?: boolean;
+  /** Include the short weekday (`Mon, Oct 3`). */
+  weekday?: boolean;
+}
+
+/**
+ * `Oct 3, 2026`. A number is a timestamp, shown in the user's time zone; a `YYYY-MM-DD` string is a UTC day (the
+ * stats ledger, model expiry dates), shown as that same day everywhere.
+ */
+export function formatDate(when: number | string, options: DateOptions = {}): string {
+  const { year = true, weekday = false } = options;
+  const day = typeof when === 'string';
+  return new Date(day ? `${when.slice(0, 10)}T00:00:00Z` : when).toLocaleDateString('en-US', {
+    ...(weekday ? { weekday: 'short' } : {}),
     month: 'short',
     day: 'numeric',
-    ...(sameYear ? {} : { year: 'numeric' }),
+    ...(year ? { year: 'numeric' } : {}),
+    ...(day ? { timeZone: 'UTC' } : {}),
   });
 }
 
@@ -124,6 +146,46 @@ export function formatDateTime(time: number): string {
     dateStyle: 'medium',
     timeStyle: 'short',
   });
+}
+
+export interface KeyBalance {
+  /** `Used this month` / `Used in total`, with the amount. */
+  usageLabel: string;
+  usage: string;
+  /** `$5.00`, or `No limit`. */
+  limit: string;
+  /** `$4.50 left`, or null without a limit. */
+  remaining: string | null;
+  /** Share of the limit still available, 0–100; null without a limit. */
+  remainingPercent: number | null;
+  /** `resets monthly`, or null. */
+  reset: string | null;
+  /** `12 of 50 used`, or null when OpenRouter did not say. */
+  freeDaily: string | null;
+}
+
+/** What a key's `GET /key` status says, as display text (Settings → Keys, the key menu, Stats). */
+export function keyBalance(status: KeyStatus): KeyBalance {
+  const monthly = status.usageMonthlyUsd !== null;
+  const limited = status.limitUsd !== null;
+  const remaining =
+    status.limitRemainingUsd ?? (limited ? Math.max(0, status.limitUsd! - status.usageUsd) : null);
+  return {
+    usageLabel: monthly ? 'Used this month' : 'Used in total',
+    usage: formatUsd(status.usageMonthlyUsd ?? status.usageUsd),
+    limit: limited ? formatUsd(status.limitUsd!) : 'No limit',
+    remaining: remaining !== null ? `${formatUsd(remaining)} left` : null,
+    remainingPercent:
+      limited && remaining !== null
+        ? status.limitUsd! > 0
+          ? Math.min(100, Math.max(0, Math.round((remaining / status.limitUsd!) * 100)))
+          : 0
+        : null,
+    reset: status.limitReset ? `resets ${status.limitReset}` : null,
+    freeDaily: status.freeDaily
+      ? `${formatInt(status.freeDaily.used)} of ${formatInt(status.freeDaily.limit)} used`
+      : null,
+  };
 }
 
 /** True on Apple platforms, where shortcuts use ⌘ instead of Ctrl. */

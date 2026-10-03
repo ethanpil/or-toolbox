@@ -16,6 +16,7 @@ import { formatUsd } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
 import { OPENROUTER_KEYS_URL } from '../shell/links';
+import { externalLink } from './external-link';
 
 export interface ConnectKeyOptions {
   /** Where the OAuth callback returns to; default: this page. */
@@ -144,11 +145,7 @@ export function connectKey(options: ConnectKeyOptions = {}): HTMLElement {
         'p',
         { class: 'form-text mb-0 mt-2' },
         'OpenRouter creates a key for this browser. You can give it a credit limit afterwards in ',
-        h(
-          'a',
-          { href: OPENROUTER_KEYS_URL, target: '_blank', rel: 'noopener noreferrer' },
-          'your OpenRouter key list',
-        ),
+        externalLink(OPENROUTER_KEYS_URL, 'your OpenRouter key list'),
         '.',
       ),
     ),

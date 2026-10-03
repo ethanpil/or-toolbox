@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { isolateChannels, testCore } from '../../core/api/test-fakes';
 import { createModelsService } from '../../core/models/models';
-import type { ApiClient, KeyStatus, Settings } from '../../core/types';
+import type { ApiClient, Settings } from '../../core/types';
 import { tools } from '../../tools/registry';
 import { CAPABILITIES } from '../../tools/types';
 import {
@@ -10,7 +10,6 @@ import {
   freeOnlyImpact,
   freeOnlyModel,
   isDestructiveChange,
-  keyBalance,
   parseUsd,
   parseWhole,
   passphraseStrength,
@@ -291,60 +290,5 @@ describe('storageUsage', () => {
       percent: 50,
     });
     expect(storageUsage(1, 1024 * 1024 * 1024)?.text).toBe('1 B of 1 GB (<1%)');
-  });
-});
-
-describe('keyBalance', () => {
-  const status = (patch: Partial<KeyStatus> = {}): KeyStatus => ({
-    label: null,
-    usageUsd: 25.5,
-    usageMonthlyUsd: 3.25,
-    limitUsd: 100,
-    limitRemainingUsd: 74.5,
-    limitReset: 'monthly',
-    isFreeTier: false,
-    freeDaily: { used: 12, limit: 50, remaining: 38 },
-    fetchedAt: 0,
-    ...patch,
-  });
-
-  it('describes a limited key', () => {
-    expect(keyBalance(status())).toEqual({
-      usageLabel: 'Used this month',
-      usage: '$3.25',
-      limit: '$100.00',
-      remaining: '$74.50 left',
-      remainingPercent: 75,
-      reset: 'resets monthly',
-      freeDaily: '12 of 50 used',
-    });
-  });
-
-  it('describes an unlimited key without monthly usage or a free counter', () => {
-    expect(
-      keyBalance(
-        status({
-          usageMonthlyUsd: null,
-          limitUsd: null,
-          limitRemainingUsd: null,
-          limitReset: null,
-          freeDaily: null,
-        }),
-      ),
-    ).toEqual({
-      usageLabel: 'Used in total',
-      usage: '$25.50',
-      limit: 'No limit',
-      remaining: null,
-      remainingPercent: null,
-      reset: null,
-      freeDaily: null,
-    });
-  });
-
-  it('derives the remaining amount when OpenRouter leaves it out', () => {
-    expect(
-      keyBalance(status({ limitUsd: 10, limitRemainingUsd: null, usageUsd: 4 })),
-    ).toMatchObject({ remaining: '$6.00 left', remainingPercent: 60 });
   });
 });

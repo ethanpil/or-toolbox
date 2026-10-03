@@ -7,8 +7,12 @@
  * `?q=` pre-fills the search (the palette links here) and is kept in the address bar as you type.
  */
 import type { Capability, CoreServices, ModelInfo } from '../core/types';
-import { copyText } from '../ui/clipboard';
+import { debounce, SEARCH_DEBOUNCE_MS } from '../core/util';
+import { copyWithToast } from '../ui/clipboard';
+import { dataTable } from '../ui/components/data-table';
 import { emptyState } from '../ui/components/empty-state';
+import { loadInto } from '../ui/components/load-into';
+import { setStarred, starButton } from '../ui/components/star-button';
 import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
 import { presentError } from '../ui/feedback/errors';
@@ -17,6 +21,7 @@ import { toast } from '../ui/feedback/toast';
 import { formatContext, formatRelativeTime, formatDateTime, plural } from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
+import { saveSettings, toggleFavouriteModel } from '../ui/settings-actions';
 import { mountPage } from '../ui/shell/index';
 import { whenVisible } from './lazy';
 import { ALL_TIME } from './stats-logic';
@@ -44,8 +49,6 @@ import {
 const VIEW_KEY = 'models.view';
 const PAGE_SIZE = 48;
 const MAX_COMPARE = 4;
-/** Typing waits this long before the list is filtered again (the same in every searchable list). */
-const SEARCH_DEBOUNCE_MS = 150;
 
 type View = 'cards' | 'table';
 
@@ -182,6 +185,9 @@ class ModelsPage {
   });
   private readonly more = whenVisible(this.moreSlot, () => this.showMore());
 
+  /** Typing in the search box or the price limit filters the list once it pauses. */
+  private readonly readSoon = debounce(() => this.readControls(), SEARCH_DEBOUNCE_MS);
+
   private readonly core: CoreServices;
   private readonly main: HTMLElement;
 
@@ -261,7 +267,6 @@ class ModelsPage {
     this.wire();
     this.renderRecent();
     this.renderTray();
-    this.showSkeleton();
     void this.loadUsage();
     void this.load();
 
@@ -355,14 +360,11 @@ class ModelsPage {
   }
 
   private wire(): void {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    this.search.addEventListener('input', () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => this.readControls(), SEARCH_DEBOUNCE_MS);
-    });
+    this.search.addEventListener('input', () => this.readSoon());
     this.search.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && this.search.value) {
         this.search.value = '';
+        this.readSoon.cancel();
         this.readControls();
       }
     });
@@ -378,10 +380,7 @@ class ModelsPage {
     ]) {
       control.addEventListener('change', () => this.readControls());
     }
-    this.maxPrice.addEventListener('input', () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => this.readControls(), SEARCH_DEBOUNCE_MS);
-    });
+    this.maxPrice.addEventListener('input', () => this.readSoon());
   }
 
   /** Copies the controls into `filters`/`sort` and redraws. */
@@ -426,13 +425,9 @@ class ModelsPage {
   private setView(view: View): void {
     if (view === this.view) return;
     this.view = view;
-    try {
-      this.core.settings.update((draft) => {
-        draft.ui[VIEW_KEY] = view;
-      });
-    } catch (error) {
-      void presentError(error);
-    }
+    saveSettings(this.core, (draft) => {
+      draft.ui[VIEW_KEY] = view;
+    });
     this.syncViewButtons();
     this.apply({ keepShown: true });
     announce(view === 'table' ? 'Table view.' : 'Card view.');
@@ -459,35 +454,26 @@ class ModelsPage {
 
   // --- data ---------------------------------------------------------------------------------------------
 
-  private async load(refresh = false): Promise<void> {
-    try {
-      this.setModels(await this.core.models.list(refresh ? { refresh: true } : undefined));
-    } catch {
-      this.list.replaceChildren(
-        emptyState({
+  private load(refresh = false): Promise<boolean> {
+    return loadInto(
+      this.list,
+      async () => {
+        this.setModels(await this.core.models.list(refresh ? { refresh: true } : undefined));
+      },
+      {
+        skeleton: cardSkeleton(),
+        status: (text) => (this.count.textContent = text),
+        messages: { loading: 'Loading models…', failed: 'The model list could not be loaded.' },
+        error: {
           icon: 'wifi-off',
           title: 'The model list could not be loaded',
           text: 'OpenRouter did not answer and nothing is cached yet. Check your connection and try again.',
-          action: h(
-            'button',
-            {
-              type: 'button',
-              class: 'btn btn-outline-primary btn-sm',
-              onclick: () => void this.retry(),
-            },
-            'Try again',
-          ),
           testId: 'models-error',
-        }),
-      );
-      this.count.textContent = 'The model list could not be loaded.';
-    }
-  }
-
-  private async retry(): Promise<void> {
-    this.showSkeleton();
-    // An explicit retry asks the network: the cache remembers a failure for five minutes.
-    await this.load(true);
+        },
+        // An explicit retry asks the network: the cache remembers a failure for five minutes.
+        retry: () => void this.load(true),
+      },
+    );
   }
 
   /** Another tab or a background refresh stored a newer catalog. */
@@ -583,36 +569,6 @@ class ModelsPage {
 
   // --- the list -----------------------------------------------------------------------------------------
 
-  private showSkeleton(): void {
-    this.list.replaceChildren(
-      h(
-        'div',
-        {
-          class: 'row row-cols-1 row-cols-md-2 row-cols-xl-3 g-3 placeholder-glow',
-          'aria-hidden': 'true',
-        },
-        [0, 1, 2, 3, 4, 5].map(() =>
-          h(
-            'div',
-            { class: 'col' },
-            h(
-              'div',
-              { class: 'card h-100 shadow-sm' },
-              h(
-                'div',
-                { class: 'card-body' },
-                h('span', { class: 'placeholder col-7 d-block mb-3' }),
-                h('span', { class: 'placeholder col-10 d-block mb-2' }),
-                h('span', { class: 'placeholder col-5 d-block' }),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-    this.count.textContent = 'Loading models…';
-  }
-
   /** Filters and sorts again, then draws the first page (or as many as were open when `keepShown`). */
   private apply(options: { keepShown: boolean }): void {
     if (!this.loaded) return;
@@ -682,34 +638,22 @@ class ModelsPage {
         h(
           'div',
           { class: 'card shadow-sm' },
-          h(
-            'div',
-            { class: 'table-responsive position-relative' },
-            h(
-              'table',
-              {
-                class: 'table table-hover align-middle mb-0 or-model-table',
-                'data-testid': 'models-table',
-              },
-              h(
-                'thead',
-                null,
-                h(
-                  'tr',
-                  null,
-                  h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Compare')),
-                  h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Favourite')),
-                  h('th', { scope: 'col' }, 'Model'),
-                  h('th', { scope: 'col' }, 'Provider'),
-                  h('th', { scope: 'col' }, 'Capabilities'),
-                  h('th', { scope: 'col' }, 'Price'),
-                  h('th', { scope: 'col' }, 'Context'),
-                  h('th', { scope: 'col' }, 'Your use'),
-                ),
-              ),
-              body,
-            ),
-          ),
+          dataTable({
+            scrollerLabel: 'Models',
+            class: 'table table-hover align-middle mb-0 or-model-table',
+            testId: 'models-table',
+            head: [
+              h('span', { class: 'visually-hidden' }, 'Compare'),
+              h('span', { class: 'visually-hidden' }, 'Favourite'),
+              'Model',
+              'Provider',
+              'Capabilities',
+              'Price',
+              'Context',
+              'Your use',
+            ],
+            body,
+          }),
         ),
       );
     }
@@ -800,15 +744,7 @@ class ModelsPage {
           'aria-label': `Copy model id ${model.id}`,
           title: 'Copy model id',
           'data-testid': 'model-copy',
-          onclick: () => {
-            void copyText(model.id).then((ok) =>
-              toast(
-                ok
-                  ? { message: `Copied ${model.id}.`, variant: 'success' }
-                  : { message: 'Copying was blocked by the browser.', variant: 'warning' },
-              ),
-            );
-          },
+          onclick: () => void copyWithToast(model.id, `Copied ${model.id}.`),
         },
         icon('clipboard'),
       ),
@@ -816,20 +752,12 @@ class ModelsPage {
   }
 
   private star(model: ModelInfo): HTMLButtonElement {
-    const on = this.isFavourite(model.id);
-    const button = h(
-      'button',
-      {
-        type: 'button',
-        class: 'btn btn-sm btn-link or-star',
-        'aria-pressed': String(on),
-        'aria-label': `Favourite: ${model.name}`,
-        title: on ? 'Remove from favourites' : 'Add to favourites',
-        'data-testid': 'model-star',
-        onclick: () => this.toggleFavourite(model),
-      },
-      icon(on ? 'star-fill' : 'star'),
-    );
+    const button = starButton({
+      pressed: this.isFavourite(model.id),
+      label: `Favourite: ${model.name}`,
+      testId: 'model-star',
+      onToggle: () => this.toggleFavourite(model),
+    });
     this.stars.set(model.id, button);
     return button;
   }
@@ -981,30 +909,14 @@ class ModelsPage {
   // --- favourites, recent -------------------------------------------------------------------------------
 
   private toggleFavourite(model: ModelInfo): void {
-    const next = !this.isFavourite(model.id);
-    try {
-      this.core.settings.update((draft) => {
-        draft.models.favourites = next
-          ? [...draft.models.favourites, model.id]
-          : draft.models.favourites.filter((id) => id !== model.id);
-      });
-    } catch (error) {
-      void presentError(error);
-      return;
-    }
-    announce(
-      next ? `${model.name} added to favourites.` : `${model.name} removed from favourites.`,
-    );
+    const on = toggleFavouriteModel(this.core, model.id);
+    if (on === null) return;
+    announce(on ? `${model.name} added to favourites.` : `${model.name} removed from favourites.`);
   }
 
   /** Updates every star in place (a re-render would drop keyboard focus). */
   private syncStars(): void {
-    for (const [id, button] of this.stars) {
-      const on = this.isFavourite(id);
-      button.setAttribute('aria-pressed', String(on));
-      button.title = on ? 'Remove from favourites' : 'Add to favourites';
-      button.replaceChildren(icon(on ? 'star-fill' : 'star'));
-    }
+    for (const [id, button] of this.stars) setStarred(button, this.isFavourite(id));
   }
 
   private renderRecent(): void {
@@ -1135,29 +1047,24 @@ class ModelsPage {
   private openComparison(models: ModelInfo[]): void {
     const sections = compareSections(models, this.usageMap);
     const columns = models.length;
-    const table = h(
-      'table',
-      { class: 'table align-middle or-compare-table mb-0', 'data-testid': 'compare-table' },
-      h(
-        'thead',
-        null,
-        h(
-          'tr',
-          null,
-          h('th', { scope: 'col' }, h('span', { class: 'visually-hidden' }, 'Property')),
-          models.map((model) =>
-            h(
-              'th',
-              { scope: 'col', class: 'fw-semibold' },
-              h('div', { class: 'text-break' }, model.name),
-              model.isFree
-                ? h('span', { class: 'badge rounded-pill text-bg-success' }, 'Free')
-                : null,
-            ),
+    const table = dataTable({
+      scrollerLabel: 'Comparison table',
+      class: 'table align-middle or-compare-table mb-0',
+      testId: 'compare-table',
+      head: [
+        h('span', { class: 'visually-hidden' }, 'Property'),
+        ...models.map((model) =>
+          h(
+            'div',
+            { class: 'fw-semibold' },
+            h('div', { class: 'text-break' }, model.name),
+            model.isFree
+              ? h('span', { class: 'badge rounded-pill text-bg-success' }, 'Free')
+              : null,
           ),
         ),
-      ),
-      sections.map((section) =>
+      ],
+      body: sections.map((section) =>
         h(
           'tbody',
           null,
@@ -1192,7 +1099,7 @@ class ModelsPage {
           ),
         ),
       ),
-    );
+    });
     const close = h(
       'button',
       { type: 'button', class: 'btn btn-outline-secondary', 'data-bs-dismiss': 'modal' },
@@ -1203,19 +1110,38 @@ class ModelsPage {
       icon: 'columns-gap',
       size: 'xl',
       scrollable: true,
-      body: h(
-        'div',
-        {
-          class: 'table-responsive position-relative',
-          role: 'region',
-          tabIndex: 0,
-          'aria-label': 'Comparison table',
-        },
-        table,
-      ),
+      body: table,
       footer: close,
       initialFocus: close,
       testId: 'compare-dialog',
     });
   }
+}
+
+/** Placeholder cards while the catalog loads. */
+function cardSkeleton(): HTMLElement {
+  return h(
+    'div',
+    {
+      class: 'row row-cols-1 row-cols-md-2 row-cols-xl-3 g-3 placeholder-glow',
+      'aria-hidden': 'true',
+    },
+    [0, 1, 2, 3, 4, 5].map(() =>
+      h(
+        'div',
+        { class: 'col' },
+        h(
+          'div',
+          { class: 'card h-100 shadow-sm' },
+          h(
+            'div',
+            { class: 'card-body' },
+            h('span', { class: 'placeholder col-7 d-block mb-3' }),
+            h('span', { class: 'placeholder col-10 d-block mb-2' }),
+            h('span', { class: 'placeholder col-5 d-block' }),
+          ),
+        ),
+      ),
+    ),
+  );
 }

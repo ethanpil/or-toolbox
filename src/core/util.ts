@@ -35,6 +35,33 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 /** Browsers clamp setTimeout delays above 2^31-1 ms to ~0; never schedule longer than this. */
 export const MAX_TIMEOUT_MS = 2_147_483_647;
 
+/** Typing waits this long before a searchable list is filtered again (the same in every one). */
+export const SEARCH_DEBOUNCE_MS = 150;
+
+/** A function that waits for `ms` of quiet before running; see `debounce`. */
+export interface Debounced<A extends unknown[]> {
+  (...args: A): void;
+  /** Drops a pending call (a closed dialog, a page that moved on). */
+  cancel(): void;
+}
+
+/** Runs `fn` with the latest arguments once calls have stopped for `ms`. */
+export function debounce<A extends unknown[]>(fn: (...args: A) => void, ms: number): Debounced<A> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const debounced = (...args: A): void => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = undefined;
+      fn(...args);
+    }, ms);
+  };
+  debounced.cancel = (): void => {
+    clearTimeout(timer);
+    timer = undefined;
+  };
+  return debounced;
+}
+
 // --- time ------------------------------------------------------------------------------------------
 
 export const MINUTE_MS = 60_000;

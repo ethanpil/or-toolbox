@@ -32,6 +32,7 @@ import { toast } from '../feedback/toast';
 import { formatModelPrice, formatRelativeTime, plural } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
+import { setToolBinding } from '../settings-actions';
 import { mountPage } from '../shell/index';
 import { historyUrl, settingsUrl } from '../shell/links';
 import { createToolContext, resolveFor } from './context';
@@ -253,10 +254,7 @@ async function buildTool(
   const chooseModel = async (): Promise<void> => {
     const current = resolveModel();
     const chosen = await modelPicker(core, { capability: primary, selected: current.model });
-    if (!chosen) return;
-    core.settings.update((draft) => {
-      draft.tools[manifest.id] = { ...draft.tools[manifest.id], model: chosen };
-    });
+    if (!chosen || !setToolBinding(core, manifest.id, { model: chosen })) return;
     if (modelOverride) {
       modelOverride = null;
       const url = new URL(location.href);
@@ -329,16 +327,7 @@ async function buildTool(
             keys,
             value: core.settings.get().tools[manifest.id]?.keyId,
             onChange: (keyId) => {
-              try {
-                core.settings.update((draft) => {
-                  const binding = { ...draft.tools[manifest.id] };
-                  if (keyId) binding.keyId = keyId;
-                  else delete binding.keyId;
-                  draft.tools[manifest.id] = binding;
-                });
-              } catch (error) {
-                void presentError(error);
-              }
+              setToolBinding(core, manifest.id, { keyId: keyId ?? null });
             },
           })
         : null,

@@ -7,8 +7,9 @@
  * Synchronous groups render on every keystroke. History and the catalog are queried after a short pause; until
  * they answer, their previous results stay on screen (re-filtered for the new text), so nothing flickers.
  */
-import type { CoreServices, ThemeMode } from '../../core/types';
+import type { CoreServices, ModelInfo } from '../../core/types';
 import { url } from '../../core/paths';
+import { debounce } from '../../core/util';
 import { getTool, tools } from '../../tools/registry';
 import { h, replace } from '../dom';
 import { presentError } from '../feedback/errors';
@@ -16,9 +17,11 @@ import { modalOpen, openModal, type ModalHandle } from '../feedback/modal';
 import { formatRelativeTime } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
+import { setTheme } from '../settings-actions';
+import { THEME_MODES } from './appearance';
 import { guardedNavigate } from './leave-guard';
 import { CATEGORY_INFO, modelsUrl, PAGES, SETTINGS_SECTIONS, settingsUrl, toolUrl } from './links';
-import { rank, scoreItem, type SearchItem } from './palette-search';
+import { rank, rankBy, scoreItem, type SearchItem } from './palette-search';
 
 export interface PaletteItem extends SearchItem {
   id: string;
@@ -41,6 +44,9 @@ const GROUP_ORDER: readonly PaletteGroup[] = [
 ];
 const PER_GROUP = 6;
 const ASYNC_DELAY_MS = 120;
+
+/** What the palette's model search matches: the name, then the id. */
+const searchableModel = (model: ModelInfo): SearchItem => ({ label: model.name, detail: model.id });
 
 /** The items that need no I/O. */
 export function staticItems(core: Pick<CoreServices, 'settings' | 'keys'>): PaletteItem[] {
@@ -74,22 +80,14 @@ export function staticItems(core: Pick<CoreServices, 'settings' | 'keys'>): Pale
       href: settingsUrl(section.id),
     });
   }
-  const themes: [ThemeMode, string, string][] = [
-    ['light', 'Light theme', 'sun'],
-    ['dark', 'Dark theme', 'moon-stars'],
-    ['system', 'System theme', 'circle-half'],
-  ];
-  for (const [mode, label, themeIcon] of themes) {
+  for (const { mode, label, icon: themeIcon } of THEME_MODES) {
     items.push({
       id: `theme:${mode}`,
       group: 'Actions',
-      label: `Switch to ${label.toLowerCase()}`,
+      label: `Switch to ${label.toLowerCase()} theme`,
       keywords: 'appearance colour mode',
       icon: themeIcon,
-      action: () =>
-        core.settings.update((draft) => {
-          draft.appearance.theme = mode;
-        }),
+      action: () => setTheme(core, mode),
     });
   }
   if (core.keys.lock.enabled() && core.keys.lock.unlocked()) {
@@ -139,13 +137,17 @@ export function togglePalette(core: CoreServices): void {
   });
 }
 
-/** Registers Ctrl/Cmd+K on this page. */
+/**
+ * Registers Ctrl/Cmd+K on this page. It works while typing in a field (and closes the palette itself), but
+ * never opens on top of another dialog, and then leaves the key to the browser.
+ */
 export function installPaletteShortcut(core: CoreServices): void {
   document.addEventListener('keydown', (event) => {
-    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'k') {
-      event.preventDefault();
-      togglePalette(core);
-    }
+    if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== 'k')
+      return;
+    if (!open && modalOpen()) return;
+    event.preventDefault();
+    togglePalette(core);
   });
 }
 
@@ -157,7 +159,6 @@ function showPalette(core: CoreServices): ModalHandle {
   let asyncItems: PaletteItem[] = [];
   let shown: PaletteItem[] = [];
   let activeId: string | null = null;
-  let timer: ReturnType<typeof setTimeout> | undefined;
   let generation = 0;
   let chosen: PaletteItem | null = null;
 
@@ -282,10 +283,7 @@ function showPalette(core: CoreServices): ModalHandle {
         : core.models
             .list()
             .then((catalog) => {
-              const found = rank(
-                catalog.map((model) => ({ label: model.name, detail: model.id, model })),
-                query,
-              ).slice(0, PER_GROUP - 1);
+              const found = rankBy(catalog, query, searchableModel).slice(0, PER_GROUP - 1);
               return [
                 {
                   id: 'models:search',
@@ -295,7 +293,7 @@ function showPalette(core: CoreServices): ModalHandle {
                   icon: 'search',
                   href: modelsUrl(query),
                 } satisfies PaletteItem,
-                ...found.map(({ model }): PaletteItem => ({
+                ...found.map((model): PaletteItem => ({
                   id: `model:${model.id}`,
                   group: 'Models',
                   label: model.name,
@@ -314,10 +312,7 @@ function showPalette(core: CoreServices): ModalHandle {
     });
   };
 
-  const scheduleAsync = (): void => {
-    clearTimeout(timer);
-    timer = setTimeout(loadAsync, ASYNC_DELAY_MS);
-  };
+  const scheduleAsync = debounce(loadAsync, ASYNC_DELAY_MS);
 
   const move = (delta: number): void => {
     if (shown.length === 0) return;
@@ -397,7 +392,7 @@ function showPalette(core: CoreServices): ModalHandle {
   loadAsync();
 
   void modal.closed.then(() => {
-    clearTimeout(timer);
+    scheduleAsync.cancel();
     generation++;
     if (!chosen) return;
     try {

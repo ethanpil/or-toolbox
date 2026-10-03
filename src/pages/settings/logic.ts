@@ -5,9 +5,9 @@
  */
 import { SHIPPED_DEFAULTS } from '../../core/models/defaults';
 import { isFreeModelId } from '../../core/models/free';
-import type { Capability, KeyStatus, Settings, ToolManifest } from '../../core/types';
+import type { Capability, Settings, ToolManifest } from '../../core/types';
 import { getTool } from '../../tools/registry';
-import { formatBytes, formatUsd } from '../../ui/format';
+import { formatBytes, formatInt, formatUsd } from '../../ui/format';
 import { SETTINGS_SECTIONS, type SettingsSection } from '../../ui/shell/links';
 
 /** The section a URL hash names (`#budgets`), or null. */
@@ -72,7 +72,7 @@ export function parseWhole(text: string, options: { min: number; max: number }):
   if (!Number.isSafeInteger(value) || value < options.min || value > options.max) {
     return {
       ok: false,
-      error: `Enter a whole number from ${options.min.toLocaleString('en-US')} to ${options.max.toLocaleString('en-US')}.`,
+      error: `Enter a whole number from ${formatInt(options.min)} to ${formatInt(options.max)}.`,
     };
   }
   return { ok: true, value };
@@ -233,45 +233,5 @@ export function storageUsage(
   return {
     text: `${formatBytes(usedBytes)} of ${formatBytes(quotaBytes)} (${percent < 1 && usedBytes > 0 ? '<1' : Math.round(percent)}%)`,
     percent,
-  };
-}
-
-export interface KeyBalance {
-  /** `Used this month` / `Used in total`, with the amount. */
-  usageLabel: string;
-  usage: string;
-  /** `$5.00`, or `No limit`. */
-  limit: string;
-  /** `$4.50 left`, or null without a limit. */
-  remaining: string | null;
-  /** Share of the limit still available, 0–100; null without a limit. */
-  remainingPercent: number | null;
-  /** `resets monthly`, or null. */
-  reset: string | null;
-  /** `12 of 50 used`, or null when OpenRouter did not say. */
-  freeDaily: string | null;
-}
-
-/** What the Keys section shows for one key's `GET /key` status. */
-export function keyBalance(status: KeyStatus): KeyBalance {
-  const monthly = status.usageMonthlyUsd !== null;
-  const limited = status.limitUsd !== null;
-  const remaining =
-    status.limitRemainingUsd ?? (limited ? Math.max(0, status.limitUsd! - status.usageUsd) : null);
-  return {
-    usageLabel: monthly ? 'Used this month' : 'Used in total',
-    usage: formatUsd(status.usageMonthlyUsd ?? status.usageUsd),
-    limit: limited ? formatUsd(status.limitUsd!) : 'No limit',
-    remaining: remaining !== null ? `${formatUsd(remaining)} left` : null,
-    remainingPercent:
-      limited && remaining !== null
-        ? status.limitUsd! > 0
-          ? Math.min(100, Math.max(0, Math.round((remaining / status.limitUsd!) * 100)))
-          : 0
-        : null,
-    reset: status.limitReset ? `resets ${status.limitReset}` : null,
-    freeDaily: status.freeDaily
-      ? `${status.freeDaily.used.toLocaleString('en-US')} of ${status.freeDaily.limit.toLocaleString('en-US')} used`
-      : null,
   };
 }

@@ -9,25 +9,22 @@
  * the passphrase lock changed in between is the key added again from its secret, which is held in memory for
  * the Undo window only and dropped when the toast closes.
  */
-import { ApiError, errorCode, InvalidInputError, userMessage } from '../../core/errors';
-import type { CoreServices, KeyInfo, KeyStatus, StoredKey, ToolId } from '../../core/types';
+import { errorCode, InvalidInputError } from '../../core/errors';
+import type { CoreServices, KeyInfo, StoredKey, ToolId } from '../../core/types';
 import { connectKey } from '../../ui/components/connect-key';
 import { emptyState } from '../../ui/components/empty-state';
+import { externalLink } from '../../ui/components/external-link';
+import { keyBalanceView, type KeyBalanceView } from '../../ui/components/key-balance';
 import { keyDot } from '../../ui/components/key-picker';
-import { type Child, h } from '../../ui/dom';
+import { switchField } from '../../ui/components/switch-field';
+import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog, promptDialog } from '../../ui/feedback/dialogs';
 import { presentError } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
-import { unlockDialog } from '../../ui/feedback/unlock';
-import { formatRelativeTime } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { OPENROUTER_KEYS_URL, settingsUrl } from '../../ui/shell/links';
-import { keyBalance } from './logic';
-import { attempt, card, externalLink, meter, rerender, type SectionView, switchField } from './ui';
-
-type BalanceState =
-  { state: 'loading' } | { state: 'ok'; status: KeyStatus } | { state: 'error'; error: unknown };
+import { attempt, card, rerender, type SectionView } from './ui';
 
 /** What Undo needs to put a removed key back. */
 interface RemovedKey {
@@ -50,178 +47,21 @@ const NO_COLOUR = '#6c757d';
 
 export function keysSection(core: CoreServices): SectionView {
   const list = h('div', { 'data-testid': 'keys-list' });
-  const balances = new Map<string, BalanceState>();
-  /** Balance containers of the rendered rows, so a balance re-renders without touching the rest. */
-  const balanceSlots = new Map<string, HTMLElement>();
+  /** One balance view per key, kept across re-renders so a rename or a colour change never flashes it. */
+  const balances = new Map<string, KeyBalanceView>();
   let shown = false;
 
-  // --- balance ------------------------------------------------------------------------------------------
-  const loadBalance = (key: KeyInfo, force = false): void => {
-    if (!core.keys.lock.unlocked()) {
-      balances.delete(key.id);
-      renderBalance(key);
-      return;
+  const balanceOf = (key: KeyInfo): KeyBalanceView => {
+    let view = balances.get(key.id);
+    if (!view) {
+      view = keyBalanceView(core, key);
+      balances.set(key.id, view);
     }
-    balances.set(key.id, { state: 'loading' });
-    renderBalance(key);
-    core.keys
-      .status(key.id, { force })
-      .then((status) => {
-        balances.set(key.id, { state: 'ok', status });
-        if (force) announce(`Balance of ${key.name} updated.`);
-      })
-      .catch((error: unknown) => {
-        balances.set(key.id, { state: 'error', error });
-        if (force) announce(`The balance of ${key.name} could not be checked.`);
-      })
-      .finally(() => {
-        const current = core.keys.get(key.id);
-        if (current) renderBalance(current);
-      });
+    return view;
   };
 
   const loadMissing = (): void => {
-    for (const key of core.keys.list()) if (!balances.has(key.id)) loadBalance(key);
-  };
-
-  const balanceError = (error: unknown): string => {
-    if (error instanceof ApiError && error.status === 401)
-      return 'OpenRouter rejected this key. It may have been deleted or disabled there.';
-    return userMessage(error);
-  };
-
-  const stat = (label: string, value: Child, testId?: string): HTMLElement =>
-    h(
-      'div',
-      { class: 'col' },
-      h('div', { class: 'small text-body-secondary' }, label),
-      h('div', { class: 'fw-semibold', 'data-testid': testId }, value),
-    );
-
-  const renderBalance = (key: KeyInfo): void => {
-    const slot = balanceSlots.get(key.id);
-    if (!slot) return;
-    const entry = balances.get(key.id);
-    const loading = entry?.state === 'loading';
-    // Stays in place (aria-disabled, still focusable) while loading, so keyboard focus survives the refresh.
-    const refresh = h(
-      'button',
-      {
-        type: 'button',
-        class: ['btn btn-sm btn-outline-secondary', loading && 'disabled'],
-        'aria-label': `Refresh the balance of ${key.name}`,
-        'aria-disabled': loading ? 'true' : null,
-        title: 'Refresh balance',
-        'data-testid': 'key-refresh',
-        'data-focus': `key:${key.id}:refresh`,
-        onclick: () => {
-          if (balances.get(key.id)?.state !== 'loading') loadBalance(key, true);
-        },
-      },
-      icon('arrow-clockwise'),
-    );
-    let body: Child;
-    if (
-      !core.keys.lock.unlocked() ||
-      (entry?.state === 'error' && errorCode(entry.error) === 'locked')
-    ) {
-      body = h(
-        'div',
-        { class: 'd-flex flex-wrap align-items-center gap-2 small' },
-        icon('lock', 'text-body-secondary'),
-        h('span', { class: 'text-body-secondary' }, 'Unlock your keys to see the balance.'),
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-outline-primary',
-            'data-testid': 'key-unlock',
-            'data-focus': `key:${key.id}:unlock`,
-            onclick: () => {
-              void unlockDialog()
-                .then((ok) => {
-                  if (ok) for (const each of core.keys.list()) loadBalance(each);
-                })
-                .catch((error: unknown) => void presentError(error));
-            },
-          },
-          'Unlock',
-        ),
-      );
-    } else if (!entry || entry.state === 'loading') {
-      body = h(
-        'div',
-        { class: 'd-flex align-items-center gap-2 small text-body-secondary' },
-        h('span', { class: 'spinner-border spinner-border-sm', 'aria-hidden': 'true' }),
-        h('span', { class: 'flex-grow-1' }, 'Checking the balance with OpenRouter…'),
-        refresh,
-      );
-    } else if (entry.state === 'error') {
-      body = h(
-        'div',
-        { class: 'd-flex flex-wrap align-items-center gap-2 small' },
-        icon('exclamation-circle', 'text-warning-emphasis'),
-        h(
-          'span',
-          { 'data-testid': 'key-balance-error' },
-          'Balance unavailable: ',
-          balanceError(entry.error),
-        ),
-        refresh,
-      );
-    } else {
-      const balance = keyBalance(entry.status);
-      body = [
-        h(
-          'div',
-          { class: 'd-flex align-items-start gap-2' },
-          h(
-            'div',
-            { class: 'row row-cols-2 row-cols-md-4 g-3 flex-grow-1' },
-            stat(balance.usageLabel, balance.usage, 'key-usage'),
-            stat(
-              'Credit limit',
-              [
-                balance.limit,
-                balance.reset &&
-                  h(
-                    'span',
-                    { class: 'fw-normal small text-body-secondary' },
-                    ` (${balance.reset})`,
-                  ),
-              ],
-              'key-limit',
-            ),
-            stat('Remaining', balance.remaining ?? '—', 'key-remaining'),
-            stat('Free requests today', balance.freeDaily ?? '—', 'key-free-daily'),
-          ),
-          refresh,
-        ),
-        balance.remainingPercent !== null &&
-          h(
-            'div',
-            { class: 'mt-3' },
-            meter({
-              percent: balance.remainingPercent,
-              tone:
-                balance.remainingPercent <= 10
-                  ? 'danger'
-                  : balance.remainingPercent <= 25
-                    ? 'warning'
-                    : 'success',
-              label: `Credit left on ${key.name}`,
-              text: `${balance.remainingPercent}% of the limit left`,
-            }),
-          ),
-        h(
-          'div',
-          { class: 'small text-body-secondary mt-2' },
-          entry.status.isFreeTier ? 'No credits bought yet (free tier). ' : '',
-          `Checked ${formatRelativeTime(entry.status.fetchedAt)}.`,
-        ),
-      ];
-    }
-    rerender(slot, body);
+    for (const key of core.keys.list()) balanceOf(key).load();
   };
 
   // --- actions ------------------------------------------------------------------------------------------
@@ -361,11 +201,6 @@ export function keysSection(core: CoreServices): SectionView {
 
   // --- rows ---------------------------------------------------------------------------------------------
   const row = (key: KeyInfo): HTMLElement => {
-    const balanceSlot = h('div', {
-      class: 'or-key-balance rounded-3 p-3 mt-3',
-      'data-testid': 'key-balance',
-    });
-    balanceSlots.set(key.id, balanceSlot);
     const colour = h('input', {
       type: 'color',
       class: 'form-control form-control-color form-control-sm',
@@ -373,7 +208,7 @@ export function keysSection(core: CoreServices): SectionView {
       title: 'Colour',
       'aria-label': `Colour of ${key.name}`,
       'data-testid': 'key-colour',
-      'data-focus': `key:${key.id}:colour`,
+      'data-focus-key': `key:${key.id}:colour`,
       onchange: () => {
         if (attempt(() => core.keys.update(key.id, { colour: colour.value })))
           announce(`Colour of ${key.name} changed.`);
@@ -403,7 +238,7 @@ export function keysSection(core: CoreServices): SectionView {
           input.checked = !checked;
       },
     });
-    retention.input.dataset.focus = `key:${key.id}:retention`;
+    retention.input.dataset.focusKey = `key:${key.id}:retention`;
 
     const element = h(
       'li',
@@ -447,7 +282,7 @@ export function keysSection(core: CoreServices): SectionView {
                 type: 'button',
                 class: 'btn btn-sm btn-outline-primary',
                 'data-testid': 'key-make-default',
-                'data-focus': `key:${key.id}:default`,
+                'data-focus-key': `key:${key.id}:default`,
                 onclick: () => makeDefault(key),
               },
               'Make default',
@@ -459,7 +294,7 @@ export function keysSection(core: CoreServices): SectionView {
               class: 'btn btn-sm btn-outline-secondary',
               'aria-label': `Rename ${key.name}`,
               'data-testid': 'key-rename',
-              'data-focus': `key:${key.id}:rename`,
+              'data-focus-key': `key:${key.id}:rename`,
               onclick: () => void rename(key),
             },
             icon('pencil', 'me-1'),
@@ -473,7 +308,7 @@ export function keysSection(core: CoreServices): SectionView {
               class: 'btn btn-sm btn-outline-danger',
               'aria-label': `Remove ${key.name}`,
               'data-testid': 'key-remove',
-              'data-focus': `key:${key.id}:remove`,
+              'data-focus-key': `key:${key.id}:remove`,
               onclick: () => void remove(key),
             },
             icon('trash', 'me-1'),
@@ -481,7 +316,7 @@ export function keysSection(core: CoreServices): SectionView {
           ),
         ),
       ),
-      balanceSlot,
+      balanceOf(key).element,
       h('div', { class: 'mt-3' }, retention.element),
     );
     return element;
@@ -489,36 +324,40 @@ export function keysSection(core: CoreServices): SectionView {
 
   const render = (): void => {
     const keys = core.keys.list();
-    balanceSlots.clear();
     for (const id of [...balances.keys()])
       if (!keys.some((key) => key.id === id)) balances.delete(id);
     rerender(
       list,
-      keys.length > 0
-        ? h('ul', { class: 'list-group shadow-sm mb-4', 'aria-label': 'Your keys' }, keys.map(row))
-        : h(
-            'div',
-            { class: 'card shadow-sm mb-4' },
-            emptyState({
-              icon: 'key',
-              title: 'No keys yet',
-              text: 'Connect with OpenRouter or paste a key below. Every tool then uses it.',
-              compact: true,
-              testId: 'keys-empty',
-            }),
-          ),
+      () =>
+        keys.length > 0
+          ? h(
+              'ul',
+              { class: 'list-group shadow-sm mb-4', 'aria-label': 'Your keys' },
+              keys.map(row),
+            )
+          : h(
+              'div',
+              { class: 'card shadow-sm mb-4' },
+              emptyState({
+                icon: 'key',
+                title: 'No keys yet',
+                text: 'Connect with OpenRouter or paste a key below. Every tool then uses it.',
+                compact: true,
+                testId: 'keys-empty',
+              }),
+            ),
       {
         // A button that went away (Make default) → the same key's Rename; a removed key → the section heading.
         fallback: (lost) => {
           const id = lost?.startsWith('key:') ? lost.split(':')[1] : undefined;
           const rename = id
-            ? list.querySelector<HTMLElement>(`[data-focus="key:${CSS.escape(id)}:rename"]`)
+            ? list.querySelector<HTMLElement>(`[data-focus-key="key:${CSS.escape(id)}:rename"]`)
             : null;
           return rename ?? document.getElementById('keys-title');
         },
       },
     );
-    for (const key of keys) renderBalance(key);
+    for (const key of keys) balanceOf(key).paint();
     if (shown) loadMissing();
   };
 
@@ -565,15 +404,4 @@ export function keysSection(core: CoreServices): SectionView {
       loadMissing();
     },
   };
-}
-
-/** Exposed for the Models section: the account's free-model counter from the default key, if readable. */
-export async function accountFreeDaily(core: CoreServices): Promise<KeyStatus['freeDaily']> {
-  const key = core.keys.resolve();
-  if (!key || !core.keys.lock.unlocked()) return null;
-  try {
-    return (await core.keys.status(key.id)).freeDaily;
-  } catch {
-    return null;
-  }
 }

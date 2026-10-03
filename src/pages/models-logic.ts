@@ -2,11 +2,13 @@
  * The Models page without a DOM: filtering, sorting, price display and the comparison table. Pure functions over
  * `ModelInfo`, so the rules are unit-tested (models-logic.test.ts) and the page only draws the result.
  */
+import { CAPABILITY_INFO } from '../core/models/capabilities';
 import type { Capability, ModelInfo, StatsRow } from '../core/types';
+import { DAY_MS } from '../core/util';
 import { CAPABILITIES } from '../tools/types';
-import { formatContext, formatMs, formatUsd, plural } from '../ui/format';
+import { formatContext, formatDate, formatInt, formatMs, formatUsd, plural } from '../ui/format';
 import { comparablePrice, describePrice, modelPrice } from '../ui/model-price';
-import { rank } from '../ui/shell/palette-search';
+import { rankBy, type SearchItem } from '../ui/shell/palette-search';
 
 export type ModelSort = 'relevance' | 'name' | 'newest' | 'price' | 'context';
 export const MODEL_SORTS: readonly { id: ModelSort; label: string }[] = [
@@ -59,19 +61,8 @@ export function activeFilterCount(filters: ModelFilters): number {
   ].filter(Boolean).length;
 }
 
-const CAPABILITY_INFO: Record<Capability, { label: string; badge: string }> = {
-  text: { label: 'Text', badge: 'Text' },
-  vision: { label: 'Vision (image input)', badge: 'Vision' },
-  image: { label: 'Image generation', badge: 'Image' },
-  tts: { label: 'Text to speech', badge: 'Speech' },
-  stt: { label: 'Speech to text', badge: 'Transcribe' },
-  video: { label: 'Video generation', badge: 'Video' },
-  music: { label: 'Music', badge: 'Music' },
-  decisions: { label: 'Decisions', badge: 'Decisions' },
-};
-
 export const CAPABILITY_FILTERS: readonly { id: Capability; label: string }[] = CAPABILITIES.map(
-  (id) => ({ id, label: CAPABILITY_INFO[id].label }),
+  (id) => ({ id, label: CAPABILITY_INFO[id].filter }),
 );
 
 /** Short name for a capability badge on a card. */
@@ -141,17 +132,11 @@ export function expiryOf(
   if (!model.expirationDate) return null;
   const time = Date.parse(`${model.expirationDate.slice(0, 10)}T00:00:00Z`);
   if (!Number.isFinite(time)) return null;
-  const dayMs = 86_400_000;
   return {
-    date: new Date(time).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      timeZone: 'UTC',
-    }),
+    date: formatDate(model.expirationDate),
     // The model is available through its expiration day.
-    expired: now >= time + dayMs,
-    daysLeft: Math.max(0, Math.ceil((time + dayMs - now) / dayMs)),
+    expired: now >= time + DAY_MS,
+    daysLeft: Math.max(0, Math.ceil((time + DAY_MS - now) / DAY_MS)),
   };
 }
 
@@ -229,6 +214,15 @@ function sortByPrice(list: ModelInfo[]): ModelInfo[] {
   });
 }
 
+/** What the search text matches in a model: the name most, then the id, then the author and capabilities. */
+function searchable(model: ModelInfo): SearchItem {
+  return {
+    label: model.name,
+    detail: model.id,
+    keywords: `${model.author} ${model.capabilities.join(' ')}`,
+  };
+}
+
 /**
  * The visible list: filters first, then the search text (ranked, with the name weighing most), then the sort.
  * "Best match" keeps the search ranking, and falls back to the name when nothing was typed.
@@ -243,15 +237,7 @@ export function queryModels(
   const text = filters.text.trim();
   const searching = text !== '';
   if (searching) {
-    list = rank(
-      list.map((model) => ({
-        label: model.name,
-        detail: model.id,
-        keywords: `${model.author} ${model.capabilities.join(' ')}`,
-        model,
-      })),
-      text,
-    ).map((entry) => entry.model);
+    list = rankBy(list, text, searchable);
   } else {
     list = [...list];
   }
@@ -347,14 +333,7 @@ export interface CompareSection {
   rows: CompareRow[];
 }
 
-const dateText = (seconds: number): string =>
-  seconds > 0
-    ? new Date(seconds * 1000).toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      })
-    : '—';
+const dateText = (seconds: number): string => (seconds > 0 ? formatDate(seconds * 1000) : '—');
 
 const list = (items: readonly string[]): string => (items.length > 0 ? items.join(', ') : '—');
 
@@ -412,9 +391,7 @@ export function compareSections(
       rows: [
         text('Context window', (model) => formatContext(model.contextLength) ?? '—'),
         text('Max output', (model) =>
-          model.maxCompletionTokens
-            ? `${model.maxCompletionTokens.toLocaleString('en-US')} tokens`
-            : '—',
+          model.maxCompletionTokens ? `${formatInt(model.maxCompletionTokens)} tokens` : '—',
         ),
       ],
     },

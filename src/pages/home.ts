@@ -7,17 +7,19 @@ import type { RunRecord, Settings } from '../core/types';
 import { getTool, tools } from '../tools/registry';
 import { TOOL_CATEGORIES, type ToolId, type ToolManifest } from '../tools/types';
 import { emptyState } from '../ui/components/empty-state';
+import { listSkeleton, loadInto } from '../ui/components/load-into';
+import { starButton } from '../ui/components/star-button';
 import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
-import { presentError } from '../ui/feedback/errors';
-import { modalOpen } from '../ui/feedback/modal';
 import { formatDateTime, formatRelativeTime, formatUsd, plural } from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
+import { toggleFavouriteTool } from '../ui/settings-actions';
 import { mountPage } from '../ui/shell/index';
 import { CATEGORY_INFO, historyUrl, toolUrl } from '../ui/shell/links';
 import { togglePalette } from '../ui/shell/palette';
 import { rank } from '../ui/shell/palette-search';
+import { plainShortcutAllowed } from '../ui/shell/shortcuts';
 import { onboarding } from './onboarding';
 
 mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, navigate }) => {
@@ -35,20 +37,9 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
 
   const isFavourite = (id: ToolId): boolean => core.settings.get().favouriteTools.includes(id);
   const toggleFavourite = (tool: ToolManifest): void => {
-    try {
-      core.settings.update((draft) => {
-        draft.favouriteTools = draft.favouriteTools.includes(tool.id)
-          ? draft.favouriteTools.filter((id) => id !== tool.id)
-          : [...draft.favouriteTools, tool.id];
-      });
-      announce(
-        isFavourite(tool.id)
-          ? `${tool.name} added to favourites.`
-          : `${tool.name} removed from favourites.`,
-      );
-    } catch (error) {
-      void presentError(error);
-    }
+    const on = toggleFavouriteTool(core, tool.id);
+    if (on === null) return;
+    announce(on ? `${tool.name} added to favourites.` : `${tool.name} removed from favourites.`);
   };
 
   const isFreeTool = (tool: ToolManifest): boolean => {
@@ -97,21 +88,15 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
             h('p', { class: 'small text-body-secondary mb-0' }, tool.description),
           ),
         ),
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-link or-star or-card-star',
-            'aria-pressed': String(starred),
-            'aria-label': `Favourite: ${tool.name}`,
-            title: starred ? 'Remove from favourites' : 'Add to favourites',
-            // Re-rendering a grid gives focus back to the same tool's star (see replace() in dom.ts).
-            'data-focus-key': `star-${tool.id}`,
-            'data-testid': `star-${tool.id}`,
-            onclick: () => toggleFavourite(tool),
-          },
-          icon(starred ? 'star-fill' : 'star'),
-        ),
+        starButton({
+          pressed: starred,
+          label: `Favourite: ${tool.name}`,
+          class: 'or-card-star',
+          // Re-rendering a grid gives focus back to the same tool's star (see replace() in dom.ts).
+          focusKey: `star-${tool.id}`,
+          testId: `star-${tool.id}`,
+          onToggle: () => toggleFavourite(tool),
+        }),
       ),
     );
   };
@@ -148,11 +133,18 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     'aria-labelledby': 'favourites-title',
     'data-testid': 'favourites',
   });
-  const recent = h('section', {
-    class: 'mb-5',
-    'aria-labelledby': 'recent-title',
-    'data-testid': 'recent-runs',
-  });
+  const recentList = h('div');
+  const recent = h(
+    'section',
+    { class: 'mb-5', 'aria-labelledby': 'recent-title', 'data-testid': 'recent-runs' },
+    sectionHeading(
+      'recent-title',
+      'clock-history',
+      'Recent runs',
+      h('a', { class: 'small', href: historyUrl() }, 'All history'),
+    ),
+    recentList,
+  );
   const categories = h('div', { 'data-testid': 'categories' });
   const results = h('section', {
     class: 'mb-5',
@@ -225,63 +217,34 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     );
   };
 
-  let recentGeneration = 0;
   const renderRecent = (): void => {
-    const mine = ++recentGeneration;
-    const heading = sectionHeading(
-      'recent-title',
-      'clock-history',
-      'Recent runs',
-      h('a', { class: 'small', href: historyUrl() }, 'All history'),
+    void loadInto(
+      recentList,
+      async () => {
+        const runs = await core.history.query({ limit: 5 });
+        return runs.length > 0
+          ? h('div', { class: 'list-group shadow-sm' }, runs.map(runRow))
+          : emptyState({
+              icon: 'clock-history',
+              title: 'No runs yet',
+              text: 'Your latest runs appear here, ready to reopen with their prompt and settings.',
+              inline: true,
+              testId: 'recent-empty',
+            });
+      },
+      {
+        skeleton: listSkeleton(2),
+        error: {
+          icon: 'exclamation-triangle',
+          title: 'Recent runs could not be loaded',
+          text: 'Browser storage is unavailable right now. Your tools still work.',
+          inline: true,
+          testId: 'recent-error',
+        },
+        retry: renderRecent,
+        keepOnLiveFailure: true,
+      },
     );
-    if (recent.childElementCount === 0) {
-      recent.replaceChildren(
-        heading,
-        h(
-          'div',
-          { class: 'list-group shadow-sm placeholder-glow', 'aria-hidden': 'true' },
-          [0, 1].map(() =>
-            h(
-              'div',
-              { class: 'list-group-item py-3' },
-              h('span', { class: 'placeholder col-6 d-block mb-2' }),
-              h('span', { class: 'placeholder placeholder-sm col-3 d-block' }),
-            ),
-          ),
-        ),
-      );
-    }
-    core.history
-      .query({ limit: 5 })
-      .then((runs) => {
-        if (mine !== recentGeneration) return;
-        recent.replaceChildren(
-          heading,
-          runs.length > 0
-            ? h('div', { class: 'list-group shadow-sm' }, runs.map(runRow))
-            : emptyState({
-                icon: 'clock-history',
-                title: 'No runs yet',
-                text: 'Your latest runs appear here, ready to reopen with their prompt and settings.',
-                inline: true,
-                testId: 'recent-empty',
-              }),
-        );
-      })
-      .catch(() => {
-        // Replace the skeleton for good (hiding it would let the search bring it back).
-        if (mine !== recentGeneration) return;
-        recent.replaceChildren(
-          heading,
-          emptyState({
-            icon: 'exclamation-triangle',
-            title: 'Recent runs could not be loaded',
-            text: 'Browser storage is unavailable right now. Your tools still work.',
-            inline: true,
-            testId: 'recent-error',
-          }),
-        );
-      });
   };
 
   const renderCategories = (): void => {
@@ -367,15 +330,7 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     }
   });
   document.addEventListener('keydown', (event) => {
-    if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey) return;
-    const target = event.target;
-    if (
-      target instanceof HTMLInputElement ||
-      target instanceof HTMLTextAreaElement ||
-      (target instanceof HTMLElement && target.isContentEditable)
-    )
-      return;
-    if (modalOpen()) return;
+    if (event.key !== '/' || !plainShortcutAllowed(event)) return;
     event.preventDefault();
     search.focus();
   });

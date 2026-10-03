@@ -17,6 +17,20 @@ declare global {
   }
 }
 
+// A page the dev server has not served yet makes Vite transform its modules, which on a busy machine takes far
+// longer than Playwright's 30 s default. The waits below name what they wait for; the test budget just has to
+// be large enough for a cold first visit.
+test.describe.configure({ timeout: 120_000 });
+
+/**
+ * Opens a tool page and waits until the shell has mounted it. Waiting for the page title (not for the `load`
+ * event, which also waits for every subresource) is the signal that the app is ready for the test to act.
+ */
+async function openTool(page: Page, path: string, title: string): Promise<void> {
+  await page.goto(path, { waitUntil: 'domcontentloaded' });
+  await expect(page.getByTestId('page-title')).toHaveText(title, { timeout: 90_000 });
+}
+
 /** Puts the page's own core (the module instance the app uses) on `window.__core`. */
 async function exposeCore(page: Page): Promise<void> {
   await page.evaluate(async (base) => {
@@ -47,8 +61,7 @@ test.describe('leave guard', () => {
 
   test('asks before leaving with results that were not downloaded', async ({ page }) => {
     const problems = await watchForProblems(page);
-    await page.goto('tools/image-generation/');
-    await expect(page.getByTestId('page-title')).toHaveText('Image generation');
+    await openTool(page, 'tools/image-generation/', 'Image generation');
     await exposeCore(page);
     await addResults(page, ['image', 'video']);
 
@@ -65,13 +78,12 @@ test.describe('leave guard', () => {
 
     await page.getByRole('link', { name: 'Models', exact: true }).click();
     await page.getByTestId('leave-guard-leave').click();
-    await expect(page).toHaveURL(/\/models\/$/);
+    await expect(page).toHaveURL(/\/models\/$/, { timeout: 30_000 });
     expect(problems).toEqual([]);
   });
 
   test('Download all saves everything, then the way is clear', async ({ page }) => {
-    await page.goto('tools/image-generation/');
-    await expect(page.getByTestId('page-title')).toHaveText('Image generation');
+    await openTool(page, 'tools/image-generation/', 'Image generation');
     await exposeCore(page);
     await addResults(page, ['image']);
     await page.getByRole('link', { name: 'History', exact: true }).click();
@@ -80,12 +92,11 @@ test.describe('leave guard', () => {
     expect((await download).suggestedFilename()).toBe('cat.png');
     await expect(page.getByTestId('leave-guard')).toContainText('Nothing will be lost');
     await page.getByTestId('leave-guard-leave').click();
-    await expect(page).toHaveURL(/\/history\/$/);
+    await expect(page).toHaveURL(/\/history\/$/, { timeout: 30_000 });
   });
 
   test('guards palette navigation too, and counts runs in progress', async ({ page }) => {
-    await page.goto('tools/chat/');
-    await expect(page.getByTestId('page-title')).toHaveText('Chat');
+    await openTool(page, 'tools/chat/', 'Chat');
     await exposeCore(page);
     // A run that has begun and not finished (no request is made).
     await page.evaluate(async () => {
@@ -123,8 +134,7 @@ test.describe('budget confirmation', () => {
     });
 
   test('Cancel stops the run before anything is sent or recorded', async ({ page, mock }) => {
-    await page.goto('tools/chat/');
-    await expect(page.getByTestId('page-title')).toHaveText('Chat');
+    await openTool(page, 'tools/chat/', 'Chat');
     await exposeCore(page);
     const result = begin(page);
     const dialog = page.getByTestId('budget-dialog');
@@ -144,8 +154,7 @@ test.describe('budget confirmation', () => {
   });
 
   test('Run anyway lets the run start', async ({ page }) => {
-    await page.goto('tools/chat/');
-    await expect(page.getByTestId('page-title')).toHaveText('Chat');
+    await openTool(page, 'tools/chat/', 'Chat');
     await exposeCore(page);
     const result = begin(page);
     await page.getByTestId('budget-confirm').click();

@@ -10,11 +10,12 @@ import { url } from '../core/paths';
 import { getTool, tools } from '../tools/registry';
 import type { ToolId } from '../tools/types';
 import { connectKey } from '../ui/components/connect-key';
+import { switchField } from '../ui/components/switch-field';
 import { type Child, h, replace } from '../ui/dom';
-import { presentError } from '../ui/feedback/errors';
 import { toast } from '../ui/feedback/toast';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
+import { saveSettings } from '../ui/settings-actions';
 import { settingsUrl, toolUrl } from '../ui/shell/links';
 
 const STEP_KEY = 'home.onboardingStep';
@@ -81,13 +82,14 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
   let picked = new Set<ToolId>();
 
   const persistStep = (next: number): void => {
-    try {
-      core.settings.update((draft) => {
+    // Storage full: the wizard still works for this visit, so say nothing.
+    saveSettings(
+      core,
+      (draft) => {
         draft.ui[STEP_KEY] = next;
-      });
-    } catch {
-      // Storage full: the wizard still works for this visit.
-    }
+      },
+      { onError: () => undefined },
+    );
   };
 
   const go = (next: number): void => {
@@ -98,15 +100,11 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
   };
 
   function finish(skipped: boolean): void {
-    try {
-      core.settings.update((draft) => {
-        draft.onboarding.completed = true;
-        delete draft.ui[STEP_KEY];
-      });
-    } catch (error) {
-      void presentError(error);
-      return;
-    }
+    const saved = saveSettings(core, (draft) => {
+      draft.onboarding.completed = true;
+      delete draft.ui[STEP_KEY];
+    });
+    if (!saved) return;
     element.remove();
     options.onClose();
     toast(
@@ -127,23 +125,16 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
   let nextButton: HTMLButtonElement | null = null;
   const stepConnect = (): Child[] => {
     const key = core.keys.resolve();
-    const switchId = uid('free-only');
-    const freeOnly = h('input', {
-      id: switchId,
-      type: 'checkbox',
-      role: 'switch',
-      class: 'form-check-input',
+    const freeOnly = switchField({
+      label: 'Use free models only',
+      help: 'Free models cost nothing but are rate-limited, and some tools (images, video, music, transcription) have none.',
       checked: core.settings.get().freeOnly,
-      'data-testid': 'onboarding-free-only',
-      onchange: () => {
-        try {
-          core.settings.update((draft) => {
-            draft.freeOnly = freeOnly.checked;
-          });
-        } catch (error) {
-          freeOnly.checked = !freeOnly.checked;
-          void presentError(error);
-        }
+      testId: 'onboarding-free-only',
+      onChange: (checked, input) => {
+        const saved = saveSettings(core, (draft) => {
+          draft.freeOnly = checked;
+        });
+        if (!saved) input.checked = !checked;
       },
     });
     return [
@@ -178,21 +169,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
                 }, 600),
             }),
           ),
-      h(
-        'div',
-        { class: 'form-check form-switch mt-4' },
-        freeOnly,
-        h(
-          'label',
-          { class: 'form-check-label fw-semibold', htmlFor: switchId },
-          'Use free models only',
-        ),
-        h(
-          'div',
-          { class: 'form-text' },
-          'Free models cost nothing but are rate-limited, and some tools (images, video, music, transcription) have none.',
-        ),
-      ),
+      h('div', { class: 'mt-4' }, freeOnly.element),
       footer(
         (nextButton = h(
           'button',
@@ -271,15 +248,10 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
             class: 'btn btn-primary',
             'data-testid': 'onboarding-next',
             onclick: () => {
-              try {
-                core.settings.update((draft) => {
-                  draft.favouriteTools = [...picked];
-                });
-              } catch (error) {
-                void presentError(error);
-                return;
-              }
-              go(3);
+              const saved = saveSettings(core, (draft) => {
+                draft.favouriteTools = [...picked];
+              });
+              if (saved) go(3);
             },
           },
           'Next',

@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
+import type { KeyStatus } from '../core/types';
 import {
   formatContext,
   formatCount,
+  formatDate,
   formatEstimate,
+  formatInt,
   formatModelPrice,
   formatMs,
   formatRelativeTime,
   formatTokens,
   formatUsd,
+  keyBalance,
   plural,
 } from './format';
 
@@ -135,5 +139,86 @@ describe('formatRelativeTime', () => {
   it('shows a date after a week, with the year only for another year', () => {
     expect(formatRelativeTime(new Date(2026, 2, 4, 12).getTime(), now)).toBe('Mar 4');
     expect(formatRelativeTime(new Date(2025, 2, 4, 12).getTime(), now)).toBe('Mar 4, 2025');
+  });
+});
+
+describe('formatInt', () => {
+  it('groups thousands and rounds to a whole number', () => {
+    expect(formatInt(0)).toBe('0');
+    expect(formatInt(1234567)).toBe('1,234,567');
+    expect(formatInt(12.6)).toBe('13');
+    expect(formatInt(-1500)).toBe('-1,500');
+    expect(formatInt(Number.NaN)).toBe('—');
+  });
+});
+
+describe('formatDate', () => {
+  it('shows a timestamp in local time and a day string as that UTC day', () => {
+    expect(formatDate(new Date(2026, 9, 3, 12).getTime())).toBe('Oct 3, 2026');
+    expect(formatDate('2026-10-03')).toBe('Oct 3, 2026');
+    // A UTC day is the same day everywhere, whatever the time zone.
+    expect(formatDate('2026-10-03T23:59:59Z')).toBe('Oct 3, 2026');
+  });
+
+  it('can leave out the year or add the weekday', () => {
+    expect(formatDate('2026-10-03', { year: false })).toBe('Oct 3');
+    expect(formatDate(new Date(2026, 9, 3, 12).getTime(), { weekday: true, year: false })).toBe(
+      'Sat, Oct 3',
+    );
+  });
+});
+
+describe('keyBalance', () => {
+  const status = (patch: Partial<KeyStatus> = {}): KeyStatus => ({
+    label: null,
+    usageUsd: 25.5,
+    usageMonthlyUsd: 3.25,
+    limitUsd: 100,
+    limitRemainingUsd: 74.5,
+    limitReset: 'monthly',
+    isFreeTier: false,
+    freeDaily: { used: 12, limit: 50, remaining: 38 },
+    fetchedAt: 0,
+    ...patch,
+  });
+
+  it('describes a limited key', () => {
+    expect(keyBalance(status())).toEqual({
+      usageLabel: 'Used this month',
+      usage: '$3.25',
+      limit: '$100.00',
+      remaining: '$74.50 left',
+      remainingPercent: 75,
+      reset: 'resets monthly',
+      freeDaily: '12 of 50 used',
+    });
+  });
+
+  it('describes an unlimited key without monthly usage or a free counter', () => {
+    expect(
+      keyBalance(
+        status({
+          usageMonthlyUsd: null,
+          limitUsd: null,
+          limitRemainingUsd: null,
+          limitReset: null,
+          freeDaily: null,
+        }),
+      ),
+    ).toEqual({
+      usageLabel: 'Used in total',
+      usage: '$25.50',
+      limit: 'No limit',
+      remaining: null,
+      remainingPercent: null,
+      reset: null,
+      freeDaily: null,
+    });
+  });
+
+  it('derives the remaining amount when OpenRouter leaves it out', () => {
+    expect(
+      keyBalance(status({ limitUsd: 10, limitRemainingUsd: null, usageUsd: 4 })),
+    ).toMatchObject({ remaining: '$6.00 left', remainingPercent: 60 });
   });
 });

@@ -10,12 +10,16 @@
 import { downloadBlob } from '../core/files';
 import { url } from '../core/paths';
 import type { CoreServices, RunRecord, RunStatus } from '../core/types';
+import { debounce, SEARCH_DEBOUNCE_MS } from '../core/util';
 import { getTool, tools } from '../tools/registry';
 import type { ToolId } from '../tools/types';
 import { Offcanvas, showOffcanvas } from '../ui/bootstrap';
-import { copyText } from '../ui/clipboard';
+import { copyWithToast } from '../ui/clipboard';
+import { dataTable } from '../ui/components/data-table';
 import { emptyState } from '../ui/components/empty-state';
+import { listSkeleton, loadInto } from '../ui/components/load-into';
 import { modelPicker } from '../ui/components/model-picker';
+import { starButton } from '../ui/components/star-button';
 import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
 import { confirmDialog, typedConfirm } from '../ui/feedback/dialogs';
@@ -24,6 +28,7 @@ import { toast } from '../ui/feedback/toast';
 import {
   formatCount,
   formatDateTime,
+  formatInt,
   formatMs,
   formatRelativeTime,
   formatUsd,
@@ -60,8 +65,6 @@ import {
 import { whenVisible } from './lazy';
 
 const EVERYTHING = Number.MAX_SAFE_INTEGER;
-/** Typing waits this long before the list is filtered again (the same in every searchable list). */
-const SEARCH_DEBOUNCE_MS = 150;
 /** The model filter is built by reading the runs in pages of this size, in the background. */
 const MODEL_SCAN_PAGE = 200;
 const MODEL_SCAN_MAX_PAGES = 500;
@@ -93,12 +96,10 @@ class HistoryPage {
   private loadingMore = false;
   /** Bumped by every (re)load; an older answer is dropped. */
   private generation = 0;
-  private reloadTimer: ReturnType<typeof setTimeout> | undefined;
   private totalRuns: number | null = null;
   /** The last day section drawn: "Show more" appends its rows here instead of redrawing everything. */
   private lastDay: { key: string; list: HTMLElement } | null = null;
   private modelScan = 0;
-  private modelTimer: ReturnType<typeof setTimeout> | undefined;
 
   private currentRun: RunRecord | null = null;
   private detailGeneration = 0;
@@ -183,6 +184,13 @@ class HistoryPage {
   private readonly moreSlot = h('div', { class: 'text-center py-3' });
   private readonly more = whenVisible(this.moreSlot, () => void this.loadMore());
 
+  /** Typing in the search box filters the list once it pauses. */
+  private readonly readSoon = debounce(() => this.readControls(), SEARCH_DEBOUNCE_MS);
+  /** A change in the history (also from another tab) redraws the list once the changes stop. */
+  private readonly reloadSoon = debounce(() => void this.reload({ keep: true }), 120);
+  /** The model filter is rebuilt a moment after the history changed. */
+  private readonly scanSoon = debounce(() => void this.scanModels(), 1500);
+
   // The detail drawer.
   private readonly drawerTitleId = uid('run-title');
   private readonly drawerTitle = h('h2', {
@@ -243,14 +251,13 @@ class HistoryPage {
     this.wire();
     this.fillKeys();
     void this.scanModels();
-    this.showSkeleton();
     void this.reload().then(() => {
       if (params.run) void this.openDeepLink(params.run);
     });
 
     this.core.history.subscribe(() => {
-      this.scheduleReload();
-      this.scheduleModelScan();
+      this.reloadSoon();
+      this.scanSoon();
     });
     this.core.keys.subscribe(() => this.fillKeys());
   }
@@ -372,14 +379,11 @@ class HistoryPage {
   }
 
   private wire(): void {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    this.search.addEventListener('input', () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => this.readControls(), SEARCH_DEBOUNCE_MS);
-    });
+    this.search.addEventListener('input', () => this.readSoon());
     this.search.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && this.search.value) {
         this.search.value = '';
+        this.readSoon.cancel();
         this.readControls();
       }
     });
@@ -465,11 +469,6 @@ class HistoryPage {
     this.paintModels([...found].sort());
   }
 
-  private scheduleModelScan(): void {
-    clearTimeout(this.modelTimer);
-    this.modelTimer = setTimeout(() => void this.scanModels(), 1500);
-  }
-
   private paintModels(models: string[]): void {
     const current = this.modelSelect.value;
     // The model being filtered by stays a choice even when no run has it any more, so the control matches the list.
@@ -494,60 +493,43 @@ class HistoryPage {
 
   // --- loading ------------------------------------------------------------------------------------------
 
-  private showSkeleton(): void {
-    this.list.replaceChildren(
-      h(
-        'div',
-        { class: 'list-group shadow-sm placeholder-glow', 'aria-hidden': 'true' },
-        [0, 1, 2, 3].map(() =>
-          h(
-            'div',
-            { class: 'list-group-item py-3' },
-            h('span', { class: 'placeholder col-6 d-block mb-2' }),
-            h('span', { class: 'placeholder placeholder-sm col-4 d-block' }),
-          ),
-        ),
-      ),
-    );
-    this.count.textContent = 'Loading history…';
-  }
-
-  private scheduleReload(): void {
-    clearTimeout(this.reloadTimer);
-    this.reloadTimer = setTimeout(() => void this.reload({ keep: true }), 120);
-  }
-
   /**
    * Loads the first page of the current filters, or with `keep` as many rows as are shown now (a live update:
-   * the list keeps its length and the keyboard focus).
+   * the list keeps its length and the keyboard focus). Content on screen stays while a reload runs, and when
+   * it fails (the toast says so); only a list that never loaded gets the skeleton and the error state.
    */
-  private async reload(options: { keep?: boolean } = {}): Promise<void> {
+  private reload(options: { keep?: boolean } = {}): Promise<boolean> {
     const mine = ++this.generation;
     const limit = options.keep ? Math.max(this.shown.length, PAGE_SIZE) : PAGE_SIZE;
-    try {
-      const [page, total] = await Promise.all([
-        this.core.history.query(toQuery(this.filters, { limit })),
-        this.core.history.count(),
-      ]);
-      if (mine !== this.generation) return;
-      this.shown = page;
-      this.hasMore = page.length >= limit;
-      this.totalRuns = total;
-      this.keepFocus(() => this.render());
-      void this.refreshOpenRun();
-    } catch (error) {
-      if (mine !== this.generation) return;
-      this.list.replaceChildren(
-        emptyState({
+    return loadInto(
+      this.list,
+      async () => {
+        const [page, total] = await Promise.all([
+          this.core.history.query(toQuery(this.filters, { limit })),
+          this.core.history.count(),
+        ]);
+        if (mine !== this.generation) return;
+        this.shown = page;
+        this.hasMore = page.length >= limit;
+        this.totalRuns = total;
+        this.keepFocus(() => this.render());
+        void this.refreshOpenRun();
+      },
+      {
+        skeleton: listSkeleton(4),
+        status: (text) => (this.count.textContent = text),
+        messages: { loading: 'Loading history…', failed: 'History could not be loaded.' },
+        error: {
           icon: 'exclamation-triangle',
           title: 'History could not be loaded',
           text: 'Browser storage is unavailable, so there is nothing to show.',
           testId: 'history-error',
-        }),
-      );
-      this.count.textContent = 'History could not be loaded.';
-      void presentError(error);
-    }
+        },
+        retry: () => void this.reload(),
+        keepOnLiveFailure: true,
+        toast: true,
+      },
+    );
   }
 
   private async loadMore(): Promise<void> {
@@ -682,7 +664,7 @@ class HistoryPage {
     const active = activeHistoryFilters(this.filters);
     const ofTotal =
       active === 0 && this.totalRuns !== null && this.totalRuns > this.shown.length
-        ? ` of ${this.totalRuns.toLocaleString('en-US')}`
+        ? ` of ${formatInt(this.totalRuns)}`
         : '';
     this.count.textContent = `${plural(this.shown.length, 'run')}${ofTotal}`;
     this.moreSlot.replaceChildren(
@@ -797,20 +779,14 @@ class HistoryPage {
       h(
         'div',
         { class: 'd-flex align-items-center pe-2' },
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-link or-star',
-            'aria-pressed': String(run.starred),
-            'aria-label': `Star: ${run.title}`,
-            title: run.starred ? 'Unstar' : 'Star',
-            'data-part': 'star',
-            'data-testid': 'run-star',
-            onclick: () => void this.toggleStar(run),
-          },
-          icon(run.starred ? 'star-fill' : 'star'),
-        ),
+        starButton({
+          pressed: run.starred,
+          label: `Star: ${run.title}`,
+          titles: ['Star', 'Unstar'],
+          part: 'star',
+          testId: 'run-star',
+          onToggle: () => void this.toggleStar(run),
+        }),
       ),
     );
   }
@@ -876,20 +852,21 @@ class HistoryPage {
   }
 
   /**
-   * Runs `draw` (which rebuilds the drawer's content), then puts the focus back on the same control. The focused
-   * button is replaced by the rebuild, and a focus lost to the page would leave Escape without effect (Bootstrap
+   * Runs `draw` (which rebuilds the drawer's content with `replace()`, so the focused control's successor, found
+   * by `data-focus-key`, gets the focus). A focus lost to the page would leave Escape without effect (Bootstrap
    * listens for it on the drawer), so when the control is gone the drawer itself takes the focus.
    */
   private keepDrawerFocus(draw: () => void): void {
     const active = document.activeElement;
     const inDrawer = active instanceof HTMLElement && this.drawerElement.contains(active);
-    const testId = inDrawer ? active.dataset.testid : undefined;
     draw();
     if (!inDrawer) return;
-    const target = testId
-      ? this.drawerBody.querySelector<HTMLElement>(`[data-testid="${testId}"]:not(:disabled)`)
-      : null;
-    (target ?? this.drawerElement).focus();
+    // `replace()` gave focus to the successor of the control that had it; when there is none (or it is disabled
+    // now) the drawer takes it.
+    const now = document.activeElement;
+    if (!(now instanceof HTMLElement) || !this.drawerElement.contains(now)) {
+      this.drawerElement.focus();
+    }
   }
 
   private detailSection(title: string, ...body: Child[]): HTMLElement {
@@ -995,6 +972,7 @@ class HistoryPage {
         ],
         disabled: extra.disabled === true,
         'aria-pressed': extra.pressed === undefined ? undefined : String(extra.pressed),
+        'data-focus-key': testId,
         'data-testid': testId,
         onclick: onClick,
       },
@@ -1041,6 +1019,7 @@ class HistoryPage {
         {
           class: 'btn btn-primary btn-sm d-inline-flex align-items-center gap-2',
           href: toolUrl(run.tool, { run: run.id }),
+          'data-focus-key': 'run-reopen',
           'data-testid': 'run-reopen',
         },
         icon('box-arrow-up-right'),
@@ -1063,15 +1042,7 @@ class HistoryPage {
         'Copy output',
         'clipboard',
         'run-copy',
-        () => {
-          void copyText(run.output ?? '').then((ok) =>
-            toast(
-              ok
-                ? { message: 'Output copied.', variant: 'success' }
-                : { message: 'Copying was blocked by the browser.', variant: 'warning' },
-            ),
-          );
-        },
+        () => void copyWithToast(run.output ?? '', 'Output copied.'),
         { disabled: !run.output },
       ),
       this.actionButton('Export JSON', 'download', 'run-export', () => void this.exportOne(run)),
@@ -1172,46 +1143,22 @@ class HistoryPage {
   }
 
   private usageTable(rows: ReturnType<typeof usageRows>): HTMLElement {
-    const heads = ['Model', 'Requests', 'Tokens in', 'Tokens out', 'Cost', 'Avg latency'];
-    return h(
-      'div',
-      { class: 'table-responsive position-relative' },
-      h(
-        'table',
-        { class: 'table table-sm small align-middle mb-0', 'data-testid': 'run-usage' },
-        h(
-          'thead',
-          null,
-          h(
-            'tr',
-            null,
-            heads.map((label, index) =>
-              h('th', { scope: 'col', class: index > 0 ? 'text-end' : '' }, label),
-            ),
-          ),
-        ),
-        h(
-          'tbody',
-          null,
-          rows.map((row) =>
-            h(
-              'tr',
-              null,
-              h('th', { scope: 'row', class: 'fw-normal text-break' }, row.model),
-              h('td', { class: 'text-end' }, String(row.requests)),
-              h('td', { class: 'text-end' }, row.promptTokens.toLocaleString('en-US')),
-              h('td', { class: 'text-end' }, row.completionTokens.toLocaleString('en-US')),
-              h('td', { class: 'text-end' }, formatUsd(row.costUsd)),
-              h(
-                'td',
-                { class: 'text-end' },
-                row.avgLatencyMs === null ? '—' : formatMs(row.avgLatencyMs),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
+    return dataTable({
+      scrollerLabel: 'Usage by model',
+      class: 'table table-sm small align-middle mb-0',
+      testId: 'run-usage',
+      head: ['Model', 'Requests', 'Tokens in', 'Tokens out', 'Cost', 'Avg latency'],
+      numericFrom: 1,
+      rowHeaderClass: 'fw-normal text-break',
+      rows: rows.map((row) => [
+        row.model,
+        String(row.requests),
+        formatInt(row.promptTokens),
+        formatInt(row.completionTokens),
+        formatUsd(row.costUsd),
+        row.avgLatencyMs === null ? '—' : formatMs(row.avgLatencyMs),
+      ]),
+    });
   }
 
   // --- run actions --------------------------------------------------------------------------------------

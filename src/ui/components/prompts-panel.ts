@@ -10,7 +10,7 @@
 import type { CoreServices, PromptEntry, ToolId } from '../../core/types';
 import { getTool } from '../../tools/registry';
 import { Offcanvas, showOffcanvas } from '../bootstrap';
-import { copyText } from '../clipboard';
+import { copyWithToast } from '../clipboard';
 import { h, replace } from '../dom';
 import { confirmDialog, promptDialog } from '../feedback/dialogs';
 import { presentError } from '../feedback/errors';
@@ -213,13 +213,7 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
     });
 
   const copy = (entry: PromptEntry): void => {
-    void copyText(entry.text).then((ok) =>
-      toast(
-        ok
-          ? { message: 'Prompt copied.', variant: 'success' }
-          : { message: 'Copying was blocked by the browser.', variant: 'warning' },
-      ),
-    );
+    void copyWithToast(entry.text, 'Prompt copied.');
   };
 
   const remove = (entry: PromptEntry): void =>
