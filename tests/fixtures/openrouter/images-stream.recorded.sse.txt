@@ -1,0 +1,36 @@
+: 
+
+: 
+
+: 
+
+: 
+
+: 
+
+: 
+
+: 
+
+data: {"type":"image_generation.partial_image","partial_image_index":0,"b64_json":"iVBORw0KGgoAAAANSUhEUgAABAAAAAQACAIAAADwf7zUAABVNGNhQlgAAFU0anVtYgAAAB5qdW1kYzJwYQARABCAAACqADibcQNj...<truncated, 1727836 chars>"}
+
+: 
+
+: 
+
+: 
+
+: 
+
+: 
+
+: 
+
+: 
+
+: 
+
+data: {"type":"image_generation.completed","b64_json":"iVBORw0KGgoAAAANSUhEUgAABAAAAAQACAIAAADwf7zUAABcIWNhQlgAAFwhanVtYgAAAB5qdW1kYzJwYQARABCAAACqADibcQNj...<truncated, 1309436 chars>","media_type":"image/png","created":1790983963,"usage":{"prompt_tokens":15,"completion_tokens":372,"total_tokens":387,"cost":0.003006,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0},"cost_details":{"upstream_inference_cost":0.003006,"upstream_inference_prompt_cost":3e-05,"upstream_inference_completions_cost":0.002976},"completion_tokens_details":{"reasoning_tokens":0,"image_tokens":372}}}
+
+data: [DONE]
+

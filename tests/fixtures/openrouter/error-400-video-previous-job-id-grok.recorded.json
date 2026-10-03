@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "x-ai/grok-imagine-video-20260512 does not support previous_job_id",
+    "code": 400
+  }
+}

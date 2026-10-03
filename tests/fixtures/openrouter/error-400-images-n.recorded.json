@@ -1,0 +1,15 @@
+{
+  "error": {
+    "message": "No provider for black-forest-labs/flux.2-klein-4b supports the requested parameter(s): n \"5\". Provider rejections: Black Forest Labs: n: must be exactly 1",
+    "code": 400,
+    "metadata": {
+      "routing_funnel": [
+        {
+          "step": "Initial Endpoints",
+          "endpoint_count": 1
+        }
+      ],
+      "failed_routing_step": "Filter by Image Capabilities"
+    }
+  }
+}

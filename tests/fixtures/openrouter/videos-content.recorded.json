@@ -1,0 +1,67 @@
+{
+  "request": "GET /api/v1/videos/{id}/content?index=0 with Authorization and Origin",
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "video/mp4",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "body_bytes": 127607,
+  "body_first_bytes_hex": "000000206674797069736f6d",
+  "redirect": null,
+  "content_length_header_present": false,
+  "without_authorization": {
+    "status": 401,
+    "body": {
+      "error": {
+        "message": "No cookie auth credentials found",
+        "code": 401
+      }
+    }
+  },
+  "range_request_bytes_0_99": {
+    "status": 200,
+    "note": "Range ignored: full body returned with 200, not 206",
+    "body_bytes_returned": 127607
+  },
+  "ffprobe_of_body": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "codec_type": "video",
+        "width": 544,
+        "height": 544,
+        "r_frame_rate": "24/1",
+        "duration": "1.041667",
+        "bit_rate": "684403"
+      },
+      {
+        "codec_name": "aac",
+        "codec_type": "audio",
+        "sample_rate": "44100",
+        "channels": 2,
+        "r_frame_rate": "0/0",
+        "duration": "1.020998",
+        "bit_rate": "124153"
+      },
+      {
+        "codec_name": "mjpeg",
+        "codec_type": "video",
+        "width": 544,
+        "height": 544,
+        "r_frame_rate": "90000/1",
+        "duration": "1.041667"
+      }
+    ],
+    "format": {
+      "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+      "duration": "1.041667",
+      "size": "127607"
+    }
+  }
+}

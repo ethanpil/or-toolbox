@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "bytedance/seedance-2.0-mini-20260811 does not support previous_job_id",
+    "code": 400
+  }
+}

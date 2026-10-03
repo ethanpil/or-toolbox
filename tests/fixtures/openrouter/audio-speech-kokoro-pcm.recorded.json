@@ -1,0 +1,20 @@
+{
+  "request": {
+    "model": "hexgrad/kokoro-82m",
+    "input": "The quick brown fox.",
+    "voice": "af_alloy",
+    "response_format": "pcm"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "audio/pcm;rate=24000;channels=1",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-tts-1790983908-YoIZ8IZjEQOCfR77d5pW",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "body_bytes": 91338,
+  "body_first_bytes_hex": "0000000000000000"
+}

@@ -1,0 +1,21 @@
+{
+  "note": "Each entry is [seconds since the first poll, HTTP status or status string]. Polls for job A and B are the only polls made; the status \"in_progress\" was never observed in 3 jobs.",
+  "job_grok_1s_480p_first_frame": {
+    "submit_to_first_poll_s": "about 3",
+    "first_poll_status": "completed",
+    "generation_time_ms": 12350
+  },
+  "job_grok_1s_480p_input_reference": [
+    [0.3, "pending"],
+    [5.6, "completed"]
+  ],
+  "job_seedance_2_0_mini_4s_480p_first_last_frame": [
+    [0.2, "pending"],
+    [10.5, "pending"],
+    [20.8, "pending"],
+    [31.0, "pending"],
+    [41.2, "pending"],
+    [51.4, "pending"],
+    [61.6, "completed"]
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "error": {
+    "message": "No provider for openai/gpt-image-1-mini supports the requested parameter(s): aspect_ratio \"21:9\". Provider rejections: OpenAI: aspect_ratio: not supported. Accepted: 1:1, 3:2, 2:3, auto",
+    "code": 400,
+    "metadata": {
+      "routing_funnel": [
+        {
+          "step": "Initial Endpoints",
+          "endpoint_count": 1
+        }
+      ],
+      "failed_routing_step": "Filter by Image Capabilities"
+    }
+  }
+}

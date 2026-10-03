@@ -1,0 +1,82 @@
+{
+  "request_provider": {
+    "options": {
+      "deepgram": {
+        "diarize": true
+      }
+    }
+  },
+  "response": {
+    "text": "The quick brown fox jumps over the lazy dog.",
+    "usage": {
+      "seconds": 3.2399375,
+      "cost": 0.00023219552083344133
+    },
+    "duration": 3.2399375,
+    "segments": [
+      {
+        "id": 0,
+        "start": 0,
+        "end": 2.8799999,
+        "text": "The quick brown fox jumps over the lazy dog.",
+        "speaker": 0
+      }
+    ],
+    "words": [
+      {
+        "word": "The",
+        "start": 0,
+        "end": 0.24,
+        "speaker": 0
+      },
+      {
+        "word": "quick",
+        "start": 0.24,
+        "end": 0.48,
+        "speaker": 0
+      },
+      {
+        "word": "brown",
+        "start": 0.48,
+        "end": 0.88,
+        "speaker": 0
+      },
+      {
+        "word": "fox",
+        "start": 0.88,
+        "end": 1.28,
+        "speaker": 0
+      },
+      {
+        "word": "jumps",
+        "start": 1.28,
+        "end": 1.76,
+        "speaker": 0
+      },
+      {
+        "word": "over",
+        "start": 1.76,
+        "end": 2,
+        "speaker": 0
+      },
+      {
+        "word": "the",
+        "start": 2,
+        "end": 2.1599998,
+        "speaker": 0
+      },
+      {
+        "word": "lazy",
+        "start": 2.1599998,
+        "end": 2.48,
+        "speaker": 0
+      },
+      {
+        "word": "dog.",
+        "start": 2.48,
+        "end": 2.8799999,
+        "speaker": 0
+      }
+    ]
+  }
+}

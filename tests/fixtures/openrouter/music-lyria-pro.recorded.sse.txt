@@ -1,0 +1,162 @@
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1790984015-bY5ztDF5mTZQY0s6BW91","object":"chat.completion.chunk","created":1790984015,"model":"google/lyria-3-pro-preview","provider":"Google AI Studio","choices":[{"index":0,"delta":{"content":"[[A0]]\n[[B1]]\n[12.0:] Morning light on the quiet hill\n[18.0:] Mist is rising and the air is still\n[24.0:] Gentle breeze through the open door\n[30.0:] Footsteps soft on the wooden floor\n[[C2]]\n[36.0:] Carry me home, carry me home\n[42.0:] To the place where I am known\n[48.0:] Carry me home, carry me home\n[54.0:] No more walking on my own\n[[D3]]\n[[B4]]\n[72.0:] Dusty photos on the mantle place\n[78.0:] Tracing lines on a familiar face\n[84.0:] Every scar and every story told\n[90.0:] In this house where we will never grow old\n[[C5]]\n[96.0:] Carry me home, carry me home\n[102.0:] To the place where I am known\n[108.0:] Carry me home, carry me home\n[114.0:] No more walking on my own\n[[E6]]\n[120.0:] When the road is long and my spirits fail\n[126.0:] And I'm lost inside this dark and stormy vale\n[132.0:] SHOUTING OUT YOUR NAME TO FIND MY WAY BACK HOME!\n[138.0:] TELL ME I WON'T EVER HAVE TO WALK ALONE!\n[[C7]]\n[144.0:] Carry me home, carry me home\n[150.0:] To the place where I am known\n[156.0:] Carry me home, carry me home\n[162.0:] No more walking on my own\n[[F8]]\n[168.0:] Carry me home...\n[174.0:] I am home.","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1790984015-bY5ztDF5mTZQY0s6BW91","object":"chat.completion.chunk","created":1790984015,"model":"google/lyria-3-pro-preview","provider":"Google AI Studio","choices":[{"index":0,"delta":{"content":"","role":"assistant","audio":{"data":"SUQzAwAAAAAvNEdFT0IAABeqAAAAYXBwbGljYXRpb24vYzJwYQBjMnBhAGMycGEgbWFuaWZlc3Qgc3RvcmUAAAAXf2p1bWIAAAAe...<truncated, 5771760 chars>"}},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1790984015-bY5ztDF5mTZQY0s6BW91","object":"chat.completion.chunk","created":1790984015,"model":"google/lyria-3-pro-preview","provider":"Google AI Studio","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop","native_finish_reason":"STOP"}]}
+
+data: {"id":"gen-1790984015-bY5ztDF5mTZQY0s6BW91","object":"chat.completion.chunk","created":1790984015,"model":"google/lyria-3-pro-preview","provider":"Google AI Studio","service_tier":"default","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop","native_finish_reason":"STOP"}],"usage":{"prompt_tokens":32,"completion_tokens":287,"total_tokens":319,"cost":0.08,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"cost_details":{"upstream_inference_cost":0.08,"upstream_inference_prompt_cost":0,"upstream_inference_completions_cost":0.08},"completion_tokens_details":{"reasoning_tokens":0,"image_tokens":0,"audio_tokens":287}}}
+
+data: [DONE]
+

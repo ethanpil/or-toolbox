@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "Video index 5 out of range (1 videos available)",
+    "code": 400
+  }
+}

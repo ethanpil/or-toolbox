@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "An explicit voice is required for this TTS provider.",
+    "code": 400
+  }
+}

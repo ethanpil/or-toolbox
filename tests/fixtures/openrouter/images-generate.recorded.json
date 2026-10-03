@@ -1,0 +1,47 @@
+{
+  "request": {
+    "model": "black-forest-labs/flux.2-klein-4b",
+    "prompt": "A flat red circle centered on a plain white background, minimal vector style",
+    "aspect_ratio": "1:1",
+    "n": 1
+  },
+  "response": {
+    "created": 0,
+    "data": [
+      {
+        "b64_json": "/9j/4AAQSkZJRgABAQAAAQABAAD/60h3SlACEQAAAAEAAEhtanVtYgAAAB5qdW1kYzJwYQARABCAAACqADibcQNjMnBhAAAASEdq...<truncated, 92836 chars>",
+        "media_type": "image/jpeg"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 19,
+      "completion_tokens": 4096,
+      "total_tokens": 4115,
+      "cost": 0.014,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 0.014,
+        "upstream_inference_prompt_cost": 0,
+        "upstream_inference_completions_cost": 0.014
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 4096
+      }
+    }
+  },
+  "headers": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-img-1790983552-TOdyb7qrp6185EBMwzAV",
+      "X-Provider-Name": "Black Forest Labs",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  }
+}

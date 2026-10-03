@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "xAI video generations require a prompt when no image input is provided",
+    "code": 400
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "model": "x-ai/grok-imagine-video",
+  "prompt": "Slow gentle color shift of an abstract gradient",
+  "duration": 1,
+  "resolution": "480p",
+  "aspect_ratio": "1:1",
+  "frame_images": [
+    {
+      "type": "image_url",
+      "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7...<truncated, 2092 base64 chars>"
+      },
+      "frame_type": "first_frame"
+    }
+  ]
+}

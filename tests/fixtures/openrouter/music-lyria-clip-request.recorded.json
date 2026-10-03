@@ -1,0 +1,11 @@
+{
+  "model": "google/lyria-3-clip-preview",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a short 10 second upbeat pop jingle with female vocals singing these lyrics.\n[Verse]\nHello world, hello day\nSunshine on the way\n[Chorus]\nLa la la, we sing along\nThis is our little song"
+    }
+  ],
+  "modalities": ["text", "audio"],
+  "stream": true
+}

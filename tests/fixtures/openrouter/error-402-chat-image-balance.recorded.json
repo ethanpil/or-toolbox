@@ -1,0 +1,18 @@
+{
+  "error": {
+    "message": "This request requires at least $1.00 in balance for image or video output",
+    "code": 402,
+    "metadata": {
+      "limit_source": "openrouter_key_limit",
+      "remedy_hint": "Raise or remove this API key's usage limit at https://openrouter.ai/settings/keys, or use a key without a limit.",
+      "provider_name": null,
+      "previous_errors": [
+        {
+          "code": 402,
+          "message": "This request requires at least $1.00 in balance for image or video output"
+        }
+      ]
+    }
+  },
+  "user_id": "user_REDACTED"
+}

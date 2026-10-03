@@ -1,0 +1,15 @@
+{
+  "error": {
+    "message": "Resolution 4K is not supported for this model. Supported resolutions: 480p, 720p",
+    "code": 400,
+    "metadata": {
+      "routing_funnel": [
+        {
+          "step": "Initial Endpoints",
+          "endpoint_count": 1
+        }
+      ],
+      "failed_routing_step": "Validate Video Parameters"
+    }
+  }
+}

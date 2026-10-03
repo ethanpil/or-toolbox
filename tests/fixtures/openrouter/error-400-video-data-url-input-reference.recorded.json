@@ -1,0 +1,19 @@
+{
+  "request_summary": {
+    "model": "bytedance/seedance-2.0-mini",
+    "input_references": [
+      {
+        "type": "video_url",
+        "video_url": {
+          "url": "data:video/mp4;base64,<127 KB mp4, 170 KB request body>"
+        }
+      }
+    ]
+  },
+  "response": {
+    "error": {
+      "message": "Invalid reference URL: input_references[0].video_url.url: Only HTTPS URLs are allowed",
+      "code": 400
+    }
+  }
+}

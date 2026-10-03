@@ -1,0 +1,109 @@
+{
+  "request": {
+    "model": "dots-studio/dots-3-note-preview:free",
+    "max_tokens": 600,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is the invoice number and the total? Answer briefly."
+          },
+          {
+            "type": "file",
+            "file": {
+              "filename": "invoice.pdf",
+              "file_data": "data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0...<truncated, 808 base64 chars>"
+            }
+          }
+        ]
+      }
+    ],
+    "plugins": [
+      {
+        "id": "file-parser",
+        "pdf": {
+          "engine": "cloudflare-ai"
+        }
+      }
+    ]
+  },
+  "response": {
+    "id": "gen-1790983747-MOaeJeXRnADl6pbzTNtU",
+    "object": "chat.completion",
+    "created": 1790983747,
+    "model": "dots-studio/dots-3-note-preview:free",
+    "provider": "AtlasCloud",
+    "system_fingerprint": null,
+    "service_tier": null,
+    "choices": [
+      {
+        "index": 0,
+        "logprobs": null,
+        "finish_reason": "stop",
+        "native_finish_reason": "stop",
+        "message": {
+          "role": "assistant",
+          "content": "\n\nInvoice number: 4711  \nTotal: 128.50 EUR",
+          "refusal": null,
+          "reasoning": "The user wants to know the invoice number and the total from the provided file.\nThe file content is shown in the prompt:\n\"Invoice 4711 total 128.50 EUR\"\n\nLet's extract the invoice number and the total:\nInvoice number: 4711\nTotal: 128.50 EUR\n\nThe user requested: \"Answer briefly.\"\n\nLet's write a brief response.\nInvoice number: 4711\nTotal: 128.50 EUR\n",
+          "reasoning_details": [
+            {
+              "type": "reasoning.text",
+              "text": "The user wants to know the invoice number and the total from the provided file.\nThe file content is shown in the prompt:\n\"Invoice 4711 total 128.50 EUR\"\n\nLet's extract the invoice number and the total:\nInvoice number: 4711\nTotal: 128.50 EUR\n\nThe user requested: \"Answer briefly.\"\n\nLet's write a brief response.\nInvoice number: 4711\nTotal: 128.50 EUR\n",
+              "format": "unknown",
+              "index": 0
+            }
+          ],
+          "annotations": [
+            {
+              "type": "file",
+              "file": {
+                "hash": "228c88c1a19a9aa56b245e27d2a4c1b73d8a40858a6559d2e6ea7653889de9ff",
+                "name": "invoice.pdf",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "<file name=\"invoice.pdf\">"
+                  },
+                  {
+                    "type": "text",
+                    "text": "# document.pdf\n## Metadata\n- PDFFormatVersion=1.4\n- IsLinearized=false\n- IsAcroFormPresent=false\n- IsXFAPresent=false\n- IsCollectionPresent=false\n- IsSignaturesPresent=false\n\n\n\n## Contents\n### Page 1\nInvoice 4711 total 128.50 EUR"
+                  },
+                  {
+                    "type": "text",
+                    "text": "</file>"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 108,
+      "completion_tokens": 129,
+      "total_tokens": 237,
+      "cost": 0,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 0,
+        "upstream_inference_prompt_cost": 0,
+        "upstream_inference_completions_cost": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 92,
+        "image_tokens": 0,
+        "audio_tokens": 0
+      }
+    }
+  }
+}

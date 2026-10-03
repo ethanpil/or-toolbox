@@ -1,0 +1,40 @@
+{
+  "request": {
+    "model": "hexgrad/kokoro-82m",
+    "input": "The quick brown fox jumps over the lazy dog.",
+    "voice": "af_alloy",
+    "response_format": "mp3"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "audio/mpeg",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-tts-1790983581-VRvRfpJnZEafGT3Xcemf",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "body_bytes": 13197,
+  "body_first_bytes_hex": "4944330400000000",
+  "ffprobe_of_body": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_name": "mp3",
+        "codec_type": "audio",
+        "sample_rate": "24000",
+        "channels": 1,
+        "r_frame_rate": "0/0",
+        "duration": "3.240000",
+        "bit_rate": "32000"
+      }
+    ],
+    "format": {
+      "format_name": "mp3",
+      "duration": "3.240000",
+      "size": "13197"
+    }
+  }
+}

@@ -1,0 +1,44 @@
+data: {"id":"gen-1790983685-vELIl0vh5b8ltNURLhyU","object":"chat.completion.chunk","created":1790983685,"model":"google/lyria-3-clip-preview","provider":"Google AI Studio","choices":[{"index":0,"delta":{"content":"[0.0:3.7] HELLO WORLD, HELLO DAY\n[3.8:7.4] SUNSHINE ON THE WAY\n[7.5:11.2] LA LA LA, WE SING ALONG\n[11.3:14.9] THIS IS OUR LITTLE SONG\n[15.0:18.7] HELLO WORLD, HELLO DAY\n[18.8:22.4] SUNSHINE ON THE WAY\n[22.5:26.2] LA LA LA, WE SING ALONG\n[26.3:29.9] THIS IS OUR LITTLE SONG","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1790983685-vELIl0vh5b8ltNURLhyU","object":"chat.completion.chunk","created":1790983685,"model":"google/lyria-3-clip-preview","provider":"Google AI Studio","choices":[{"index":0,"delta":{"content":"","role":"assistant","audio":{"data":"SUQzAwAAAAAvNEdFT0IAABeqAAAAYXBwbGljYXRpb24vYzJwYQBjMnBhAGMycGEgbWFuaWZlc3Qgc3RvcmUAAAAXf2p1bWIAAAAe...<truncated, 992816 chars>"}},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1790983685-vELIl0vh5b8ltNURLhyU","object":"chat.completion.chunk","created":1790983685,"model":"google/lyria-3-clip-preview","provider":"Google AI Studio","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop","native_finish_reason":"STOP"}]}
+
+data: {"id":"gen-1790983685-vELIl0vh5b8ltNURLhyU","object":"chat.completion.chunk","created":1790983685,"model":"google/lyria-3-clip-preview","provider":"Google AI Studio","service_tier":"default","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop","native_finish_reason":"STOP"}],"usage":{"prompt_tokens":49,"completion_tokens":71,"total_tokens":120,"cost":0.04,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"cost_details":{"upstream_inference_cost":0.04,"upstream_inference_prompt_cost":0,"upstream_inference_completions_cost":0.04},"completion_tokens_details":{"reasoning_tokens":0,"image_tokens":0,"audio_tokens":71}}}
+
+data: [DONE]
+

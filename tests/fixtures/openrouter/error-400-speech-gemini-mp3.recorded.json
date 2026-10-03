@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "Gemini TTS only supports response_format=\"pcm\". Got \"mp3\".",
+    "code": 400
+  }
+}

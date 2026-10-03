@@ -1,0 +1,55 @@
+{
+  "request": {
+    "model": "black-forest-labs/flux.2-klein-4b",
+    "prompt": "Change the red circle to blue; keep everything else the same",
+    "aspect_ratio": "1:1",
+    "n": 1,
+    "input_references": [
+      {
+        "type": "image_url",
+        "image_url": {
+          "url": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/60h3SlACEQAA...<truncated, 92836 base64 chars>"
+        }
+      }
+    ]
+  },
+  "response": {
+    "created": 0,
+    "data": [
+      {
+        "b64_json": "/9j/4AAQSkZJRgABAQAAAQABAAD/65pESlACEQAAAAEAAJo6anVtYgAAAB5qdW1kYzJwYQARABCAAACqADibcQNjMnBhAAAASEdq...<truncated, 140220 chars>",
+        "media_type": "image/jpeg"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 4096,
+      "completion_tokens": 4096,
+      "total_tokens": 8192,
+      "cost": 0.015,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 0.015,
+        "upstream_inference_prompt_cost": 0,
+        "upstream_inference_completions_cost": 0.015
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 4096
+      }
+    }
+  },
+  "headers": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-img-1790983566-sVuR89Ip1JjCbPfQK7ln",
+      "X-Provider-Name": "Black Forest Labs",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  }
+}

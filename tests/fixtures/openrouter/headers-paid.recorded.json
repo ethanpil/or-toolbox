@@ -1,0 +1,104 @@
+{
+  "POST_videos_202": {
+    "status": 202,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "GET_videos_id_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "GET_videos_id_content_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "video/mp4",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "POST_images_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-img-1790983552-TOdyb7qrp6185EBMwzAV",
+      "X-Provider-Name": "Black Forest Labs",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "POST_images_stream_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/event-stream",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-cache",
+      "X-Generation-Id": "gen-img-1790983956-HmCx7yRQfWvgNEQZoRSs",
+      "X-Provider-Name": "OpenAI",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "POST_audio_speech_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "audio/mpeg",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-tts-1790983581-VRvRfpJnZEafGT3Xcemf",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "POST_audio_transcriptions_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-stt-1790983594-xTYhSSZk85yAaiIJjM53",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "POST_chat_completions_lyria_stream_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "text/event-stream",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-cache",
+      "X-Generation-Id": "gen-1790983685-vELIl0vh5b8ltNURLhyU",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "POST_api_alpha_decisions_200": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Generation-Id": "gen-dec-1790983734-YuAZOw48Sz9n2968BKbe",
+      "X-Provider-Name": "TypeSafe"
+    }
+  },
+  "POST_chat_completions_402_image_balance": {
+    "status": 402,
+    "headers": {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray",
+      "X-Generation-Id": "gen-1790984075-u42gJKxwZXfUx1IXARMT"
+    }
+  }
+}

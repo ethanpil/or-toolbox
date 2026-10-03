@@ -1,0 +1,25 @@
+{
+  "model": "google/lyria-3-clip-preview",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Instrumental only, no vocals. Mood inspired by this image."
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7...<truncated, 2092 base64 chars>"
+          }
+        }
+      ]
+    }
+  ],
+  "modalities": ["text", "audio"],
+  "audio": {
+    "format": "wav"
+  },
+  "stream": true
+}

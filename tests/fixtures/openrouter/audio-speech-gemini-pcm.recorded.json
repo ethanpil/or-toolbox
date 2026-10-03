@@ -1,0 +1,20 @@
+{
+  "request": {
+    "model": "google/gemini-3.8-flash-tts",
+    "input": "The quick brown fox.",
+    "voice": "Kore",
+    "response_format": "pcm"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "audio/pcm;rate=24000;channels=1",
+      "Transfer-Encoding": "chunked",
+      "Access-Control-Allow-Origin": "*",
+      "X-Generation-Id": "gen-tts-1790983910-XtUli6wbLHke1K41x6gt",
+      "access-control-expose-headers": "X-Generation-Id,X-Provider-Name,request-id,cf-ray"
+    }
+  },
+  "body_bytes": 94080,
+  "body_first_bytes_hex": "0000000000000000"
+}

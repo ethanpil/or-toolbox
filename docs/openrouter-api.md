@@ -1,6 +1,6 @@
 # OpenRouter API reference for ORtoolbox
 
-Single source of API truth for the toolbox. Captured **2026-10-02** from OpenRouter's published docs (`llms.txt`, per-page `.md` files, `openapi.json`), from keyless live requests, and from authenticated probes made the same day with a throwaway key. **Authenticated probes were restricted to free models (`:free`) and about 17 generation requests; no paid model or paid endpoint was called.** Consequently the following were never exercised live and stay doc-only: image generation and editing, music/Lyria, video, speech-to-text (no free model exists for any of them today, see section 9.3), and every paid-model behaviour (real non-zero `usage.cost`, `/generation` lookups).
+Single source of API truth for the toolbox. Captured **2026-10-02** from OpenRouter's published docs (`llms.txt`, per-page `.md` files, `openapi.json`), from keyless live requests, and from authenticated probes with a throwaway key in two rounds: (1) free models only, about 17 generation requests; (2) a small paid round (cap $3.00; **actual spend about $0.43**, ledger in section 16) that exercised video, image generation/editing/streaming, TTS, STT, music (Lyria Clip and Pro), Jev decisions and PDF input. Still never exercised live: native video continuation (`previous_job_id` on a model that supports it), the chat-route image output (402, see section 3), and the account's own free-tier 429.
 
 ## How to read this document
 
@@ -9,7 +9,7 @@ Every statement carries one of three tags.
 | Tag | Meaning |
 | --- | --- |
 | **[doc]** | Read in OpenRouter's docs or OpenAPI spec on 2026-10-02. The source URL is given per section. |
-| **[probed]** | Observed in a live request made on 2026-10-02: keyless, with a deliberately fake key, or authenticated against a free model. Authenticated recordings are `tests/fixtures/openrouter/*.recorded.*` (identifiers redacted). |
+| **[probed]** | Observed in a live request made on 2026-10-02: keyless, with a deliberately fake key, or authenticated (free models, then a small paid round). Authenticated recordings are `tests/fixtures/openrouter/*.recorded.*` (identifiers redacted, base64 truncated); small real media is in `tests/fixtures/media/`. |
 | **[unverified]** | Could not be confirmed. The text says what is still unknown and how to find out. |
 
 Where the docs contradict each other, both versions are listed and the conflict is called out.
@@ -22,20 +22,23 @@ Raw sources used: `https://openrouter.ai/docs/llms.txt`, `https://openrouter.ai/
 
 | PLAN.md says | What the API actually does |
 | --- | --- |
-| `POST /images` **or** chat with image output | **Both exist.** `POST /api/v1/images` is a dedicated Image API (preferred). Chat with `modalities` still accepted by the schema but no longer described in prose docs. **[doc]** [probed 401 + CORS on `/images`] |
-| Image editor uses a painted **mask** for inpaint/outpaint | **No mask parameter exists** on `/images` or in the chat schema (searched spec and all docs). Editing = `input_references` (images) + prompt. A mask must be expressed by sending a marked-up image plus instructions. **[doc]** |
-| TTS output MP3 / WAV | `response_format` is only `mp3` or `pcm` (default **`pcm`**). No `wav`. PCM is raw 16-bit little-endian; build the WAV header client-side. **[doc]** **The PCM sample rate is in the response `Content-Type`**, e.g. `audio/pcm;rate=44100;channels=1` (recorded with `fish-audio/s2.1-pro-free:free`); parse `rate` and `channels` from it. **[probed]** The docs' example model `openai/gpt-4o-mini-tts-2025-12-15` is **not in the catalog today** (endpoints lookup 404, no OpenAI model among the 23 `speech` models). **[probed]** |
+| `POST /images` **or** chat with image output | **Use `POST /api/v1/images`.** Probed live: generation, editing (base64 `data:` URL in `input_references` + instruction) and OpenAI SSE streaming all work. The chat route (`modalities:["image","text"]`) returned **402 "This request requires at least $1.00 in balance for image or video output"** (`limit_source: openrouter_key_limit`) for a key with <$1 of limit remaining, whereas `/images` and `/videos` worked with the same key, so spend-limited keys must use `/images`. **[doc]** **[probed]** |
+| Image editor uses a painted **mask** for inpaint/outpaint | **No mask parameter exists** on `/images` or in the chat schema (searched spec and all docs). Editing = `input_references` (images) + prompt. **[probed]** an edit with a 1024x1024 JPEG sent as a base64 data URL plus "Change the red circle to blue; keep everything else the same" returned a 1024x1024 JPEG with the circle recoloured (centre pixel (227,0,9) -> (5,139,252)) for $0.015 on `black-forest-labs/flux.2-klein-4b`. A mask must be expressed by sending a marked-up image plus instructions. |
+| TTS output MP3 / WAV | `response_format` is only `mp3` or `pcm` (default **`pcm`**), never `wav`: build the WAV header client-side. **[doc]** **Format support is per model:** `google/gemini-3.8-flash-tts` returns **400 `Gemini TTS only supports response_format="pcm". Got "mp3".`** (free), so the tool must be able to transcode PCM to MP3 in the browser. **[probed]** **The PCM sample rate is in the response `Content-Type`**: `audio/pcm;rate=44100;channels=1` (Fish), `audio/pcm;rate=24000;channels=1` (Kokoro and Gemini); parse `rate`/`channels`. **[probed]** Some providers require an explicit `voice` (Kokoro: 400 `An explicit voice is required for this TTS provider.`); Fish did not. **[probed]** The docs' example model `openai/gpt-4o-mini-tts-2025-12-15` is **not in the catalog** (404, and no OpenAI model among the 23 `speech` models). **[probed]** |
 | Decision: "Yes/No" questions | The type is named **`noul`**, and its answer is `{type:"noul", noul:<P(yes)>}` with **no `confidence` field**. `confidence` exists only on `choice` and `score`. **[doc]** [probed on the free model `inception/mercury-decide:free`: same request schema accepted, answers as documented] |
 | Decision endpoint `POST /api/alpha/decisions` | Full URL is `https://openrouter.ai/api/alpha/decisions` (**not** under `/api/v1`). `/api/v1/api/alpha/decisions` and `/api/v1/decisions` return 404. The OpenAPI file lists it under the `/api/v1` server, which is wrong. **[probed]** |
-| Music: lyrics / instrumental / duration fields | **No such request fields are documented.** Lyria's `supported_parameters` are only `max_tokens, response_format, seed, temperature, top_p`. Lyrics, instrumental and duration can only be expressed in the prompt text. Price is flat **$0.08/song (Pro)** and **$0.04/clip (Clip, 30 s)** per the model descriptions; the catalog's numeric `pricing` is `"0"`. **[probed]** |
-| Video: "generated clips can't be used directly" for native extend | Spec has **`previous_job_id`** (id of a completed job, same model/endpoint) for models that support continuation. Only the field is documented; which models accept it is **[unverified]** (FLUX.3 Video describes "video continuation workflows"). `input_references` also accepts `video_url` and `audio_url` parts (Seedance 2.0+). **[doc]** |
-| Video: "download links need the user's key" | Correct: `GET /videos/{id}/content` needs `Authorization` and **proxies the bytes** (no redirect documented). But `unsigned_urls[]` can in principle point at a non-OpenRouter host; always download via the content endpoint. **[doc]** |
+| Music: lyrics / instrumental / duration fields | **No request fields exist; everything is prompt text, and duration is not controllable.** Lyria's `supported_parameters` are only `max_tokens, response_format, seed, temperature, top_p`. **[probed]** with both models (`modalities:["text","audio"]`, `stream:true`, no `audio` object): **Clip returns a 30.8 s MP3, Pro a 180.1 s MP3**, even when the prompt said "10 second". The audio arrives as **one single `delta.audio.data` base64 chunk** (Clip 745 KB, Pro 4.3 MB decoded; the stream is 1.0 MB and 5.8 MB), **MP3 44.1 kHz stereo 192 kbps with an ID3v2.3 header carrying a C2PA manifest**, not WAV. `audio:{format:"wav"}` is accepted and **ignored**. The lyrics come back as timestamped text in `delta.content` (`[0.0:3.7] HELLO WORLD, HELLO DAY`; Pro adds section markers `[[A0]] [[B1]]` and expands/repeats lyrics to fill the song; instrumental gives `<instrumental>`), so `[Verse]`/`[Chorus]` tags in the prompt are honoured. `usage.cost` is the flat **$0.04 (Clip) / $0.08 (Pro)**. 17 (Clip) and 76 (Pro) `: OPENROUTER PROCESSING` keep-alive lines arrive during the 10 s and 43 s wait. An image content part is accepted. |
+| Video: "OpenRouter appears to reject local `data:` URLs for video" and native extend | **Split result.** `data:` URLs are **accepted for images** in `frame_images` (first **and** last frame, tested on grok-imagine-video and Seedance 2.0 mini) and in image `input_references` (grok). They are **rejected for video**: `input_references[].video_url` with a `data:video/mp4;...` URL returns **400 `Invalid reference URL: input_references[0].video_url.url: Only HTTPS URLs are allowed`** (free). So "Continue from last frame" works with no hosting, but native extend by uploaded video needs a public HTTPS URL, as PLAN assumed. **[probed]** For continuation of a *generated* clip there is `previous_job_id`, but it is per model: `x-ai/grok-imagine-video` and `bytedance/seedance-2.0-mini` both reject it with **400 `<model-snapshot> does not support previous_job_id`** (free); which model accepts it is still **[unverified]** (FLUX.3 Video is the likely one; a probe costs $0.85+). **[probed]** |
+| Video: "download links need the user's key" | Correct. `GET /videos/{id}/content?index=0` **requires `Authorization`** (401 without), returns **200 `video/mp4` with `Transfer-Encoding: chunked` and no `Content-Length`**, **no redirect**, ignores `Range` (full 200, not 206), and carries `Access-Control-Allow-Origin: *`; the preflight is 204. `unsigned_urls[0]` was exactly the same-host content URL. Fetch to a Blob. **[probed]** A finished video was still downloadable, byte-identical, 18 minutes later; the real retention limit is still unknown (section 7.4). |
 | App attribution header `X-Title` | Current name is **`X-OpenRouter-Title`** (`X-Title` still supported). `HTTP-Referer` is required for attribution. Both pass CORS preflight. **[doc]** [probed] |
 | PKCE connect "can request a limit" | The `/auth` URL has **no documented limit parameter** (only `callback_url`, `code_challenge`, `code_challenge_method`, `key_label`, `workspace_id`, `required_workspace_id`, `state`). A `limit` exists only on `POST /auth/keys/code`, which needs authentication, so it cannot be used for first sign-in. **[doc]** |
 | Free model = `:free` suffix | Correct, and **zero price is not a free signal**: 107 of 647 catalog entries have `pricing.prompt == "0" && pricing.completion == "0"` but only 24 end in `:free` (image/video/rerank models price through other fields). **[probed]** |
-| Cost via `usage` accounting flag | `usage: {include: true}` and `stream_options.include_usage` are **deprecated no-ops**; `usage` (with `cost`) is always returned. **[doc]** |
+| Cost via `usage` accounting flag | `usage: {include: true}` and `stream_options.include_usage` are **deprecated no-ops**; `usage` (with `cost`) is always returned. **[doc]** **[probed]** `usage.cost` is present by default on chat (JSON and SSE), `/images` (JSON and SSE), STT and decisions, and in the completed `/videos/{id}` poll. TTS and the video content endpoint return raw bytes with no cost, so cost needs `GET /generation` (below). |
 | `GET /credits` for balance | The docs say it needs a **management key**, but it returned **200 for an ordinary key** (`is_management_key:false`) with `{data:{total_credits,total_usage}}` (account-level totals, not per-key). **[probed]** Treat it as available but undocumented-for-ordinary-keys; fall back to `GET /key` if it ever returns 401/403. |
 | Preferring non-retaining providers is a harmless per-key setting | `provider.data_collection:"deny"` **excludes free models**: a request to a `:free` model with it returns `404 "No endpoints found matching your data policy (Free model training)"`. So "free-only mode" and "no-retention" cannot be combined for text models. **[probed]** |
+| STT diarization via top-level `diarize` | The spec's top-level `diarize:true` was **rejected with 400 `The selected model does not support diarize...` for all four models tried** (`openai/whisper-large-v3-turbo`, `x-ai/grok-stt-1.0`, `microsoft/mai-transcribe-2`, `deepgram/nova-3`; free). The **provider-option route works**: `provider.options.deepgram.diarize:true` and `provider.options.azure.diarization.enabled:true` both returned `speaker` indexes on `segments[]` and `words[]`. Use provider options. **[probed]** |
+| Reading cost and usage after the fact | `GET /generation?id=<X-Generation-Id>` **does work** for every type (`api_type`: `completions`, `image`, `video`, `tts`, `stt`, `decisions`) but is **eventually consistent**: 404 for the first ~1 to 8 minutes (images found at ~2.5 min, TTS at 5.7 min; two free-model ids still 404 at 8 min and found at ~50 min). `GET /key` `usage` also lags by minutes (it read $0.353 while about $0.43 had been spent) and `free_model_daily_requests.used` had not advanced. Do not use either for live budget checks; use `usage.cost` from responses and a local ledger. **[probed]** |
+| TTS price shown in the catalog | `/models` `pricing` shows only the **cheapest endpoint**. A `hexgrad/kokoro-82m` request was routed to Together and billed **$0.000176 for 44 characters ($4/M chars) while the catalog says $0.62/M chars (DeepInfra)**: 6.5x higher. `provider.order/only/sort` are not applied to speech requests, so estimate with the **highest** endpoint price from `GET /models/{id}/endpoints`. **[probed]** |
 
 ---
 
@@ -60,7 +63,7 @@ Raw sources used: `https://openrouter.ai/docs/llms.txt`, `https://openrouter.ai/
 
 Source: https://openrouter.ai/docs/app-attribution, https://openrouter.ai/docs/api_reference/authentication
 
-**Usage and cost (all endpoints that bill):** every response carries `usage.cost` (USD, number) with no opt-in. For streams it is on the last chunk before `[DONE]`. **[doc]** **[probed]** on free models: `usage.cost` is present by default and equals `0` (chat non-stream, chat stream, decisions); sending `"usage":{"include":true}` is accepted with no effect (200, same shape), confirming it is a deprecated no-op. Raw-byte endpoints (TTS, video content) cannot carry it; the docs say to use `GET /generation?id=<X-Generation-Id>` afterwards (`api_type` includes `tts`, `stt`, `image`, `video`, `decisions`) **[doc]**. **[probed]** `GET /generation?id=...` returned **404 "Generation ... not found"** for 4 free-model generations (chat, TTS, decisions) at roughly 3 and 8 minutes after the request, so the lookup is **not confirmed to work** even for ids the API itself returned (fixture `error-404-generation-not-found.recorded.json`); it may not store free-model generations, or it may lag. Source: https://openrouter.ai/docs/cookbook/administration/usage-accounting
+**Usage and cost (all endpoints that bill):** every response carries `usage.cost` (USD, number) with no opt-in. For streams it is on the last chunk before `[DONE]`. **[doc]** **[probed]** on free models: `usage.cost` is present by default and equals `0` (chat non-stream, chat stream, decisions); sending `"usage":{"include":true}` is accepted with no effect (200, same shape), confirming it is a deprecated no-op. Raw-byte endpoints (TTS, video content) cannot carry it; the docs say to use `GET /generation?id=<X-Generation-Id>` afterwards (`api_type` includes `tts`, `stt`, `image`, `video`, `decisions`) **[doc]**. **[probed]** `GET /generation?id=...` works for chat, TTS, STT, image, video and decisions ids (`api_type` `completions|tts|stt|image|video|decisions`; the record has `total_cost`, `usage`, `model` (dated snapshot), `provider_name`, `tokens_prompt`, `tokens_completion`, `num_media_prompt`, `num_media_completion`, `latency`, `generation_time`, `streamed`, `finish_reason`, `origin`, ...; fixtures `generation-*.recorded.json`). It is **eventually consistent**: it returned `404 {"error":{"message":"Generation gen-... not found","code":404}}` at 1.3 minutes (TTS) and for free-model ids at about 3 and 8 minutes, but 200 for images at about 2.5 minutes, TTS at 5.7 minutes and every id at about 50 minutes (fixture `error-404-generation-not-found.recorded.json`). Retry with backoff for up to ~10 minutes if you need the figure; never block a UI on it. Source: https://openrouter.ai/docs/cookbook/administration/usage-accounting
 
 **Exposed response headers:** only `X-Generation-Id, X-Provider-Name, request-id, cf-ray` appear in `Access-Control-Expose-Headers`, on keyless, error and authenticated 200/429/400 responses alike **[probed]**. `Retry-After` is not exposed (section 12.3). Note the exposed list names `X-Provider-Name`, but only the decisions response actually carried it; chat and TTS responses did not.
 
@@ -142,7 +145,7 @@ data: {"id":"gen-abc123","object":"chat.completion.chunk","created":1234567890,"
 * Framing is **LF only** (no CR): every event is `data: <json>\n\n`; the file ends `data: [DONE]\n\n`. Split on `\n`, not `\r\n`.
 * Chunks use `delta.content: ""` plus `delta.role: "assistant"` on every chunk, and reasoning models stream `delta.reasoning` (string) and `delta.reasoning_details[]` before any visible `content`. The first chunks may carry only reasoning. Do not treat `content: ""` as the start or end of the answer.
 * Termination matches the docs exactly: one chunk with `finish_reason:"stop"` and `native_finish_reason:"stop"`, then a second chunk with the same content-free delta, the same finish reason and the `usage` object (including `cost`), then `data: [DONE]`.
-* **No `: OPENROUTER PROCESSING` comment line appeared** in these sub-5-second streams (0 comment lines in 3 recordings), so the keep-alive comment is documented but only expected on slow starts. Keep skipping `:` lines.
+* **No `: OPENROUTER PROCESSING` comment line appeared** in these sub-5-second streams (0 comment lines in 3 recordings), so the keep-alive comment only shows up on slow starts: the Lyria streams (10 s and 43 s) carried 17 and 76 of them, and image streams carry empty `: ` comment lines. Keep skipping every line that starts with `:`.
 * **Reasoning can consume the whole budget:** a 600-token cap on a mandatory-reasoning model streamed 116 KB of `reasoning` chunks and ended with `finish_reason:"length"`, empty `content` and `usage.completion_tokens_details.reasoning_tokens == completion_tokens` (recorded in `chat-stream-reasoning-length.recorded.sse.txt`). Still HTTP 200, no error event.
 
 ### 2.4 Content parts (user messages) **[doc]**
@@ -177,7 +180,7 @@ Works with any model. Send the PDF as a `file` part (URL or `data:application/pd
 | `native` | Only for models with native file input; charged as input tokens. **Default first choice when available.** |
 | `pdf-text` | Deprecated; redirected to `cloudflare-ai`. |
 
-Annotations: the assistant message may include `annotations: [{type:"file", file:{hash, name?, content:[{type:"text"|"image_url", ...}]}}]`. Echo them back in a later request to skip re-parsing (and re-paying for OCR). On a provider failure after a successful parse, the same array is in `error.metadata.file_annotations`. Fixture: `chat-completion-reasoning-pdf.documented.json`. Source: https://openrouter.ai/docs/guides/overview/multimodal/pdfs
+Annotations: the assistant message may include `annotations: [{type:"file", file:{hash, name?, content:[{type:"text"|"image_url", ...}]}}]`. Echo them back in a later request to skip re-parsing (and re-paying for OCR). On a provider failure after a successful parse, the same array is in `error.metadata.file_annotations`. Fixture: `chat-completion-reasoning-pdf.documented.json`. **[probed]** a 604-byte one-page text PDF (`tests/fixtures/media/invoice.pdf`) sent as `{type:"file", file:{filename, file_data:"data:application/pdf;base64,..."}}` with `plugins:[{id:"file-parser", pdf:{engine:"cloudflare-ai"}}]` to the free model `dots-studio/dots-3-note-preview:free` returned 200, `usage.cost: 0`, and the answer "Invoice number: 4711 / Total: 128.50 EUR". The parsed document came back in `choices[0].message.annotations[0]` as `{type:"file", file:{hash:<64 hex>, name:"invoice.pdf", content:[{type:"text",text:"<file name=\"invoice.pdf\">"}, {type:"text", text:"# document.pdf\n## Metadata\n- PDFFormatVersion=1.4 ...\n## Contents\n### Page 1\nInvoice 4711 total 128.50 EUR"}, {type:"text",text:"</file>"}]}}`. So the free engine is currently named **`cloudflare-ai`** (markdown with a metadata header and `### Page N` sections) and it works on a model without file input. Fixture `chat-completion-pdf.recorded.json`. Source: https://openrouter.ai/docs/guides/overview/multimodal/pdfs
 
 ### 2.6 Structured outputs (`response_format` json_schema) **[doc]**
 
@@ -270,7 +273,7 @@ Source: https://openrouter.ai/docs/guides/overview/multimodal/image-generation, 
 | `GET /api/v1/images/models` | none **[probed]** | 57 image models with `supported_parameters` descriptors. |
 | `GET /api/v1/images/models/{author}/{slug}/endpoints` | none **[probed]** | Per-provider capabilities, pricing, passthrough options. |
 
-Chat-route image output also exists: `modalities: ["image","text"]` on `/chat/completions` for models whose `architecture.output_modalities` contains `image` plus `text` (11 today, e.g. `google/gemini-3.1-flash-image`, `openai/gpt-5-image`). The response puts images at `choices[0].message.images[].image_url.url` ("URL or base64-encoded data of the generated image"). **[doc: spec only]** The prose docs no longer describe this route or the `image_config` keys. Use `/images` unless a model is chat-only. Fixture: `chat-completion-image-output.documented.json`.
+Chat-route image output also exists: `modalities: ["image","text"]` on `/chat/completions` for models whose `architecture.output_modalities` contains `image` plus `text` (11 today, e.g. `google/gemini-3.1-flash-image`, `openai/gpt-5-image`). The response puts images at `choices[0].message.images[].image_url.url` ("URL or base64-encoded data of the generated image"). **[doc: spec only]** The prose docs no longer describe this route or the `image_config` keys. Use `/images` unless a model is chat-only. **[probed]** a chat-route request (`google/gemini-3.1-flash-lite-image`, `modalities:["image","text"]`, `image_config:{"aspect_ratio":"1:1"}`) was refused before any generation with **`402 {"error":{"message":"This request requires at least $1.00 in balance for image or video output","code":402,"metadata":{"limit_source":"openrouter_key_limit","remedy_hint":"Raise or remove this API key's usage limit ..."}}}`** (not billed; `error-402-chat-image-balance.recorded.json`). The key's remaining limit was about $0.57 (a $1.00 limit with about $0.43 spent), and the same key had just run `/images` and `/videos` jobs successfully, so the **$1.00 minimum applies to the chat route** and counts the key's own limit. The real `message.images` shape and `image_config` keys stay **[unverified]**. Fixture: `chat-completion-image-output.documented.json`.
 
 ### 3.2 Request body (`ImageGenerationRequest`) **[doc]**
 
@@ -335,9 +338,18 @@ data: [DONE]
 
 A fourth event type `image_generation.text_chunk` (`{phase:"content"|"reasoning"|"draft", text}`) exists for text-based formats (SVG). Fixtures: `images-generate.documented.json`, `images-stream.documented.json`, `images-stream-error.documented.json`.
 
+**[probed] real `/images` calls** (CORS headers `Access-Control-Allow-Origin: *`, `X-Generation-Id: gen-img-<unix>-<20 chars>`, `X-Provider-Name`; fixtures `images-generate.recorded.json`, `images-edit.recorded.json`, `images-stream.recorded.sse.txt`; base64 truncated):
+
+| Call | Result |
+| --- | --- |
+| `black-forest-labs/flux.2-klein-4b`, `{prompt, aspect_ratio:"1:1", n:1}` | 200 in 4.3 s. Body `{created: 0, data:[{b64_json, media_type:"image/jpeg"}], usage:{prompt_tokens:19, completion_tokens:4096, total_tokens:4115, cost:0.014, is_byok:false, prompt_tokens_details, cost_details{upstream_inference_cost, ...}, completion_tokens_details{image_tokens:4096}}}`. **`created` is `0`** (do not use it), there is **no `id` in the body** (the id is only the `X-Generation-Id` header), and `media_type` was **`image/jpeg` although no `output_format` was sent** (the model default; flux klein supports `output_format: png|jpeg`). Output was 1024x1024, 69,625 bytes (`tests/fixtures/media/generated-image.jpg`). Cost $0.014 for the 1024x1024 output (catalog price $0.014/megapixel). |
+| Same model with `input_references:[{type:"image_url", image_url:{url:"data:image/jpeg;base64,..."}}]` + edit instruction | 200 in 4.7 s, JPEG 1024x1024 (105,165 bytes, `edited-image.jpg`), `usage.prompt_tokens: 4096` (the input image is counted as 4096 tokens), cost **$0.015**. **Base64 data URLs are accepted for `/images` references.** |
+| `openai/gpt-image-1-mini`, `{quality:"low", aspect_ratio:"1:1", stream:true}` | 200, `text/event-stream`, 6.8 s, 3.0 MB. Framing is LF only. The stream began with **7 empty comment lines (`: ` colon + space, not `: OPENROUTER PROCESSING`)**, then one `image_generation.partial_image` event (`partial_image_index:0`, 1.73 M base64 chars), 8 more `: ` lines, then `image_generation.completed` (`b64_json` 1.31 M chars, `media_type:"image/png"`, `created` set, `usage{completion_tokens:372, cost:0.003006, ...}`) and `data: [DONE]`. Both images were PNGs carrying a C2PA manifest (starts `iVBORw0K...` then `jumb`/`c2pa`). Only one partial arrived at `quality:"low"`. A parser must tolerate `:` comment lines with no text. |
+| `n:5` on klein; `aspect_ratio:"21:9"` on gpt-image-1-mini | Free 400s: `No provider for black-forest-labs/flux.2-klein-4b supports the requested parameter(s): n "5". Provider rejections: Black Forest Labs: n: must be exactly 1` and `... aspect_ratio "21:9". Provider rejections: OpenAI: aspect_ratio: not supported. Accepted: 1:1, 3:2, 2:3, auto`, with `metadata.routing_funnel` / `failed_routing_step:"Filter by Image Capabilities"`. The accepted values are listed in the message, so surface it. |
+
 ### 3.5 Catalog and pricing
 
-`GET /images/models` (`data[]` of `{id, name, description, created, architecture{input_modalities, output_modalities}, supported_parameters, supports_streaming, endpoints}`) **[probed]**; per-endpoint pricing is an array `{billable: output_image|input_image|input_reference|input_text|input_font, unit: image|megapixel|token|request, cost_usd, variant?}` (e.g. seedream-4.5 $0.04/image; FLUX.2 Pro $0.03/megapixel; gpt-image-2 token-priced) **[probed]**. Units differ per model, so a pre-run estimate needs per-unit handling; the real cost is `usage.cost`. `/models?output_modalities=image` returns 59 entries: the 57 above plus `openrouter/auto` and `openrouter/auto-beta` **[probed]**. Fixtures: `images-models.json` (15 of 57), `images-model-endpoints.*.json`.
+`GET /images/models` (`data[]` of `{id, name, description, created, architecture{input_modalities, output_modalities}, supported_parameters, supports_streaming, endpoints}`) **[probed]**; per-endpoint pricing is an array `{billable: output_image|input_image|input_reference|input_text|input_font, unit: image|megapixel|token|request, cost_usd, variant?}` (e.g. seedream-4.5 $0.04/image; FLUX.2 Pro $0.03/megapixel; gpt-image-2 token-priced) **[probed]**. Units differ per model, so a pre-run estimate needs per-unit handling; the real cost is `usage.cost`. `/models?output_modalities=image` returns 59 entries: the 57 above plus `openrouter/auto` and `openrouter/auto-beta` **[probed]**. Catalog per-image and per-megapixel prices matched the billed `usage.cost` in the probes above (klein $0.014 for a 1024x1024 output, gpt-image-1-mini $0.003006 at `quality:"low"`); adding one 1024x1024 reference image to the edit added $0.001 (billed $0.015). Cheapest per-image/megapixel models today (endpoint pricing): `recraft/recraft-v4.1-flash` $0.007/image, `black-forest-labs/flux.2-klein-4b` $0.014/MP, `bytedance-seed/seedream-5-0-flash` $0.018/image. Fixtures: `images-models.json` (15 of 57), `images-model-endpoints.*.json`.
 
 ---
 
@@ -354,7 +366,7 @@ CORS **[probed]**: preflight 204 with `access-control-allow-origin: *`. With an 
 | `model`* | string, a model from `GET /models?output_modalities=speech` |
 | `input`* | string to synthesize. Some models (Seed Audio 1.0) treat it as a prompt that can also describe non-speech audio. |
 | `voice` | string. "Provider-dependent": omit only when the provider documents a default; otherwise an explicit voice is required (omitting it where unsupported is a validation error). |
-| `response_format` | **`mp3` or `pcm`** (default `pcm`). `pcm` is raw 16-bit little-endian; Azure MAI-Voice PCM is 24 kHz mono **[doc]**. **[probed]** the response `Content-Type` carries the format: `audio/pcm;rate=44100;channels=1` for Fish Audio (so read `rate`/`channels` from the header rather than assuming 24 kHz); whether every provider emits these parameters is **[unverified]**. The spec description mentions `wav` in prose but the enum is only `mp3 \| pcm`. |
+| `response_format` | **`mp3` or `pcm`** (default `pcm`). `pcm` is raw 16-bit little-endian; Azure MAI-Voice PCM is 24 kHz mono **[doc]**. **[probed]** the response `Content-Type` carries the parameters: `audio/pcm;rate=44100;channels=1` (Fish Audio), `audio/pcm;rate=24000;channels=1` (Kokoro, Gemini TTS); read `rate`/`channels` from the header. **Not every model supports both formats: `google/gemini-3.8-flash-tts` rejects `mp3` with a free 400 `Gemini TTS only supports response_format="pcm". Got "mp3".`** The spec description mentions `wav` in prose but the enum is only `mp3 \| pcm`. |
 | `speed` | number, default 1.0. Honoured by some models (OpenAI-style); others ignore it or 400 on a non-default value. Seed Audio: 0.5-2.0. |
 | `input_references` | voice cloning / voice design: 1-3 `{type:"input_audio", input_audio:{data \| url}}` (optionally each followed by `{type:"text", text:<transcript>}`), **or** exactly one `{type:"image_url", image_url:{url}}`. Never both kinds. Limits: 15 MiB decoded per inline clip (20 MiB base64), transcript <=10,000 chars, URLs <=2048 chars. Only routed to endpoints with `supports_voice_cloning` / `supports_multiple_audio_references` / `supports_image_reference` (per-endpoint flags). `@Audio1..@Audio3` placeholders in `input` address multiple clips (Seed Audio 1.0 only). |
 | `provider` | `zdr`, `data_collection`, and `options{<slug>:{...}}`; `order/only/ignore` are not applied. Examples: OpenAI `options.openai.instructions`; Google `options.google-ai-studio.speech_metadata.style`. |
@@ -376,7 +388,7 @@ Verbatim request:
 
 ### 4.2 Voices **[probed]**
 
-There is **no voices-list endpoint**. Voices are the catalog field `supported_voices` (`string[]` or `null`) on `GET /models?output_modalities=speech` entries (and `/models`). Today 18 of 23 TTS models list voices (e.g. Gemini TTS 30 names such as `Zephyr`, `Puck`, `Charon`, `Kore`; Kokoro 54 ids like `af_alloy`; MAI-Voice 97 ids like `en-US-Harper:MAI-Voice-2.1`; Deepgram Aura-2 `aura-2-thalia-en`; Qwen TTS `loongjohn`). Models with `null` (Fish Audio x4, Seed Audio: 5 of 23) list no voices: `voice` is optional, a provider-specific id (Seed Audio accepts a Seed speaker id), or replaced by `input_references`. **[probed]** `fish-audio/s2.1-pro-free:free` synthesized fine with **no `voice`** field. **`openai/whisper-1` (an STT model) has `supported_voices: []`**, so check `Array.isArray && length` rather than truthiness. No voice preview/sample audio is exposed by the API; previews require a synthesis request per voice.
+There is **no voices-list endpoint**. Voices are the catalog field `supported_voices` (`string[]` or `null`) on `GET /models?output_modalities=speech` entries (and `/models`). Today 18 of 23 TTS models list voices (e.g. Gemini TTS 30 names such as `Zephyr`, `Puck`, `Charon`, `Kore`; Kokoro 54 ids like `af_alloy`; MAI-Voice 97 ids like `en-US-Harper:MAI-Voice-2.1`; Deepgram Aura-2 `aura-2-thalia-en`; Qwen TTS `loongjohn`). Models with `null` (Fish Audio x4, Seed Audio: 5 of 23) list no voices: `voice` is optional, a provider-specific id (Seed Audio accepts a Seed speaker id), or replaced by `input_references`. **[probed]** `fish-audio/s2.1-pro-free:free` synthesized fine with **no `voice`** field, but `hexgrad/kokoro-82m` without `voice` returned a free 400 `An explicit voice is required for this TTS provider.`; with `voice:"af_alloy"` (from its `supported_voices`) it worked, and Gemini TTS accepted `voice:"Kore"`. **`openai/whisper-1` (an STT model) has `supported_voices: []`**, so check `Array.isArray && length` rather than truthiness. No voice preview/sample audio is exposed by the API; previews require a synthesis request per voice.
 
 ### 4.3 Response **[doc]**
 
@@ -389,13 +401,14 @@ There is **no voices-list endpoint**. Voices are the catalog field `supported_vo
 
 Fixtures `audio-speech-mp3.recorded.json` and `audio-speech-pcm.recorded.json` store the request, headers, byte count and first bytes (the audio itself is not stored). `audio-speech-response.documented.json` is the earlier shape-only fixture.
 
-* **Cost:** not in the response body. Read `X-Generation-Id` (exposed to browsers **[probed]**) and call `GET /generation?id=...` (`total_cost`) **[doc]**. **[probed]** that lookup returned 404 for the free-model TTS id up to ~8 minutes later (section 1), so TTS cost retrieval is **[unverified]**; for paid models you may have to estimate from the catalog price and your input length.
+* **Cost:** not in the response body or headers (only `X-Generation-Id: gen-tts-...` and, for some providers, `X-Provider-Name`). **[probed]** `GET /generation?id=<X-Generation-Id>` returned the cost: 404 at 1.3 minutes, 200 at 5.7 minutes with `{api_type:"tts", total_cost, usage, tokens_prompt, provider_name, model (dated snapshot)}`. Real costs: `hexgrad/kokoro-82m` 44 characters = **$0.000176** (`tokens_prompt: 11`; routed to Together at $4/M characters, whereas `/models` and DeepInfra say $0.62/M), `google/gemini-3.8-flash-tts` "The quick brown fox." = **$0.00057** (`tokens_prompt: 5`, `tokens_completion: 63` audio tokens). So **the catalog price is a lower bound**; budget with the most expensive endpoint from `GET /models/{id}/endpoints` and reconcile from `/generation` later (fixtures `generation-tts.recorded.json`, `audio-speech-*.recorded.json`).
+* **[probed] outputs:** Kokoro `mp3` for 44 chars: 13,197 bytes, MP3 24 kHz mono 32 kbps, 3.24 s (`tests/fixtures/media/speech.mp3`); Kokoro `pcm` for "The quick brown fox." = 91,338 bytes (1.9 s at 24 kHz); Gemini `pcm` = 94,080 bytes (1.96 s at 24 kHz).
 * **Pricing units are not machine-readable.** `/models` gives one number in `pricing.prompt`/`pricing.completion` and the unit depends on the model **[probed via model pages]**: most TTS per character (`$15/M characters`), Fish Audio per **UTF-8 byte**, Gemini TTS per token (`prompt` and `completion` both used), Seed Audio per second of output (`completion` field, `$0.15/minute` on the page). Estimates must special-case by model family.
 * **Limits:** Seed Audio 1.0: `input` <=3000 chars, <=120 s of output. Other models' maximum input length is **[unverified]** (catalog `context_length` is tokens, 4096 for Kokoro/Orpheus/Sesame/Voxtral TTS, 15000 for Grok TTS, 32768 for Gemini TTS, 0 for many). The docs advise chunking long text and concatenating audio.
 
 ### 4.4 Free TTS
 
-`fish-audio/s2.1-pro-free:free` is the only free speech model today and is subject to the free-model limits (section 12). **[probed]** It is the only audio endpoint exercised live; STT, music and image/video have no free model.
+`fish-audio/s2.1-pro-free:free` is the only free speech model today and is subject to the free-model limits (section 12). **[probed]** Paid TTS models were probed too (Kokoro, Gemini TTS; sections 4.1 to 4.3).
 
 ---
 
@@ -417,7 +430,7 @@ JSON body (`application/json`):
 | `temperature` | number 0-1 |
 | `response_format` | `json` (default; returns `{text, usage}`) or `verbose_json`. **`text`, `srt`, `vtt` are rejected with 400**, so build SRT/VTT client-side from `segments`/`words`. Some models reject `verbose_json` (the docs name `openai/gpt-4o-transcribe` and `microsoft/mai-transcribe-1.5`). |
 | `timestamp_granularities` | `["segment"]` and/or `["word"]`; only with `verbose_json` |
-| `diarize` | boolean. **Spec:** top-level; labels each word (`words[].speaker`, `words[].speaker_label`); requires `verbose_json` (400 otherwise); word timestamps are implied; 400 if the model cannot diarize. **Guide** (older wording): enable via `provider.options.<slug>`, e.g. `{"azure":{"diarization":{"enabled":true}}}` or Deepgram `diarize`. Both are documented (the spec is more detailed; which is newer is not stated). Which models support it is not machine-readable (model pages mention Gemini 3.5 Transcribe, MAI-Transcribe 2, Grok STT, Fish Transcribe 1 Pro). **[unverified]** which spelling each provider honours. |
+| `diarize` | boolean. **[probed] Rejected with 400 `The selected model does not support diarize. Remove the field or choose a model whose provider supports it.` on `openai/whisper-large-v3-turbo`, `x-ai/grok-stt-1.0`, `microsoft/mai-transcribe-2` and `deepgram/nova-3`; use `provider.options` (works, see 5.4).** **Spec:** top-level; labels each word (`words[].speaker`, `words[].speaker_label`); requires `verbose_json` (400 otherwise); word timestamps are implied; 400 if the model cannot diarize. **Guide** (older wording): enable via `provider.options.<slug>`, e.g. `{"azure":{"diarization":{"enabled":true}}}` or Deepgram `diarize`. Both are documented (the spec is more detailed; which is newer is not stated). Which models support it is not machine-readable (model pages mention Gemini 3.5 Transcribe, MAI-Transcribe 2, Grok STT, Fish Transcribe 1 Pro). No model honouring the top-level field was found among the four tried. |
 | `keyterms` | `string[]` (each 1-100 chars), vocabulary bias; 400 if unsupported |
 | `provider` | `zdr`, `data_collection`, `options{<slug>:{...}}` |
 | `user`, `session_id`, `trace` | as elsewhere |
@@ -480,6 +493,22 @@ Verbatim JSON request (cURL form from the guide):
 
 Cost is `usage.cost` in the body. Header `X-Generation-Id` is also returned. Fixtures: `audio-transcriptions.documented.json`, `audio-transcriptions-verbose.documented.json`.
 
+### 5.4 Probed results (paid round; `tests/fixtures/openrouter/audio-transcriptions-*.recorded.json`)
+
+A 3.24 s Kokoro MP3 ("The quick brown fox jumps over the lazy dog.") was transcribed with several request forms. All CORS headers as elsewhere; `X-Generation-Id: gen-stt-<unix>-<20 chars>`.
+
+| Request | Result |
+| --- | --- |
+| JSON `input_audio:{data:<base64 raw bytes>, format:"mp3"}` on `openai/whisper-large-v3-turbo`, default format | 200 `{"text":" The quick brown fox jumps over the lazy dog.","usage":{"seconds":3.17,"cost":0.0000105561}}` (note the **leading space** in `text`). |
+| Same + `response_format:"verbose_json"`, `timestamp_granularities:["segment","word"]`, `language:"en"` | 200 with `task:"transcribe"`, `language:"en"`, `duration:3.17`, `segments[]` (`id, seek, start, end, text, tokens[], temperature, avg_logprob, compression_ratio, no_speech_prob`) and `words[]` (`word` with leading space, `start`, `end`; floats like `0.11999999731779099`). |
+| Multipart `-F file=@speech.mp3 -F model=... -F response_format=verbose_json -F timestamp_granularities[]=word -F timestamp_granularities[]=segment` | 200, the same verbose shape and cost (OpenAI-compatible multipart works; no `Content-Type` header to set manually with `FormData`). |
+| `response_format:"srt"` (multipart) | Free 400 `Unsupported response_format "srt". Only "json" and "verbose_json" are supported.` Generate SRT/VTT yourself. |
+| `x-ai/grok-stt-1.0`, JSON | 200, `text` without leading space, `usage:{seconds:3.24, cost:0.00009}`. |
+| `deepgram/nova-3`, `verbose_json`, `timestamp_granularities:["word","segment"]`, `provider:{options:{deepgram:{diarize:true}}}` | 200: `{text, usage{seconds:3.2399375, cost:0.000232195}, duration, segments:[{id,start,end,text,speaker:0}], words:[{word,start,end,speaker:0}]}` (no `task`/`language`; words have no leading space). |
+| `microsoft/mai-transcribe-2`, same with `provider:{options:{azure:{diarization:{enabled:true}}}}` | 200: `language:"en"`, `duration:3.17`, segments/words with `speaker:0`; **`usage.seconds` was `4` for 3.17 s of audio and cost `0.000111`, i.e. billed in whole seconds, rounded up** ($0.10/hour x 4 s). Whisper billed 3.17 s fractionally. |
+
+`GET /generation` for STT ids returns `api_type:"stt"` and `total_cost` equal to `usage.cost` once indexed (`generation-stt.recorded.json`). `usage.cost` in the body is authoritative; no estimate is needed after the fact.
+
 **Pricing units** vary and are not in the API **[probed via model pages]**: most STT models per second of audio (`pricing.prompt`, e.g. `openai/whisper-1` `$0.0001/second`); Microsoft MAI-Transcribe per **hour** (`pricing.prompt` is `0.1` and `0.36`); Gemini Transcribe and `openai/gpt-4o-*-transcribe` per token (prompt and completion). There is no free STT model today.
 
 ---
@@ -495,11 +524,44 @@ Cost is `usage.cost` in the body. Header `X-Generation-Id` is also returned. Fix
 
 * Single provider (Google AI Studio). `supported_parameters`: `max_tokens, response_format, seed, temperature, top_p` (no `audio`, `reasoning`, tools). Inputs: text and image. Descriptions: "48kHz stereo audio", "vocals, timed lyrics, and full instrumental arrangements"; Pro makes "full-length songs with verses, choruses, bridges", Clip makes "short clips, loops, previews".
 * There is **no `music` output modality**. `GET /models?output_modalities=music` returns 400 (valid values: `text, image, embeddings, audio, video, rerank, decisions, speech, transcription, all`). `output_modalities=audio` returns 4 models: the 2 Lyria models plus `openai/gpt-audio` and `openai/gpt-audio-mini` (speech chat models). Identify Lyria by id prefix `google/lyria-`.
-* Model-level fixture: `model-endpoints.google-lyria-3-pro-preview.json` (endpoint flags include `supports_image_reference: false`, a TTS-oriented flag whose meaning for Lyria chat is **[unverified]**).
+* Model-level fixture: `model-endpoints.google-lyria-3-pro-preview.json` (endpoint flags include `supports_image_reference: false`, a TTS-oriented flag that does not gate chat input: Lyria accepted an `image_url` part anyway, section 6.2).
 
-### 6.2 Request: only the generic chat audio-output contract is documented **[doc]**
+### 6.2 Request and stream shape **[probed]** (Lyria) and **[doc]** (generic audio output)
 
-Source: https://openrouter.ai/docs/guides/overview/multimodal/audio. For models with audio output:
+**[probed] Lyria 3 Clip, minimal working request** (no `audio` object; fixtures `music-lyria-clip-request.recorded.json`, `music-lyria-clip.recorded.sse.txt`):
+
+```json
+{
+  "model": "google/lyria-3-clip-preview",
+  "messages": [{ "role": "user", "content": "Write a short 10 second upbeat pop jingle with female vocals singing these lyrics.\n[Verse]\nHello world, hello day\nSunshine on the way\n[Chorus]\nLa la la, we sing along\nThis is our little song" }],
+  "modalities": ["text", "audio"],
+  "stream": true
+}
+```
+
+Response `200 text/event-stream` (10.8 s, LF framing, `X-Generation-Id`, CORS `*`). Event sequence, in order:
+
+1. **17 `: OPENROUTER PROCESSING` comment lines** arrive first (one about every 0.6 s) while the model works; then
+2. chunk 0: `choices[0].delta = {role:"assistant", content:"[0.0:3.7] HELLO WORLD, HELLO DAY\n[3.8:7.4] SUNSHINE ON THE WAY\n..."}` (the timed lyrics, `provider:"Google AI Studio"`, `native_finish_reason: null`);
+3. chunk 1: `delta = {role:"assistant", content:"", audio:{data:"<ONE base64 string, 992,816 chars>"}}`. **The whole file is a single chunk; there is no `transcript` and no `id`/`expires_at`.** Field path: `choices[0].delta.audio.data`;
+4. chunk 2 and chunk 3: `finish_reason:"stop"` (twice, the second carries `usage`), then `data: [DONE]`.
+
+`usage` on the last chunk: `{prompt_tokens:49, completion_tokens:71, total_tokens:120, cost:0.04, is_byok:false, cost_details{upstream_inference_cost:0.04,...}, completion_tokens_details{audio_tokens:71}}`. `GET /generation` later reports `api_type:"completions"`, `streamed:true`, `total_cost:0.04`.
+
+**Decoded audio:** the base64 decodes to **MP3**, 744,610 bytes, **44.1 kHz stereo, 192 kbps, 30.77 s**, starting `ID3\x03\x00` (an ID3v2.3 tag of about 6 KB holding a `GEOB application/c2pa` Google C2PA content-credentials manifest, then MPEG frames). Not WAV, not Ogg. An `<audio>` element or `decodeAudioData` plays it directly; strip or ignore the ID3 tag if you re-mux.
+
+**Other probed variants:**
+
+| Variant | Result |
+| --- | --- |
+| Clip with `[{type:"text"}, {type:"image_url", data URL PNG}]` content, `audio:{format:"wav"}`, prompt "Instrumental only, no vocals" | 200, $0.04. **Image accepted; `audio.format:"wav"` accepted but ignored** (still `ID3` + MP3, 744,930 bytes). `delta.content` was `<instrumental>`. (`music-lyria-clip-image-wav.recorded.sse.txt`) |
+| **Lyria 3 Pro**, lyrics with `[Verse]`/`[Chorus]` tags, no `audio` | 200 in **43.1 s**, `usage.cost: 0.08`, **76 keep-alive comments**, stream 5.78 MB, one audio chunk (5.77 M base64 chars) = **MP3 44.1 kHz stereo 192 kbps, 180.11 s, 4,328,819 bytes**. `delta.content` held the whole structure and timed lyrics: `[[A0]]`, `[[B1]]`, `[12.0:] Morning light on the quiet hill`, ... with sections `[[A0]]..[[D3]]`, repeated choruses and an invented second verse. (`music-lyria-pro.recorded.sse.txt`) |
+
+**Duration is not controllable.** The Clip prompt asked for 10 seconds and returned 30.77 s of audio (and timestamps to 29.9 s); Pro returned a full 3-minute song from a two-line prompt. Plan the UI around fixed lengths (about 30 s and about 3 min) and let users trim in the browser.
+
+**Memory:** a Pro stream is 5.8 MB of JSON text; accumulate the one chunk, `atob` it (about 4.3 MB) and discard the SSE text.
+
+**Generic audio-output contract from the docs (other models, e.g. speech-chat):** Source: https://openrouter.ai/docs/guides/overview/multimodal/audio. For models with audio output:
 
 ```json
 {
@@ -531,14 +593,12 @@ Source: https://openrouter.ai/docs/guides/overview/multimodal/audio. For models 
 
 * `audio.voice` and `audio.format` (`wav, mp3, flac, opus, pcm16`; "vary by model") are documented for speech-chat models. The final `usage` chunk and `[DONE]` follow as in 2.3. Fixture: `chat-stream-audio.documented.json` (**generic shape, not a Lyria capture**).
 
-### 6.3 What is NOT documented anywhere (all **[unverified]**)
+### 6.3 Remaining unknowns for music
 
-* Request fields for lyrics, instrumental/vocal toggle, duration, genre/tempo: none exist in `supported_parameters` or the docs. The only mechanism is text in the user message (section tags such as `[Verse]`/`[Chorus]` and phrases like "instrumental only" or a length are prompt conventions of the underlying Gemini API, not OpenRouter fields). Verify with a spike.
-* Whether `modalities:["text","audio"]` and the `audio` object are required, optional or rejected for Lyria; which audio container the stream carries when `audio.format` is omitted (MP3 vs WAV vs PCM); whether `delta.audio.transcript` carries lyrics; chunk count/size.
-* Image input: the catalog lists `image` as an input modality, but how many images and how they steer the song are not documented.
-* Whether `usage.cost` reports the flat $0.08/$0.04 (the token prices are 0).
-
-**Spike to run with a spend-limited key (Stage 0):** one streaming request to `google/lyria-3-clip-preview` with `modalities:["text","audio"]`, `stream:true`, prompt `"A 10 second instrumental piano loop"`, no `audio` object; log every chunk's keys and the first 32 bytes of the decoded audio to learn the container and sample rate; repeat with `audio:{format:"mp3"}`; read `usage.cost` from the last chunk.
+* `usage.cost` for Lyria is the **flat** $0.04 / $0.08 (confirmed on both). The catalog `pricing` of `"0"` is meaningless for these models.
+* Whether `seed`, `temperature`, `top_p` change the result or whether a lyrics-only prompt can force a given length is untested (nothing in the probes suggests a length control).
+* The maximum number of reference images and how strongly they steer the song: one image was accepted and the text transcript was `<instrumental>`; the effect cannot be judged without listening.
+* Whether longer/other Pro prompts ever split the audio into several chunks (both Pro and Clip sent exactly one).
 
 ---
 
@@ -607,11 +667,22 @@ If both `frame_images` and `input_references` are sent, `frame_images` wins and 
 
 Spec shape for the other reference types: `{"type":"video_url","video_url":{"url":"..."}}`, `{"type":"audio_url","audio_url":{"url":"..."}}`.
 
-**Image inputs: data URLs?** The docs for `/videos` only ever show `https` URLs and say "Use a stable, directly downloadable image URL"; they never say `data:` URLs are accepted or rejected for `frame_images` or `input_references`. The `/images` endpoint explicitly allows base64 data URLs, and chat `video_url` says "data: URLs supported". **[unverified]** for `/videos` (image and video). Auth is checked before validation (a keyless probe gets 401), and no free video model exists, so this could not be probed within the free-model-only rule. Test with a spend-limited key and a paid model: submit a cheap model with a tiny `data:image/png;base64,...` as `first_frame` and look for 202 vs 400 (a 400 body names the field).
+**`data:` URLs, probed (paid round):**
 
-**Video `data:` URLs:** no statement either way for `input_references[].video_url` on `/videos` **[unverified]**.
+| Input | Result |
+| --- | --- |
+| `frame_images:[{... frame_type:"first_frame", image_url:{url:"data:image/png;base64,..."}}]` (512x512 PNG, 2,114-char data URL) on `x-ai/grok-imagine-video`, `duration:1, resolution:"480p", aspect_ratio:"1:1"` | **202 accepted**; completed; `usage.cost: 0.052` (= $0.05/s at 480p + $0.002 image input). Output 544x544 H.264 24 fps with an AAC stereo track, 1.04 s, 127,607 bytes (`tests/fixtures/media/video-1s.mp4`). |
+| `frame_images` with **both** `first_frame` and `last_frame` data URLs on `bytedance/seedance-2.0-mini`, `duration:4, resolution:"480p", aspect_ratio:"1:1", generate_audio:false` | **202 accepted**; completed after 62 s; `usage.cost: 0.1358`. Output 640x640 H.264, 4.04 s, no audio track, 833,425 bytes. |
+| `input_references:[{type:"image_url", image_url:{url:"data:image/png;base64,..."}}]` (no frame_images) on grok | **202 accepted**, completed in about 6 s, `usage.cost: 0.052`. |
+| `input_references:[{type:"video_url", video_url:{url:"data:video/mp4;base64,..."}}]` (the 127 KB mp4 above, 170 KB request body) on `bytedance/seedance-2.0-mini` | **400 (free): `Invalid reference URL: input_references[0].video_url.url: Only HTTPS URLs are allowed`**. Video references must be public HTTPS URLs. |
 
-### 7.3 Responses **[doc]**
+So: **image data URLs work everywhere tried (first frame, last frame, reference); video data URLs are rejected, confirming PLAN's constraint.** "Continue from last frame" needs no hosting; native extend from a user-supplied video needs a public HTTPS link. Whether Seedance accepts an HTTPS `video_url` and extends it was not tested (no hosting available in the probe environment).
+
+**Validation errors (all free 400, fixtures `error-400-video-*.recorded.json`):** unsupported duration `Duration 99s is not supported for this model. Supported durations: 1, 2, ..., 15s` (with `metadata.routing_funnel` and `failed_routing_step:"Validate Video Parameters"`); unsupported resolution `Resolution 4K is not supported for this model. Supported resolutions: 480p, 720p`; no prompt and no image on grok `xAI video generations require a prompt when no image input is provided`. Unknown job id: `404 {"error":{"message":"Job <id> not found","code":404}}` for both `/videos/{id}` and `/content`; `/content?index=5` on a one-video job: `400 Video index 5 out of range (1 videos available)`.
+
+**`previous_job_id` (probed, free rejections):** `x-ai/grok-imagine-video` -> `400 x-ai/grok-imagine-video-20260512 does not support previous_job_id`; `bytedance/seedance-2.0-mini` (using its own completed job) -> `400 bytedance/seedance-2.0-mini-20260811 does not support previous_job_id`. The support is per model and there is no catalog flag, but an unsupported model fails fast and unbilled with that message, so the app can try it and fall back to last-frame continuation. Which model accepts it remains unverified (FLUX.3 Video untested: 5 s minimum at 720p is about $0.85).
+
+### 7.3 Responses **[doc]** **[probed]**
 
 Submit **202** (`VideoGenerationResponse`):
 
@@ -647,10 +718,19 @@ Fields: `id*`, `polling_url*`, `status*`, `generation_id`, `error` (string, on f
 
 **Id format conflict:** the spec says `gen-vid-<timestamp>-<20 alphanumerics>`; docs examples show `abc123` and a bare 20-char id (`y34x1YREG4Pkdcj7f02v`). Do not parse ids; store them as opaque strings. `polling_url` may be absolute (guide) or relative (`/api/v1/videos/...` in the spec example): resolve with `new URL(polling_url, "https://openrouter.ai")`. Poll about every 30 s (docs); generation takes 30 s to several minutes. Fixtures: `videos-submit-202.documented.json`, `videos-poll-in-progress.documented.json`, `videos-poll-completed.documented.json`, `videos-poll-failed.documented.json`.
 
+**[probed] real timings and bodies** (fixtures `videos-submit-202.recorded.json`, `videos-poll-pending.recorded.json`, `videos-poll-completed.recorded.json`, `videos-poll-completed-seedance.recorded.json`, `videos-poll-timelines.recorded.json`, `videos-content.recorded.json`):
+
+* Submit returned **202 in 2.4 to 3.6 s** with exactly `{id, polling_url, status:"pending"}`; `id` is `gen-vid-<unix>-<20 alphanumerics>` (so the spec's pattern is correct and the doc examples are not), `polling_url` is **absolute** `https://openrouter.ai/api/v1/videos/<id>`.
+* grok-imagine-video, 1 s clip: the first poll about 3 s after submit already said `completed` (`generation_time` 12,350 ms per `/generation`); a second grok job: `pending` at 0.3 s, `completed` at 5.6 s. Seedance 2.0 mini, 4 s 480p: **`pending` at every poll for 61.6 s**, then `completed`.
+* **`in_progress` was never observed** in 3 jobs; only `pending` then `completed`. Do not wait for `in_progress`.
+* `pending` body: `{id, generation_id (equal to id), polling_url, status}`. `completed` body: `{id, generation_id, polling_url, status:"completed", unsigned_urls:["https://openrouter.ai/api/v1/videos/<id>/content?index=0"], usage:{cost, is_byok:false}}` with `cost` exactly 0.052 / 0.1358.
+* Poll requests with `Origin` return `Access-Control-Allow-Origin: *`; preflight 204 on `/videos/{id}` and `/videos/{id}/content`.
+* **Cost estimate lesson:** the Seedance price is per token (`tokens = height x width x seconds x 24 / 1024` per the catalog text): 640 x 640 x 4.04 s -> 38,800 tokens x $0.0000035 = $0.1358 exactly. A 480p **1:1** clip is 640x640, not 480x480, so naive estimates were low; grok bills per second ($0.05/s at 480p) and made 544x544.
+
 ### 7.4 Download and retention
 
-* `GET /videos/{jobId}/content?index=0` returns `video/mp4` bytes "proxied from the upstream provider" **[doc]**. **Send `Authorization`.** No redirect to a signed URL on another host is documented; the only documented location is `openrouter.ai`. `<video src>` cannot send the header, so fetch to a `Blob` and use an object URL. `unsigned_urls[0]` normally points at this same endpoint; the cookbook warns only to add the bearer header when the URL starts with `https://openrouter.ai/api/`, which implies it can be a non-OpenRouter URL in some cases. The OpenAPI example even shows `https://storage.example.com/video.mp4`. Use the content endpoint to stay inside the CSP (`connect-src 'self' https://openrouter.ai`).
-* **How long finished videos stay downloadable: not documented.** The docs say only that the provider "must retain the generated video output briefly" and "keeps the generated video until you download it". **[unverified]** The `expired` status refers to a job exceeding its time to live. Plan on downloading immediately and treat re-download after a reload as best effort.
+* `GET /videos/{jobId}/content?index=0` returns `video/mp4` bytes **[doc]**. **[probed]** exactly: `200`, `Content-Type: video/mp4`, **`Transfer-Encoding: chunked` with no `Content-Length`** (a browser cannot show download progress as a percentage), **no redirect** (no `Location`), `Access-Control-Allow-Origin: *`, `Access-Control-Expose-Headers: X-Generation-Id,...`, body starts `00 00 00 20 66 74 79 70 69 73 6f 6d` (`ftypisom` MP4). **Without `Authorization` it is `401 {"error":{"message":"No cookie auth credentials found","code":401}}`**, so `<video src>` cannot load it: fetch to a `Blob` and use an object URL. A `Range: bytes=0-99` request got the **full body with 200 (not 206)**, so there is no seeking by range. `unsigned_urls[0]` was exactly this same-host content URL in all three jobs, so use it or the constructed URL interchangeably, but prefer the constructed one to stay inside the CSP (`connect-src 'self' https://openrouter.ai`) should a provider ever return another host.
+* **Retention:** a completed job was polled and re-downloaded **18 minutes** after completion and the bytes were identical. The real limit is **not documented and not yet bounded beyond 18 minutes**; the docs say only that the provider "must retain the generated video output briefly". Download immediately and treat later re-download as best effort. The `expired` status refers to a job exceeding its time to live.
 * Video is **not ZDR-eligible**; ZDR enforcement (account or per request) blocks video routing. **[doc]**
 
 ### 7.5 `GET /videos/models` **[probed]**
@@ -672,7 +752,7 @@ Observations today: 15 models support `first_frame` and `last_frame`, 10 `first_
 | `video_continuation` pricing SKU and "video continuation workflows" in the description | `black-forest-labs/flux-3-video` |
 | Model page text: "video extension", "up to 50 image, video, and audio reference assets" | `bytedance/seedance-2.5` |
 
-No catalog field says which models accept `previous_job_id`. **[unverified]**
+No catalog field says which models accept `previous_job_id`; the API rejects unsupported models with a free 400 (section 7.2). Tested unsupported: `x-ai/grok-imagine-video`, `bytedance/seedance-2.0-mini`. Untested: FLUX.3 Video. **[unverified]** for any positive.
 
 ---
 
@@ -785,6 +865,8 @@ Top level: `id` ("gen-dec-..."), `model` (dated snapshot), `provider`, `answers`
 
 **[probed] Mercury Decide response:** `200`, `model: "inception/mercury-decide-20260930"` (dated snapshot of the id you sent), `provider: "Inception"`, `usage: {input_tokens: 253, output_tokens: 6, cost: 0}`; the `noul` answer had only `type` and `noul` (0.99992...), `choice` had `choice`, `probabilities` (3 options) and `confidence`, `score` had `score` (1.9988), `legend`, `probabilities` keyed `"0".."2"` and `confidence`. Probabilities are long unrounded floats and the key order differs from the Jev example, so never depend on order; `id` and `provider` come last in the object. Output tokens were 6 even for 3 questions.
 
+**[probed] Jev (`typesafe/jev-1.13`) with the tutorial request** (fixture `decisions-response-jev.recorded.json`): `200` in 0.3 s, `model: "typesafe/jev-1.13-20260917"`, `provider: "TypeSafe"`, `usage: {input_tokens: 476, output_tokens: 70, cost: 0.000019992}` (the same cost as the docs example, so billing is deterministic per input token). Probabilities were **rounded to 2 decimals** (`noul: 0.96`, choice `{frontend:0.26, account:0, payments:0.74}`, `confidence: 0.6`, score `1.99`), unlike Mercury's long floats; the probabilities differ slightly from the tutorial's published numbers (payments 0.74 vs 0.78), so thresholds must tolerate run-to-run drift. Headers: `X-Generation-Id: gen-dec-<unix>-<20 chars>`, `X-Provider-Name: TypeSafe`, `Access-Control-Allow-Origin: *`. `GET /generation` returned `api_type:"decisions"`, `total_cost: 0.000019992`.
+
 ### 8.3 Models **[probed]**
 
 `GET /models?output_modalities=decisions` returns 10 models, all `text->decisions`: `typesafe/jev-1.13`, `~typesafe/jev-latest` (alias_target `typesafe/jev-1.13`), `liquid/d1`, `togethercomputer/tev1-4b-experimental`, `inception/mercury-decide:free`, `upstage/solar-decide`, `respan/span-01`, `respan/span-01-lite`, `respan/span-01-lite:free`, `jaredpalmer/kev-4b`. Jev: context 32,000, input `$0.000000042`/token ($0.042/M), completion `0`. **[probed]** `inception/mercury-decide:free` accepts exactly the Jev request schema (`noul`/`choice`/`score`) and returns the same answer shapes. The other non-Jev models (`liquid/d1`, `togethercomputer/tev1-4b-experimental`, `upstage/solar-decide`, `respan/span-01`, `respan/span-01-lite`, `jaredpalmer/kev-4b`) were not probed (the second free one, `respan/span-01-lite:free`, was skipped to save quota); Span-01 is described as a "behavior scoring model", possibly with a different question type, so treat acceptance as **[unverified]**. Free decision models: `inception/mercury-decide:free`, `respan/span-01-lite:free`.
@@ -890,7 +972,7 @@ Response `{data:{...}}` (verbatim example; fixture `key.documented.json`):
 * `rate_limit` is legacy, always `-1`/ignore.
 * **Total balance:** `GET /credits` returns `{data:{total_credits, total_usage}}` (account-wide USD, not per key). The docs say it needs a **management key**, but **[probed]** it returned `200` for an ordinary key (`is_management_key:false`, per-key `limit:1`). Fixture `credits.recorded.json` has the shape with the numbers replaced by the docs' example values. Because this contradicts the docs, code should treat 401/403 as "balance unavailable" and show per-key `limit_remaining` instead.
 * **[probed] live `GET /key` (fixture `key.recorded.json`, label, creator id and workspace id redacted):** 200, `Cache-Control: private, no-store`, `Access-Control-Allow-Origin: *` with the exposed-headers list. Differences from the docs' example: `rate_limit` was `{requests:-1, interval:"10s", note:"This field is deprecated and safe to ignore."}`; `allowed_data_regions:["global"]`; `limit_reset`, `expires_at`, `organization_id` were `null`; `limit`/`limit_remaining` were numbers (this key had a $1 limit); `is_free_tier:false` together with `free_model_daily_requests.limit:1000`. **`free_model_daily_requests.used` stayed at 2 across ~14 successful free-model requests over ~8 minutes**, so the counter is delayed or does not reflect these calls; do not use it for an exact live "requests left" display and prefer decrementing a local counter from 429s.
-* `X-Generation-Id`-based lookups: `GET /generation?id=gen-...` is documented to return `data.total_cost`, `usage`, `tokens_prompt/completion`, `api_type`, `latency`, `provider_name`, ... (fixture `generation.documented.json`). **[probed]** it returned `404 {"error":{"message":"Generation gen-... not found","code":404}}` for four free-model ids (chat, TTS, decisions) minutes after creation, so the documented shape is **unconfirmed**.
+* `X-Generation-Id`-based lookups: `GET /generation?id=gen-...` is documented to return `data.total_cost`, `usage`, `tokens_prompt/completion`, `api_type`, `latency`, `provider_name`, ... (fixture `generation.documented.json`). **[probed]** the documented shape is confirmed for chat, image, video, TTS, STT and decisions ids (fixtures `generation-*.recorded.json`; `app_id` and `workspace_id` replaced), but the lookup is eventually consistent: 404 for the first 1 to 8 minutes, then 200 (section 1).
 
 ---
 
@@ -1075,7 +1157,7 @@ No `Access-Control-Allow-Credentials` (do not use `credentials: "include"`), **n
 | `GET /api/v1/models/user` | 204 | 401 | `*` |
 | `POST /api/v1/auth/keys` | 204 | 400 (`Invalid code` / Zod) | `*` |
 
-Error bodies are therefore readable by browser JS on 401/400. **[probed, authenticated, `Origin: https://ethanpil.github.io`]** the success and error paths all carry `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: X-Generation-Id,X-Provider-Name,request-id,cf-ray` (header name sometimes returned in lower case; treat names case-insensitively): `GET /key` 200, `POST /chat/completions` 200 (JSON and `text/event-stream`), 400, 404 and 429, `POST /audio/speech` 200 (audio bytes), `POST /api/alpha/decisions` 200. So a browser can read streaming bodies, audio bytes and error bodies, and can read `X-Generation-Id` (and `X-Provider-Name` where sent) but **not** `Retry-After` or `X-RateLimit-*`. Not probed (no free model): `/images`, `/audio/transcriptions`, `/videos*` success paths and their content endpoint (expected identical). The `/auth` consent page is a normal top-level navigation, not CORS.
+Error bodies are therefore readable by browser JS on 401/400. **[probed, authenticated, `Origin: https://ethanpil.github.io`]** the success and error paths all carry `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: X-Generation-Id,X-Provider-Name,request-id,cf-ray` (header name sometimes returned in lower case; treat names case-insensitively): `GET /key` 200, `POST /chat/completions` 200 (JSON and `text/event-stream`), 400, 404 and 429, `POST /audio/speech` 200 (audio bytes), `POST /api/alpha/decisions` 200. So a browser can read streaming bodies, audio bytes and error bodies, and can read `X-Generation-Id` (and `X-Provider-Name` where sent) but **not** `Retry-After` or `X-RateLimit-*`. **[probed, paid round]** the same two headers (`Access-Control-Allow-Origin: *`, the exposed list) were also present on the success paths of `POST /images` (JSON and SSE), `POST /audio/transcriptions` (JSON and multipart), `POST /videos` (202), `GET /videos/{id}` (200), `GET /videos/{id}/content` (200 `video/mp4`, authenticated), the Lyria SSE stream, and `POST /audio/speech` for several providers; the preflights for `/videos/{id}` and `/videos/{id}/content` returned 204 with the usual allow lists (`Range` is not in `Access-Control-Allow-Headers`). `X-Provider-Name` appeared only on some responses (images, decisions) and `X-Generation-Id` on all billable ones (`gen-img-`, `gen-tts-`, `gen-stt-`, `gen-dec-`; video ids are `gen-vid-` and chat ids `gen-`). The `/auth` consent page is a normal top-level navigation, not CORS.
 
 ---
 
@@ -1113,6 +1195,24 @@ Error bodies are therefore readable by browser JS on 401/400. **[probed, authent
 | `error-429-upstream.recorded.json`, `error-429-upstream-2.recorded.json` | Two natural upstream-pool 429s (`user_id` redacted); the second has `retry_after_seconds` and `headers`. |
 | `headers-authenticated.recorded.json` | Response headers (status, content-type, cors, `X-Generation-Id`, `Retry-After`, ...) for `/key`, chat JSON and SSE, 400, 429, TTS and decisions. |
 
+**Recorded in the paid round** (real, base64 truncated to the first 100 chars with `...<truncated, N chars>`, `user_id`/`app_id`/`workspace_id` replaced; media kept only when small):
+
+| File | Contents |
+| --- | --- |
+| `videos-request-first-frame-data-url.recorded.json`, `videos-submit-202.recorded.json`, `videos-poll-pending.recorded.json`, `videos-poll-completed.recorded.json`, `videos-poll-completed-seedance.recorded.json`, `videos-poll-timelines.recorded.json`, `videos-content.recorded.json` | Grok first-frame data-URL job: request, 202, pending and completed polls (cost 0.052), timelines of the 3 jobs, and the content download (headers, 127,607 bytes, 401 without auth, Range ignored, ffprobe). |
+| `error-400-video-data-url-input-reference.recorded.json`, `error-400-video-previous-job-id-grok.recorded.json`, `error-400-video-previous-job-id-seedance.recorded.json`, `error-400-video-duration.recorded.json`, `error-400-video-resolution.recorded.json`, `error-400-video-no-prompt.recorded.json`, `error-404-video-job.recorded.json`, `error-400-video-content-index.recorded.json` | Video validation errors (all unbilled). |
+| `images-generate.recorded.json`, `images-edit.recorded.json`, `images-stream.recorded.sse.txt` | `/images` generation, edit with a data-URL reference, OpenAI SSE streaming (`: ` comments, partial, completed, `[DONE]`). |
+| `error-400-images-n.recorded.json`, `error-400-images-aspect-ratio.recorded.json`, `error-402-chat-image-balance.recorded.json` | Image validation errors and the chat-route $1.00 balance 402. |
+| `audio-speech-kokoro-mp3.recorded.json`, `audio-speech-kokoro-pcm.recorded.json`, `audio-speech-gemini-pcm.recorded.json`, `error-400-speech-gemini-mp3.recorded.json`, `error-400-speech-voice-required.recorded.json` | TTS request, headers, byte counts, ffprobe, and per-model format/voice errors. |
+| `audio-transcriptions-json.recorded.json`, `audio-transcriptions-verbose.recorded.json`, `audio-transcriptions-multipart-verbose.recorded.json`, `audio-transcriptions-grok.recorded.json`, `audio-transcriptions-diarize-deepgram-options.recorded.json`, `audio-transcriptions-diarize-azure-options.recorded.json`, `error-400-stt-srt.recorded.json`, `error-400-stt-diarize-unsupported.recorded.json` | STT responses and errors (verbose + words, diarization through `provider.options`). |
+| `music-lyria-clip.recorded.sse.txt`, `music-lyria-clip-image-wav.recorded.sse.txt`, `music-lyria-pro.recorded.sse.txt`, `music-lyria-clip-request.recorded.json`, `music-lyria-clip-image-wav-request.recorded.json` | Lyria streams: 17/76 keep-alive comments, timed-lyrics chunk, one truncated audio chunk, usage. |
+| `decisions-response-jev.recorded.json` | Jev with the tutorial request (the request is `decisions-request.documented.json`). |
+| `chat-completion-pdf.recorded.json` | PDF via the `cloudflare-ai` engine on a free model, with `annotations`. |
+| `generation-tts|image|video|decisions|chat-music|stt.recorded.json` | `GET /generation` records for each `api_type`. |
+| `headers-paid.recorded.json` | Response headers for the paid calls. |
+
+**Small real media** in `tests/fixtures/media/`: `generated-image.jpg` (69,625 B, 1024x1024 JPEG from `/images`), `edited-image.jpg` (105,165 B), `speech.mp3` (13,197 B, Kokoro, 24 kHz mono), `video-1s.mp4` (127,607 B, 544x544 H.264 + AAC, 1.04 s, grok-imagine-video), `invoice.pdf` (604 B, one text page). The Lyria MP3s (745 KB and 4.3 MB) were not kept.
+
 **Hand-built `*.documented.json`** (not recorded; shapes follow the docs or OpenAPI exactly; ids and tokens are invented; the `auth-keys-response` key is a placeholder, not the docs' example key):
 
 | File | Source of shape |
@@ -1131,19 +1231,48 @@ Error bodies are therefore readable by browser JS on 401/400. **[probed, authent
 
 ## 15. Still unverified
 
-Resolved by the free-model probes and removed from this list: PCM sample rate (read it from `Content-Type`), whether `Retry-After` is readable cross-origin (no; use `error.metadata.retry_after_seconds`), authenticated success-path CORS, the real SSE framing, and whether Mercury Decide accepts the Jev schema (yes).
+Resolved by the probes and removed from this list: PCM sample rate (in `Content-Type`), `Retry-After` readability (no; body `retry_after_seconds`), authenticated CORS on every endpoint class, real SSE framing for chat/image/music, Mercury and Jev schemas, base64 data URLs for video frames and image references (accepted), video data URLs (rejected, HTTPS only), video download behaviour, the Lyria request and stream shape, STT diarization route, `/generation` availability, and PDF engine name.
 
-Still needs a **paid** call or a capability with no free model:
+Still open:
 
-1. `/videos` accepts base64 `data:` URLs for `frame_images` and image `input_references` (and `video_url` references): no statement either way (7.2). Blocks "Continue from last frame" if false, since a browser-only app has no public HTTPS host. No free video model exists.
-2. How long a finished video stays downloadable (7.4).
-3. Which video models accept `previous_job_id` (7.5).
-4. Lyria: request fields for lyrics/instrumental/duration, required `modalities`/`audio` fields, audio container and sample rate in the stream, image-input semantics, `usage.cost` (6.3). No free audio-output model exists.
-5. Image generation/editing: real response, `usage.cost`, chat-route `message.images` shape, `image_config` keys, streaming events (no free image model exists).
-6. STT: real response, which provider honours top-level `diarize` vs provider-option diarization, per-model support lists (no free STT model exists).
-7. TTS: per-model input length limits; whether non-Fish providers also put `rate`/`channels` in the PCM `Content-Type`; paid-model cost retrieval (`GET /generation` returned 404 for free-model ids; see section 1).
-8. The account's own free-model 429 (20/min, 50 or 1000/day): body, headers, and whether `free_model_daily_requests.used` ever advances (it stayed at 2 here).
+1. **Which video model accepts `previous_job_id`.** Rejected (free 400) by grok-imagine-video and Seedance 2.0 mini; FLUX.3 Video is the candidate (about $0.85 to probe). Also untested: whether Seedance extends a video given as an **HTTPS** `video_url` reference (no public hosting in the probe).
+2. **Video retention beyond 18 minutes** (the only data point: still downloadable, identical bytes).
+3. **Chat-route image output** (`message.images` shape, `image_config` keys): the request was refused by the $1.00 balance rule, so only `/images` is probed.
+4. Whether the **$1.00 minimum balance rule** also applies to other chat-route image/video output paths and to keys whose limit is above $1 but nearly used up.
+5. The account's **own free-tier 429** (20 per minute, 50 or 1000 per day): body and headers; and whether `free_model_daily_requests.used` ever advances promptly (it stayed at 2 here).
+6. Whether any STT model honours **top-level `diarize`** (four tried, all rejected).
+7. **Lyria**: effect of `seed`/`temperature`, multiple reference images, and whether any prompt can change the duration.
+8. TTS: per-model **input length limits**; Azure/MAI and ElevenLabs-style models were not probed for `rate` in `Content-Type`.
 9. Whether `/auth` honours an undocumented key-limit parameter (11.1).
 10. Mistral OCR per-1,000-page price (template variable did not render).
-11. Whether `respan/span-01*` and the other non-Mercury decisions models accept the Jev schema; any cap on questions per request.
-12. Real non-zero `usage.cost` values on paid models (all free-model costs were 0).
+11. Whether `respan/span-01*` and the other non-Mercury, non-Jev decisions models accept the Jev schema; any cap on questions per request.
+12. Real `usage.cost` on **text** models with paid pricing (all chat probes used free models; image, TTS, STT, video, music and decisions costs are confirmed).
+
+---
+
+## 16. Spend ledger (paid round, 2026-10-02)
+
+Cap $3.00 (hard stop $2.80); the key itself carried a **$1.00 limit**, which was the effective ceiling. `GET /key` `usage` lags by minutes, so the ledger below uses each response's own `usage.cost`.
+
+| # | Request | Model | Cost (USD) |
+| --- | --- | --- | --- |
+| 1 | Video, first-frame data URL, 1 s 480p 1:1 | `x-ai/grok-imagine-video` | 0.052 |
+| 2 | Video, `previous_job_id` | grok | 0 (400) |
+| 3a | Image generation, 1:1 | `black-forest-labs/flux.2-klein-4b` | 0.014 |
+| 3b | Image edit with data-URL reference | flux.2-klein-4b | 0.015 |
+| 4 | TTS mp3, 44 chars | `hexgrad/kokoro-82m` | 0.000176 |
+| 5 | STT x7 successes (whisper turbo x3, grok, MAI, Deepgram) + 5 free 400s | various | 0.000465 |
+| 6 | Lyria Clip, lyrics | `google/lyria-3-clip-preview` | 0.04 |
+| 7 | Jev tutorial request | `typesafe/jev-1.13` | 0.000019992 |
+| 8 | PDF chat, `cloudflare-ai` | `dots-studio/dots-3-note-preview:free` | 0 |
+| 9 | Video, video data URL reference | Seedance 2.0 mini | 0 (400) |
+| 10 | Video, image data URL in `input_references` | grok | 0.052 |
+| 11 | Video, first+last frame data URLs, 4 s | `bytedance/seedance-2.0-mini` | 0.1358 |
+| 12 | Video, `previous_job_id` | Seedance 2.0 mini | 0 (400) |
+| 13 | TTS pcm x2 (Kokoro 20 chars, Gemini) + 2 free 400s | kokoro, `google/gemini-3.8-flash-tts` | 0.00008 + 0.00057 |
+| 14 | Image stream, `quality:"low"` | `openai/gpt-image-1-mini` | 0.003006 |
+| 15 | Lyria Clip, image input + `audio.format:"wav"` | lyria-3-clip-preview | 0.04 |
+| 16 | Lyria Pro, lyrics | `google/lyria-3-pro-preview` | 0.08 |
+| 17 | Chat-route image output | `google/gemini-3.1-flash-lite-image` | 0 (402) |
+| 18 | Free validation probes (video, image, content) | various | 0 |
+| | **Total** | | **about 0.4331** |

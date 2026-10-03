@@ -1,0 +1,85 @@
+{
+  "request_provider": {
+    "options": {
+      "azure": {
+        "diarization": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "response": {
+    "text": "The quick brown fox jumps over the lazy dog.",
+    "usage": {
+      "seconds": 4,
+      "cost": 0.00011111111111111112
+    },
+    "language": "en",
+    "duration": 3.17,
+    "segments": [
+      {
+        "id": 0,
+        "start": 0.08,
+        "end": 2.839,
+        "text": "The quick brown fox jumps over the lazy dog.",
+        "speaker": 0
+      }
+    ],
+    "words": [
+      {
+        "word": "The",
+        "start": 0.08,
+        "end": 0.16,
+        "speaker": 0
+      },
+      {
+        "word": "quick",
+        "start": 0.2,
+        "end": 0.4,
+        "speaker": 0
+      },
+      {
+        "word": "brown",
+        "start": 0.52,
+        "end": 0.76,
+        "speaker": 0
+      },
+      {
+        "word": "fox",
+        "start": 0.92,
+        "end": 1.159,
+        "speaker": 0
+      },
+      {
+        "word": "jumps",
+        "start": 1.4,
+        "end": 1.64,
+        "speaker": 0
+      },
+      {
+        "word": "over",
+        "start": 1.76,
+        "end": 1.919,
+        "speaker": 0
+      },
+      {
+        "word": "the",
+        "start": 1.96,
+        "end": 2.04,
+        "speaker": 0
+      },
+      {
+        "word": "lazy",
+        "start": 2.12,
+        "end": 2.399,
+        "speaker": 0
+      },
+      {
+        "word": "dog.",
+        "start": 2.52,
+        "end": 2.839,
+        "speaker": 0
+      }
+    ]
+  }
+}

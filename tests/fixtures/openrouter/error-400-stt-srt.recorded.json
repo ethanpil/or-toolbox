@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "Unsupported response_format \"srt\". Only \"json\" and \"verbose_json\" are supported.",
+    "code": 400
+  }
+}
