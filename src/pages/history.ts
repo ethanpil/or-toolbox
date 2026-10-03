@@ -38,15 +38,20 @@ import {
   activeHistoryFilters,
   appendPage,
   costInfo,
+  dayKey,
+  dayLabel,
+  type DayGroup,
   entriesOf,
   groupByDay,
   type HistoryFilters,
   latencyText,
+  modelsOf,
   nextPage,
   NO_HISTORY_FILTERS,
   outputView,
   PAGE_SIZE,
   parseHistoryParams,
+  splitDeletable,
   STATUS_INFO,
   toQuery,
   tokenText,
@@ -55,6 +60,11 @@ import {
 import { whenVisible } from './lazy';
 
 const EVERYTHING = Number.MAX_SAFE_INTEGER;
+/** Typing waits this long before the list is filtered again (the same in every searchable list). */
+const SEARCH_DEBOUNCE_MS = 150;
+/** The model filter is built by reading the runs in pages of this size, in the background. */
+const MODEL_SCAN_PAGE = 200;
+const MODEL_SCAN_MAX_PAGES = 500;
 const STATUSES: RunStatus[] = ['ok', 'error', 'aborted', 'running'];
 
 const fileStem = (text: string): string =>
@@ -85,6 +95,10 @@ class HistoryPage {
   private generation = 0;
   private reloadTimer: ReturnType<typeof setTimeout> | undefined;
   private totalRuns: number | null = null;
+  /** The last day section drawn: "Show more" appends its rows here instead of redrawing everything. */
+  private lastDay: { key: string; list: HTMLElement } | null = null;
+  private modelScan = 0;
+  private modelTimer: ReturnType<typeof setTimeout> | undefined;
 
   private currentRun: RunRecord | null = null;
   private detailGeneration = 0;
@@ -228,13 +242,16 @@ class HistoryPage {
     this.main.append(this.toolbar(), this.filterPanel(), this.count, this.list, this.moreSlot);
     this.wire();
     this.fillKeys();
-    void this.fillModels();
+    void this.scanModels();
     this.showSkeleton();
     void this.reload().then(() => {
       if (params.run) void this.openDeepLink(params.run);
     });
 
-    this.core.history.subscribe(() => this.scheduleReload());
+    this.core.history.subscribe(() => {
+      this.scheduleReload();
+      this.scheduleModelScan();
+    });
     this.core.keys.subscribe(() => this.fillKeys());
   }
 
@@ -358,7 +375,7 @@ class HistoryPage {
     let timer: ReturnType<typeof setTimeout> | undefined;
     this.search.addEventListener('input', () => {
       clearTimeout(timer);
-      timer = setTimeout(() => this.readControls(), 200);
+      timer = setTimeout(() => this.readControls(), SEARCH_DEBOUNCE_MS);
     });
     this.search.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && this.search.value) {
@@ -418,21 +435,53 @@ class HistoryPage {
     this.keySelect.value = keys.some((key) => key.id === current) ? current : '';
   }
 
-  /** Every model that ever ran (the stats ledger outlives deleted history), so the filter is complete. */
-  private async fillModels(): Promise<void> {
+  /**
+   * The model filter lists every model the runs in the history called (`model` and `models`, so routed ids such
+   * as the ones behind `openrouter/free` are there), read from the runs themselves in pages in the background; a
+   * deleted run's models disappear with it.
+   */
+  private async scanModels(): Promise<void> {
+    const mine = ++this.modelScan;
+    const found = new Set<string>();
+    let before: number | undefined;
     try {
-      const rows = await this.core.stats.rows({ from: '0000-01-01', to: '9999-12-31' });
-      const models = [...new Set(rows.map((row) => row.model))].sort();
-      const current = this.modelSelect.value;
-      replace(
-        this.modelSelect,
-        h('option', { value: '' }, 'Any model'),
-        models.map((model) => h('option', { value: model }, model)),
-      );
-      this.modelSelect.value = models.includes(current) ? current : '';
+      for (let pages = 0; pages < MODEL_SCAN_MAX_PAGES; pages++) {
+        const page = await this.core.history.query({
+          limit: MODEL_SCAN_PAGE,
+          ...(before === undefined ? {} : { before }),
+        });
+        if (mine !== this.modelScan) return;
+        for (const model of modelsOf(page)) found.add(model);
+        const last = page.at(-1);
+        if (page.length < MODEL_SCAN_PAGE || !last) break;
+        // The cursor is exclusive and runs can share a millisecond: ask again from just after the last one.
+        const next = last.startedAt + 1;
+        if (before !== undefined && next >= before) break;
+        before = next;
+      }
     } catch {
-      // The filter keeps "Any model" only.
+      return; // The filter keeps what it had.
     }
+    this.paintModels([...found].sort());
+  }
+
+  private scheduleModelScan(): void {
+    clearTimeout(this.modelTimer);
+    this.modelTimer = setTimeout(() => void this.scanModels(), 1500);
+  }
+
+  private paintModels(models: string[]): void {
+    const current = this.modelSelect.value;
+    // The model being filtered by stays a choice even when no run has it any more, so the control matches the list.
+    const options = [
+      ...new Set([...models, ...(this.filters.model ? [this.filters.model] : [])]),
+    ].sort();
+    replace(
+      this.modelSelect,
+      h('option', { value: '' }, 'Any model'),
+      options.map((model) => h('option', { value: model }, model)),
+    );
+    this.modelSelect.value = options.includes(current) ? current : '';
   }
 
   /** Keeps one query parameter in the address bar (`null` removes it). */
@@ -510,9 +559,12 @@ class HistoryPage {
     try {
       const page = await this.core.history.query(toQuery(this.filters, next));
       if (mine !== this.generation) return;
+      const before = this.shown.length;
       this.shown = appendPage(this.shown, page);
       this.hasMore = page.length >= next.limit;
-      this.keepFocus(() => this.render());
+      // Only the new rows are built; the ones on screen (and the focus in them) stay as they are.
+      this.appendRows(this.shown.slice(before));
+      this.renderFooter();
     } catch (error) {
       void presentError(error, { retry: () => void this.loadMore() });
     } finally {
@@ -580,27 +632,59 @@ class HistoryPage {
       return;
     }
 
+    const days = groupByDay(this.shown).map((group) => ({
+      key: group.key,
+      ...this.daySection(group),
+    }));
+    this.lastDay = days.at(-1) ? { key: days.at(-1)!.key, list: days.at(-1)!.list } : null;
+    replace(
+      this.list,
+      days.map((day) => day.section),
+    );
+    this.renderFooter();
+  }
+
+  private daySection(group: Pick<DayGroup, 'label' | 'runs'>): {
+    section: HTMLElement;
+    list: HTMLElement;
+  } {
+    const headingId = uid('history-day');
+    const list = h(
+      'div',
+      { class: 'list-group shadow-sm' },
+      group.runs.map((run) => this.row(run)),
+    );
+    const section = h(
+      'section',
+      { class: 'mb-4', 'aria-labelledby': headingId, 'data-testid': 'history-day' },
+      h('h2', { id: headingId, class: 'or-section-label mb-2' }, group.label),
+      list,
+    );
+    return { section, list };
+  }
+
+  /** Adds runs (older than everything shown) to the last day, or opens the days they belong to. */
+  private appendRows(runs: readonly RunRecord[]): void {
+    for (const run of runs) {
+      const key = dayKey(run.startedAt);
+      if (this.lastDay?.key === key) {
+        this.lastDay.list.append(this.row(run));
+      } else {
+        const day = this.daySection({ label: dayLabel(run.startedAt), runs: [run] });
+        this.list.append(day.section);
+        this.lastDay = { key, list: day.list };
+      }
+    }
+  }
+
+  /** The count line and the "Show more" button. */
+  private renderFooter(): void {
+    const active = activeHistoryFilters(this.filters);
     const ofTotal =
       active === 0 && this.totalRuns !== null && this.totalRuns > this.shown.length
         ? ` of ${this.totalRuns.toLocaleString('en-US')}`
         : '';
     this.count.textContent = `${plural(this.shown.length, 'run')}${ofTotal}`;
-    replace(
-      this.list,
-      groupByDay(this.shown).map((group) => {
-        const headingId = uid('history-day');
-        return h(
-          'section',
-          { class: 'mb-4', 'aria-labelledby': headingId, 'data-testid': 'history-day' },
-          h('h2', { id: headingId, class: 'or-section-label mb-2' }, group.label),
-          h(
-            'div',
-            { class: 'list-group shadow-sm' },
-            group.runs.map((run) => this.row(run)),
-          ),
-        );
-      }),
-    );
     this.moreSlot.replaceChildren(
       this.hasMore
         ? h(
@@ -775,7 +859,9 @@ class HistoryPage {
   /** A live update of the open run (it finished, was starred in another tab, or was deleted). */
   private async refreshOpenRun(): Promise<void> {
     const open = this.currentRun;
-    if (!open || !this.drawerElement.classList.contains('show')) return;
+    // `currentRun` is set while the drawer is opening or open and cleared once it is hidden, so a change that
+    // arrives during the slide-in is not lost.
+    if (!open) return;
     const latest = await this.core.history.get(open.id).catch(() => undefined);
     if (this.currentRun?.id !== open.id) return;
     if (!latest) {
@@ -991,12 +1077,20 @@ class HistoryPage {
       this.actionButton('Export JSON', 'download', 'run-export', () => void this.exportOne(run)),
       this.actionButton('Delete', 'trash', 'run-delete', () => void this.deleteOne(run), {
         danger: true,
+        disabled: run.status === 'running',
       }),
     );
 
     replace(
       this.drawerBody,
       actions,
+      run.status === 'running'
+        ? h(
+            'p',
+            { class: 'small text-body-secondary mb-4', 'data-testid': 'run-delete-note' },
+            'This run is still in progress, so it cannot be deleted yet.',
+          )
+        : null,
       this.detailSection(
         'Summary',
         this.definitionList([
@@ -1081,7 +1175,7 @@ class HistoryPage {
     const heads = ['Model', 'Requests', 'Tokens in', 'Tokens out', 'Cost', 'Avg latency'];
     return h(
       'div',
-      { class: 'table-responsive' },
+      { class: 'table-responsive position-relative' },
       h(
         'table',
         { class: 'table table-sm small align-middle mb-0', 'data-testid': 'run-usage' },
@@ -1152,6 +1246,13 @@ class HistoryPage {
     if (!ok) return;
     const latest = await this.core.history.get(run.id).catch(() => undefined);
     if (!latest) return;
+    if (latest.status === 'running') {
+      toast({
+        message: 'This run is still in progress, so it cannot be deleted yet.',
+        variant: 'warning',
+      });
+      return;
+    }
     this.drawer.hide();
     await this.deleteRuns([latest]);
   }
@@ -1215,21 +1316,30 @@ class HistoryPage {
   }
 
   private async deleteFiltered(): Promise<void> {
-    let runs: RunRecord[];
+    let matches: RunRecord[];
     try {
-      runs = await this.matching();
+      matches = await this.matching();
     } catch (error) {
       void presentError(error);
       return;
     }
+    // A run in progress belongs to a live page: it is never deleted (and so never brought back by Undo).
+    const { deletable: runs, running } = splitDeletable(matches);
     if (runs.length === 0) {
       toast({
-        message: 'No runs match the filters, so there is nothing to delete.',
+        message:
+          running.length > 0
+            ? 'The filters match only runs in progress, and those cannot be deleted yet.'
+            : 'No runs match the filters, so there is nothing to delete.',
         variant: 'warning',
       });
       return;
     }
-    const all = activeHistoryFilters(this.filters) === 0;
+    const all = activeHistoryFilters(this.filters) === 0 && running.length === 0;
+    const kept =
+      running.length > 0
+        ? ` ${plural(running.length, 'run')} in progress ${running.length === 1 ? 'is' : 'are'} kept.`
+        : '';
     const ok = await typedConfirm({
       title: all ? 'Delete all history?' : `Delete ${plural(runs.length, 'run')}?`,
       message: h(
@@ -1238,7 +1348,7 @@ class HistoryPage {
         all
           ? `All ${plural(runs.length, 'run')} will be removed from your history`
           : `The ${plural(runs.length, 'run')} matching the current filters will be removed from your history`,
-        '. Starred runs are included and spending stats are not affected. Export first if you want a copy; you can also undo for a few seconds.',
+        `. Starred runs are included and spending stats are not affected.${kept} Export first if you want a copy; you can also undo for a few seconds.`,
       ),
       phrase: 'delete',
       confirmLabel: all ? 'Delete everything' : `Delete ${plural(runs.length, 'run')}`,

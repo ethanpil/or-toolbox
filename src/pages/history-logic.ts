@@ -291,15 +291,107 @@ export interface OutputView {
   text: string;
 }
 
-/** JSON outputs (extractors, decisions) are pretty-printed; everything else is Markdown/plain text. */
+const JSON_WHITESPACE = /\s/;
+/** Deeper than this is shown as stored: indenting it would only make it harder to read. */
+const MAX_PRETTY_DEPTH = 64;
+
+/**
+ * Re-indents JSON text without reading its values: numbers, strings (escapes included), literals, key order and
+ * duplicate keys are copied exactly as written, so `12345678901234567890`, `1e999` and `1.50` stay what the model
+ * wrote (a parse and stringify round trip would change them). Only whitespace outside strings is replaced. The
+ * text must already be valid JSON; text nested deeper than 64 levels is returned unchanged.
+ */
+export function prettyJson(text: string): string {
+  const source = text.trim();
+  const length = source.length;
+  let out = '';
+  let depth = 0;
+  let i = 0;
+  const newline = (): string => `\n${'  '.repeat(depth)}`;
+  while (i < length) {
+    const ch = source[i]!;
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < length && source[j] !== '"') j += source[j] === '\\' ? 2 : 1;
+      out += source.slice(i, j + 1);
+      i = j + 1;
+    } else if (ch === '{' || ch === '[') {
+      let k = i + 1;
+      while (k < length && JSON_WHITESPACE.test(source[k]!)) k++;
+      if (source[k] === (ch === '{' ? '}' : ']')) {
+        out += ch + source[k]!;
+        i = k + 1;
+      } else {
+        depth++;
+        if (depth > MAX_PRETTY_DEPTH) return source;
+        out += ch + newline();
+        i++;
+      }
+    } else if (ch === '}' || ch === ']') {
+      depth--;
+      out += newline() + ch;
+      i++;
+    } else if (ch === ',') {
+      out += ',' + newline();
+      i++;
+    } else if (ch === ':') {
+      out += ': ';
+      i++;
+    } else if (JSON_WHITESPACE.test(ch)) {
+      i++;
+    } else {
+      // A number, true, false or null: copied verbatim up to the next structural character.
+      let j = i;
+      while (j < length && !/[\s,:{}[\]"]/.test(source[j]!)) j++;
+      out += source.slice(i, j);
+      i = j;
+    }
+  }
+  return out;
+}
+
+/**
+ * JSON outputs (extractors, decisions) are indented for reading and otherwise shown as stored; everything else is
+ * Markdown/plain text. The text is only parsed to check that it is JSON; its values are never re-serialised.
+ */
 export function outputView(output: string): OutputView {
   const trimmed = output.trim();
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     try {
-      return { kind: 'json', text: JSON.stringify(JSON.parse(trimmed) as unknown, null, 2) };
+      JSON.parse(trimmed);
+      return { kind: 'json', text: prettyJson(trimmed) };
     } catch {
       // Not JSON after all.
     }
   }
   return { kind: 'markdown', text: output };
+}
+
+// --- deleting and filtering by what the runs hold ---------------------------------------------------------
+
+/**
+ * Runs that may be deleted, and the ones in progress that may not: a running run belongs to a live page (or the
+ * orphan sweep) and is never removed from under it, nor brought back by Undo.
+ */
+export function splitDeletable(runs: readonly RunRecord[]): {
+  deletable: RunRecord[];
+  running: RunRecord[];
+} {
+  return {
+    deletable: runs.filter((run) => run.status !== 'running'),
+    running: runs.filter((run) => run.status === 'running'),
+  };
+}
+
+/**
+ * Every model the runs called (the primary model and the others of a run, so routed ids such as the models behind
+ * `openrouter/free` are filterable), once each and sorted. Built from the runs themselves, so a deleted run's
+ * models do not linger.
+ */
+export function modelsOf(runs: readonly RunRecord[]): string[] {
+  const models = new Set<string>();
+  for (const run of runs) {
+    for (const model of [run.model, ...run.models]) if (model) models.add(model);
+  }
+  return [...models].sort();
 }

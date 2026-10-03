@@ -14,8 +14,11 @@ import {
   localDayStart,
   nextPage,
   NO_HISTORY_FILTERS,
+  modelsOf,
   outputView,
+  prettyJson,
   parseHistoryParams,
+  splitDeletable,
   toQuery,
   tokenText,
   usageRows,
@@ -295,5 +298,93 @@ describe('settings and output', () => {
     expect(outputView('# Title\n\ntext')).toEqual({ kind: 'markdown', text: '# Title\n\ntext' });
     expect(outputView('{not json')).toEqual({ kind: 'markdown', text: '{not json' });
     expect(outputView('')).toEqual({ kind: 'markdown', text: '' });
+  });
+});
+
+describe('JSON output keeps every value as stored', () => {
+  /** The tokens of a JSON text with all whitespace outside strings dropped: what "unchanged" means. */
+  const tokens = (text: string): string => (text.match(/"(?:[^"\\]|\\.)*"|[^\s"]/g) ?? []).join('');
+
+  it('keeps big integers, exponents that overflow, trailing zeros and negative zero', () => {
+    const input = '{"id": 12345678901234567890, "big": 1e999, "price": 1.50, "z": -0, "e": 1E+2}';
+    const view = outputView(input);
+    expect(view.kind).toBe('json');
+    expect(view.text).toContain('12345678901234567890');
+    expect(view.text).toContain('1e999');
+    expect(view.text).toContain('1.50');
+    expect(view.text).toContain('-0');
+    expect(view.text).toContain('1E+2');
+    expect(tokens(view.text)).toBe(tokens(input));
+  });
+
+  it('keeps duplicate keys, key order and escapes inside strings', () => {
+    const input = '{"a":1,"a":2,"s":"x, {y}: [z] \\"q\\" \\\\ \\u00e9  spaced","b":"\\n"}';
+    const view = outputView(input);
+    expect(view.text.split('\n').filter((line) => line.includes('"a"'))).toHaveLength(2);
+    expect(view.text).toContain('"x, {y}: [z] \\"q\\" \\\\ \\u00e9  spaced"');
+    expect(tokens(view.text)).toBe(tokens(input));
+  });
+
+  it('indents objects and arrays, and keeps empty ones compact', () => {
+    expect(prettyJson('{"a":[],"b":{},"c":[{"d":null},true,"x"]}')).toBe(
+      [
+        '{',
+        '  "a": [],',
+        '  "b": {},',
+        '  "c": [',
+        '    {',
+        '      "d": null',
+        '    },',
+        '    true,',
+        '    "x"',
+        '  ]',
+        '}',
+      ].join('\n'),
+    );
+    expect(prettyJson('[ ]')).toBe('[]');
+    expect(prettyJson('  {  }  ')).toBe('{}');
+    expect(prettyJson('"just a string"')).toBe('"just a string"');
+    expect(prettyJson('12345678901234567890')).toBe('12345678901234567890');
+  });
+
+  it('shows text that is too deeply nested as stored', () => {
+    const deep = '['.repeat(100) + ']'.repeat(100);
+    expect(prettyJson(deep)).toBe(deep);
+    expect(outputView(deep)).toEqual({ kind: 'json', text: deep });
+  });
+
+  it('a top-level scalar is not treated as JSON output', () => {
+    expect(outputView('42')).toEqual({ kind: 'markdown', text: '42' });
+  });
+});
+
+describe('deleting runs', () => {
+  it('never deletes a run in progress, and says how many it kept', () => {
+    const runs = [
+      run('a', 3, { status: 'ok' }),
+      run('b', 2, { status: 'running' }),
+      run('c', 1, { status: 'error' }),
+      run('d', 0, { status: 'aborted' }),
+    ];
+    const { deletable, running } = splitDeletable(runs);
+    expect(deletable.map((r) => r.id)).toEqual(['a', 'c', 'd']);
+    expect(running.map((r) => r.id)).toEqual(['b']);
+    expect(splitDeletable([])).toEqual({ deletable: [], running: [] });
+  });
+});
+
+describe('models of the runs', () => {
+  it('lists the primary and every other model, once each, sorted', () => {
+    const runs = [
+      run('a', 3, { model: 'openrouter/free', models: ['openrouter/free'] }),
+      run('b', 2, { model: 'x/one', models: ['x/one', 'y/two:free', 'x/one'] }),
+      run('c', 1, { model: 'x/one', models: [] }),
+    ];
+    expect(modelsOf(runs)).toEqual(['openrouter/free', 'x/one', 'y/two:free']);
+    expect(modelsOf([])).toEqual([]);
+  });
+
+  it('skips empty ids', () => {
+    expect(modelsOf([run('a', 1, { model: '', models: ['', 'x/y'] })])).toEqual(['x/y']);
   });
 });

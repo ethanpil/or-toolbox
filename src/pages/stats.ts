@@ -11,6 +11,7 @@
  * - Budget burn-down for the month, free requests today, and each key's balance and spend.
  */
 import { errorCode, userMessage } from '../core/errors';
+import { DAY_MS, MAX_TIMEOUT_MS, utcDay } from '../core/util';
 import { url } from '../core/paths';
 import type { CoreServices, KeyInfo, KeyStatus, StatsRow } from '../core/types';
 import { getTool } from '../tools/registry';
@@ -27,6 +28,7 @@ import { mountPage } from '../ui/shell/index';
 import { settingsUrl } from '../ui/shell/links';
 import type * as StatsCharts from './stats-charts';
 import {
+  ALL_TIME,
   averageLatency,
   budgetPace,
   change,
@@ -38,15 +40,19 @@ import {
   freeShare,
   type Group,
   groupBy,
+  markEstimate,
   OTHER,
   parseCustomRange,
   preferredOrder,
   presetRange,
   previousRange,
+  pruneHidden,
   RANGE_PRESETS,
   type RangePreset,
   rangeDays,
   rangeLabel,
+  resolveRange,
+  rowsIn,
   type Series,
   type SeriesDimension,
   seriesSummary,
@@ -55,11 +61,10 @@ import {
   timeSeries,
   tokensByModel,
   totalsOf,
+  type Totals,
 } from './stats-logic';
 
 const RANGE_KEY = 'stats.range';
-const ALL_TIME: DateRange = { from: '0000-01-01', to: '9999-12-31' };
-
 type ChartsModule = typeof StatsCharts;
 type BarChart = StatsCharts.BarChart;
 type BarChartInput = StatsCharts.BarChartInput;
@@ -84,6 +89,12 @@ mountPage(
     new StatsPage(core, main).start();
   },
 );
+
+/** A hero figure that includes estimates: a small, quiet ≈ before the number (the text still reads "≈ $0.60"). */
+const approximately = (text: string, estimatedUsd: number): Child =>
+  estimatedUsd > 0
+    ? [h('span', { class: 'or-kpi-approx', title: 'Includes estimated costs' }, '≈'), ' ', text]
+    : text;
 
 const dayFull = (day: string): string =>
   new Date(`${day}T00:00:00Z`).toLocaleDateString('en-US', {
@@ -116,7 +127,7 @@ class ChartCard {
   private data: CardData | null = null;
   private tableView = false;
   private creating = false;
-  private readonly hiddenSeries = new Set<string>();
+  private hiddenSeries = new Set<string>();
 
   private readonly legend = h('ul', { class: 'or-legend mb-3', 'aria-label': 'Legend' });
   private readonly canvas: HTMLCanvasElement;
@@ -209,6 +220,13 @@ class ChartCard {
 
   show(data: CardData | null): void {
     this.data = data;
+    // A hidden series can only be shown again through the legend, which is not drawn for fewer than two series:
+    // forget what is hidden whenever the legend goes away or a hidden series left the chart.
+    const kept = pruneHidden(this.hiddenSeries, data?.legend.map((entry) => entry.id) ?? []);
+    const pruned = kept.size !== this.hiddenSeries.size;
+    this.hiddenSeries = kept;
+    this.canvas.dataset.hidden = String(kept.size);
+    if (pruned) this.chart?.setHidden([...kept]);
     const hasData = data !== null && data.input.series.length > 0;
     this.empty.hidden = hasData;
     this.toggle.hidden = !hasData;
@@ -252,11 +270,12 @@ class ChartCard {
                 if (show) this.hiddenSeries.delete(entry.id);
                 else this.hiddenSeries.add(entry.id);
                 button.setAttribute('aria-pressed', String(show));
+                this.canvas.dataset.hidden = String(this.hiddenSeries.size);
                 this.chart?.setVisible(entry.id, show);
               },
             },
             h('span', {
-              class: 'or-swatch',
+              class: 'or-legend-swatch',
               'aria-hidden': 'true',
               ...(entry.slot === null ? {} : { 'data-slot': String(entry.slot + 1) }),
             }),
@@ -346,7 +365,7 @@ class ChartCard {
       const latest = this.data;
       if (!latest || this.tableView || this.chart) return;
       this.chart = createBarChart(this.canvas, latest.input);
-      for (const id of this.hiddenSeries) this.chart.setVisible(id, false);
+      this.chart.setHidden([...this.hiddenSeries]);
       this.canvas.dataset.rendered = 'true';
       this.canvas.dataset.series = String(latest.input.series.length);
       this.note.hidden = true;
@@ -365,7 +384,14 @@ class ChartCard {
 
 class StatsPage {
   private preset: RangePreset = '30d';
+  /** What the page shows now; a relative preset is resolved again on every load (see `resolveRange`). */
   private range: DateRange = presetRange('30d');
+  /** The range of the Custom preset, kept apart so a reload cannot turn it into the last preset's days. */
+  private customRange: DateRange = presetRange('30d');
+  /** The whole ledger, read once per load: the range, the previous range, the month and today come from it. */
+  private ledgerReady = false;
+  private loadedDay = '';
+  private rolloverTimer: ReturnType<typeof setTimeout> | undefined;
   private rows: StatsRow[] = [];
   private previousRows: StatsRow[] = [];
   private allRows: StatsRow[] = [];
@@ -404,7 +430,7 @@ class StatsPage {
   private readonly footnote = h(
     'p',
     { class: 'small text-body-secondary mb-4' },
-    'Runs and requests come from the daily spend ledger kept in this browser; a run that used several models counts once per model. Days are UTC. Free requests are those to :free models.',
+    'Runs and requests come from the daily spend ledger kept in this browser; days are UTC, and free requests are those to :free models. A figure marked ≈ includes estimates: a cost worked out from catalog prices because OpenRouter reported none, or the amount reserved for a run whose cost is unknown.',
   );
   private readonly dashboard = h('div', { hidden: true, 'data-testid': 'stats-dashboard' });
   private readonly emptyAll = h('div', { 'data-testid': 'stats-empty-slot' });
@@ -484,7 +510,7 @@ class StatsPage {
     const preset = RANGE_PRESETS.find((entry) => entry.id === saved);
     if (preset) {
       this.preset = preset.id;
-      this.range = presetRange(preset.id);
+      this.range = resolveRange(preset.id, this.customRange);
     }
     this.fromInput.value = this.range.from;
     this.toInput.value = this.range.to;
@@ -497,6 +523,10 @@ class StatsPage {
     void this.reload();
 
     this.core.stats.subscribe(() => this.scheduleReload());
+    // A page left open (or a tab brought back) on a new UTC day shows the new day's ranges.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && utcDay() !== this.loadedDay) void this.reload();
+    });
     this.core.keys.subscribe(() => this.renderBudget());
     this.core.settings.subscribe((next, prev) => {
       if (JSON.stringify(next.budgets) !== JSON.stringify(prev.budgets)) this.renderBudget();
@@ -560,12 +590,13 @@ class StatsPage {
   private choose(preset: RangePreset): void {
     if (preset === 'custom') {
       this.preset = 'custom';
+      this.customRange = this.range;
       this.syncRangeControls();
       this.fromInput.focus();
       return;
     }
     this.preset = preset;
-    this.range = presetRange(preset);
+    this.range = resolveRange(preset, this.customRange);
     this.customError.hidden = true;
     this.fromInput.value = this.range.from;
     this.toInput.value = this.range.to;
@@ -577,7 +608,8 @@ class StatsPage {
       // Not remembered; the range still applies.
     }
     this.syncRangeControls();
-    void this.reload(true);
+    if (this.ledgerReady) this.showRange(true);
+    else void this.reload(true);
   }
 
   private applyCustom(): void {
@@ -588,10 +620,12 @@ class StatsPage {
       return;
     }
     this.customError.hidden = true;
+    this.customRange = result.range;
     this.range = result.range;
     this.preset = 'custom';
     this.syncRangeControls();
-    void this.reload(true);
+    if (this.ledgerReady) this.showRange(true);
+    else void this.reload(true);
   }
 
   private syncRangeControls(): void {
@@ -608,29 +642,58 @@ class StatsPage {
 
   private scheduleReload(): void {
     clearTimeout(this.reloadTimer);
-    this.reloadTimer = setTimeout(() => {
-      void this.reload();
-      this.renderBudget();
-    }, 250);
+    this.reloadTimer = setTimeout(() => void this.reload(), 250);
   }
 
+  /** Reloads at the next UTC midnight (a little after), so the relative ranges and "this month" roll over. */
+  private scheduleRollover(): void {
+    clearTimeout(this.rolloverTimer);
+    const untilMidnight = DAY_MS - (Date.now() % DAY_MS) + 1000;
+    this.rolloverTimer = setTimeout(
+      () => void this.reload(),
+      Math.min(untilMidnight, MAX_TIMEOUT_MS),
+    );
+  }
+
+  /**
+   * Derives everything on screen from the ledger in memory: the range (resolved again from the clock for a
+   * relative preset), the range before it, this month, today and each key's spend. Changing the range needs no
+   * new read; only a change of the ledger (or the clock rolling over) reads it again.
+   */
+  private showRange(announceResult: boolean): void {
+    this.range = resolveRange(this.preset, this.customRange);
+    this.rows = rowsIn(this.allRows, this.range);
+    this.previousRows = rowsIn(this.allRows, previousRange(this.range));
+    if (this.preset !== 'custom') {
+      this.fromInput.value = this.range.from;
+      this.toInput.value = this.range.to;
+    }
+    this.syncRangeControls();
+    this.render();
+    this.renderBudget();
+    this.scheduleRollover();
+    if (announceResult) {
+      announce(
+        `Showing ${rangeLabel(this.range)}: ${formatUsd(totalsOf(this.rows).costUsd)} spent.`,
+      );
+    }
+  }
+
+  /**
+   * Reads the whole ledger once and derives everything from it in memory: the range (recomputed from the clock
+   * for a relative preset, so the page rolls over at UTC midnight and at the end of the month), the range before
+   * it, this month, today and each key's spend.
+   */
   private async reload(announceResult = false): Promise<void> {
     const mine = ++this.generation;
     for (const card of [this.spendCard, this.requestsCard, this.tokensCard]) card.loading(true);
     try {
-      const [rows, previousRows, allRows] = await Promise.all([
-        this.core.stats.rows(this.range),
-        this.core.stats.rows(previousRange(this.range)),
-        this.core.stats.rows(ALL_TIME),
-      ]);
+      const allRows = await this.core.stats.rows(ALL_TIME);
       if (mine !== this.generation) return;
-      this.rows = rows;
-      this.previousRows = previousRows;
       this.allRows = allRows;
-      this.render();
-      if (announceResult) {
-        announce(`Showing ${rangeLabel(this.range)}: ${formatUsd(totalsOf(rows).costUsd)} spent.`);
-      }
+      this.ledgerReady = true;
+      this.loadedDay = utcDay();
+      this.showRange(announceResult);
     } catch (error) {
       if (mine !== this.generation) return;
       this.dashboard.hidden = true;
@@ -811,8 +874,17 @@ class StatsPage {
       this.tile({
         id: 'spend',
         label: 'Spend',
-        value: formatUsd(totals.costUsd),
-        note: this.deltaNote(totals.costUsd, before.costUsd) ?? 'in this period',
+        value: approximately(formatUsd(totals.costUsd), totals.estimatedUsd),
+        note: [
+          this.deltaNote(totals.costUsd, before.costUsd) ?? 'in this period',
+          totals.estimatedUsd > 0
+            ? h(
+                'div',
+                { 'data-testid': 'kpi-spend-estimated' },
+                `Includes ${formatUsd(totals.estimatedUsd)} estimated`,
+              )
+            : null,
+        ],
         columns: 'col-12 col-xl-3',
         hero: true,
       }),
@@ -857,20 +929,20 @@ class StatsPage {
             : h(
                 'div',
                 {
-                  class: 'or-meter-split mt-2',
+                  class: 'or-stats-meter-split mt-2',
                   role: 'img',
                   'aria-label': `${formatPercent(share)} of requests were free, ${formatPercent(1 - share)} paid`,
                   'data-testid': 'kpi-free-split',
                 },
                 totals.paidRequests > 0
                   ? h('span', {
-                      class: 'or-meter-paid',
+                      class: 'or-stats-meter-paid',
                       style: { flex: `${totals.paidRequests} 1 0` },
                     })
                   : null,
                 totals.freeRequests > 0
                   ? h('span', {
-                      class: 'or-meter-free',
+                      class: 'or-stats-meter-free',
                       style: { flex: `${totals.freeRequests} 1 0` },
                     })
                   : null,
@@ -912,6 +984,7 @@ class StatsPage {
           label: label(s.id),
           slot: s.slot,
           values: s.values,
+          ...(s.estimated ? { estimated: s.estimated } : {}),
         })),
         format,
         integers,
@@ -1006,7 +1079,7 @@ class StatsPage {
           : h(
               'div',
               {
-                class: 'table-responsive',
+                class: 'table-responsive position-relative',
                 role: 'region',
                 tabIndex: 0,
                 'aria-label': `${options.title}, table`,
@@ -1058,8 +1131,13 @@ class StatsPage {
       { class: 'd-flex flex-column align-items-end gap-1' },
       h(
         'span',
-        null,
-        formatUsd(group.costUsd),
+        group.estimatedUsd > 0
+          ? {
+              title: `Includes ${formatUsd(group.estimatedUsd)} estimated from catalog prices or reserved for runs of unknown cost.`,
+              'data-estimated': 'true',
+            }
+          : null,
+        markEstimate(formatUsd(group.costUsd), group.estimatedUsd),
         total > 0
           ? h('span', { class: 'text-body-secondary' }, ` · ${formatPercent(share)}`)
           : null,
@@ -1119,6 +1197,7 @@ class StatsPage {
       groups: groupBy(this.rows, 'model'),
       label: (group) => group.id,
       columns: [
+        { label: 'Runs', cell: (group) => group.runs.toLocaleString('en-US') },
         { label: 'Requests', cell: requests },
         { label: 'Spend', cell: (group) => this.spendCell(group, total.costUsd) },
         { label: 'Tokens in', cell: (group) => formatCount(group.promptTokens) },
@@ -1205,6 +1284,17 @@ class StatsPage {
         keysCard,
       ),
     );
+    // Until the ledger is read the cards are placeholders; the load that reads it draws them for real.
+    if (!this.ledgerReady) return;
+
+    // The month, today and each key come from the ledger already in memory (no further reads).
+    const month = rowsIn(this.allRows, presetRange('month'));
+    const today = utcDay();
+    const freeToday = totalsOf(rowsIn(this.allRows, { from: today, to: today })).freeRequests;
+    const monthByKey = new Map(
+      keys.map((key) => [key.id, totalsOf(month.filter((row) => row.keyId === key.id))]),
+    );
+    monthCard.replaceChildren(this.monthCard(totalsOf(month), settings.budgets));
 
     const statuses = new Map<string, KeyStatus | Error>();
     const statusLoads = keys.map(async (key) => {
@@ -1214,31 +1304,11 @@ class StatsPage {
         statuses.set(key.id, error instanceof Error ? error : new Error(String(error)));
       }
     });
-
-    void (async () => {
-      let month = 0;
-      let freeToday = 0;
-      const monthByKey = new Map<string, number>();
-      try {
-        [month, freeToday] = await Promise.all([
-          this.core.stats.monthSpend(),
-          this.core.stats.freeRequestsToday(),
-        ]);
-        await Promise.all(
-          keys.map(async (key) => {
-            monthByKey.set(key.id, await this.core.stats.monthSpend({ keyId: key.id }));
-          }),
-        );
-      } catch {
-        // Zeros are shown.
-      }
-      if (mine !== this.budgetGeneration) return;
-      monthCard.replaceChildren(this.monthCard(month, settings.budgets));
-      await Promise.all(statusLoads);
+    void Promise.all(statusLoads).then(() => {
       if (mine !== this.budgetGeneration) return;
       freeCard.replaceChildren(this.freeCard(freeToday, [...statuses.values()]));
       keysCard.replaceChildren(this.keysCard(keys, statuses, monthByKey, settings.budgets));
-    })();
+    });
   }
 
   private meter(options: {
@@ -1256,7 +1326,7 @@ class StatsPage {
     return h(
       'div',
       {
-        class: 'or-meter',
+        class: 'or-stats-meter',
         role: 'meter',
         'aria-label': options.label,
         'aria-valuemin': '0',
@@ -1266,14 +1336,14 @@ class StatsPage {
         'data-testid': options.testId,
       },
       h('div', {
-        class: 'or-meter-fill',
+        class: 'or-stats-meter-fill',
         'data-severity': options.severity ?? 'ok',
         style: { width: `${clamped * 100}%` },
       }),
       options.pace === undefined
         ? null
         : h('div', {
-            class: 'or-meter-pace',
+            class: 'or-stats-meter-pace',
             title: 'Where an even spender would be today',
             style: { left: `calc(${Math.min(1, options.pace) * 100}% - 1px)` },
           }),
@@ -1281,9 +1351,10 @@ class StatsPage {
   }
 
   private monthCard(
-    spend: number,
+    totals: Totals,
     budgets: { mode: string; monthlyUsd: number | null },
   ): HTMLElement {
+    const spend = totals.costUsd;
     const limit = budgets.monthlyUsd;
     const mode =
       budgets.mode === 'hard' ? 'Hard stop' : budgets.mode === 'warn' ? 'Warn' : 'Disabled';
@@ -1298,7 +1369,7 @@ class StatsPage {
         h(
           'div',
           { class: 'or-kpi-value mb-1', 'data-testid': 'budget-month-spend' },
-          formatUsd(spend),
+          markEstimate(formatUsd(spend), totals.estimatedUsd),
         ),
         pace && limit !== null
           ? [
@@ -1418,7 +1489,7 @@ class StatsPage {
   private keysCard(
     keys: KeyInfo[],
     statuses: Map<string, KeyStatus | Error>,
-    monthByKey: Map<string, number>,
+    monthByKey: Map<string, Totals>,
     budgets: { perKeyMonthlyUsd: Record<string, number | null> },
   ): HTMLElement {
     if (keys.length === 0) {
@@ -1487,9 +1558,11 @@ class StatsPage {
       );
     };
     const monthly = (key: KeyInfo): Child => {
-      const spend = monthByKey.get(key.id) ?? 0;
+      const totals = monthByKey.get(key.id);
+      const spend = totals?.costUsd ?? 0;
+      const spendText = markEstimate(formatUsd(spend), totals?.estimatedUsd ?? 0);
       const limit = budgets.perKeyMonthlyUsd[key.id] ?? null;
-      if (limit === null) return formatUsd(spend);
+      if (limit === null) return spendText;
       const pace = budgetPace(spend, limit);
       return h(
         'div',
@@ -1497,7 +1570,7 @@ class StatsPage {
         h(
           'span',
           null,
-          formatUsd(spend),
+          spendText,
           h('span', { class: 'text-body-secondary' }, ` of ${formatUsd(limit)}`),
         ),
         h(
@@ -1522,7 +1595,12 @@ class StatsPage {
         h('h3', { class: 'h6 mb-3' }, 'Keys'),
         h(
           'div',
-          { class: 'table-responsive', role: 'region', tabIndex: 0, 'aria-label': 'Keys, table' },
+          {
+            class: 'table-responsive position-relative',
+            role: 'region',
+            tabIndex: 0,
+            'aria-label': 'Keys, table',
+          },
           h(
             'table',
             { class: 'table table-sm align-middle mb-0' },

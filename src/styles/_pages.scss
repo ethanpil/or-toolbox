@@ -62,6 +62,16 @@
   padding-bottom: 6rem !important;
 }
 
+// A small icon button (copy an id) that still meets the 24 × 24 px minimum target size.
+.or-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.5rem;
+  min-height: 1.5rem;
+  padding: 0 0.25rem;
+}
+
 .or-compare-chip {
   max-width: 14rem;
   padding: 0.4em 0.6em;
@@ -70,11 +80,16 @@
   background-color: var(--bs-secondary-bg);
   border: 1px solid var(--bs-border-color);
 
-  .btn-close {
+  // The remove button is a 24 × 24 px target (WCAG 2.5.8); the X inside stays small.
+  .or-chip-close {
     --bs-btn-close-opacity: 0.6;
-    padding: 0.25rem;
-    margin-left: 0.125rem;
-    font-size: 0.5rem;
+    box-sizing: border-box;
+    flex-shrink: 0;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    margin: -0.2rem -0.3rem -0.2rem 0;
+    background-size: 0.55rem;
   }
 }
 
@@ -175,13 +190,21 @@
   letter-spacing: -0.03em;
 }
 
+.or-kpi-approx {
+  margin-right: 0.1em;
+  font-size: 0.6em;
+  font-weight: 500;
+  color: var(--bs-secondary-color);
+  vertical-align: 0.2em;
+}
+
 .or-kpi-note {
   font-size: 0.8125rem;
   color: var(--bs-secondary-color);
 }
 
 // A meter: the fill carries the state, the track is a lighter step of the same hue.
-.or-meter {
+.or-stats-meter {
   position: relative;
   height: 0.5rem;
   overflow: hidden;
@@ -189,7 +212,7 @@
   border-radius: 0.25rem;
 }
 
-.or-meter-fill {
+.or-stats-meter-fill {
   height: 100%;
   background-color: var(--or-viz-1);
   border-radius: 0.25rem;
@@ -209,7 +232,7 @@
 }
 
 // Where an even spender would be this month.
-.or-meter-pace {
+.or-stats-meter-pace {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -218,7 +241,7 @@
   opacity: 0.55;
 }
 
-.or-meter-split {
+.or-stats-meter-split {
   display: flex;
   gap: 2px;
   height: 0.5rem;
@@ -231,11 +254,11 @@
   }
 }
 
-.or-meter-paid {
+.or-stats-meter-paid {
   background-color: var(--or-viz-1);
 }
 
-.or-meter-free {
+.or-stats-meter-free {
   background-color: var(--or-viz-3);
 }
 
@@ -263,6 +286,7 @@
 
 .or-legend-item {
   display: inline-flex;
+  min-height: 1.5rem;
   gap: 0.4rem;
   align-items: center;
   padding: 0.125rem 0.375rem;
@@ -281,7 +305,7 @@
     color: var(--bs-secondary-color);
     text-decoration: line-through;
 
-    .or-swatch {
+    .or-legend-swatch {
       opacity: 0.35;
     }
   }
@@ -293,7 +317,7 @@
 }
 
 // A short key of the series colour, like the marks it stands for (a column or segment).
-.or-swatch {
+.or-legend-swatch {
   display: inline-block;
   flex-shrink: 0;
   width: 0.75rem;
@@ -303,7 +327,7 @@
 }
 
 @for $slot from 1 through 7 {
-  .or-swatch[data-slot='#{$slot}'] {
+  .or-legend-swatch[data-slot='#{$slot}'] {
     background-color: var(--or-viz-#{$slot});
   }
 }
@@ -327,6 +351,8 @@
 }
 
 .or-data-table {
+  // The caption is .visually-hidden (absolutely positioned): without this it would escape the scroller.
+  position: relative;
   max-height: 20rem;
   overflow: auto;
   border: 1px solid var(--bs-border-color-translucent);

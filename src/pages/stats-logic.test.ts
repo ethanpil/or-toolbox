@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { StatsRow } from '../core/types';
 import {
+  ALL_TIME,
   assignSlots,
   averageLatency,
   budgetPace,
@@ -12,12 +13,16 @@ import {
   freeShare,
   groupBy,
   OTHER,
+  markEstimate,
   parseCustomRange,
   preferredOrder,
   presetRange,
   previousRange,
+  pruneHidden,
   rangeDays,
   rangeLabel,
+  resolveRange,
+  rowsIn,
   seriesSummary,
   seriesTable,
   SERIES_SLOTS,
@@ -39,6 +44,7 @@ function row(partial: Partial<StatsRow> = {}): StatsRow {
     promptTokens: 100,
     completionTokens: 50,
     costUsd: 0.01,
+    estimatedUsd: 0,
     latencyMsTotal: 1000,
     ...partial,
   };
@@ -108,6 +114,7 @@ describe('totals', () => {
   it('sums everything, and splits requests into free and paid', () => {
     expect(totalsOf(rows)).toEqual({
       costUsd: 0.4,
+      estimatedUsd: 0,
       requests: 10,
       runs: 8,
       errors: 1,
@@ -389,5 +396,121 @@ describe('series summary', () => {
     expect(seriesSummary('Requests', days, [], label, String)).toBe(
       'Requests: no data in this period.',
     );
+  });
+});
+
+describe('estimated spend', () => {
+  const days = ['2026-10-01', '2026-10-02', '2026-10-03'];
+
+  it('sums the estimated part with the totals and the groups', () => {
+    const rows = [
+      row({ tool: 'chat', costUsd: 0.4, estimatedUsd: 0.1 }),
+      row({ tool: 'chat', costUsd: 0.2, estimatedUsd: 0 }),
+      row({ tool: 'ocr', costUsd: 0.3, estimatedUsd: 0.3 }),
+    ];
+    expect(totalsOf(rows).estimatedUsd).toBeCloseTo(0.4);
+    expect(groupBy(rows, 'tool').map((g) => [g.id, g.costUsd, g.estimatedUsd])).toEqual([
+      ['chat', expect.closeTo(0.6) as number, expect.closeTo(0.1) as number],
+      ['ocr', 0.3, 0.3],
+    ]);
+    expect(totalsOf([]).estimatedUsd).toBe(0);
+  });
+
+  it('marks a figure that includes an estimate with ≈, and leaves exact ones alone', () => {
+    expect(markEstimate('$1.65', 0.3)).toBe('≈ $1.65');
+    expect(markEstimate('$1.65', 0)).toBe('$1.65');
+  });
+
+  it('carries the estimated part of each day through the spend series, folded into Other too', () => {
+    const rows = [
+      row({ day: '2026-10-01', tool: 'chat', costUsd: 1, estimatedUsd: 0.25 }),
+      row({ day: '2026-10-01', tool: 'chat', model: 'm2', costUsd: 1, estimatedUsd: 0.25 }),
+      row({ day: '2026-10-03', tool: 'chat', costUsd: 2 }),
+    ];
+    const [chat] = timeSeries(rows, days, 'tool', 'costUsd');
+    expect(chat!.values).toEqual([2, 0, 2]);
+    expect(chat!.estimated).toEqual([0.5, 0, 0]);
+    // The requests series has no estimated part.
+    expect(timeSeries(rows, days, 'tool', 'requests')[0]!.estimated).toEqual([0, 0, 0]);
+
+    const many = Array.from({ length: 9 }, (_, i) =>
+      row({ model: `m${i}`, costUsd: 10 - i, estimatedUsd: i === 8 ? 1 : 0 }),
+    );
+    const other = timeSeries(many, days, 'model', 'costUsd').find((s) => s.id === OTHER);
+    expect(other?.estimated).toEqual([1, 0, 0]);
+  });
+
+  it('marks estimated cells and totals in the table view, and says so in the summary', () => {
+    const series = [
+      { id: 'chat', slot: 0, values: [1, 0, 2], total: 3, estimated: [0.5, 0, 0] },
+      { id: 'ocr', slot: 1, values: [0.5, 0, 0], total: 0.5, estimated: [0, 0, 0] },
+    ];
+    const format = (value: number): string => `$${value}`;
+    expect(seriesTable(days, series, String, format).body).toEqual([
+      ['Oct 1', '≈ $1', '$0.5', '≈ $1.5'],
+      ['Oct 3', '$2', '$0', '$2'],
+    ]);
+    expect(seriesSummary('Spend', days, series, String, format)).toContain(
+      'Includes estimated costs.',
+    );
+    expect(seriesSummary('Spend', days, [{ ...series[1]! }], String, format)).not.toContain(
+      'estimated',
+    );
+  });
+});
+
+describe('hidden series', () => {
+  it('forgets hidden series when the legend goes away (a lone series is always shown)', () => {
+    expect(pruneHidden(new Set(['a']), ['a'])).toEqual(new Set());
+    expect(pruneHidden(new Set(['a', 'b']), [])).toEqual(new Set());
+  });
+
+  it('keeps the hidden series that are still in a legend, and drops the ones that left', () => {
+    expect(pruneHidden(new Set(['a', 'gone']), ['a', 'b'])).toEqual(new Set(['a']));
+    expect(pruneHidden(new Set(), ['a', 'b'])).toEqual(new Set());
+  });
+});
+
+describe('relative ranges roll over', () => {
+  const custom = { from: '2026-01-01', to: '2026-01-31' };
+
+  it('recomputes the presets from the current time, and leaves custom ranges alone', () => {
+    const before = Date.UTC(2026, 9, 3, 23, 59, 59);
+    const after = Date.UTC(2026, 9, 4, 0, 0, 1);
+    expect(resolveRange('7d', custom, before)).toEqual({ from: '2026-09-27', to: '2026-10-03' });
+    expect(resolveRange('7d', custom, after)).toEqual({ from: '2026-09-28', to: '2026-10-04' });
+    expect(resolveRange('custom', custom, after)).toBe(custom);
+  });
+
+  it('this month starts over at the end of the month, and so does the range before it', () => {
+    const last = Date.UTC(2026, 9, 31, 23, 59, 59);
+    const first = Date.UTC(2026, 10, 1, 0, 0, 1);
+    expect(resolveRange('month', custom, last)).toEqual({ from: '2026-10-01', to: '2026-10-31' });
+    const november = resolveRange('month', custom, first);
+    expect(november).toEqual({ from: '2026-11-01', to: '2026-11-01' });
+    expect(previousRange(november)).toEqual({ from: '2026-10-31', to: '2026-10-31' });
+  });
+});
+
+describe('reading one ledger', () => {
+  const rows = [
+    row({ day: '2026-09-30', costUsd: 1 }),
+    row({ day: '2026-10-01', costUsd: 2 }),
+    row({ day: '2026-10-03', costUsd: 4 }),
+    row({ day: '2026-10-03', keyId: 'k2', costUsd: 8, free: true, requests: 5 }),
+  ];
+
+  it('picks the rows of a range, both days included', () => {
+    expect(rowsIn(rows, { from: '2026-10-01', to: '2026-10-03' })).toHaveLength(3);
+    expect(rowsIn(rows, { from: '2026-10-02', to: '2026-10-02' })).toEqual([]);
+    expect(rowsIn(rows, ALL_TIME)).toHaveLength(4);
+  });
+
+  it('derives the month, a key and today from it', () => {
+    const month = rowsIn(rows, presetRange('month', Date.UTC(2026, 9, 3, 12)));
+    expect(totalsOf(month).costUsd).toBeCloseTo(14);
+    expect(totalsOf(month.filter((r) => r.keyId === 'k2')).costUsd).toBe(8);
+    const today = rowsIn(rows, { from: '2026-10-03', to: '2026-10-03' });
+    expect(totalsOf(today).freeRequests).toBe(5);
   });
 });

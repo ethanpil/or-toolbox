@@ -5,7 +5,7 @@
  *
  * Call after the page has loaded once (the app creates the database at page start).
  */
-import type { Page } from '@playwright/test';
+import type { BrowserContext, Page } from '@playwright/test';
 import type { RunRecord, StatsRow } from '../../src/core/types';
 
 export const DAY_MS = 86_400_000;
@@ -83,10 +83,39 @@ export function makeStats(day: string, partial: Partial<StatsRow> = {}): StatsRo
     promptTokens: 1000,
     completionTokens: 500,
     costUsd: 0.01,
+    estimatedUsd: 0,
     latencyMsTotal: 1000,
     ...partial,
   };
 }
+
+/** Records every index the page reads (`store.index(...)` queries), as `window.__indexReads`: `stats.model`, `stats.day`. */
+export async function recordIndexReads(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    const reads: string[] = [];
+    (window as unknown as { __indexReads: string[] }).__indexReads = reads;
+    const prototype = IDBIndex.prototype as unknown as Record<
+      string,
+      (...args: unknown[]) => unknown
+    >;
+    for (const method of ['getAll', 'get', 'openCursor', 'count', 'getAllKeys'] as const) {
+      const original = prototype[method]!;
+      prototype[method] = function (this: IDBIndex, ...args: unknown[]) {
+        reads.push(`${this.objectStore.name}.${this.name}`);
+        return original.apply(this, args);
+      };
+    }
+  });
+}
+
+/** The indexes read so far (needs `recordIndexReads`). */
+export const indexReads = (page: Page): Promise<string[]> =>
+  page.evaluate(() => (window as unknown as { __indexReads?: string[] }).__indexReads ?? []);
+
+export const clearIndexReads = (page: Page): Promise<void> =>
+  page.evaluate(() => {
+    (window as unknown as { __indexReads?: string[] }).__indexReads?.splice(0);
+  });
 
 /** Writes runs and stats rows, then tells the open pages (live updates). */
 export async function seedDb(

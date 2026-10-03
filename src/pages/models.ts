@@ -19,8 +19,10 @@ import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
 import { mountPage } from '../ui/shell/index';
 import { whenVisible } from './lazy';
+import { ALL_TIME } from './stats-logic';
 import {
   activeFilterCount,
+  hiddenByPriceLimit,
   CAPABILITY_FILTERS,
   capabilityBadge,
   compareSections,
@@ -33,14 +35,17 @@ import {
   type ModelUsage,
   NO_FILTERS,
   parseQuery,
-  priceText,
+  priceLines,
   queryModels,
+  usageByModel,
   usageText,
 } from './models-logic';
 
 const VIEW_KEY = 'models.view';
 const PAGE_SIZE = 48;
 const MAX_COMPARE = 4;
+/** Typing waits this long before the list is filtered again (the same in every searchable list). */
+const SEARCH_DEBOUNCE_MS = 150;
 
 type View = 'cards' | 'table';
 
@@ -74,7 +79,10 @@ class ModelsPage {
   private checks = new Map<string, HTMLInputElement>();
   private stars = new Map<string, HTMLButtonElement>();
   private usageSlots: { id: string; element: HTMLElement }[] = [];
-  private usageCache = new Map<string, Promise<ModelUsage>>();
+  /** Your own use of every model, from one read of the ledger (rebuilt when the ledger changes). */
+  private usageMap = new Map<string, ModelUsage>();
+  private usageReady = false;
+  private usageGeneration = 0;
   private rows: HTMLElement | null = null;
 
   private readonly ids = {
@@ -158,6 +166,11 @@ class ModelsPage {
     hidden: true,
     'data-testid': 'models-recent',
   });
+  private readonly priceNote = h('p', {
+    class: 'small text-body-secondary mb-2',
+    hidden: true,
+    'data-testid': 'models-price-note',
+  });
   private readonly list = h('div', { tabIndex: -1, 'data-testid': 'models-list' });
   private readonly moreSlot = h('div', { class: 'text-center py-3' });
   private readonly resetButton: HTMLButtonElement;
@@ -239,6 +252,7 @@ class ModelsPage {
       this.recent,
       h('h2', { class: 'visually-hidden' }, 'Models'),
       this.count,
+      this.priceNote,
       this.list,
       this.moreSlot,
       this.tray,
@@ -248,13 +262,11 @@ class ModelsPage {
     this.renderRecent();
     this.renderTray();
     this.showSkeleton();
+    void this.loadUsage();
     void this.load();
 
     this.core.bus.on('models-refreshed', () => void this.reload());
-    this.core.stats.subscribe(() => {
-      this.usageCache.clear();
-      for (const slot of this.usageSlots) if (slot.element.isConnected) this.fillUsage(slot);
-    });
+    this.core.stats.subscribe(() => void this.loadUsage());
     this.core.settings.subscribe((next, prev) => {
       const favouritesChanged = next.models.favourites.join() !== prev.models.favourites.join();
       if (favouritesChanged) {
@@ -346,7 +358,7 @@ class ModelsPage {
     let timer: ReturnType<typeof setTimeout> | undefined;
     this.search.addEventListener('input', () => {
       clearTimeout(timer);
-      timer = setTimeout(() => this.readControls(), 120);
+      timer = setTimeout(() => this.readControls(), SEARCH_DEBOUNCE_MS);
     });
     this.search.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && this.search.value) {
@@ -368,7 +380,7 @@ class ModelsPage {
     }
     this.maxPrice.addEventListener('input', () => {
       clearTimeout(timer);
-      timer = setTimeout(() => this.readControls(), 200);
+      timer = setTimeout(() => this.readControls(), SEARCH_DEBOUNCE_MS);
     });
   }
 
@@ -621,6 +633,12 @@ class ModelsPage {
     const found = this.visible.length;
     this.count.textContent =
       found === total ? plural(total, 'model') : `${found} of ${plural(total, 'model')} match`;
+    const hidden = hiddenByPriceLimit(this.models, this.filters, this.favouriteSet());
+    this.priceNote.hidden = hidden === 0;
+    this.priceNote.textContent =
+      hidden === 0
+        ? ''
+        : `The price limit compares per-token prices. ${plural(hidden, 'model')} billed per image, hour of audio, character or request ${hidden === 1 ? 'is' : 'are'} not shown while it is set.`;
 
     if (found === 0) {
       this.list.replaceChildren(
@@ -666,7 +684,7 @@ class ModelsPage {
           { class: 'card shadow-sm' },
           h(
             'div',
-            { class: 'table-responsive' },
+            { class: 'table-responsive position-relative' },
             h(
               'table',
               {
@@ -778,7 +796,7 @@ class ModelsPage {
         'button',
         {
           type: 'button',
-          class: 'btn btn-sm btn-link py-0 px-1 flex-shrink-0',
+          class: 'btn btn-sm btn-link or-icon-button flex-shrink-0',
           'aria-label': `Copy model id ${model.id}`,
           title: 'Copy model id',
           'data-testid': 'model-copy',
@@ -843,27 +861,48 @@ class ModelsPage {
   }
 
   private usage(model: ModelInfo, className = 'small text-body-secondary'): HTMLElement {
-    const element = h('span', { class: className, 'data-testid': 'model-usage' }, '…');
+    const element = h('span', { class: className, 'data-testid': 'model-usage' });
     const slot = { id: model.id, element };
     this.usageSlots.push(slot);
-    this.fillUsage(slot);
+    this.paintUsage(slot);
     return element;
   }
 
-  private fillUsage(slot: { id: string; element: HTMLElement }): void {
-    let promise = this.usageCache.get(slot.id);
-    if (!promise) {
-      promise = this.core.stats.modelSummary(slot.id);
-      this.usageCache.set(slot.id, promise);
+  private paintUsage(slot: { id: string; element: HTMLElement }): void {
+    const usage = this.usageMap.get(slot.id);
+    slot.element.textContent = this.usageReady ? usageText(usage) : '…';
+    slot.element.dataset.runs = String(usage?.runs ?? 0);
+  }
+
+  /** One read of the whole ledger serves every card (and the comparison); repaints the cards on screen. */
+  private async loadUsage(): Promise<void> {
+    const mine = ++this.usageGeneration;
+    let usage = new Map<string, ModelUsage>();
+    try {
+      usage = usageByModel(await this.core.stats.rows(ALL_TIME));
+    } catch {
+      // Cards say "Not used yet".
     }
-    promise.then(
-      (usage) => {
-        slot.element.textContent = usageText(usage);
-        slot.element.dataset.runs = String(usage.runs);
-      },
-      () => {
-        slot.element.textContent = '—';
-      },
+    if (mine !== this.usageGeneration) return;
+    this.usageMap = usage;
+    this.usageReady = true;
+    for (const slot of this.usageSlots) if (slot.element.isConnected) this.paintUsage(slot);
+  }
+
+  /** The price in the model's own unit, with extra lines for audio tokens and image output. */
+  private priceNode(model: ModelInfo): HTMLElement {
+    const { text, extras } = priceLines(model);
+    return h(
+      'span',
+      { class: 'd-block' },
+      h('span', { 'data-testid': 'model-price' }, text),
+      extras.map((line) =>
+        h(
+          'span',
+          { class: 'd-block small text-body-secondary', 'data-testid': 'model-price-extra' },
+          line,
+        ),
+      ),
     );
   }
 
@@ -904,7 +943,7 @@ class ModelsPage {
             'dl',
             { class: 'row small mb-0' },
             fact('Provider', model.author || '—'),
-            fact('Price', h('span', { 'data-testid': 'model-price' }, priceText(model))),
+            fact('Price', this.priceNode(model)),
             fact('Context', context ? context.replace(' context', ' tokens') : '—'),
           ),
         ),
@@ -933,7 +972,7 @@ class ModelsPage {
       ),
       h('td', null, model.author || '—'),
       h('td', null, this.badges(model)),
-      h('td', { class: 'small', 'data-testid': 'model-price' }, priceText(model)),
+      h('td', { class: 'small' }, this.priceNode(model)),
       h('td', { class: 'small text-nowrap' }, context ? context.replace(' context', '') : '—'),
       h('td', null, this.usage(model)),
     );
@@ -1051,7 +1090,7 @@ class ModelsPage {
               h('span', { class: 'text-truncate' }, model.name),
               h('button', {
                 type: 'button',
-                class: 'btn-close btn-sm',
+                class: 'btn-close or-chip-close',
                 'aria-label': `Remove ${model.name} from the comparison`,
                 onclick: () => {
                   this.toggleCompare(model, false);
@@ -1070,7 +1109,7 @@ class ModelsPage {
             class: 'btn btn-primary btn-sm',
             disabled: selected.length < 2,
             'data-testid': 'compare-open',
-            onclick: () => void this.openComparison(selected),
+            onclick: () => this.openComparison(selected),
           },
           icon('columns-gap', 'me-1'),
           'Compare',
@@ -1093,18 +1132,8 @@ class ModelsPage {
     );
   }
 
-  private async openComparison(models: ModelInfo[]): Promise<void> {
-    const usage = new Map<string, ModelUsage>();
-    await Promise.all(
-      models.map(async (model) => {
-        try {
-          usage.set(model.id, await this.core.stats.modelSummary(model.id));
-        } catch {
-          // Shown as "Not used yet".
-        }
-      }),
-    );
-    const sections = compareSections(models, usage);
+  private openComparison(models: ModelInfo[]): void {
+    const sections = compareSections(models, this.usageMap);
     const columns = models.length;
     const table = h(
       'table',
@@ -1177,7 +1206,7 @@ class ModelsPage {
       body: h(
         'div',
         {
-          class: 'table-responsive',
+          class: 'table-responsive position-relative',
           role: 'region',
           tabIndex: 0,
           'aria-label': 'Comparison table',

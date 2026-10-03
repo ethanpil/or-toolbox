@@ -18,6 +18,9 @@ export interface DateRange {
   to: string;
 }
 
+/** Every day the ledger can hold: one read of it serves a whole page. */
+export const ALL_TIME: DateRange = { from: '0000-01-01', to: '9999-12-31' };
+
 export const RANGE_PRESETS: readonly { id: Exclude<RangePreset, 'custom'>; label: string }[] = [
   { id: '7d', label: '7 days' },
   { id: '30d', label: '30 days' },
@@ -46,6 +49,23 @@ export function presetRange(
   if (preset === 'month') return { from: utcMonthStart(now), to };
   const days = preset === '7d' ? 7 : preset === '30d' ? 30 : 90;
   return { from: utcDay(now - (days - 1) * DAY_MS), to };
+}
+
+/**
+ * The range for a preset, from the current time: a relative range (7, 30, 90 days, this month) is recomputed on
+ * every load, so a page left open rolls over at UTC midnight and at the end of the month. A custom range is kept.
+ */
+export function resolveRange(
+  preset: RangePreset,
+  custom: DateRange,
+  now: number = Date.now(),
+): DateRange {
+  return preset === 'custom' ? custom : presetRange(preset, now);
+}
+
+/** The rows of one range (both days included) out of a ledger already read: one read serves the whole page. */
+export function rowsIn(rows: readonly StatsRow[], range: DateRange): StatsRow[] {
+  return rows.filter((row) => row.day >= range.from && row.day <= range.to);
 }
 
 /** Number of days in a range, inclusive; 0 for a reversed or unreadable one. */
@@ -112,6 +132,8 @@ export function shortDay(day: string): string {
 
 export interface Totals {
   costUsd: number;
+  /** The part of `costUsd` that is an estimate (see `StatsRow.estimatedUsd`). */
+  estimatedUsd: number;
   requests: number;
   runs: number;
   errors: number;
@@ -124,6 +146,7 @@ export interface Totals {
 
 const emptyTotals = (): Totals => ({
   costUsd: 0,
+  estimatedUsd: 0,
   requests: 0,
   runs: 0,
   errors: 0,
@@ -136,6 +159,7 @@ const emptyTotals = (): Totals => ({
 
 function add(into: Totals, row: StatsRow): void {
   into.costUsd += row.costUsd;
+  into.estimatedUsd += row.estimatedUsd ?? 0;
   into.requests += row.requests;
   into.runs += row.runs;
   into.errors += row.errors;
@@ -151,6 +175,10 @@ export function totalsOf(rows: readonly StatsRow[]): Totals {
   for (const row of rows) add(totals, row);
   return totals;
 }
+
+/** A money figure that includes estimates reads `≈ $1.65`; an exact one is left as it is. */
+export const markEstimate = (text: string, estimatedUsd: number): string =>
+  estimatedUsd > 0 ? `≈ ${text}` : text;
 
 /** Failed runs per run, or null when nothing ran. */
 export const errorRate = (totals: Pick<Totals, 'errors' | 'runs'>): number | null =>
@@ -222,6 +250,8 @@ export interface Series {
   /** One value per day of the range. */
   values: number[];
   total: number;
+  /** For the spend metric, the part of each day's value that is an estimate (absent or 0: all of it is exact). */
+  estimated?: number[];
 }
 
 export const OTHER = '__other__';
@@ -275,6 +305,7 @@ export function timeSeries(
 ): Series[] {
   const index = new Map(days.map((day, position) => [day, position]));
   const byId = new Map<string, number[]>();
+  const estimatedById = new Map<string, number[]>();
   const totals = new Map<string, { metric: number; other: number }>();
   const otherMetric: Metric = metric === 'costUsd' ? 'requests' : 'costUsd';
 
@@ -286,9 +317,14 @@ export function timeSeries(
     if (!values) {
       values = new Array<number>(days.length).fill(0);
       byId.set(id, values);
+      estimatedById.set(id, new Array<number>(days.length).fill(0));
       totals.set(id, { metric: 0, other: 0 });
     }
     values[position] = (values[position] ?? 0) + row[metric];
+    if (metric === 'costUsd') {
+      const estimated = estimatedById.get(id)!;
+      estimated[position] = (estimated[position] ?? 0) + (row.estimatedUsd ?? 0);
+    }
     const total = totals.get(id)!;
     total.metric += row[metric];
     total.other += row[otherMetric];
@@ -311,17 +347,38 @@ export function timeSeries(
     slot: slots.get(id) ?? null,
     values: byId.get(id)!,
     total: totals.get(id)!.metric,
+    estimated: estimatedById.get(id)!,
   }));
   if (rest.length > 0) {
     const values = new Array<number>(days.length).fill(0);
+    const estimated = new Array<number>(days.length).fill(0);
     for (const id of rest) {
       byId.get(id)!.forEach((value, position) => {
         values[position] = (values[position] ?? 0) + value;
       });
+      estimatedById.get(id)!.forEach((value, position) => {
+        estimated[position] = (estimated[position] ?? 0) + value;
+      });
     }
-    series.push({ id: OTHER, slot: null, values, total: values.reduce((a, b) => a + b, 0) });
+    series.push({
+      id: OTHER,
+      slot: null,
+      values,
+      total: values.reduce((a, b) => a + b, 0),
+      estimated,
+    });
   }
   return series;
+}
+
+/**
+ * The hidden series that may stay hidden. A legend is only drawn for two or more series, and it is the only way to
+ * show a series again, so with fewer than two everything is shown; a series that left the chart is forgotten.
+ */
+export function pruneHidden(hidden: ReadonlySet<string>, ids: readonly string[]): Set<string> {
+  if (ids.length < 2) return new Set();
+  const present = new Set(ids);
+  return new Set([...hidden].filter((id) => present.has(id)));
 }
 
 export interface TokenBar {
@@ -349,7 +406,7 @@ export function tokensByModel(rows: readonly StatsRow[], limit = 8): TokenBar[] 
 
 /**
  * The table twin of a time chart: a header row (Day, one column per series, Total), a row per day that has
- * data (days with nothing add nothing to read), formatted by `format`.
+ * data (days with nothing add nothing to read), formatted by `format`; a figure that includes estimates is marked ≈.
  */
 export function seriesTable(
   days: readonly string[],
@@ -361,12 +418,14 @@ export function seriesTable(
   const body: string[][] = [];
   days.forEach((day, position) => {
     const values = series.map((s) => s.values[position] ?? 0);
+    const estimates = series.map((s) => s.estimated?.[position] ?? 0);
     const total = values.reduce((a, b) => a + b, 0);
     if (total === 0) return;
+    const estimatedTotal = estimates.reduce((a, b) => a + b, 0);
     body.push([
       shortDay(day),
-      ...values.map(format),
-      ...(series.length > 1 ? [format(total)] : []),
+      ...values.map((value, i) => markEstimate(format(value), estimates[i] ?? 0)),
+      ...(series.length > 1 ? [markEstimate(format(total), estimatedTotal)] : []),
     ]);
   });
   return { head, body };
@@ -441,6 +500,9 @@ export function seriesSummary(
     `${title}: ${format(total)} over ${active} active ${active === 1 ? 'day' : 'days'}.`,
     `Busiest day ${shortDay(days[peak] ?? '')} with ${format(perDay[peak] ?? 0)}.`,
     series.length > 1 ? `Largest series ${label(biggest.id)} with ${format(biggest.total)}.` : '',
+    series.some((s) => (s.estimated ?? []).some((value) => value > 0))
+      ? 'Includes estimated costs.'
+      : '',
     'The table view lists every value.',
   ]
     .filter(Boolean)
