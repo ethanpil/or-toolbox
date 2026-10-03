@@ -5,6 +5,7 @@
  * answers land in a review grid where they can be corrected; exports read the corrected values. One run per
  * batch, its output the JSON of the results (checkpointed as documents finish).
  */
+import type { ChatRequest, ChatResponse } from '../../core/api/types';
 import { ApiError, errorCode, InvalidInputError, userMessage } from '../../core/errors';
 import { toJsonBlob } from '../../core/export/table';
 import { runPool } from '../../core/pool';
@@ -22,18 +23,22 @@ import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
 import { imageViewer } from '../../ui/components/image-viewer';
 import { h, replace } from '../../ui/dom';
 import { confirmDialog, promptDialog } from '../../ui/feedback/dialogs';
+import { announce } from '../../ui/feedback/announce';
 import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
 import { openModal } from '../../ui/feedback/modal';
 import { toast } from '../../ui/feedback/toast';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
+import type { Runner, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
 import { schemaBuilder } from './builder';
 import {
   buildRequest,
   estimateDocumentTokens,
+  fallbackMode,
+  isUnsupportedStrict,
   MAX_PAGES_PER_REQUEST,
+  type OutputMode,
   outputMode,
   parseAnswer,
   repairRequest,
@@ -479,6 +484,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     },
     onRetry: (doc) => retry([doc.key]),
     onSource: (doc) => void showSource(doc),
+    retryBlocked: () => runBlocked(),
   });
   const gridBox = h('div', { hidden: true }, grid.element);
   const empty = emptyState({
@@ -499,6 +505,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       type: 'button',
       class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
       hidden: true,
+      'data-retry': '',
       'data-testid': 'de-retry-failed',
       onclick: () =>
         retry(
@@ -729,25 +736,49 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
 
   const json = (): string => JSON.stringify(jsonResults(results), null, 2);
 
-  const extractOne = async (
+  /** The structured-output mode of the batch being extracted; strict mode can drop to JSON mode mid-batch. */
+  interface BatchMode {
+    mode: OutputMode;
+    supported: readonly string[];
+  }
+
+  const requestFor = (
     run: RunHandle,
-    unit: Unit,
     doc: DocResult,
-    mode: ReturnType<typeof outputMode>,
-  ): Promise<void> => {
-    const pages: PageInput[] = [];
-    for (const ref of unit.refs) pages.push(await docs.loadPage(ref));
-    const body = buildRequest(
+    pages: readonly PageInput[],
+    batch: BatchMode,
+  ): ChatRequest =>
+    buildRequest(
       run.model,
       gridFields,
       { fileName: doc.fileName, pages },
       {
         instructions: prompt.value,
-        mode,
+        mode: batch.mode,
         textHint: textHint.checked,
+        supported: batch.supported,
       },
     );
-    const first = await ctx.api.chat(body, { run });
+
+  const extractOne = async (
+    run: RunHandle,
+    unit: Unit,
+    doc: DocResult,
+    batch: BatchMode,
+  ): Promise<void> => {
+    const pages: PageInput[] = [];
+    for (const ref of unit.refs) pages.push(await docs.loadPage(ref));
+    let body = requestFor(run, doc, pages, batch);
+    let first: ChatResponse;
+    try {
+      first = await ctx.api.chat(body, { run });
+    } catch (error) {
+      // No provider serves the strict request: carry on (this document and the rest) in JSON mode.
+      if (body.response_format?.type !== 'json_schema' || !isUnsupportedStrict(error)) throw error;
+      if (batch.mode === 'schema') batch.mode = fallbackMode(batch.supported);
+      body = requestFor(run, doc, pages, batch);
+      first = await ctx.api.chat(body, { run });
+    }
     const answer = first.choices[0]?.message.content ?? '';
     let parsed = parseAnswer(gridFields, answer);
     if (!parsed.ok) {
@@ -761,19 +792,50 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     doc.edited = [];
   };
 
-  let retryKeys: string[] | null = null;
-  const retry = (keys: string[]): void => {
-    if (runner.busy || keys.length === 0) return;
-    retryKeys = keys;
-    void runner.trigger();
+  /** The documents a Retry asks for; `run` takes them the moment the runner starts it (see `retry`). */
+  let pendingRetry: string[] | null = null;
+
+  /** Why Run cannot start now (busy, or disabled with a reason); null when it can. */
+  function runBlocked(): string | null {
+    if (runner.busy) return 'Wait until the current run ends.';
+    if (runner.button.getAttribute('aria-disabled') !== 'true') return null;
+    return (
+      runner.element.querySelector('[data-testid="run-hint"]')?.textContent?.trim() ||
+      'Extracting is not possible right now.'
+    );
+  }
+
+  /** Brings every Retry button in line with the runner (Run disabled or busy disables them, with the reason). */
+  const syncRetryButtons = (): void => {
+    const reason = runBlocked();
+    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]')) {
+      button.setAttribute('aria-disabled', String(reason !== null));
+      button.classList.toggle('disabled', reason !== null);
+      button.title = reason ?? '';
+    }
   };
 
+  function retry(keys: string[]): void {
+    const blocked = runBlocked();
+    if (blocked) {
+      announce(blocked);
+      return;
+    }
+    if (keys.length === 0) return;
+    pendingRetry = keys;
+    void runner.trigger();
+    // The runner calls `run` synchronously when it starts; if it did not start, these keys must not wait around to
+    // turn a later Run press into a retry.
+    pendingRetry = null;
+  }
+
   const run = async (signal: AbortSignal): Promise<void> => {
-    const keys = retryKeys;
-    retryKeys = null;
+    const keys = pendingRetry;
+    pendingRetry = null;
     let plan: Unit[];
     if (keys) {
       plan = keys.flatMap((key) => units.get(key) ?? []);
+      if (plan.length === 0) return;
     } else {
       if (!builder.validate()) {
         setBuilderOpen(true);
@@ -785,6 +847,32 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         ui.status(docs.files().length ? 'Choose at least one page.' : 'Add a document first.');
         return;
       }
+    }
+
+    const model = ctx.model().model;
+    const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
+    const supported = info?.supportedParameters ?? [];
+    const batchMode: BatchMode = { mode: outputMode(supported), supported };
+    const firstFile = plan[0]!.refs[0]!.fileName;
+    const files = new Set(plan.map((unit) => unit.refs[0]!.fileName));
+    let runHandle: RunHandle;
+    try {
+      runHandle = await ctx.beginRun(
+        {
+          title: `${keys ? 'Retry: ' : ''}${firstFile}${files.size > 1 ? ` and ${plural(files.size - 1, 'more file')}` : ''}`,
+          ...(keys && model ? { estimateUsd: await estimateFor(plan, model) } : {}),
+        },
+        signal,
+      );
+    } catch (error) {
+      // Refused before anything was sent (no key, locked, free-only, budget, Cancel): the grid, its corrections and
+      // the statuses stay exactly as they were. A refused retry offers to retry the same documents.
+      if (keys && !isStop(error)) void presentError(error, { retry: () => retry(keys) });
+      throw error;
+    }
+
+    // The run is on: only now replace (or reset) what it extracts.
+    if (!keys) {
       gridFields = builder.fields();
       units = new Map(plan.map((unit) => [unit.key, unit]));
       results = plan.map((unit, index) => ({
@@ -803,37 +891,21 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       grid.render(results);
     }
     const batch = results.filter((doc) => plan.some((unit) => unit.key === doc.key));
+    const retryHadFocus = retryFailed.contains(document.activeElement);
     for (const doc of batch) {
       doc.status = 'queued';
       doc.error = null;
       grid.update(doc);
     }
-    renderSummary();
-
-    const model = ctx.model().model;
-    const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
-    const mode = outputMode(info?.supportedParameters ?? []);
-    const files = new Set(batch.map((doc) => doc.fileName));
-    let runHandle: RunHandle;
-    try {
-      runHandle = await ctx.beginRun(
-        {
-          title: `${keys ? 'Retry: ' : ''}${batch[0]!.fileName}${files.size > 1 ? ` and ${plural(files.size - 1, 'more file')}` : ''}`,
-          ...(keys && model ? { estimateUsd: await estimateFor(plan, model) } : {}),
-        },
-        signal,
-      );
-    } catch (error) {
-      for (const doc of batch) {
-        doc.status = 'stopped';
-        grid.update(doc);
-      }
-      renderSummary();
-      throw error;
-    }
-
     reading = true;
     renderSummary();
+    // "Retry failed" hides while reading: keep keyboard focus on the first document it retries.
+    if (retryHadFocus && batch[0]) {
+      grid.element
+        .querySelector<HTMLElement>(`[data-focus-key="source:${CSS.escape(batch[0].key)}"]`)
+        ?.focus();
+    }
+
     let lastError = null as Error | null; // assigned inside the pool callbacks
     try {
       try {
@@ -846,7 +918,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
             doc.status = 'running';
             grid.update(doc);
             try {
-              await extractOne(runHandle, unit, doc, mode);
+              await extractOne(runHandle, unit, doc, batchMode);
               doc.status = 'done';
             } catch (error) {
               if (isStop(error) || runHandle.signal.aborted) {
@@ -881,6 +953,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         const reason: unknown = runHandle.signal.reason;
         throw reason instanceof Error ? reason : abortError('Stopped.');
       }
+      // Only this run's documents decide whether it failed: a retry whose documents all fail again fails.
       const done = batch.filter((doc) => doc.status === 'done').length;
       if (done === 0 && lastError) {
         // Every row already shows its error: the runner need not show it again (unless it needs an action).
@@ -895,7 +968,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         meta: {
           documents: results.length,
           failed: results.filter((doc) => doc.status !== 'done').length,
-          mode,
+          mode: batchMode.mode,
         },
       });
     } catch (error) {
@@ -908,7 +981,15 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     }
   };
 
-  const runner = ui.runner({ label: 'Extract', icon: 'braces', run });
+  const runner: Runner = ui.runner({ label: 'Extract', icon: 'braces', run });
+  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry buttons.
+  new MutationObserver(syncRetryButtons).observe(runner.element, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['aria-disabled'],
+  });
   renderSchemaBar();
   renderSummary();
 

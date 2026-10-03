@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { ApiError } from '../../core/errors';
 import {
   buildRequest,
   estimateDocumentTokens,
+  fallbackMode,
+  isUnsupportedStrict,
   outputMode,
   parseAnswer,
   repairRequest,
@@ -87,6 +90,59 @@ describe('extraction requests', () => {
     );
     expect(plain.response_format).toBeUndefined();
     expect(systemPrompt(fields, '', 'prompt')).toContain('Answer with the JSON object only');
+  });
+
+  it('sends only parameters the model supports when routing requires them all', () => {
+    const strict = buildRequest(
+      'm',
+      fields,
+      { fileName: 'a.png', pages: [page] },
+      {
+        instructions: '',
+        mode: 'schema',
+        textHint: false,
+        supported: ['response_format', 'structured_outputs'],
+      },
+    );
+    expect(strict.provider).toEqual({ require_parameters: true });
+    expect(strict).not.toHaveProperty('temperature');
+    expect(strict).not.toHaveProperty('max_tokens');
+    const full = buildRequest(
+      'm',
+      fields,
+      { fileName: 'a.png', pages: [page] },
+      {
+        instructions: '',
+        mode: 'schema',
+        textHint: false,
+        supported: ['response_format', 'structured_outputs', 'temperature', 'max_tokens'],
+      },
+    );
+    expect(full).toMatchObject({ temperature: 0, max_tokens: 8192 });
+  });
+
+  it('tells the model that a required field it cannot find is null', () => {
+    const system = systemPrompt(fields, '', 'schema');
+    expect(system).toMatch(/required fields too/i);
+    expect(system).toMatch(/use null for anything the document does not show/);
+  });
+
+  it('recognises a strict request no provider can serve, and the mode to fall back to', () => {
+    expect(
+      isUnsupportedStrict(
+        new ApiError('No endpoints found that can handle the requested parameters.', 404),
+      ),
+    ).toBe(true);
+    expect(
+      isUnsupportedStrict(
+        new ApiError('This model does not support response_format json_schema', 400),
+      ),
+    ).toBe(true);
+    expect(isUnsupportedStrict(new ApiError('Not found on OpenRouter.', 404))).toBe(false);
+    expect(isUnsupportedStrict(new ApiError('Rate limited', 429))).toBe(false);
+    expect(isUnsupportedStrict(new Error('No endpoints found'))).toBe(false);
+    expect(fallbackMode(['response_format', 'structured_outputs'])).toBe('json');
+    expect(fallbackMode(['structured_outputs'])).toBe('prompt');
   });
 
   it('asks once more, with the bad answer and the problem, when the answer was not usable', () => {

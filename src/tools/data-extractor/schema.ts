@@ -175,7 +175,9 @@ function scalarSchema(
 }
 
 function fieldSchema(field: FieldDef): Record<string, unknown> {
-  const nullable = !field.required;
+  // Required fields too: a document that does not show the value must be able to say so (null), or the model
+  // is forced to invent one and "Required, but not found" can never be flagged.
+  const nullable = true;
   const description = describe(field.type, field.description);
   switch (field.type) {
     case 'enum': {
@@ -217,7 +219,8 @@ function fieldSchema(field: FieldDef): Record<string, unknown> {
 
 /**
  * The JSON Schema of one document's answer, written for strict structured outputs: every property is listed in
- * `required`, optional ones may be `null`, and no other properties are allowed.
+ * `required` and may be `null` (whether the field is required is checked after the answer, not by the model), and
+ * no other properties are allowed.
  */
 export function toJsonSchema(fields: readonly FieldDef[]): Record<string, unknown> {
   return {
@@ -240,12 +243,23 @@ export interface Normalized {
 
 const CURRENCY_MARKS = /[$€£¥₹₩₽₺₪฿₫₦₴₱]|\b[A-Z]{3}\b|\b(?:USD|EUR|GBP|CHF|JPY|CAD|AUD)\b/gi;
 
+/** A number read from text, and why it may be wrong when the text could mean another one. */
+export interface ReadNumber {
+  value: number;
+  /** Set when the text could also mean another number (`1.234`: 1234 or 1.234). */
+  doubtful?: string;
+}
+
 /**
- * A number as people write it on documents: `1,234.56`, `1.234,56`, `1 234,56`, `1'234.50`, `$12.00`, `(12.00)`
- * and `12.00-` (negative), `€ 5`. Null when it is not a number.
+ * A number as people write it on documents: `1,234.56`, `1.234,56`, `1 234,56`, `1'234.50`, `$12.00`, `(12.00)`,
+ * `12.00-` and `(-12.00)` (negative), `€ 5`, `1,23,456` (Indian grouping). Null when it is not a number.
+ *
+ * One separator followed by exactly three digits (`1.234`, `1,234`, `€1.000`) is read as a thousands separator, the
+ * likelier meaning on a document, but marked `doubtful` (it could be a decimal mark). After a lone `0` a separator
+ * is always a decimal mark (`0,500`).
  */
-export function parseNumber(input: unknown): number | null {
-  if (typeof input === 'number') return Number.isFinite(input) ? input : null;
+export function readNumber(input: unknown): ReadNumber | null {
+  if (typeof input === 'number') return Number.isFinite(input) ? { value: input } : null;
   if (typeof input !== 'string') return null;
   let text = input.trim();
   if (!text) return null;
@@ -255,35 +269,59 @@ export function parseNumber(input: unknown): number | null {
     text = text.slice(1, -1);
   }
   text = text.replace(CURRENCY_MARKS, '').replace(/[\s\u00a0\u202f']/g, '');
+  // A minus (before or after) makes it negative; written together with brackets it is still just negative.
   if (/^-/.test(text)) {
-    negative = !negative;
+    negative = true;
     text = text.slice(1);
   } else if (/-$/.test(text)) {
-    negative = !negative;
+    negative = true;
     text = text.slice(0, -1);
   } else if (/^\+/.test(text)) {
     text = text.slice(1);
   }
   if (!/^[\d.,]+$/.test(text) || !/\d/.test(text)) return null;
-  const lastComma = text.lastIndexOf(',');
-  const lastDot = text.lastIndexOf('.');
-  if (lastComma >= 0 && lastDot >= 0) {
-    // Both: the later one is the decimal mark.
-    const decimal = lastComma > lastDot ? ',' : '.';
+  let doubtful: string | undefined;
+  const commas = (text.match(/,/g) ?? []).length;
+  const dots = (text.match(/\./g) ?? []).length;
+  if (commas > 0 && dots > 0) {
+    // Both: the later one is the decimal mark, and it appears once.
+    const decimal = text.lastIndexOf(',') > text.lastIndexOf('.') ? ',' : '.';
     const thousands = decimal === ',' ? '.' : ',';
+    if ((decimal === ',' ? commas : dots) > 1) return null;
     text = text.split(thousands).join('').replace(decimal, '.');
-  } else if (lastComma >= 0) {
-    // Only commas: thousands when every group after the first has three digits, otherwise a decimal comma.
-    text = /^\d{1,3}(,\d{3})+$/.test(text) ? text.replace(/,/g, '') : text.replace(',', '.');
-  } else if ((text.match(/\./g) ?? []).length > 1) {
-    // 1.234.567: dots as thousands separators.
-    if (!/^\d{1,3}(\.\d{3})+$/.test(text)) return null;
-    text = text.replace(/\./g, '');
+  } else if (commas + dots > 1) {
+    // One kind, several times: thousands groups (1.234.567, 1,234,567, Indian 1,23,456).
+    const mark = commas ? ',' : '.';
+    const groups = text.split(mark);
+    const western = groups.slice(1).every((group) => group.length === 3);
+    const indian =
+      mark === ',' &&
+      groups.at(-1)?.length === 3 &&
+      groups.slice(1, -1).every((group) => group.length === 2);
+    if (!(western || indian) || !/^\d{1,3}$/.test(groups[0] ?? '')) return null;
+    text = groups.join('');
+  } else if (commas + dots === 1) {
+    const mark = commas ? ',' : '.';
+    const [whole = '', fraction = ''] = text.split(mark);
+    if (fraction.length === 3 && /^[1-9]\d{0,2}$/.test(whole)) {
+      // 1.234 / 1,234: a thousands separator most likely, but it could be a decimal mark.
+      const sign = negative ? '-' : '';
+      text = `${whole}${fraction}`;
+      doubtful = `Read as ${sign}${text}; it could also mean ${sign}${whole}.${fraction}.`;
+    } else {
+      text = `${whole}.${fraction}`;
+    }
   }
-  if (!/^\d*\.?\d*$/.test(text) || text === '.') return null;
+  if (!/^\d*\.?\d*$/.test(text) || text === '.' || text === '') return null;
   const value = Number(text);
   if (!Number.isFinite(value)) return null;
-  return negative ? -value : value;
+  const signed = negative && value !== 0 ? -value : value;
+  return doubtful ? { value: signed, doubtful } : { value: signed };
+}
+
+/** `readNumber`'s value (doubtful readings included); null when the text is not a number. */
+export function parseNumber(input: unknown): number | null {
+  return readNumber(input)?.value ?? null;
 }
 
 const MONTHS = [
@@ -379,10 +417,11 @@ export function normalizeValue(
       };
     case 'number':
     case 'currency': {
-      const value = parseNumber(raw);
-      if (value !== null)
-        return { value: definition.type === 'currency' ? Math.round(value * 1e6) / 1e6 : value };
-      return { value: asText(raw), issue: 'Not a number.' };
+      const read = readNumber(raw);
+      if (read === null) return { value: asText(raw), issue: 'Not a number.' };
+      const value =
+        definition.type === 'currency' ? Math.round(read.value * 1e6) / 1e6 : read.value;
+      return read.doubtful ? { value, issue: read.doubtful } : { value };
     }
     case 'date': {
       const value = parseDate(asText(raw));

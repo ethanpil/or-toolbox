@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatRequest, ChatResponse, RawModel } from '../../core/api/types';
+import { ApiError, FreeOnlyError, RunCancelledError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
@@ -180,6 +181,184 @@ describe('Data extractor tool', { timeout: 30_000 }, () => {
     const run = (await t.core.history.query({ tool: 'data-extractor' }))[0]!;
     expect(run.status).toBe('ok');
     expect(run.meta).toMatchObject({ documents: 2, failed: 1, mode: 'json' });
+  });
+
+  it('falls back to JSON mode for the batch when no provider serves the strict request', async () => {
+    const chat = vi.fn((body: ChatRequest) => {
+      if (body.response_format?.type === 'json_schema') {
+        return Promise.reject(
+          new ApiError('No endpoints found that can handle the requested parameters.', 404),
+        );
+      }
+      return Promise.resolve(
+        response('{"vendor_name":"A","invoice_date":"2026-01-02","total":1,"line_items":[]}'),
+      );
+    });
+    t = createToolTestContext(getTool('data-extractor'), {
+      catalog: [STRUCTURED],
+      modelOverride: 'test/structured',
+      api: { chat },
+    });
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { concurrency: 1 } });
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    await t.runners[0]!.trigger();
+    // One strict attempt, then JSON mode for that document and the rest of the batch.
+    expect(chat.mock.calls.map((call) => call[0].response_format?.type)).toEqual([
+      'json_schema',
+      'json_object',
+      'json_object',
+    ]);
+    expect($$(t.zones.output, 'de-row').map((row) => row.dataset['status'])).toEqual([
+      'done',
+      'done',
+    ]);
+    const run = (await t.core.history.query({ tool: 'data-extractor' }))[0]!;
+    expect(run.meta).toMatchObject({ mode: 'json' });
+  });
+
+  it('a refused run or retry leaves the grid and its corrections as they were', async () => {
+    const chat = vi.fn((body: ChatRequest) =>
+      fileOf(body) === 'b.png'
+        ? Promise.reject(new ApiError('Mocked error 400', 400))
+        : Promise.resolve(
+            response('{"vendor_name":"A","invoice_date":"2026-01-02","total":1,"line_items":[]}'),
+          ),
+    );
+    t = createToolTestContext(getTool('data-extractor'), {
+      catalog: [STRUCTURED],
+      modelOverride: 'test/structured',
+      api: { chat },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    await t.runners[0]!.trigger();
+    const vendor = t.zones.output.querySelector<HTMLInputElement>(
+      '[aria-label="Vendor name, document 1"]',
+    )!;
+    vendor.value = 'Corrected';
+    vendor.dispatchEvent(new Event('change'));
+    const snapshot = () => ({
+      rows: $$(t!.zones.output, 'de-row').map((row) => row.outerHTML),
+      summary: $$(t!.zones.output, 'de-summary')[0]?.textContent,
+    });
+    const before = snapshot();
+    expect(before.summary).toBe('1 of 2 documents extracted · 1 corrected · 1 failed');
+
+    t.ctx.beginRun = vi
+      .fn()
+      .mockRejectedValueOnce(new RunCancelledError())
+      .mockRejectedValueOnce(new FreeOnlyError(['test/structured']));
+    await t.runners[0]!.trigger();
+    expect(snapshot()).toEqual(before);
+    $$(t.zones.output, 'de-retry')[0]!.click();
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect(t.ctx.beginRun).toHaveBeenCalledTimes(2);
+    expect(snapshot()).toEqual(before);
+    expect(chat).toHaveBeenCalledTimes(2);
+  });
+
+  it('Retry: disabled with the reason while Run cannot start, and never kept for the next Run', async () => {
+    const failing = new Set(['b.png']);
+    const chat = vi.fn((body: ChatRequest) =>
+      failing.has(fileOf(body))
+        ? Promise.reject(new ApiError('Mocked error 400', 400))
+        : Promise.resolve(
+            response('{"vendor_name":"A","invoice_date":"2026-01-02","total":1,"line_items":[]}'),
+          ),
+    );
+    t = createToolTestContext(getTool('data-extractor'), {
+      catalog: [STRUCTURED],
+      modelOverride: 'test/structured',
+      api: { chat },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    await t.runners[0]!.trigger();
+
+    t.runners[0]!.setDisabled('Not now.');
+    await vi.waitFor(() =>
+      expect($$(t!.zones.output, 'de-retry')[0]?.getAttribute('aria-disabled')).toBe('true'),
+    );
+    expect($$(t.zones.output, 'de-retry')[0]?.title).toBe('Not now.');
+    expect($$(t.zones.output, 'de-retry-failed')[0]?.getAttribute('aria-disabled')).toBe('true');
+    $$(t.zones.output, 'de-retry')[0]!.click();
+    $$(t.zones.output, 'de-retry-failed')[0]!.click();
+    expect(chat).toHaveBeenCalledTimes(2);
+
+    t.runners[0]!.setDisabled(null);
+    failing.clear();
+    await t.runners[0]!.trigger();
+    // A full run of both documents, not the refused retry of b.png.
+    expect(chat).toHaveBeenCalledTimes(4);
+    expect((await t.core.history.query({ tool: 'data-extractor' }))[0]?.title).toBe(
+      'a.png and 1 more file',
+    );
+  });
+
+  it('the toast Retry after a refused retry retries the same documents', async () => {
+    const failing = new Set(['b.png']);
+    const chat = vi.fn((body: ChatRequest) =>
+      failing.has(fileOf(body))
+        ? Promise.reject(new ApiError('Mocked error 400', 400))
+        : Promise.resolve(
+            response('{"vendor_name":"A","invoice_date":"2026-01-02","total":1,"line_items":[]}'),
+          ),
+    );
+    t = createToolTestContext(getTool('data-extractor'), {
+      catalog: [STRUCTURED],
+      modelOverride: 'test/structured',
+      api: { chat },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png'), png('c.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(3));
+    await t.runners[0]!.trigger();
+    failing.clear();
+
+    const begin = t.ctx.beginRun.bind(t.ctx);
+    t.ctx.beginRun = vi.fn().mockRejectedValueOnce(new ApiError('Mocked refusal', 500));
+    $$(t.zones.output, 'de-retry')[0]!.click();
+    const retryToast = await vi.waitFor(() => {
+      const button = document.querySelector<HTMLElement>('[data-testid="toast-retry"]');
+      expect(button).not.toBeNull();
+      return button!;
+    });
+    t.ctx.beginRun = begin;
+    retryToast.click();
+    await vi.waitFor(() => expect(chat).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect(fileOf(chat.mock.calls.at(-1)![0])).toBe('b.png');
+    expect((await t.core.history.query({ tool: 'data-extractor' }))[0]?.title).toBe('Retry: b.png');
+  });
+
+  it('a retry whose documents all fail again is a failed run', async () => {
+    const chat = vi.fn((body: ChatRequest) =>
+      fileOf(body) === 'b.png'
+        ? Promise.reject(new ApiError('Mocked error 400', 400))
+        : Promise.resolve(
+            response('{"vendor_name":"A","invoice_date":"2026-01-02","total":1,"line_items":[]}'),
+          ),
+    );
+    t = createToolTestContext(getTool('data-extractor'), {
+      catalog: [STRUCTURED],
+      modelOverride: 'test/structured',
+      api: { chat },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([png('a.png'), png('b.png')]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(2));
+    await t.runners[0]!.trigger();
+    $$(t.zones.output, 'de-retry')[0]!.click();
+    await vi.waitFor(async () =>
+      expect(await t!.core.history.query({ tool: 'data-extractor' })).toHaveLength(2),
+    );
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    const runs = await t.core.history.query({ tool: 'data-extractor' });
+    expect(runs[0]).toMatchObject({ title: 'Retry: b.png', status: 'error' });
   });
 
   it('refuses to run with a broken schema and opens the field editor', async () => {

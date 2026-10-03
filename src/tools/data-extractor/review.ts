@@ -28,6 +28,36 @@ export interface ReviewGridOptions {
   onEdit: (doc: DocResult) => void;
   onRetry: (doc: DocResult) => void;
   onSource: (doc: DocResult) => void;
+  /** Why Retry cannot start now (Run busy or disabled); its buttons show it and stay inactive. */
+  retryBlocked?: () => string | null;
+}
+
+/**
+ * Table-cell keys (`field[row].column`, in issues or corrections) after row `removed` of `field` is deleted: that
+ * row's keys go, later rows move up one. Built anew in row order, so no key ever overwrites another.
+ */
+export function shiftRowKeys<T>(
+  entries: Readonly<Record<string, T>>,
+  field: string,
+  removed: number,
+): Record<string, T> {
+  // Field names are `a-z0-9_` (normalizeFieldName), so they need no escaping in a pattern.
+  const pattern = new RegExp(`^${field}\\[(\\d+)\\]\\.(.+)$`);
+  const out: Record<string, T> = {};
+  const moved: { row: number; column: string; value: T }[] = [];
+  for (const [key, value] of Object.entries(entries)) {
+    const match = pattern.exec(key);
+    if (!match) {
+      out[key] = value;
+      continue;
+    }
+    const row = Number(match[1]);
+    if (row === removed) continue;
+    moved.push({ row: row > removed ? row - 1 : row, column: match[2]!, value });
+  }
+  moved.sort((a, b) => a.row - b.row || a.column.localeCompare(b.column));
+  for (const { row, column, value } of moved) out[`${field}[${row}].${column}`] = value;
+  return out;
 }
 
 export interface ReviewGrid {
@@ -204,6 +234,25 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
     cell?.replaceChildren(issuesBadge(doc));
   };
 
+  const retryButton = (doc: DocResult, label: string): HTMLButtonElement => {
+    const blocked = options.retryBlocked?.() ?? null;
+    return h(
+      'button',
+      {
+        type: 'button',
+        class: ['btn btn-sm btn-outline-primary', blocked !== null && 'disabled'],
+        'aria-label': `Retry ${label}`,
+        'aria-disabled': String(blocked !== null),
+        title: blocked ?? '',
+        'data-retry': '',
+        'data-focus-key': `retry:${doc.key}`,
+        'data-testid': 'de-retry',
+        onclick: () => options.onRetry(doc),
+      },
+      icon('arrow-clockwise'),
+    );
+  };
+
   const detailId = (doc: DocResult, field: FieldDef): string =>
     `de-detail-${doc.key}-${field.name}`.replace(/[^\w-]/g, '_');
 
@@ -226,21 +275,7 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
             { class: `badge ${statusClass}`, 'data-testid': 'de-status', title: doc.error ?? '' },
             statusText,
           ),
-          doc.status === 'failed' || doc.status === 'stopped'
-            ? h(
-                'button',
-                {
-                  type: 'button',
-                  class: 'btn btn-sm btn-outline-primary',
-                  'aria-label': `Retry ${label}`,
-                  title: doc.error ?? 'Retry',
-                  'data-focus-key': `retry:${doc.key}`,
-                  'data-testid': 'de-retry',
-                  onclick: () => options.onRetry(doc),
-                },
-                icon('arrow-clockwise'),
-              )
-            : null,
+          doc.status === 'failed' || doc.status === 'stopped' ? retryButton(doc, label) : null,
         ),
         doc.error ? h('div', { class: 'small text-danger-emphasis text-wrap' }, doc.error) : null,
       ),
@@ -347,16 +382,11 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
         const removeItem = (row: number): void => {
           const next = items.filter((_, index) => index !== row);
           doc.values[field.name] = next;
-          // Cell issues are keyed by row: drop this row's, shift the later ones up.
-          for (const key of Object.keys(doc.issues)) {
-            const match = new RegExp(`^${field.name}\\[(\\d+)\\]\\.(.+)$`).exec(key);
-            if (!match) continue;
-            const index = Number(match[1]);
-            const issue = doc.issues[key]!;
-            delete doc.issues[key];
-            if (index > row) doc.issues[`${field.name}[${index - 1}].${match[2]}`] = issue;
-            else if (index < row) doc.issues[key] = issue;
-          }
+          // Cell issues and corrections are keyed by row: drop this row's, move the later ones up.
+          doc.issues = shiftRowKeys(doc.issues, field.name, row);
+          doc.edited = Object.keys(
+            shiftRowKeys(Object.fromEntries(doc.edited.map((key) => [key, true])), field.name, row),
+          );
           if (field.required && next.length === 0)
             doc.issues[field.name] = 'Required, but not found.';
           if (!doc.edited.includes(field.name)) doc.edited.push(field.name);
@@ -480,9 +510,12 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
     for (const row of old) row.remove();
     const wanted = focusKey ?? keyed;
     if (wanted) {
-      [...body.querySelectorAll<HTMLElement>('[data-focus-key]')]
-        .find((candidate) => candidate.getAttribute('data-focus-key') === wanted)
-        ?.focus();
+      const find = (key: string): HTMLElement | undefined =>
+        [...body.querySelectorAll<HTMLElement>('[data-focus-key]')].find(
+          (candidate) => candidate.getAttribute('data-focus-key') === key,
+        );
+      // The control that had focus may be gone (a Retry that started): stay in the row, on its source button.
+      (find(wanted) ?? (keyed ? find(`source:${doc.key}`) : undefined))?.focus();
     }
   }
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DocResult } from './export';
 import { presetById } from './presets';
-import { reviewGrid } from './review';
+import { reviewGrid, shiftRowKeys } from './review';
 import { normalizeRecord } from './schema';
 
 const fields = presetById('invoice')!.fields;
@@ -125,6 +125,54 @@ describe('review grid', () => {
     // The issue moved up with its row.
     expect(doc.issues['line_items[0].amount']).toBe('Not a number.');
     expect(doc.issues['line_items[1].amount']).toBeUndefined();
+  });
+
+  it('shifts row issues and corrections by row order, never overwriting one', () => {
+    // Keys in an order where shifting one at a time would overwrite row 1's issue with row 2's.
+    const issues = {
+      total: 'Not a number.',
+      'line_items[2].amount': 'Third',
+      'line_items[1].amount': 'Second',
+      'line_items[0].quantity': 'First',
+      'line_items[1].quantity': 'Second quantity',
+    };
+    expect(shiftRowKeys(issues, 'line_items', 0)).toEqual({
+      total: 'Not a number.',
+      'line_items[0].amount': 'Second',
+      'line_items[0].quantity': 'Second quantity',
+      'line_items[1].amount': 'Third',
+    });
+    expect(shiftRowKeys(issues, 'line_items', 1)).toEqual({
+      total: 'Not a number.',
+      'line_items[0].quantity': 'First',
+      'line_items[1].amount': 'Third',
+    });
+    // Another table field with a name that starts the same is left alone.
+    expect(shiftRowKeys({ 'line_items_2[1].x': 'Other' }, 'line_items', 0)).toEqual({
+      'line_items_2[1].x': 'Other',
+    });
+  });
+
+  it('keeps focus in the row when its Retry starts', () => {
+    const doc = { ...makeDoc(), status: 'failed' as const, error: 'Mocked error' };
+    const grid = reviewGrid({
+      fields: () => fields,
+      onEdit: vi.fn(),
+      onRetry: (retried) => {
+        retried.status = 'queued';
+        retried.error = null;
+        grid.update(retried);
+      },
+      onSource: vi.fn(),
+    });
+    document.body.append(grid.element);
+    grid.render([doc]);
+    const retry = grid.element.querySelector<HTMLButtonElement>('[data-testid="de-retry"]')!;
+    retry.focus();
+    retry.click();
+    expect(grid.element.querySelector('[data-testid="de-retry"]')).toBeNull();
+    expect(document.activeElement?.getAttribute('data-testid')).toBe('de-source');
+    expect(grid.element.contains(document.activeElement)).toBe(true);
   });
 
   it('keeps text typed in one row while another row is redrawn', () => {
