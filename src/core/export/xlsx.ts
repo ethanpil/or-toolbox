@@ -16,7 +16,10 @@
  * in JSON); strings that do not parse stay text. Text is never taken for a
  * formula. The header row is bold and frozen, and column widths fit the content.
  */
+import { InvalidInputError } from '../errors';
+import { DAY_MS } from '../util';
 import { cellText, type ExportRow } from './table';
+import { stripIllegalXml } from './xml';
 
 export interface XlsxColumn {
   key: string;
@@ -44,20 +47,32 @@ const DATE_FORMAT = 'yyyy-mm-dd';
 const DATE_TIME_FORMAT = 'yyyy-mm-dd hh:mm:ss';
 
 /**
- * Makes a worksheet name Excel accepts: at most 31 characters, none of
- * `[ ] : * ? / \`, no leading or trailing apostrophe, not empty, not
- * "History" (reserved), and different from every name in `taken` (compared
- * ignoring case). Adds the result to `taken`.
+ * Makes a worksheet name Excel accepts, in this order: characters XML cannot
+ * hold are removed, white space becomes one space, `[ ] : * ? / \` become `_`;
+ * the result is cut to 31 characters, and only then are leading and trailing
+ * apostrophes dropped (the cut can leave one at the end). An empty result
+ * becomes `Sheet N` (N is `position`, default one more than the names already
+ * taken), and "History", which Excel reserves, becomes `History_`. Finally the
+ * name is made different from every name in `taken`, comparing ignoring case,
+ * by adding ` (2)`, ` (3)`, … within the 31 characters. The final name is
+ * added to `taken`.
  */
-export function sanitizeSheetName(name: string, taken: Set<string> = new Set()): string {
-  let base = name
+export function sanitizeSheetName(
+  name: string,
+  taken: Set<string> = new Set(),
+  position: number = taken.size + 1,
+): string {
+  const cut = stripIllegalXml(name)
+    .replace(/\s+/g, ' ')
     .replace(ILLEGAL_SHEET_CHARS, '_')
     .trim()
+    .slice(0, 31);
+  // The cut may have split a surrogate pair: clean again before judging what is left.
+  let base = stripIllegalXml(cut)
     .replace(/^'+|'+$/g, '')
-    .slice(0, 31)
     .trim();
-  if (!base) base = 'Sheet';
-  if (base.toLowerCase() === 'history') base = 'History_';
+  if (!base) base = `Sheet ${position}`;
+  if (base.toLowerCase() === 'history') base = `${base}_`;
 
   let candidate = base;
   for (let n = 2; taken.has(candidate.toLowerCase()); n++) {
@@ -76,9 +91,63 @@ type Cell =
   | { kind: 'boolean'; value: boolean }
   | { kind: 'date'; value: number; format: string };
 
-const NUMBER_TEXT = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
-const DAY_MS = 86_400_000;
+/** A decimal number written the one canonical way: no sign but `-`, no leading zeros, no exponent. */
+const CANONICAL_DECIMAL = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
+/** Excel keeps 15 significant digits; more would be silently rounded. */
+const MAX_SIGNIFICANT_DIGITS = 15;
+
+/**
+ * The number a text stands for, if turning it into a number loses nothing:
+ * canonical decimal notation and at most 15 significant digits. `007` (an
+ * identifier), `1e5`, `+5`, `.5`, `1,234` and `12345678901234567` stay text.
+ */
+function canonicalNumber(text: string): number | null {
+  if (!CANONICAL_DECIMAL.test(text)) return null;
+  const significant = text.replace('-', '').replace('.', '').replace(/^0+/, '');
+  return significant.length <= MAX_SIGNIFICANT_DIGITS ? Number(text) : null;
+}
+
+const ISO_DATE =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+
+/**
+ * A date or date-time in ISO 8601 form as a Date, or `null` if the text does
+ * not name a real moment: `2026-02-31` and `10:60` are rejected rather than
+ * rolled over into March or the next hour. A time without a zone is UTC, like
+ * a bare date. Years before 1900 are not read (a spreadsheet cannot show them).
+ */
+function parseIsoDate(text: string): Date | null {
+  const match = ISO_DATE.exec(text);
+  if (!match) return null;
+  const [, y = '', mo = '', d = '', h = '0', mi = '0', s = '0', fraction = '', zone = ''] = match;
+  const [year, month, day, hour, minute, second] = [y, mo, d, h, mi, s].map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  if (year < 1900 || month < 1 || month > 12 || day < 1) return null;
+  if (hour > 23 || minute > 59 || second > 59) return null;
+  const firstOfMonth = new Date(Date.UTC(year, month - 1, 1));
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (Number.isNaN(firstOfMonth.getTime()) || day > daysInMonth) return null;
+
+  let offsetMinutes = 0;
+  if (zone && zone !== 'Z') {
+    const sign = zone.startsWith('-') ? -1 : 1;
+    const digits = zone.slice(1).replace(':', '');
+    const [zh, zm] = [Number(digits.slice(0, 2)), Number(digits.slice(2, 4))];
+    if (zh > 23 || zm > 59) return null;
+    offsetMinutes = sign * (zh * 60 + zm);
+  }
+  const ms = fraction ? Math.round(Number(`0.${fraction}`) * 1000) : 0;
+  return new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second, ms) - offsetMinutes * 60_000,
+  );
+}
+
 /** Days from 1899-12-30, Excel's day 0, to 1970-01-01. */
 const EXCEL_EPOCH_DAYS = 25_569;
 /** 1900-03-01: from here on the Excel serial number is a plain day count (Excel counts a 29 February 1900 that never was). */
@@ -101,7 +170,10 @@ function dateCell(date: Date): Cell {
 function toCell(value: unknown, column: XlsxColumn): Cell | null {
   if (value === null || value === undefined || value === '') return null;
   if (typeof value === 'number') {
-    return Number.isFinite(value) ? { kind: 'number', value, format: column.format } : null;
+    // NaN and the infinities have no spreadsheet number: show what they are.
+    return Number.isFinite(value)
+      ? { kind: 'number', value, format: column.format }
+      : { kind: 'string', value: String(value) };
   }
   if (typeof value === 'boolean') return { kind: 'boolean', value };
   if (value instanceof Date) {
@@ -109,15 +181,13 @@ function toCell(value: unknown, column: XlsxColumn): Cell | null {
     return cell.kind === 'string' && cell.value === '' ? null : cell;
   }
   if (typeof value === 'string') {
-    const text = value.trim();
-    if (column.type === 'number' && NUMBER_TEXT.test(text)) {
-      return { kind: 'number', value: Number(text), format: column.format };
+    if (column.type === 'number') {
+      const number = canonicalNumber(value);
+      if (number !== null) return { kind: 'number', value: number, format: column.format };
     }
-    if (column.type === 'date' && ISO_DATE.test(text)) {
-      // A date-time without a zone is taken as UTC, like a bare date.
-      const zoned = /[T ]/.test(text) && !/(Z|[+-]\d{2}:?\d{2})$/.test(text);
-      const cell = dateCell(new Date(zoned ? `${text.replace(' ', 'T')}Z` : text));
-      if (!(cell.kind === 'string' && cell.value === '')) return cell;
+    if (column.type === 'date') {
+      const date = parseIsoDate(value);
+      if (date) return dateCell(date);
     }
     return { kind: 'string', value: value.slice(0, MAX_CELL_CHARS) };
   }
@@ -127,16 +197,17 @@ function toCell(value: unknown, column: XlsxColumn): Cell | null {
 
 // --- XML ----------------------------------------------------------------------
 
-/** Characters XML 1.0 cannot carry: most control characters and the non-characters. */
-// eslint-disable-next-line no-control-regex -- control characters are exactly what is removed here.
-const XML_ILLEGAL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f￾￿]/g;
+/**
+ * Excel reads `_xHHHH_` inside text as an escaped character, so a text that
+ * contains that sequence literally (`_x0041_`) would turn into `A`. The escape
+ * for the underscore itself, `_x005F_`, in front of it keeps the text as it was.
+ */
+function escapeXString(text: string): string {
+  return text.replace(/_(?=[xX][0-9a-fA-F]{4}_)/g, '_x005F_');
+}
 
 function escapeText(text: string): string {
-  return text
-    .replace(XML_ILLEGAL, '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return stripIllegalXml(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function escapeAttribute(text: string): string {
@@ -186,7 +257,7 @@ class Registry {
   stringsXml(): string {
     const items = [...this.strings.keys()].map((text) => {
       const edge = /^\s|\s$|[\r\n\t]/.test(text);
-      return `<si><t${edge ? ' xml:space="preserve"' : ''}>${escapeText(text)}</t></si>`;
+      return `<si><t${edge ? ' xml:space="preserve"' : ''}>${escapeText(escapeXString(text))}</t></si>`;
     });
     return `${XML_HEADER}<sst xmlns="${MAIN_NS}" count="${this.stringCount}" uniqueCount="${this.strings.size}">${items.join('')}</sst>`;
   }
@@ -290,13 +361,13 @@ function sheetXml(sheet: XlsxSheet, registry: Registry, selected: boolean): stri
 
 /** Builds a workbook with one sheet per entry. */
 export async function toXlsx(sheets: readonly XlsxSheet[]): Promise<Blob> {
-  if (sheets.length === 0) throw new Error('A workbook needs at least one sheet.');
+  if (sheets.length === 0) throw new InvalidInputError('A workbook needs at least one sheet.');
   const { zipSync, strToU8 } = await import('fflate');
   const registry = new Registry();
   const names = new Set<string>();
 
   const sheetParts = sheets.map((sheet, index) => ({
-    name: sanitizeSheetName(sheet.name, names),
+    name: sanitizeSheetName(sheet.name, names, index + 1),
     xml: sheetXml(sheet, registry, index === 0),
   }));
   const sheetEntries = sheetParts.map((_, i) => `xl/worksheets/sheet${i + 1}.xml`);
@@ -321,7 +392,7 @@ export async function toXlsx(sheets: readonly XlsxSheet[]): Promise<Blob> {
     sheetParts
       .map(
         (part, i) =>
-          `<sheet name="${escapeAttribute(part.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`,
+          `<sheet name="${escapeAttribute(escapeXString(part.name))}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`,
       )
       .join('') +
     '</sheets></workbook>';

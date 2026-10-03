@@ -49,6 +49,69 @@ describe('unescapeHtml', () => {
     );
     expect(unescapeHtml('&amp;lt;')).toBe('&lt;'); // one level only
   });
+
+  it('survives numeric references no character can have', () => {
+    expect(unescapeHtml('a&#99999999;b')).toBe('a�b');
+    expect(unescapeHtml('a&#xFFFFFFFF;b')).toBe('a�b');
+    expect(unescapeHtml('&#55357;')).toBe('�'); // a lone surrogate
+  });
+});
+
+/** Characters XML 1.0 forbids: control characters except tab, newline and carriage return, and U+FFFE/U+FFFF. */
+function hasIllegal(text: string): boolean {
+  return [...text].some((char) => {
+    const code = char.codePointAt(0) ?? 0;
+    return code < 9 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code >= 0xfffe;
+  });
+}
+
+describe('toDocx with characters XML cannot hold', () => {
+  const NUL = String.fromCharCode(0);
+  const BEL = String.fromCharCode(7);
+  const ESC = String.fromCharCode(27);
+
+  it('removes them from paragraphs, headings, tables, links, lists and code blocks', async () => {
+    const markdown = [
+      `# Head${NUL}ing`,
+      '',
+      `Para${BEL}graph with entity &#1;&#0;&#27; and **bo${ESC}ld**.`,
+      '',
+      `- item${NUL}one`,
+      '',
+      `| a${BEL} | b |`,
+      '| --- | --- |',
+      `| c${ESC} | d |`,
+      '',
+      '```',
+      `code${NUL}line`,
+      `second${BEL}line`,
+      '```',
+      '',
+      `\`inline${ESC}code\` and [link${NUL}text](https://example.com)`,
+    ].join('\n');
+    const xml = (await open(await toDocx(markdown)))['word/document.xml'] ?? '';
+
+    expect(hasIllegal(xml)).toBe(false);
+    for (const text of [
+      'Heading',
+      'Paragraph with entity',
+      'bold',
+      'itemone',
+      'codeline',
+      'secondline',
+      'inlinecode',
+      'linktext',
+      '>a<',
+      '>c<',
+    ]) {
+      expect(xml, text).toContain(text);
+    }
+  });
+
+  it('keeps tabs, newlines and carriage returns that are legal', async () => {
+    const xml = (await open(await toDocx('```\na\tb\n```')))['word/document.xml'] ?? '';
+    expect(xml).toContain('a\tb');
+  });
 });
 
 describe('toDocx', () => {

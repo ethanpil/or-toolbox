@@ -19,6 +19,7 @@ import type {
   Table as DocxTable,
 } from 'docx';
 import type { Token, Tokens } from 'marked';
+import { stripIllegalXml } from './xml';
 
 type Docx = typeof DocxModule;
 
@@ -42,14 +43,26 @@ const MONOSPACE = 'Consolas';
 const CODE_SHADING = 'F3F4F6';
 const SAFE_LINK = /^(https?:|mailto:)/i;
 
-/** marked leaves HTML entities in text tokens; Word wants the characters. */
+/** The character for a numeric reference, or U+FFFD where none exists (too large, or a surrogate). */
+function fromReference(code: number): string {
+  const valid =
+    Number.isInteger(code) && code >= 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff);
+  return valid ? String.fromCodePoint(code) : String.fromCharCode(0xfffd);
+}
+
+/**
+ * marked leaves HTML entities in text tokens; Word wants the characters. A
+ * reference to a character that cannot exist (`&#99999999;`) becomes U+FFFD;
+ * one to a control character (`&#1;`) is decoded here and removed later, with
+ * every other control character, when the text goes into the document.
+ */
 export function unescapeHtml(text: string): string {
   return text
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
-    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (_, code: string) => fromReference(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => fromReference(parseInt(code, 16)))
     .replace(/&amp;/g, '&');
 }
 
@@ -57,9 +70,10 @@ function stripTags(html: string): string {
   return unescapeHtml(html.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]*>/g, '')).trim();
 }
 
+/** Text runs for `text`, one per line, with the characters XML cannot hold removed. */
 function run(context: Context, text: string, style: Style): ParagraphChild[] {
   const { TextRun } = context.docx;
-  const parts = text.split('\n');
+  const parts = stripIllegalXml(text).split('\n');
   return parts.map(
     (part, index) =>
       new TextRun({
@@ -109,10 +123,11 @@ function inline(
         break;
       case 'link': {
         const link = token as Tokens.Link;
-        if (SAFE_LINK.test(link.href)) {
+        const href = stripIllegalXml(link.href);
+        if (SAFE_LINK.test(href)) {
           children.push(
             new context.docx.ExternalHyperlink({
-              link: link.href,
+              link: href,
               children: inline(context, link.tokens, { ...style, link: true }),
             }),
           );
@@ -278,7 +293,9 @@ function block(context: Context, tokens: readonly Token[]): Block[] {
         blocks.push(new Paragraph({ children: [] }));
         break;
       case 'code': {
-        const lines = (token as Tokens.Code).text.replace(/\r\n?/g, '\n').split('\n');
+        const lines = stripIllegalXml((token as Tokens.Code).text.replace(/\r\n?/g, '\n')).split(
+          '\n',
+        );
         blocks.push(
           new Paragraph({
             ...base(context),

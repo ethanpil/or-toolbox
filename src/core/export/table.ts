@@ -47,21 +47,26 @@ export function cellText(value: unknown): string {
 export interface DelimitedOptions {
   /** Write the column headers first. Default true. */
   header?: boolean;
+  /**
+   * Defuse spreadsheet formulas. Text taken from documents can be anything,
+   * and Excel, Sheets and LibreOffice run a cell that starts with `=`, `+`,
+   * `-`, `@`, tab or carriage return as a formula (`=HYPERLINK(...)`, DDE).
+   * With this on, such a text cell gets a leading apostrophe, so the
+   * spreadsheet shows it instead of running it. Cells that are plain numbers
+   * (`-5`, `+1,234.56`, `-$5.00`, `5%`) are left alone, and so are numbers
+   * that are not text. Default true; turn it off for data you trust, to write
+   * values exactly as they are.
+   */
+  formulaSafe?: boolean;
 }
 
 export interface CsvOptions extends DelimitedOptions {
   /**
    * Start the file with a UTF-8 byte order mark, which makes Excel read it as
-   * UTF-8 instead of the system code page. Default false.
+   * UTF-8 instead of the system code page (accents and CJK come out as
+   * garbage without it). Other readers ignore or skip it. Default true.
    */
   bom?: boolean;
-  /**
-   * Defuse spreadsheet formulas: a text cell starting with `=`, `+`, `-`, `@`,
-   * tab or CR (unless it is a plain number) gets a leading apostrophe, so
-   * Excel shows it instead of running it. Use for text taken from untrusted
-   * documents. Default false, which writes values exactly as they are.
-   */
-  formulaSafe?: boolean;
 }
 
 function delimited(
@@ -70,22 +75,24 @@ function delimited(
   delimiter: string,
   newline: string,
   needsQuotes: RegExp,
-  prepare: (text: string, isString: boolean) => string,
-  header: boolean,
+  options: DelimitedOptions,
 ): string {
   const resolved = resolveColumns(columns);
-  const quote = (text: string): string =>
-    needsQuotes.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  const safe = options.formulaSafe ?? true;
+  const quote = (text: string, isString: boolean): string => {
+    const defused = safe && isString ? defuseFormula(text) : text;
+    return needsQuotes.test(defused) ? `"${defused.replace(/"/g, '""')}"` : defused;
+  };
   const lines: string[] = [];
-  if (header) {
-    lines.push(resolved.map((column) => quote(prepare(column.header, true))).join(delimiter));
+  if (options.header ?? true) {
+    lines.push(resolved.map((column) => quote(column.header, true)).join(delimiter));
   }
   for (const row of rows) {
     lines.push(
       resolved
         .map((column) => {
           const value = row[column.key];
-          return quote(prepare(cellText(value), typeof value === 'string'));
+          return quote(cellText(value), typeof value === 'string');
         })
         .join(delimiter),
     );
@@ -96,44 +103,49 @@ function delimited(
 /** The UTF-8 byte order mark as a character; written out so no invisible character sits in the source. */
 const BOM = String.fromCharCode(0xfeff);
 
-/** A formula starter that is not just a signed number. */
+/** Characters that make a spreadsheet read a cell as a formula. */
 const FORMULA_START = /^[=+\-@\t\r]/;
-const PLAIN_NUMBER = /^[+-]?\d[\d.,]*$/;
+
+/**
+ * A whole cell that is a number as people write one: optional sign, optional
+ * currency symbol, digits with thousands separators or a decimal part,
+ * optional exponent or percent. Nothing else may follow, so `-5+cmd|...`
+ * does not qualify.
+ */
+const WRITTEN_NUMBER =
+  /^[+-]? ?[$€£¥]? ?(?=\.?\d)(?:\d{1,3}(?:,\d{3})+|\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?%?$/;
+
+/** Prefixes an apostrophe to text a spreadsheet would run, unless it is just a number. */
+function defuseFormula(text: string): string {
+  return FORMULA_START.test(text) && !WRITTEN_NUMBER.test(text) ? `'${text}` : text;
+}
 
 /**
  * RFC 4180 CSV: comma-separated, CRLF between records, fields containing a
- * comma, quote, CR or LF in double quotes with quotes doubled. No trailing newline.
+ * comma, quote, CR or LF in double quotes with quotes doubled. No trailing
+ * newline. Starts with a byte order mark and defuses formulas unless told not
+ * to (see the options).
  */
 export function toCsv(
   rows: readonly ExportRow[],
   columns: readonly ExportColumn[],
   options: CsvOptions = {},
 ): string {
-  const safe = options.formulaSafe ?? false;
-  const body = delimited(
-    rows,
-    columns,
-    ',',
-    '\r\n',
-    /[",\r\n]/,
-    (text, isString) =>
-      safe && isString && FORMULA_START.test(text) && !PLAIN_NUMBER.test(text) ? `'${text}` : text,
-    options.header ?? true,
-  );
-  return options.bom ? BOM + body : body;
+  const body = delimited(rows, columns, ',', '\r\n', /[",\r\n]/, options);
+  return (options.bom ?? true) ? BOM + body : body;
 }
 
 /**
  * Tab-separated text, as pasted into spreadsheets: LF between records, and a
  * field containing a tab, quote, CR or LF in double quotes with quotes doubled
- * (what Excel itself writes to the clipboard).
+ * (what Excel itself writes to the clipboard). Defuses formulas like `toCsv`.
  */
 export function toTsv(
   rows: readonly ExportRow[],
   columns: readonly ExportColumn[],
   options: DelimitedOptions = {},
 ): string {
-  return delimited(rows, columns, '\t', '\n', /["\t\r\n]/, (text) => text, options.header ?? true);
+  return delimited(rows, columns, '\t', '\n', /["\t\r\n]/, options);
 }
 
 /** A GitHub-flavoured Markdown table. `|` and `\` are escaped and line breaks become `<br>`. */

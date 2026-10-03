@@ -6,6 +6,7 @@
  * Nothing here touches the network or storage. The readers work in browsers
  * and in jsdom (Vitest); `downloadBlob` needs a document.
  */
+import { InvalidInputError } from './errors';
 
 // --- reading ----------------------------------------------------------------
 
@@ -22,7 +23,7 @@ export async function readAsDataUrl(blob: Blob): Promise<string> {
       resolve(reader.result as string);
     };
     reader.onerror = () => {
-      reject(reader.error ?? new Error('Could not read the file.'));
+      reject(new InvalidInputError('Could not read the file.', { cause: reader.error }));
     };
     reader.readAsDataURL(source);
   });
@@ -46,40 +47,100 @@ export function readAsArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
 
 // --- format sniffing --------------------------------------------------------
 
-const ascii = (bytes: Uint8Array, start: number, text: string): boolean => {
+/** True if `bytes` holds the ASCII `text` at `start`. */
+export function matchesAscii(bytes: Uint8Array, start: number, text: string): boolean {
   if (bytes.length < start + text.length) return false;
   for (let i = 0; i < text.length; i++) {
     if (bytes[start + i] !== text.charCodeAt(i)) return false;
   }
   return true;
-};
+}
 
 const startsWith = (bytes: Uint8Array, signature: number[]): boolean =>
   bytes.length >= signature.length && signature.every((value, i) => bytes[i] === value);
 
+/** How many bytes `sniffMime` looks at: enough for an SVG's prolog, comments and doctype. */
+const SNIFF_BYTES = 1024;
+
+const HEIC_BRANDS = new Set(['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'hevm', 'hevs']);
+const AVIF_BRANDS = new Set(['avif', 'avis']);
+const HEIF_BRANDS = new Set(['mif1', 'msf1']);
+const MP4_AUDIO_BRANDS = new Set(['M4A ', 'M4B ', 'M4P ']);
+
+/** The major brand and the compatible brands of an `ftyp` box at the start of `bytes`. */
+function ftypBrands(bytes: Uint8Array): string[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const size = Math.min(view.getUint32(0), bytes.length);
+  const brand = (at: number): string =>
+    String.fromCharCode(bytes[at] ?? 0, bytes[at + 1] ?? 0, bytes[at + 2] ?? 0, bytes[at + 3] ?? 0);
+  const brands = [brand(8)];
+  // Bytes 12-15 are the minor version; compatible brands follow.
+  for (let at = 16; at + 4 <= size; at += 4) brands.push(brand(at));
+  return brands;
+}
+
+function classifyFtyp(bytes: Uint8Array): string {
+  const [major = '', ...compatible] = ftypBrands(bytes);
+  if (HEIC_BRANDS.has(major)) return 'image/heic';
+  if (AVIF_BRANDS.has(major)) return 'image/avif';
+  if (HEIF_BRANDS.has(major)) {
+    // `mif1` is the generic HEIF brand: the compatible brands say which codec is inside.
+    if (compatible.some((brand) => AVIF_BRANDS.has(brand))) return 'image/avif';
+    if (compatible.some((brand) => HEIC_BRANDS.has(brand))) return 'image/heic';
+    return 'image/heif';
+  }
+  if (MP4_AUDIO_BRANDS.has(major)) return 'audio/mp4';
+  if (major === 'qt  ') return 'video/quicktime';
+  // `isom`, `mp42` and friends: video unless the tracks say otherwise (see `sniffBlobMime`).
+  return 'video/mp4';
+}
+
+const SVG_START =
+  /^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--[\s\S]*?-->\s*)*(?:<!DOCTYPE\s+svg[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg[\s>/]/i;
+
 /**
- * Recognises a file from its magic bytes (at least the first 16, ideally 64).
- * Returns the MIME type, or `null` when the format is not one of: PNG, JPEG,
- * WebP, GIF, PDF, MP3 (ID3 tag or frame sync), WAV, MP4 (also M4A and
- * QuickTime/MOV), WebM, Ogg, ZIP.
+ * True if the text starts like an SVG document: optional XML prolog, comments
+ * and doctype, then `<svg`. (TextDecoder drops a leading byte order mark.)
+ */
+function looksLikeSvg(bytes: Uint8Array): boolean {
+  // Cheap rejection before decoding: the first byte of the text is `<`, a space, or a byte order mark.
+  const first = bytes[0];
+  if (
+    first !== 0x3c &&
+    first !== 0x20 &&
+    first !== 0x0a &&
+    first !== 0x0d &&
+    first !== 0x09 &&
+    first !== 0xef
+  ) {
+    return false;
+  }
+  return SVG_START.test(new TextDecoder().decode(bytes.subarray(0, SNIFF_BYTES)));
+}
+
+/**
+ * Recognises a file from its magic bytes (the first 64 are enough, except for
+ * SVG, which can need up to 1,024). Returns the MIME type, or `null` when the
+ * format is not one of: PNG, JPEG, WebP, GIF, SVG, HEIC/HEIF/AVIF, PDF, MP3
+ * (ID3 tag or frame sync), WAV, MP4/M4A/QuickTime, WebM, Ogg, ZIP.
+ *
+ * The first bytes cannot say whether an MP4 or WebM holds video: those come
+ * back as `video/mp4` and `video/webm` (M4A and friends as `audio/mp4`). Use
+ * `sniffBlobMime`, which looks at the tracks, when audio-only files matter.
  */
 export function sniffMime(bytes: Uint8Array): string | null {
   if (startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return 'image/png';
   if (startsWith(bytes, [0xff, 0xd8, 0xff])) return 'image/jpeg';
-  if (ascii(bytes, 0, 'GIF87a') || ascii(bytes, 0, 'GIF89a')) return 'image/gif';
-  if (ascii(bytes, 0, 'RIFF')) {
-    if (ascii(bytes, 8, 'WEBP')) return 'image/webp';
-    if (ascii(bytes, 8, 'WAVE')) return 'audio/wav';
+  if (matchesAscii(bytes, 0, 'GIF87a') || matchesAscii(bytes, 0, 'GIF89a')) return 'image/gif';
+  if (matchesAscii(bytes, 0, 'RIFF')) {
+    if (matchesAscii(bytes, 8, 'WEBP')) return 'image/webp';
+    if (matchesAscii(bytes, 8, 'WAVE')) return 'audio/wav';
     return null;
   }
-  if (ascii(bytes, 0, '%PDF-')) return 'application/pdf';
-  if (ascii(bytes, 0, 'ID3')) return 'audio/mpeg';
-  if (ascii(bytes, 0, 'OggS')) return 'audio/ogg';
-  if (ascii(bytes, 4, 'ftyp')) {
-    if (ascii(bytes, 8, 'M4A ') || ascii(bytes, 8, 'M4B ')) return 'audio/mp4';
-    if (ascii(bytes, 8, 'qt  ')) return 'video/quicktime';
-    return 'video/mp4';
-  }
+  if (matchesAscii(bytes, 0, '%PDF-')) return 'application/pdf';
+  if (matchesAscii(bytes, 0, 'ID3')) return 'audio/mpeg';
+  if (matchesAscii(bytes, 0, 'OggS')) return 'audio/ogg';
+  if (matchesAscii(bytes, 4, 'ftyp')) return classifyFtyp(bytes);
   if (startsWith(bytes, [0x1a, 0x45, 0xdf, 0xa3])) return 'video/webm';
   if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04]) || startsWith(bytes, [0x50, 0x4b, 0x05, 0x06])) {
     return 'application/zip';
@@ -94,12 +155,137 @@ export function sniffMime(bytes: Uint8Array): string | null {
   ) {
     return 'audio/mpeg';
   }
+  if (looksLikeSvg(bytes)) return 'image/svg+xml';
   return null;
 }
 
-/** `sniffMime` on the first bytes of a Blob. */
+/** The largest `moov` box `sniffBlobMime` reads to look at an MP4's tracks. */
+const MAX_MOOV_BYTES = 8 * 1024 * 1024;
+
+const fourcc = (view: DataView, at: number): string =>
+  String.fromCharCode(
+    view.getUint8(at),
+    view.getUint8(at + 1),
+    view.getUint8(at + 2),
+    view.getUint8(at + 3),
+  );
+
+/**
+ * Walks the top-level boxes of an MP4 to its `moov` box and reads the track
+ * handler types (`vide`, `soun`). Returns `null` when it cannot tell.
+ */
+async function mp4Tracks(blob: Blob): Promise<{ video: boolean; sound: boolean } | null> {
+  let offset = 0;
+  for (let boxes = 0; boxes < 64 && offset + 8 <= blob.size; boxes++) {
+    const head = await blob.slice(offset, offset + 16).arrayBuffer();
+    if (head.byteLength < 8) return null;
+    const view = new DataView(head);
+    let size = view.getUint32(0);
+    let headerBytes = 8;
+    if (size === 1 && head.byteLength >= 16) {
+      size = Number(view.getBigUint64(8));
+      headerBytes = 16;
+    } else if (size === 0) {
+      size = blob.size - offset; // runs to the end of the file
+    }
+    if (size < headerBytes) return null;
+    if (fourcc(view, 4) === 'moov') {
+      if (size > MAX_MOOV_BYTES) return null;
+      const body = new Uint8Array(
+        await blob.slice(offset + headerBytes, offset + size).arrayBuffer(),
+      );
+      let video = false;
+      let sound = false;
+      // hdlr box: size, 'hdlr', version/flags, pre-defined, then the handler type, 12 bytes after the tag.
+      for (
+        let i = body.indexOf(0x68);
+        i >= 0 && i + 16 <= body.length;
+        i = body.indexOf(0x68, i + 1)
+      ) {
+        if (!matchesAscii(body, i, 'hdlr')) continue;
+        if (matchesAscii(body, i + 12, 'vide')) video = true;
+        if (matchesAscii(body, i + 12, 'soun')) sound = true;
+      }
+      return video || sound ? { video, sound } : null;
+    }
+    offset += size;
+  }
+  return null;
+}
+
+/** EBML element id of `Tracks`. */
+const WEBM_TRACKS = [0x16, 0x54, 0xae, 0x6b];
+/** How much of a WebM's start is searched for its `Tracks` element. */
+const WEBM_SCAN_BYTES = 64 * 1024;
+
+/** True/false for video present in a WebM's Tracks element, `null` if it cannot be found. */
+async function webmHasVideo(blob: Blob): Promise<boolean | null> {
+  const bytes = new Uint8Array(await blob.slice(0, WEBM_SCAN_BYTES).arrayBuffer());
+  let at = -1;
+  for (let i = 0; i + WEBM_TRACKS.length < bytes.length; i++) {
+    if (WEBM_TRACKS.every((value, k) => bytes[i + k] === value)) {
+      at = i + WEBM_TRACKS.length;
+      break;
+    }
+  }
+  if (at < 0) return null;
+  // The element size is a variable-length integer: the leading zeros of the first byte give its length.
+  const lead = bytes[at] ?? 0;
+  const length = lead === 0 ? 8 : Math.clz32(lead) - 23;
+  let size = lead & (0xff >> length);
+  for (let k = 1; k < length; k++) size = size * 256 + (bytes[at + k] ?? 0);
+  const start = at + length;
+  // An unknown size is all ones; scan to the end of what was read.
+  const end = Math.min(bytes.length, size >= 2 ** 40 ? bytes.length : start + size);
+  const types: number[] = [];
+  // TrackType element: id 0x83, one-byte size 0x81, value 1 (video) or 2 (audio).
+  for (let i = start; i + 2 < end; i++) {
+    if (bytes[i] === 0x83 && bytes[i + 1] === 0x81) types.push(bytes[i + 2] ?? 0);
+  }
+  if (types.includes(1)) return true;
+  return types.includes(2) ? false : null;
+}
+
+/**
+ * `sniffMime` on the first bytes of a Blob, plus a look inside MP4 and WebM
+ * files: one with sound tracks only is `audio/mp4` / `audio/webm`.
+ */
 export async function sniffBlobMime(blob: Blob): Promise<string | null> {
-  return sniffMime(new Uint8Array(await blob.slice(0, 64).arrayBuffer()));
+  const type = sniffMime(new Uint8Array(await blob.slice(0, SNIFF_BYTES).arrayBuffer()));
+  if (type === 'video/mp4') {
+    const tracks = await mp4Tracks(blob);
+    return tracks && tracks.sound && !tracks.video ? 'audio/mp4' : type;
+  }
+  if (type === 'video/webm') {
+    return (await webmHasVideo(blob)) === false ? 'audio/webm' : type;
+  }
+  return type;
+}
+
+const EXTENSIONS: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/svg+xml': 'svg',
+  'image/heic': 'heic',
+  'image/heif': 'heif',
+  'image/avif': 'avif',
+  'application/pdf': 'pdf',
+  'application/zip': 'zip',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/mp4': 'm4a',
+  'audio/webm': 'webm',
+  'video/mp4': 'mp4',
+  'video/quicktime': 'mov',
+  'video/webm': 'webm',
+};
+
+/** The usual file extension (no dot) for a MIME type from `sniffMime`, or `undefined`. */
+export function extensionForMime(type: string | null | undefined): string | undefined {
+  return type ? EXTENSIONS[type.toLowerCase()] : undefined;
 }
 
 // --- formatting -------------------------------------------------------------
@@ -140,16 +326,15 @@ const MAX_NAME_LENGTH = 180;
 
 /**
  * Makes a string safe as a file name on Windows, macOS and Linux: replaces
- * `< > : " / \ | ? *`, control characters and bidirectional overrides,
+ * `< > : " / \ | ? *` and control characters, removes bidirectional overrides,
  * removes trailing dots and spaces, avoids reserved names (`CON`, `NUL`,
- * `COM1`, …) and caps the length while keeping the extension. Never returns
- * an empty string.
+ * `COM1`, …, also `CON .txt` and `nul.tar.gz`, which Windows treats the same)
+ * and caps the length while keeping the extension. Never returns an empty string.
  */
 export function sanitizeFilename(name: string, fallback = 'file'): string {
-  let clean = name
-    // eslint-disable-next-line no-control-regex -- control characters are exactly what is removed here.
-    .replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, '_')
-    .replace(/[‎‏‪-‮⁦-⁩]/g, '')
+  const clean = name
+    .replace(/[\p{Cc}<>:"/\\|?*]/gu, '_')
+    .replace(/\p{Bidi_Control}/gu, '')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/[. ]+$/, '');
@@ -162,17 +347,22 @@ export function sanitizeFilename(name: string, fallback = 'file'): string {
     base = clean.slice(0, MAX_NAME_LENGTH);
     extension = '';
   }
-  // Windows reserves these names whatever follows the first dot (`NUL.tar.gz` too).
-  if (RESERVED_WINDOWS_NAMES.test(base.split('.')[0] ?? '')) base = `_${base}`;
+  // Spaces before the dot are dropped by Windows, so "CON .txt" is the device CON.
+  base = base.trim();
+  // Reserved whatever follows the first dot (`NUL.tar.gz` too).
+  if (RESERVED_WINDOWS_NAMES.test((base.split('.')[0] ?? '').trim())) base = `_${base}`;
   base = base.slice(0, MAX_NAME_LENGTH - extension.length).replace(/[. ]+$/, '');
-  clean = base + extension;
-  return clean || fallback;
+  return base + extension || fallback;
 }
+
+/** The widest zero padding `{n:3}` may ask for. */
+const MAX_PADDING = 20;
 
 /**
  * Fills `{placeholders}` in a file name pattern and sanitises the result.
- * `{n:3}` zero-pads a number to three digits. Placeholders without a value
- * stay as written, so a typo is visible in the name.
+ * `{n:3}` zero-pads a value to three digits (at most 20). Placeholders
+ * without a value of their own in `vars` stay as written, so a typo is
+ * visible in the name.
  *
  * ```ts
  * applyFilenamePattern('{name}-{n}.{ext}', { name: 'shoe', n: 2, ext: 'jpg' }); // 'shoe-2.jpg'
@@ -186,9 +376,12 @@ export function applyFilenamePattern(
   const filled = pattern.replace(
     /\{(\w+)(?::(\d+))?\}/g,
     (placeholder: string, key: string, width: string | undefined) => {
-      const value = vars[key];
+      // Own properties only: `{constructor}` must not pick up Object's.
+      const value = Object.hasOwn(vars, key) ? vars[key] : undefined;
       if (value === undefined) return placeholder;
-      return width ? String(value).padStart(Number(width), '0') : String(value);
+      return width
+        ? String(value).padStart(Math.min(Number(width), MAX_PADDING), '0')
+        : String(value);
     },
   );
   return sanitizeFilename(filled);
@@ -202,17 +395,15 @@ export function applyFilenamePattern(
 export function uniqueFilename(name: string, used: Set<string>): string {
   const key = (value: string): string => value.toLowerCase();
   let candidate = name;
-  if (used.has(key(candidate))) {
-    const dot = name.lastIndexOf('.');
-    const base = dot > 0 ? name.slice(0, dot) : name;
-    const extension = dot > 0 ? name.slice(dot) : '';
-    let n = 2;
-    do {
-      candidate = `${base} (${n++})${extension}`;
-    } while (used.has(key(candidate)));
-  }
+  for (let n = 2; used.has(key(candidate)); n++) candidate = numberedFilename(name, n);
   used.add(key(candidate));
   return candidate;
+}
+
+/** `numberedFilename('a.png', 2)` → `'a (2).png'`: the number goes before the extension. */
+export function numberedFilename(name: string, n: number): string {
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? `${name.slice(0, dot)} (${n})${name.slice(dot)}` : `${name} (${n})`;
 }
 
 // --- saving -----------------------------------------------------------------
