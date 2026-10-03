@@ -1,7 +1,7 @@
 /**
  * Retry timing for the API client: exponential backoff with full jitter, honouring the server's
  * `error.metadata.retry_after_seconds` (the `Retry-After` header is not readable cross-origin,
- * docs/openrouter-api.md §12.3). Sleeps reject as soon as the signal aborts.
+ * docs/openrouter-api.md §12.3). Which failures may be retried at all is decided in client.ts.
  */
 
 export interface RetryPolicy {
@@ -39,32 +39,4 @@ export function retryDelay(
   }
   const window = Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** (attempt - 1));
   return Math.floor(policy.random() * window);
-}
-
-/** The error every aborted operation rejects with (`isAbortError` recognises it). */
-export function abortError(): DOMException {
-  return new DOMException('The operation was aborted.', 'AbortError');
-}
-
-export function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw abortError();
-}
-
-/** Resolves after `ms`, or rejects with an AbortError as soon as `signal` aborts. */
-export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError());
-      return;
-    }
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      reject(abortError());
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
 }

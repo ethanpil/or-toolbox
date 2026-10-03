@@ -1,12 +1,15 @@
 /**
  * Client-side throttle for `:free` models: at most 20 requests per rolling minute (docs/openrouter-api.md §12.1).
- * Callers queue instead of failing. The window is shared by every tab of the origin through localStorage
- * timestamps (read-modify-write is not atomic across tabs, so two tabs racing can briefly exceed the cap by one
- * or two; OpenRouter's own 429 handling covers that). Without localStorage the window is per tab.
+ * Callers queue instead of failing; an aborted caller leaves the queue at once.
+ *
+ * The window is shared by every tab through localStorage timestamps (read-modify-write is not atomic across
+ * tabs, so two tabs racing can briefly exceed the cap by one or two; OpenRouter's own 429 handling covers that).
+ * This tab also keeps the window in memory and merges it with the stored one, so a full, blocked or corrupted
+ * storage never resets the window: it only stops other tabs from seeing this tab's requests.
  */
 
 import { LS_KEYS, local } from '../storage/local';
-import { sleep, throwIfAborted } from './retry';
+import { abortError, isFiniteNumber, parseJsonSafe, sleep, throwIfAborted } from '../util';
 
 /** localStorage key holding the shared request timestamps (JSON number[]). Not secret, safe to delete. */
 export const FREE_THROTTLE_STORAGE_KEY = LS_KEYS.freeRequests;
@@ -19,12 +22,25 @@ export interface FreeThrottleOptions {
   now?: () => number;
 }
 
+/** Multiset union (per value, the larger count), sorted ascending. */
+function union(a: number[], b: number[]): number[] {
+  const counts = new Map<number, number>();
+  for (const t of a) counts.set(t, (counts.get(t) ?? 0) + 1);
+  const out = [...a];
+  for (const t of b) {
+    const left = counts.get(t) ?? 0;
+    if (left > 0) counts.set(t, left - 1);
+    else out.push(t);
+  }
+  return out.sort((x, y) => x - y);
+}
+
 export class FreeModelThrottle {
   private readonly limit: number;
   private readonly windowMs: number;
   private readonly storage: () => Storage | undefined;
   private readonly now: () => number;
-  /** Per-tab fallback when storage is unavailable. */
+  /** This tab's view of the window (includes what it last read from storage). */
   private memory: number[] = [];
   /** Serialises callers in this tab so they get slots in arrival order. */
   private tail: Promise<void> = Promise.resolve();
@@ -38,19 +54,27 @@ export class FreeModelThrottle {
 
   /** Waits until a request slot is free, then records the request. Rejects with AbortError on abort. */
   acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(abortError());
     const turn = this.tail.then(() => this.waitForSlot(signal));
     this.tail = turn.catch(() => undefined);
-    return turn;
+    if (!signal) return turn;
+    // Leave the queue immediately on abort; when this caller's turn comes, waitForSlot sees the abort and
+    // takes no slot.
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => reject(abortError());
+      signal.addEventListener('abort', onAbort, { once: true });
+      turn.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    });
   }
 
   private async waitForSlot(signal?: AbortSignal): Promise<void> {
     for (;;) {
       throwIfAborted(signal);
       const now = this.now();
-      const stamps = this.read(now);
+      const stamps = this.window(now);
       if (stamps.length < this.limit) {
         stamps.push(now);
-        this.write(stamps);
+        this.save(stamps);
         return;
       }
       const oldest = stamps[stamps.length - this.limit] ?? now;
@@ -58,24 +82,22 @@ export class FreeModelThrottle {
     }
   }
 
-  private read(now: number): number[] {
-    let stamps = this.memory;
-    const storage = this.storage();
-    if (storage) {
-      try {
-        const parsed: unknown = JSON.parse(storage.getItem(FREE_THROTTLE_STORAGE_KEY) ?? '[]');
-        if (Array.isArray(parsed))
-          stamps = parsed.filter((t): t is number => typeof t === 'number');
-      } catch {
-        // Corrupt value: start a fresh window.
-        stamps = [];
-      }
+  /** Current window: memory merged with storage, expired and future-dated entries dropped. */
+  private window(now: number): number[] {
+    let stored: number[] = [];
+    try {
+      const raw = this.storage()?.getItem(FREE_THROTTLE_STORAGE_KEY);
+      const parsed = raw ? parseJsonSafe(raw) : [];
+      if (Array.isArray(parsed)) stored = parsed.filter(isFiniteNumber);
+    } catch {
+      // Blocked or corrupt: the in-memory window still applies.
     }
-    // Drop expired entries and anything stamped in the future by a skewed clock.
-    return stamps.filter((t) => t > now - this.windowMs && t <= now + 1000).sort((a, b) => a - b);
+    const live = (t: number): boolean => t > now - this.windowMs && t <= now + 1000;
+    this.memory = union(this.memory.filter(live), stored.filter(live));
+    return [...this.memory];
   }
 
-  private write(stamps: number[]): void {
+  private save(stamps: number[]): void {
     this.memory = stamps;
     try {
       this.storage()?.setItem(FREE_THROTTLE_STORAGE_KEY, JSON.stringify(stamps));

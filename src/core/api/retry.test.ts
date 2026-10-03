@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isAbortError } from '../errors';
-import { DEFAULT_RETRY_POLICY, retryDelay, sleep, type RetryPolicy } from './retry';
+import { sleep } from '../util';
+import { DEFAULT_RETRY_POLICY, retryDelay, type RetryPolicy } from './retry';
 import { FREE_THROTTLE_STORAGE_KEY, FreeModelThrottle } from './throttle';
 
 const policy: RetryPolicy = { ...DEFAULT_RETRY_POLICY, random: () => 0.5 };
@@ -104,5 +105,55 @@ describe('FreeModelThrottle', () => {
     expect(isAbortError(await aborted)).toBe(true);
     await vi.advanceTimersByTimeAsync(1001);
     expect(laterGranted).toBe(true);
+  });
+
+  it('rejects an aborted waiter at once, even while queued behind another waiter', async () => {
+    const throttle = new FreeModelThrottle({ limit: 1, windowMs: 60_000 });
+    await throttle.acquire();
+    let firstGranted = false;
+    void throttle.acquire().then(() => (firstGranted = true)); // waits a minute
+    const controller = new AbortController();
+    let outcome: unknown = 'pending';
+    void throttle.acquire(controller.signal).then(
+      () => (outcome = 'granted'),
+      (e: unknown) => (outcome = e),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(isAbortError(outcome)).toBe(true);
+    expect(firstGranted).toBe(false);
+    // The aborted caller took no slot: the next minute serves the earlier waiter only.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(firstGranted).toBe(true);
+  });
+
+  it('keeps enforcing the window when storage cannot be written', async () => {
+    const readOnly = {
+      getItem: () => null,
+      setItem: () => {
+        throw new DOMException('full', 'QuotaExceededError');
+      },
+    } as unknown as Storage;
+    const throttle = new FreeModelThrottle({ storage: () => readOnly });
+    expect(await acquireMany(throttle, 25)).toBe(20);
+  });
+
+  it('never lets an unreadable or corrupted store reset the window', async () => {
+    let mode: 'ok' | 'throw' | 'corrupt' = 'ok';
+    const store = new Map<string, string>();
+    const flaky = {
+      getItem: (key: string) => {
+        if (mode === 'throw') throw new DOMException('blocked', 'SecurityError');
+        return mode === 'corrupt' ? '{oops' : (store.get(key) ?? null);
+      },
+      setItem: (key: string, value: string) => void store.set(key, value),
+    } as unknown as Storage;
+    const throttle = new FreeModelThrottle({ storage: () => flaky });
+    expect(await acquireMany(throttle, 15)).toBe(15);
+    mode = 'throw';
+    expect(await acquireMany(throttle, 3)).toBe(3);
+    mode = 'corrupt';
+    expect(await acquireMany(throttle, 5)).toBe(2);
   });
 });

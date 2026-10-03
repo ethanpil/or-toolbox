@@ -10,16 +10,9 @@
  */
 
 import type { ApiError } from '../errors';
+import { isRecord, isString } from '../util';
 import { apiErrorFromBody, bodyError, statusFromCode } from './error-map';
 import type { ChatStreamEvent, ChatStreamResult, WireUsage } from './types';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function str(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined;
-}
 
 export class ChatStreamAssembler {
   private id = '';
@@ -46,13 +39,21 @@ export class ChatStreamAssembler {
     return this.usage;
   }
 
+  /** True once a terminal `finish_reason` arrived. */
+  get finished(): boolean {
+    return this.finishReason !== null;
+  }
+
   push(chunk: unknown): void {
     if (!isRecord(chunk)) return;
+    const id = chunk['id'];
+    const model = chunk['model'];
+    const provider = chunk['provider'];
 
-    if (!this.metaSent && (str(chunk['id']) || str(chunk['model']))) {
-      this.id = str(chunk['id']) ?? '';
-      this.model = str(chunk['model']) ?? '';
-      this.provider = str(chunk['provider']);
+    if (!this.metaSent && ((isString(id) && id) || (isString(model) && model))) {
+      this.id = isString(id) ? id : '';
+      this.model = isString(model) ? model : '';
+      this.provider = isString(provider) ? provider : undefined;
       this.metaSent = true;
       this.onEvent({
         type: 'meta',
@@ -62,24 +63,35 @@ export class ChatStreamAssembler {
       });
     }
 
-    if (isRecord(chunk['usage'])) this.usage = chunk['usage'];
+    const usage = chunk['usage'];
+    if (isRecord(usage)) this.usage = usage;
 
     const error = bodyError(chunk);
-    if (error) throw this.midStreamError(chunk, error);
+    if (error) {
+      throw apiErrorFromBody(
+        statusFromCode(error['code']),
+        { error },
+        {
+          midStream: true,
+          generationId: this.generationId ?? (isString(id) ? id : null),
+          providerName: isString(provider) ? provider : null,
+        },
+      ) satisfies ApiError;
+    }
 
     const choices = Array.isArray(chunk['choices']) ? chunk['choices'] : [];
     const choice: unknown = choices[0];
     if (isRecord(choice)) {
       const delta = choice['delta'];
       if (isRecord(delta)) this.delta(delta);
-      const reason = str(choice['finish_reason']);
-      if (reason && this.finishReason === null) {
+      const reason = choice['finish_reason'];
+      if (isString(reason) && reason && this.finishReason === null) {
         this.finishReason = reason;
         this.onEvent({ type: 'finish', reason });
       }
     }
 
-    if (isRecord(chunk['usage'])) this.onEvent({ type: 'usage', usage: this.usage as WireUsage });
+    if (isRecord(usage)) this.onEvent({ type: 'usage', usage });
   }
 
   result(): ChatStreamResult {
@@ -98,13 +110,13 @@ export class ChatStreamAssembler {
   }
 
   private delta(delta: Record<string, unknown>): void {
-    const reasoning = str(delta['reasoning']);
-    if (reasoning) {
+    const reasoning = delta['reasoning'];
+    if (isString(reasoning) && reasoning) {
       this.reasoning.push(reasoning);
       this.onEvent({ type: 'reasoning', text: reasoning });
     }
-    const content = str(delta['content']);
-    if (content) {
+    const content = delta['content'];
+    if (isString(content) && content) {
       this.text.push(content);
       this.onEvent({ type: 'text', text: content });
     }
@@ -113,7 +125,7 @@ export class ChatStreamAssembler {
       for (const image of images) {
         const url =
           isRecord(image) && isRecord(image['image_url']) ? image['image_url']['url'] : '';
-        if (typeof url === 'string' && url) {
+        if (isString(url) && url) {
           this.images.push(url);
           this.onEvent({ type: 'image', url });
         }
@@ -121,25 +133,13 @@ export class ChatStreamAssembler {
     }
     const audio = delta['audio'];
     if (isRecord(audio)) {
-      const data = str(audio['data']) ?? '';
-      const transcript = str(audio['transcript']);
+      const data = isString(audio['data']) ? audio['data'] : '';
+      const transcript = isString(audio['transcript']) ? audio['transcript'] : '';
       if (data) this.audioChunks.push(data);
       if (transcript) this.transcript.push(transcript);
       if (data || transcript) {
         this.onEvent({ type: 'audio', data, ...(transcript ? { transcript } : {}) });
       }
     }
-  }
-
-  private midStreamError(chunk: Record<string, unknown>, error: Record<string, unknown>): ApiError {
-    return apiErrorFromBody(
-      statusFromCode(error['code']),
-      { error },
-      {
-        midStream: true,
-        generationId: this.generationId ?? str(chunk['id']) ?? null,
-        providerName: str(chunk['provider']) ?? null,
-      },
-    );
   }
 }

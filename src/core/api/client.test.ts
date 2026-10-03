@@ -13,6 +13,7 @@ import error402Balance from '../../../tests/fixtures/openrouter/error-402-chat-i
 import error402InFlight from '../../../tests/fixtures/openrouter/error-402-in-flight-budget.documented.json';
 import error404Video from '../../../tests/fixtures/openrouter/error-404-video-job.recorded.json';
 import error429 from '../../../tests/fixtures/openrouter/error-429-upstream-2.recorded.json';
+import error429Plain from '../../../tests/fixtures/openrouter/error-429.documented.json';
 import error400Model from '../../../tests/fixtures/openrouter/error-400-invalid-model.recorded.json';
 import error502 from '../../../tests/fixtures/openrouter/error-502-provider.documented.json';
 import imagesGenerate from '../../../tests/fixtures/openrouter/images-generate.recorded.json';
@@ -35,10 +36,18 @@ import videoFailed from '../../../tests/fixtures/openrouter/videos-poll-failed.d
 import videosModels from '../../../tests/fixtures/openrouter/videos-models.json';
 import { ApiError, NetworkError, RateLimitError, isAbortError } from '../errors';
 import type { KeyInfo, KeysService, ModelsService } from '../types';
-import { API_BASE, DECISIONS_URL, createApiClient, type ApiClientOptions } from './client';
+import {
+  API_BASE,
+  DECISIONS_URL,
+  createApiClient,
+  mayRetry,
+  type ApiClientOptions,
+} from './client';
 import type { FreeModelThrottle } from './throttle';
-import { fakeCore, fakeRun, type FakeRun } from './test-fakes';
+import { fakeRun, isolateChannels, testCore, type FakeRun } from './test-fakes';
 import type { ChatRequest, ChatStreamEvent } from './types';
+
+beforeEach(() => isolateChannels());
 
 /** Fake test key: never matches the pre-commit hook's real-key pattern. */
 const SECRET = `sk-or-v1-test${'x'.repeat(60)}`;
@@ -102,7 +111,7 @@ function setup(
   const keys = { secret: vi.fn(() => Promise.resolve(SECRET)), get: vi.fn(() => info) };
   const models = { estimate: vi.fn(() => Promise.resolve(0.000176)) };
   const throttle = { acquire: vi.fn(() => Promise.resolve()) };
-  const core = fakeCore({
+  const core = testCore({
     keys: keys as unknown as KeysService,
     models: models as unknown as ModelsService,
   });
@@ -256,7 +265,7 @@ describe('retries', () => {
   afterEach(() => vi.useRealTimers());
 
   it('backs off with full jitter between attempts', async () => {
-    const s = setup([json(error502, 502), json(error502, 502), json(chatRecorded)], {
+    const s = setup([json(error429Plain, 429), json(error429Plain, 429), json(chatRecorded)], {
       options: { retry: { random: () => 0.5 } },
     });
     const done = s.client.chat(chatBody, { run: s.run });
@@ -282,25 +291,26 @@ describe('retries', () => {
   });
 
   it('gives up after three attempts', async () => {
-    const s = setup([json(error502, 502), json(error502, 502), json(error502, 502)]);
+    const s = setup([json(error429Plain, 429), json(error429Plain, 429), json(error429Plain, 429)]);
     const done = s.client.chat(chatBody, { run: s.run }).catch((e: unknown) => e);
     await vi.advanceTimersByTimeAsync(10_000);
     const error = await done;
-    expect(error).toBeInstanceOf(ApiError);
-    expect((error as ApiError).status).toBe(502);
+    expect(error).toBeInstanceOf(RateLimitError);
     expect(s.fetch).toHaveBeenCalledTimes(3);
   });
 
-  it('retries network failures and the in-flight-budget 402, then surfaces NetworkError', async () => {
+  it('retries the in-flight-budget 402, but not a chat request that failed in transit', async () => {
     const s = setup([
       json(error402InFlight, 402),
       new TypeError('fetch failed'),
-      new TypeError('x'),
+      json(chatRecorded),
     ]);
     const done = s.client.chat(chatBody, { run: s.run }).catch((e: unknown) => e);
     await vi.advanceTimersByTimeAsync(10_000);
     expect(await done).toBeInstanceOf(NetworkError);
-    expect(s.fetch).toHaveBeenCalledTimes(3);
+    expect(s.fetch).toHaveBeenCalledTimes(2);
+    // It may have reached the provider: the cost is unknown, never free.
+    expect(s.run.usages).toEqual([expect.objectContaining({ costUsd: 0, costUnknown: true })]);
   });
 
   it('does not retry client errors or other 402s', async () => {
@@ -315,12 +325,16 @@ describe('retries', () => {
     }
   });
 
-  it('retries a 200 whose body is an error', async () => {
+  it('maps a 200 whose body is an error to ApiError, retried only where reads are safe', async () => {
     const s = setup([json(chatError200), json(chatRecorded)]);
-    const done = s.client.chat(chatBody, { run: s.run });
+    await expect(s.client.chat(chatBody, { run: s.run })).rejects.toMatchObject({ status: 502 });
+    expect(s.fetch).toHaveBeenCalledTimes(1);
+
+    const get = setup([json(chatError200), json(videoPending)]);
+    const done = get.client.videos.status(videoPending.id, { keyId: 'key-1' });
     await vi.advanceTimersByTimeAsync(0);
-    await expect(done).resolves.toMatchObject({ id: chatRecorded.id });
-    expect(s.fetch).toHaveBeenCalledTimes(2);
+    await expect(done).resolves.toMatchObject({ status: 'pending' });
+    expect(get.fetch).toHaveBeenCalledTimes(2);
   });
 
   it('respects retry: false', async () => {
@@ -332,7 +346,7 @@ describe('retries', () => {
   });
 
   it('stops waiting as soon as the run aborts', async () => {
-    const s = setup([json(error502, 502), json(chatRecorded)], {
+    const s = setup([json(error429Plain, 429), json(chatRecorded)], {
       options: { retry: { random: () => 0.99 } },
     });
     const done = s.client.chat(chatBody, { run: s.run }).catch((e: unknown) => e);
@@ -344,7 +358,7 @@ describe('retries', () => {
   });
 
   it('aborts on the run signal even when the call has its own signal', async () => {
-    const s = setup([json(error502, 502), json(chatRecorded)]);
+    const s = setup([json(error429Plain, 429), json(chatRecorded)]);
     const own = new AbortController();
     const done = s.client
       .chat(chatBody, { run: s.run, signal: own.signal })
@@ -442,13 +456,47 @@ describe('chatStream', () => {
     expect((error as ApiError).detail.midStream).toBe(true);
     expect(events).toContainEqual({ type: 'text', text: 'Partial ' });
     expect(s.fetch).toHaveBeenCalledTimes(1);
+    // Text arrived and no usage chunk did: booked as unknown.
+    expect(s.run.usages).toEqual([expect.objectContaining({ costUnknown: true })]);
   });
 
-  it('retries an error that arrives before the stream starts', async () => {
-    const s = setup([json(error502, 502), sse(chatStreamText)]);
+  it('retries a refusal that arrives before the stream starts', async () => {
+    const s = setup([json(error429Plain, 429), sse(chatStreamText)]);
     const result = await s.client.chatStream(chatBody, { run: s.run, onEvent: () => undefined });
     expect(result.finishReason).toBe('stop');
     expect(s.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails, with unknown cost, when the stream ends without [DONE] or a usage chunk', async () => {
+    const cut = 'data: {"id":"g","model":"m","choices":[{"delta":{"content":"Hal"}}]}\n\n';
+    const s = setup([sse(cut)]);
+    const events: ChatStreamEvent[] = [];
+    const error: unknown = await s.client
+      .chatStream(chatBody, { run: s.run, onEvent: (e) => events.push(e) })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(NetworkError);
+    expect(events).toContainEqual({ type: 'text', text: 'Hal' });
+    expect(s.run.usages).toEqual([
+      expect.objectContaining({ costUsd: 0, costUnknown: true, promptTokens: 0 }),
+    ]);
+  });
+
+  it('accepts a complete stream without a usage chunk, with unknown cost', async () => {
+    const text =
+      'data: {"id":"g","model":"m","choices":[{"delta":{"content":"Hi"},"finish_reason":"stop"}]}\n\n' +
+      'data: [DONE]\n\n';
+    const s = setup([sse(text)]);
+    const result = await s.client.chatStream(chatBody, { run: s.run, onEvent: () => undefined });
+    expect(result.text).toBe('Hi');
+    expect(s.run.usages).toEqual([expect.objectContaining({ costUnknown: true })]);
+
+    const free = setup([sse(text)]);
+    await free.client.chatStream(
+      { ...chatBody, model: 'liquid/lfm-2.5-2.6b:free' },
+      { run: free.run, onEvent: () => undefined },
+    );
+    expect(free.run.usages[0]).toMatchObject({ costUsd: 0 });
+    expect(free.run.usages[0]?.costUnknown).toBeUndefined();
   });
 
   it('aborts cleanly mid-stream', async () => {
@@ -470,7 +518,8 @@ describe('chatStream', () => {
       })
       .catch((e: unknown) => e);
     expect(isAbortError(error)).toBe(true);
-    expect(s.run.usages).toHaveLength(0);
+    // The provider may bill what it generated: the run books its reservation.
+    expect(s.run.usages).toEqual([expect.objectContaining({ costUsd: 0, costUnknown: true })]);
   });
 
   it('replays a JSON answer from a provider that cannot stream', async () => {
@@ -548,6 +597,45 @@ describe('images', () => {
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).detail.midStream).toBe(true);
     expect((error as ApiError).status).toBe(500);
+    // A failed generation is not billed (docs §3.4).
+    expect(s.run.usages).toEqual([]);
+  });
+
+  const completed = (cost: number): string =>
+    `data: {"type":"image_generation.completed","b64_json":"${PNG_B64}","media_type":"image/png","usage":{"completion_tokens":272,"cost":${cost}}}\n\n`;
+
+  it('keeps completed images and their usage when a later event fails', async () => {
+    const text =
+      completed(0.011) +
+      'data: {"type":"error","error":{"message":"Generation failed","code":"server_error"}}\n\n';
+    const s = setup([sse(text)]);
+    const result = await s.client.images(
+      { model: 'openai/gpt-image-2', prompt: 'x', stream: true, n: 2 },
+      { run: s.run },
+    );
+    expect(result.images).toHaveLength(1);
+    expect(result.error).toBeInstanceOf(ApiError);
+    expect(s.run.usages).toEqual([expect.objectContaining({ costUsd: 0.011 })]);
+  });
+
+  it('keeps completed images when the connection drops after them', async () => {
+    const s = setup([sse(completed(0.011))]);
+    const result = await s.client.images(
+      { model: 'openai/gpt-image-2', prompt: 'x', stream: true },
+      { run: s.run },
+    );
+    expect(result.images).toHaveLength(1);
+    expect(s.run.usages[0]).toMatchObject({ costUsd: 0.011 });
+  });
+
+  it('books an unknown cost when the stream drops before any image', async () => {
+    const partial = `data: {"type":"image_generation.partial_image","b64_json":"${PNG_B64}"}\n\n`;
+    const s = setup([sse(partial)]);
+    const error: unknown = await s.client
+      .images({ model: 'openai/gpt-image-2', prompt: 'x', stream: true }, { run: s.run })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(NetworkError);
+    expect(s.run.usages).toEqual([expect.objectContaining({ costUnknown: true })]);
   });
 });
 
@@ -572,8 +660,21 @@ describe('speech', () => {
       kind: 'speech',
       model: 'hexgrad/kokoro-82m',
       characters: speechKokoro.request.input.length,
+      bytes: speechKokoro.request.input.length,
     });
     expect(s.run.usages[0]).toMatchObject({ costUsd: 0.000176, costEstimated: true });
+  });
+
+  it('passes UTF-8 bytes for byte-priced providers and books unknown without an estimate', async () => {
+    const s = setup([
+      new Response(new Uint8Array(4), { headers: { 'Content-Type': 'audio/mpeg' } }),
+    ]);
+    s.models.estimate.mockResolvedValueOnce(null);
+    await s.client.speech({ model: 'fish-audio/s2.1-pro', input: 'Grüße 🌍' }, { run: s.run });
+    expect(s.models.estimate).toHaveBeenCalledWith(
+      expect.objectContaining({ characters: 7, bytes: 12 }),
+    );
+    expect(s.run.usages[0]).toMatchObject({ costUsd: 0, costEstimated: false, costUnknown: true });
   });
 
   it('picks mp3, or pcm for Gemini TTS, when the caller does not choose', async () => {
@@ -833,5 +934,207 @@ describe('catalog and account', () => {
       }),
     ).rejects.toBeInstanceOf(ApiError);
     expect(s.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** A 200 whose body breaks off mid-download. */
+function brokenBody(contentType = 'application/json'): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"id":'));
+      controller.error(new TypeError('network error'));
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'Content-Type': contentType } });
+}
+
+const imageOk = (): Response =>
+  json({ created: 1, data: [{ b64_json: PNG_B64 }], usage: { cost: 0.01 } });
+const noProvider = (): Response =>
+  json({ error: { code: 503, message: 'No endpoints found for this model.' } }, 503);
+
+describe('retry rules', () => {
+  it('decides per kind of request', () => {
+    const e = (status: number, metadata?: Record<string, unknown>): ApiError =>
+      new ApiError('x', status, metadata ? { metadata } : {});
+    const inFlight = e(402, { limit_source: 'openrouter_in_flight_budget' });
+    const net = new NetworkError();
+    expect([e(429), inFlight, e(503), e(502), e(408), net].map((x) => mayRetry(x, 'read'))).toEqual(
+      [true, true, true, true, true, true],
+    );
+    expect(
+      [e(429), inFlight, e(503), e(502), e(524), e(408), net].map((x) => mayRetry(x, 'paid')),
+    ).toEqual([true, true, true, false, false, false, false]);
+    expect([e(429), inFlight, e(503), e(502), net].map((x) => mayRetry(x, 'chat'))).toEqual([
+      true,
+      true,
+      false,
+      false,
+      false,
+    ]);
+    expect(mayRetry(e(429), 'never')).toBe(false);
+    expect(mayRetry(new ApiError('x', 429, { midStream: true }), 'read')).toBe(false);
+  });
+
+  it('retries a paid POST only when no provider started it', async () => {
+    const retried = setup([noProvider(), imageOk()]);
+    await retried.client.images({ model: 'm', prompt: 'x' }, { run: retried.run });
+    expect(retried.fetch).toHaveBeenCalledTimes(2);
+
+    for (const status of [500, 502, 408, 524]) {
+      const s = setup([json(error502, status), imageOk()]);
+      await expect(
+        s.client.images({ model: 'm', prompt: 'x' }, { run: s.run }),
+      ).rejects.toMatchObject({
+        status,
+      });
+      expect(s.fetch).toHaveBeenCalledTimes(1);
+      // An error answer is not billed.
+      expect(s.run.usages).toEqual([]);
+    }
+
+    const chat = setup([noProvider(), json(chatRecorded)]);
+    await expect(chat.client.chat(chatBody, { run: chat.run })).rejects.toMatchObject({
+      status: 503,
+    });
+    expect(chat.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('never resends a paid POST that may have reached the server, and books its cost as unknown', async () => {
+    const video = setup([new TypeError('fetch failed'), json(videoSubmit, 202)]);
+    await expect(
+      video.client.videos.submit(
+        { model: 'x-ai/grok-imagine-video', prompt: 'p' },
+        { run: video.run },
+      ),
+    ).rejects.toBeInstanceOf(NetworkError);
+    expect(video.fetch).toHaveBeenCalledTimes(1);
+    expect(video.run.usages).toEqual([
+      expect.objectContaining({ model: 'x-ai/grok-imagine-video', costUnknown: true }),
+    ]);
+
+    const decide = setup([new TypeError('fetch failed'), json(jev)]);
+    await expect(
+      decide.client.decide(jevRequest as Parameters<typeof decide.client.decide>[0], {
+        run: decide.run,
+      }),
+    ).rejects.toBeInstanceOf(NetworkError);
+    expect(decide.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries idempotent reads after network failures and 5xx', async () => {
+    const s = setup([new TypeError('fetch failed'), json(error502, 502), json(videoPending)]);
+    await expect(
+      s.client.videos.status(videoPending.id, { keyId: 'key-1' }),
+    ).resolves.toMatchObject({ status: 'pending' });
+    expect(s.fetch).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('body read failures', () => {
+  it('maps a 2xx body that breaks off to NetworkError, never resending a paid POST', async () => {
+    const chat = setup([brokenBody(), json(chatRecorded)]);
+    await expect(chat.client.chat(chatBody, { run: chat.run })).rejects.toBeInstanceOf(
+      NetworkError,
+    );
+    expect(chat.fetch).toHaveBeenCalledTimes(1);
+    expect(chat.run.usages).toEqual([expect.objectContaining({ costUnknown: true })]);
+
+    const speech = setup([brokenBody('audio/mpeg'), new Response(new Uint8Array([1]))]);
+    await expect(
+      speech.client.speech({ model: 'hexgrad/kokoro-82m', input: 'hi' }, { run: speech.run }),
+    ).rejects.toBeInstanceOf(NetworkError);
+    expect(speech.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries reads whose body breaks off', async () => {
+    const bytes = new Uint8Array([0, 0, 0, 0x20, 0x66, 0x74, 0x79, 0x70]);
+    const s = setup([
+      brokenBody('video/mp4'),
+      new Response(bytes, { headers: { 'Content-Type': 'video/mp4' } }),
+    ]);
+    const blob = await s.client.videos.content('job', { keyId: 'key-1' });
+    expect(blob.size).toBe(bytes.length);
+    expect(s.fetch).toHaveBeenCalledTimes(2);
+
+    const catalog = setup([brokenBody(), json(modelsFixture)]);
+    expect(await catalog.client.catalog.models()).toHaveLength(modelsFixture.data.length);
+    expect(catalog.fetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('response shape checks', () => {
+  it('turns malformed success bodies into ApiError, never a TypeError', async () => {
+    for (const body of [{}, { choices: [] }, { choices: [{}] }, { error: 'boom' }]) {
+      const s = setup([json(body)]);
+      const error: unknown = await s.client.chat(chatBody, { run: s.run }).catch((e: unknown) => e);
+      expect(error, JSON.stringify(body)).toBeInstanceOf(ApiError);
+      expect(s.fetch).toHaveBeenCalledTimes(1);
+    }
+    const decide = setup([json({ id: 'x' })]);
+    await expect(
+      decide.client.decide(jevRequest as Parameters<typeof decide.client.decide>[0], {
+        run: decide.run,
+      }),
+    ).rejects.toMatchObject({
+      status: 502,
+      message: 'OpenRouter returned an unexpected response.',
+    });
+    const images = setup([json({ created: 1 })]);
+    await expect(
+      images.client.images({ model: 'm', prompt: 'x' }, { run: images.run }),
+    ).rejects.toBeInstanceOf(ApiError);
+    const stt = setup([json({ usage: {} })]);
+    await expect(
+      stt.client.transcribe(
+        {
+          model: 'x-ai/grok-stt-1.0',
+          audio: new Blob([new Uint8Array([1])], { type: 'audio/mpeg' }),
+        },
+        { run: stt.run },
+      ),
+    ).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it('checks read bodies too (and retries them like other read failures)', async () => {
+    const s = setup([json({}), json({ id: 'x' }), json({ data: 'nope' })]);
+    await expect(s.client.videos.status('x', { keyId: 'key-1' })).rejects.toBeInstanceOf(ApiError);
+    expect(s.fetch).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('no-retention with fallback models', () => {
+  it('denies data collection when any model may be paid, and only skips all-free requests', async () => {
+    const s = setup([json(chatRecorded), json(chatRecorded)], { noRetention: true });
+    await s.client.chat(
+      { ...chatBody, model: 'liquid/lfm-2.5-2.6b:free', models: ['openai/gpt-6-luna'] },
+      { run: s.run },
+    );
+    await s.client.chat(
+      { ...chatBody, model: 'liquid/lfm-2.5-2.6b:free', models: ['qwen/qwen3.8-27b:free'] },
+      { run: s.run },
+    );
+    expect(call(s, 0).body['provider']).toEqual({ data_collection: 'deny' });
+    expect(call(s, 1).body['provider']).toBeUndefined();
+  });
+});
+
+describe('unknown cost', () => {
+  it('books a response without usage as unknown, never as free', async () => {
+    const { usage: _dropped, ...withoutUsage } = chatRecorded;
+    const s = setup([json(withoutUsage), json(withoutUsage)]);
+    await s.client.chat(chatBody, { run: s.run });
+    expect(s.run.usages[0]).toMatchObject({ costUsd: 0, costEstimated: false, costUnknown: true });
+    await s.client.chat({ ...chatBody, model: 'liquid/lfm-2.5-2.6b:free' }, { run: s.run });
+    expect(s.run.usages[1]).toMatchObject({ costUsd: 0 });
+    expect(s.run.usages[1]?.costUnknown).toBeUndefined();
+    expect(_dropped).toBeDefined();
+  });
+
+  it('books a missing cost as unknown when it cannot be estimated', async () => {
+    const s = setup([json({ ...jev, usage: { input_tokens: 10, output_tokens: 1 } })]);
+    s.models.estimate.mockResolvedValueOnce(null);
+    await s.client.decide(jevRequest as Parameters<typeof s.client.decide>[0], { run: s.run });
+    expect(s.run.usages[0]).toMatchObject({ promptTokens: 10, costUsd: 0, costUnknown: true });
   });
 });

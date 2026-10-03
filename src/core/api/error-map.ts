@@ -8,6 +8,7 @@
  */
 
 import { ApiError, RateLimitError, type ApiErrorDetail } from '../errors';
+import { isFiniteNumber, isRecord, isString, parseJsonSafe } from '../util';
 
 /** Keys removed from `error.metadata` before it is kept on the error. */
 const ACCOUNT_KEYS = new Set([
@@ -24,10 +25,6 @@ export interface ErrorContext {
   generationId?: string | null;
   providerName?: string | null;
   midStream?: boolean;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function clip(text: string): string {
@@ -47,8 +44,7 @@ function sanitizeMetadata(metadata: unknown): Record<string, unknown> | undefine
 function retryAfterMs(metadata: Record<string, unknown> | undefined): number | undefined {
   if (!metadata) return undefined;
   const seconds = metadata['retry_after_seconds'];
-  if (typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0)
-    return seconds * 1000;
+  if (isFiniteNumber(seconds) && seconds >= 0) return seconds * 1000;
   const headers = metadata['headers'];
   if (isRecord(headers)) {
     const value = headers['Retry-After'] ?? headers['retry-after'];
@@ -111,11 +107,11 @@ function messageFor(
 
 function zodMessage(raw: string): string {
   try {
-    const issues: unknown = JSON.parse(raw);
+    const issues = parseJsonSafe(raw);
     if (Array.isArray(issues) && isRecord(issues[0])) {
       const issue = issues[0];
       const path = Array.isArray(issue['path']) ? issue['path'].join('.') : '';
-      const text = typeof issue['message'] === 'string' ? issue['message'] : 'invalid value';
+      const text = isString(issue['message']) ? issue['message'] : 'invalid value';
       return clip(`OpenRouter rejected the request: ${path ? `${path}: ` : ''}${text}`);
     }
   } catch {
@@ -140,9 +136,9 @@ export function apiErrorFromBody(
 
   if (isRecord(error) && error['name'] === 'ZodError') {
     detail.errorType = 'invalid_request';
-    const raw = typeof error['message'] === 'string' ? error['message'] : '';
+    const raw = isString(error['message']) ? error['message'] : '';
     try {
-      const issues: unknown = JSON.parse(raw);
+      const issues = parseJsonSafe(raw);
       if (Array.isArray(issues)) detail.metadata = { issues };
     } catch {
       // Keep going without structured issues.
@@ -176,9 +172,14 @@ export function apiErrorFromBody(
     : new ApiError(message, status, detail);
 }
 
-/** True when a parsed 2xx body or SSE chunk carries an `error` object instead of a result. */
+/**
+ * The `error` a parsed 2xx body or SSE chunk carries instead of a result, or null. A bare string
+ * (`{"error":"…"}`) is returned as `{ message }`.
+ */
 export function bodyError(body: unknown): Record<string, unknown> | null {
   if (!isRecord(body)) return null;
   const error = body['error'];
-  return isRecord(error) ? error : null;
+  if (isRecord(error)) return error;
+  if (isString(error) && error) return { message: error };
+  return null;
 }
