@@ -26,6 +26,12 @@ All notable changes to this project are documented here. The format follows
 - Exporters: CSV, TSV, XLSX, DOCX, SRT, VTT, ZIP (55a35a4).
 - Composition root `getCore()` (c8da141).
 - Gapless audio stitching and an off-main-thread image pipeline (Stage 1 review).
+- Page shell `mountPage()`: navbar with tools menu, key chip and balance, lock, theme and free-only badge; command palette (Ctrl/Cmd+K); leave-page guard; budget confirmation; live accent colour, density and reduced motion (a94c4fe).
+- Feedback: toasts with Undo, confirm, typed-confirm, prompt and unlock dialogs, `presentError()` per error code (a94c4fe).
+- Shared components: drop zone, model and key pickers, cost badge, prompts panel, output panel, export menu, image, audio and video players, job list (3dd8a33).
+- Tool framework `mountTool()`: header chips, three-zone layout, Run/Stop, URL state, drop and paste, Send to…; all 14 tools mount through it (0e06dde).
+- Home with search, favourites, recent runs and first-run onboarding; Privacy page (39fd198).
+- Tool authoring guide and Stage 2 e2e specs (4c42391).
 
 ### Changed
 
@@ -34,6 +40,7 @@ All notable changes to this project are documented here. The format follows
 - Budgets count reservations of running runs; unknown costs book the reservation (Stage 1 review).
 - Stats survive "Delete all prompts and history" (c8da141).
 - Auto-lock 0 means never (82808cd).
+- OAuth callback, Diagnostics, Settings, Models, History and Stats render on the shell (39fd198).
 
 ### Fixed
 
@@ -42,3 +49,4 @@ All notable changes to this project are documented here. The format follows
 ### Removed
 
 - `write-excel-file` dependency; XLSX is written directly (472888c).
+- Stage 0 placeholder frame `src/ui/stub.ts` (39fd198).
