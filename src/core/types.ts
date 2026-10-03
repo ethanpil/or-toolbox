@@ -297,7 +297,13 @@ export interface ModelsService {
 
 export type EstimateInput =
   | { kind: 'tokens'; model: string; promptTokens: number; completionTokens: number }
-  | { kind: 'speech'; model: string; characters: number }
+  | {
+      kind: 'speech';
+      model: string;
+      characters: number;
+      /** UTF-8 byte length of the input; Fish Audio bills per byte. Assumed 4 per character when absent. */
+      bytes?: number;
+    }
   | { kind: 'transcription'; model: string; seconds: number }
   | {
       kind: 'image';
@@ -473,10 +479,11 @@ export interface ApiClient {
   };
   /** Keyless catalog reads (used by ModelsService). */
   catalog: {
-    models(params?: Record<string, string>): Promise<RawModel[]>;
-    modelEndpoints(modelId: string): Promise<RawModelEndpoint[]>;
-    imageModels(): Promise<RawImageModel[]>;
-    videoModels(): Promise<RawVideoModel[]>;
+    /** `retry: false` for background refreshes (one attempt, no backoff). */
+    models(params?: Record<string, string>, opts?: { retry?: boolean }): Promise<RawModel[]>;
+    modelEndpoints(modelId: string, opts?: { retry?: boolean }): Promise<RawModelEndpoint[]>;
+    imageModels(opts?: { retry?: boolean }): Promise<RawImageModel[]>;
+    videoModels(opts?: { retry?: boolean }): Promise<RawVideoModel[]>;
   };
   /** Account reads with an explicit secret (used by KeysService and OAuth). */
   account: {

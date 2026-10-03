@@ -9,7 +9,7 @@
  */
 
 import { NetworkError } from '../errors';
-import { abortError } from './retry';
+import { abortError } from '../util';
 
 export interface SseEvent {
   /** `event:` field, or null for the default `message` type. */

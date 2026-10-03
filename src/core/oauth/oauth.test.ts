@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import authKeys from '../../../tests/fixtures/openrouter/auth-keys-response.documented.json';
-import { fakeCore, fakeSettings, linkedBuses } from '../api/test-fakes';
-import { ApiError } from '../errors';
+import { isolateChannels, testCore } from '../api/test-fakes';
+import { ApiError, KeyLockedError, errorCode, userMessage } from '../errors';
 import { createKeysService } from '../keys/keys';
 import { SS_KEYS } from '../storage/local';
 import type { ApiClient, KeyInfo, KeysService } from '../types';
@@ -32,14 +32,15 @@ function setup(now = () => 1_000_000) {
   const navigate = vi.fn<(href: string) => void>();
   const exchangeAuthCode = vi.fn(() => Promise.resolve({ key: OAUTH_KEY }));
   const add = vi.fn(() => Promise.resolve(keyInfo));
+  const lock = { locked: false };
   const oauth = createOAuthService(
-    fakeCore({
+    testCore({
       api: { account: { exchangeAuthCode } } as unknown as ApiClient,
-      keys: { add } as unknown as KeysService,
+      keys: { add, lock: { unlocked: () => !lock.locked } } as unknown as KeysService,
     }),
     { navigate, now },
   );
-  return { oauth, navigate, exchangeAuthCode, add };
+  return { oauth, navigate, exchangeAuthCode, add, lock };
 }
 
 async function started(
@@ -52,7 +53,10 @@ async function started(
   return new URL(href);
 }
 
-beforeEach(() => sessionStorage.clear());
+beforeEach(() => {
+  isolateChannels();
+  sessionStorage.clear();
+});
 
 describe('pkce', () => {
   it('computes the RFC 7636 S256 test vector', async () => {
@@ -185,16 +189,44 @@ describe('complete', () => {
     expect(s.add).not.toHaveBeenCalled();
   });
 
+  it('refuses while locked without consuming anything, then works with the same params', async () => {
+    const s = setup();
+    const params = await callbackParams(s);
+    const pending = sessionStorage.getItem(SS_KEYS.oauth);
+    s.lock.locked = true;
+    const error: unknown = await s.oauth.complete(params).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(KeyLockedError);
+    expect(errorCode(error)).toBe('locked');
+    expect(sessionStorage.getItem(SS_KEYS.oauth)).toBe(pending);
+    expect(s.exchangeAuthCode).not.toHaveBeenCalled();
+    s.lock.locked = false;
+    await expect(s.oauth.complete(params)).resolves.toMatchObject({ key: keyInfo });
+    expect(s.exchangeAuthCode).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to start while locked', async () => {
+    const s = setup();
+    s.lock.locked = true;
+    await expect(s.oauth.start()).rejects.toBeInstanceOf(KeyLockedError);
+    expect(s.navigate).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem(SS_KEYS.oauth)).toBeNull();
+  });
+
+  it('shows its own message to the user (OAuthError is an OrError)', async () => {
+    const s = setup();
+    const error: unknown = await s.oauth.complete(new URLSearchParams()).catch((e: unknown) => e);
+    expect(errorCode(error)).toBe('oauth');
+    expect(userMessage(error)).toMatch(/no sign-in code/);
+  });
+
   it('stores a usable default key end to end with the real keys service', async () => {
     localStorage.clear();
-    const settings = fakeSettings();
-    const core = fakeCore({
-      settings,
-      bus: linkedBuses(1)[0],
+    const core = testCore({
       api: {
         account: { exchangeAuthCode: () => Promise.resolve({ key: OAUTH_KEY }) },
       } as unknown as ApiClient,
     });
+    const settings = core.settings;
     core.keys = createKeysService(core);
     const navigate = vi.fn<(href: string) => void>();
     const oauth = createOAuthService(core, { navigate });

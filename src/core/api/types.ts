@@ -5,6 +5,8 @@
  * field-level detail may be refined against the reference, but do not rename or remove exports.
  */
 
+import type { OrError } from '../errors';
+
 // --- shared ----------------------------------------------------------------------------------------
 
 /** Wire `usage` object. `cost` is always present on billed JSON responses [§1]. */
@@ -160,7 +162,7 @@ export interface ImageRequest {
   seed?: number;
   /** Only OpenAI models stream; others answer with a buffered JSON body, which the client also accepts. */
   stream?: boolean;
-  /** https URLs or base64 `data:` URLs (see `blobToDataUrl`) [§3.2]. */
+  /** https URLs or base64 `data:` URLs (see `readAsDataUrl` in src/core/files.ts) [§3.2]. */
   input_references?: Array<{ type: 'image_url'; image_url: { url: string } }>;
   /** `/images` accepts only `only, order, ignore, sort, allow_fallbacks, options` [§2.9]. */
   provider?: ProviderPreferences;
@@ -180,6 +182,11 @@ export interface ImageResult {
   usage: WireUsage | null;
   /** `X-Generation-Id` (the body carries no id). */
   generationId: string | null;
+  /**
+   * Set when a stream failed (error event, dropped connection) after some images had completed: `images` holds
+   * those, and their usage was reported. Without any completed image the call rejects instead.
+   */
+  error?: OrError;
 }
 
 // --- speech [§4] -----------------------------------------------------------------------------------

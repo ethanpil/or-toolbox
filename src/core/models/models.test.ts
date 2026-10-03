@@ -1,20 +1,26 @@
 import 'fake-indexeddb/auto';
-import { IDBFactory } from 'fake-indexeddb';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import modelsFixture from '../../../tests/fixtures/openrouter/models.json';
 import videosFixture from '../../../tests/fixtures/openrouter/videos-models.json';
 import imagesFixture from '../../../tests/fixtures/openrouter/images-models.json';
 import type { RawModel, RawModelEndpoint } from '../api/types';
-import { fakeCore, fakeSettings, linkedBuses } from '../api/test-fakes';
+import { isolateChannels, testCore } from '../api/test-fakes';
 import { closeDbForTests, getDb } from '../storage/db';
-import type { ApiClient, ModelsService, Settings, SettingsService } from '../types';
-import { CATALOG_MAX_AGE_MS, KV_CATALOG, createModelsService, kvEndpoints } from './models';
+import { resetDb } from '../testing/state-fakes';
+import type { ApiClient, BusEvent, CoreServices, ModelsService, Settings } from '../types';
+import {
+  CATALOG_MAX_AGE_MS,
+  KV_CATALOG,
+  REFRESH_FAILURE_BACKOFF_MS,
+  createModelsService,
+  kvEndpoints,
+} from './models';
 
 const RAW = modelsFixture.data as unknown as RawModel[];
 const DAY = CATALOG_MAX_AGE_MS;
 
 interface Catalog {
-  models: Mock<() => Promise<RawModel[]>>;
+  models: Mock<(params?: unknown, opts?: { retry?: boolean }) => Promise<RawModel[]>>;
   modelEndpoints: Mock<(id: string) => Promise<RawModelEndpoint[]>>;
   imageModels: Mock;
   videoModels: Mock;
@@ -36,20 +42,33 @@ function catalogApi(): Catalog {
   };
 }
 
-function service(
-  catalog: Catalog,
-  settings: SettingsService = fakeSettings(),
-  bus = linkedBuses(1)[0],
-): ModelsService {
-  return createModelsService(
-    fakeCore({ api: { catalog } as unknown as ApiClient, settings, ...(bus ? { bus } : {}) }),
-    { now: () => clock },
-  );
+interface Tab {
+  models: ModelsService;
+  core: CoreServices;
+  /** models-refreshed events this tab received. */
+  events: BusEvent[];
+}
+
+/** One tab with the real bus and settings; tabs in one test talk to each other. */
+function tab(catalog: Catalog = catalogApi()): Tab {
+  const core = testCore({ api: { catalog } as unknown as ApiClient });
+  const events: BusEvent[] = [];
+  core.bus.on('models-refreshed', (event) => events.push(event));
+  const models = createModelsService(core, { now: () => clock });
+  core.models = models;
+  return { models, core, events };
+}
+
+const service = (catalog: Catalog = catalogApi()): ModelsService => tab(catalog).models;
+
+async function storedCatalog(): Promise<unknown> {
+  return (await (await getDb()).get('kv', KV_CATALOG))?.value;
 }
 
 beforeEach(async () => {
-  await closeDbForTests();
-  globalThis.indexedDB = new IDBFactory();
+  isolateChannels();
+  localStorage.clear();
+  await resetDb();
   clock = 1_000_000;
 });
 
@@ -60,17 +79,17 @@ afterEach(async () => {
 describe('catalog cache', () => {
   it('fetches once, normalises, stores {fetchedAt, models} in IndexedDB and announces it', async () => {
     const catalog = catalogApi();
-    const [bus] = linkedBuses(1);
-    const models = service(catalog, fakeSettings(), bus);
+    const { models, events } = tab(catalog);
     const list = await models.list();
     expect(list).toHaveLength(RAW.length);
     expect(list[0]?.pricing.prompt).toBe(0.000002);
     await models.list();
     expect(catalog.models).toHaveBeenCalledTimes(1);
-    expect(catalog.models).toHaveBeenCalledWith({ output_modalities: 'all' });
-    const stored = await (await getDb()).get('kv', KV_CATALOG);
-    expect(stored?.value).toEqual({ fetchedAt: clock, models: RAW });
-    expect(bus?.events).toEqual([{ type: 'models-refreshed' }]);
+    expect(catalog.models).toHaveBeenCalledWith({ output_modalities: 'all' }, { retry: true });
+    await vi.waitFor(async () =>
+      expect(await storedCatalog()).toEqual({ fetchedAt: clock, models: RAW }),
+    );
+    await vi.waitFor(() => expect(events).toEqual([{ type: 'models-refreshed' }]));
     expect(models.lastRefreshed()).toBe(clock);
   });
 
@@ -82,7 +101,8 @@ describe('catalog cache', () => {
   });
 
   it('serves a fresh IndexedDB copy to a new page without fetching', async () => {
-    await service(catalogApi()).list();
+    await service().list();
+    await vi.waitFor(async () => expect(await storedCatalog()).toBeDefined());
     const catalog = catalogApi();
     clock += DAY - 1;
     const list = await service(catalog).list();
@@ -90,19 +110,48 @@ describe('catalog cache', () => {
     expect(catalog.models).not.toHaveBeenCalled();
   });
 
-  it('refreshes when older than 24 hours or on demand', async () => {
+  it('returns a stale copy at once and refreshes it in the background, once, without retries', async () => {
     const catalog = catalogApi();
     const models = service(catalog);
     await models.list();
     clock += DAY;
-    await models.list();
+    let release: (value: RawModel[]) => void = () => undefined;
+    catalog.models.mockImplementationOnce(
+      () => new Promise<RawModel[]>((resolve) => (release = resolve)),
+    );
+    // The refresh hangs, yet the stale copy comes back immediately (twice, one refresh).
+    expect(await models.list()).toHaveLength(RAW.length);
+    expect(await models.list()).toHaveLength(RAW.length);
     expect(catalog.models).toHaveBeenCalledTimes(2);
+    expect(catalog.models).toHaveBeenLastCalledWith({ output_modalities: 'all' }, { retry: false });
+    release(RAW.slice(0, 3));
+    await vi.waitFor(async () => expect(await models.list()).toHaveLength(3));
+    expect(models.lastRefreshed()).toBe(clock);
+
     await models.list({ refresh: true });
     expect(catalog.models).toHaveBeenCalledTimes(3);
   });
 
-  it('works offline from a stale cache and fails without one', async () => {
-    await service(catalogApi()).list();
+  it('remembers a failed background refresh for a few minutes', async () => {
+    const catalog = catalogApi();
+    const models = service(catalog);
+    await models.list();
+    clock += DAY;
+    catalog.models.mockRejectedValue(new TypeError('offline'));
+    await models.list();
+    await vi.waitFor(() => expect(catalog.models).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await models.list();
+    await models.list();
+    expect(catalog.models).toHaveBeenCalledTimes(2);
+    clock += REFRESH_FAILURE_BACKOFF_MS;
+    await models.list();
+    expect(catalog.models).toHaveBeenCalledTimes(3);
+  });
+
+  it('works offline from a stale cache and fails fast without one', async () => {
+    await service().list();
+    await vi.waitFor(async () => expect(await storedCatalog()).toBeDefined());
     const offline = catalogApi();
     offline.models.mockRejectedValue(new TypeError('offline'));
     clock += 3 * DAY;
@@ -111,40 +160,62 @@ describe('catalog cache', () => {
     expect(await models.list({ refresh: true })).toHaveLength(RAW.length);
     expect(models.lastRefreshed()).toBe(1_000_000);
 
-    globalThis.indexedDB = new IDBFactory();
-    await closeDbForTests();
-    await expect(service(offline).list()).rejects.toThrow('offline');
+    await resetDb();
+    const empty = catalogApi();
+    empty.models.mockRejectedValue(new TypeError('offline'));
+    const fresh = service(empty);
+    await expect(fresh.list()).rejects.toThrow('offline');
+    await expect(fresh.list()).rejects.toThrow('offline');
+    expect(empty.models).toHaveBeenCalledTimes(1);
+    await expect(fresh.list({ refresh: true })).rejects.toThrow('offline');
+    expect(empty.models).toHaveBeenCalledTimes(2);
   });
 
   it('reloads from IndexedDB when another tab refreshed', async () => {
-    const [busA, busB] = linkedBuses(2);
     const catalogA = catalogApi();
     const catalogB = catalogApi();
-    const tabA = service(catalogA, fakeSettings(), busA);
-    const tabB = service(catalogB, fakeSettings(), busB);
-    await tabA.list();
-    await tabB.list();
+    const tabA = tab(catalogA);
+    const tabB = tab(catalogB);
+    await tabA.models.list();
+    await vi.waitFor(async () => expect(await storedCatalog()).toBeDefined());
+    await tabB.models.list();
     expect(catalogB.models).toHaveBeenCalledTimes(0);
 
     clock += 10;
     catalogA.models.mockResolvedValue(RAW.slice(0, 5));
-    await tabA.list({ refresh: true });
-    expect(await tabB.list()).toHaveLength(5);
+    await tabA.models.list({ refresh: true });
+    await vi.waitFor(() => expect(tabB.events.length).toBeGreaterThanOrEqual(2));
+    expect(await tabB.models.list()).toHaveLength(5);
     expect(catalogB.models).toHaveBeenCalledTimes(0);
     // Its own announcement does not make tab A reload.
-    expect(await tabA.list()).toHaveLength(5);
+    expect(await tabA.models.list()).toHaveLength(5);
+  });
+
+  it('forgets everything in memory on a data reset from any tab', async () => {
+    const catalog = catalogApi();
+    const tabA = tab(catalog);
+    const tabB = tab();
+    await tabA.models.list();
+    await tabA.models.endpoints('hexgrad/kokoro-82m');
+    await vi.waitFor(async () => expect(await storedCatalog()).toBeDefined());
+    await resetDb(); // what "Reset everything" does to IndexedDB
+    tabB.core.bus.emit({ type: 'data-reset' });
+    await vi.waitFor(() => expect(tabA.models.lastRefreshed()).toBeNull());
+    await tabA.models.list();
+    await tabA.models.endpoints('hexgrad/kokoro-82m');
+    expect(catalog.models).toHaveBeenCalledTimes(2);
+    expect(catalog.modelEndpoints).toHaveBeenCalledTimes(2);
   });
 });
 
 describe('queries', () => {
   it('gets by id and filters by capability, free-only aware', async () => {
-    const settings = fakeSettings();
-    const models = service(catalogApi(), settings);
+    const { models, core } = tab();
     expect((await models.get('typesafe/jev-1.13'))?.capabilities).toEqual(['decisions']);
     expect(await models.get('nope/nope')).toBeUndefined();
     const tts = await models.forCapability('tts');
     expect(tts.length).toBeGreaterThan(2);
-    settings.update((d) => {
+    core.settings.update((d) => {
       d.freeOnly = true;
     });
     expect((await models.forCapability('tts')).map((m) => m.id)).toEqual([
@@ -154,7 +225,7 @@ describe('queries', () => {
   });
 
   it('checks free ids synchronously and exposes shipped defaults', () => {
-    const models = service(catalogApi());
+    const models = service();
     expect(models.isFree('x/y:free')).toBe(true);
     expect(models.isFree('openrouter/free')).toBe(true);
     expect(models.isFree('google/veo-3.1')).toBe(false);
@@ -174,8 +245,10 @@ describe('queries', () => {
     expect(catalog.imageModels).toHaveBeenCalledTimes(1);
     expect(catalog.videoModels).toHaveBeenCalledTimes(1);
     expect(catalog.modelEndpoints).toHaveBeenCalledTimes(1);
-    const stored = await (await getDb()).get('kv', kvEndpoints('hexgrad/kokoro-82m'));
-    expect((stored?.value as { endpoints: unknown[] }).endpoints).toHaveLength(2);
+    await vi.waitFor(async () => {
+      const stored = await (await getDb()).get('kv', kvEndpoints('hexgrad/kokoro-82m'));
+      expect((stored?.value as { endpoints: unknown[] } | undefined)?.endpoints).toHaveLength(2);
+    });
     await models.imageModels({ refresh: true });
     expect(catalog.imageModels).toHaveBeenCalledTimes(2);
   });
@@ -183,9 +256,9 @@ describe('queries', () => {
 
 describe('resolve', () => {
   function withSettings(patch: (draft: Settings) => void): ModelsService {
-    const settings = fakeSettings();
-    settings.update(patch);
-    return service(catalogApi(), settings);
+    const { models, core } = tab();
+    core.settings.update(patch);
+    return models;
   }
 
   it('cascades run override → tool binding → capability default → shipped default', () => {
@@ -252,7 +325,7 @@ describe('resolve', () => {
 
 describe('estimate', () => {
   it('covers each kind from the cached data', async () => {
-    const models = service(catalogApi());
+    const models = service();
     expect(
       await models.estimate({
         kind: 'tokens',
@@ -314,7 +387,7 @@ describe('estimate', () => {
       await models.estimate({ kind: 'speech', model: 'hexgrad/kokoro-82m', characters: 9 }),
     ).toBeNull();
 
-    const online = service(catalogApi());
+    const online = service();
     expect(
       await online.estimate({
         kind: 'tokens',
@@ -322,6 +395,16 @@ describe('estimate', () => {
         promptTokens: 1,
         completionTokens: 1,
       }),
+    ).toBeNull();
+  });
+
+  it('never estimates TTS from the cheapest catalog price when endpoints are unavailable', async () => {
+    const catalog = catalogApi();
+    catalog.modelEndpoints.mockRejectedValue(new TypeError('offline'));
+    const models = service(catalog);
+    await models.list(); // the catalog itself is available and lists a Kokoro price
+    expect(
+      await models.estimate({ kind: 'speech', model: 'hexgrad/kokoro-82m', characters: 44 }),
     ).toBeNull();
   });
 });

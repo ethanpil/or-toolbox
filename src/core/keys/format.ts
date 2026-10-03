@@ -1,11 +1,9 @@
 /** OpenRouter key format checks and masking. Format only: liveness is checked with `GET /key`. */
 
-export const KEY_PREFIX = 'sk-or-';
+// Thrown by `keys.add` when the pasted text is not shaped like a key (historical import path; lives in errors.ts).
+export { InvalidKeyError } from '../errors';
 
-/** Thrown by `keys.add` when the pasted text is not shaped like an OpenRouter key. */
-export class InvalidKeyError extends Error {
-  override readonly name = 'InvalidKeyError';
-}
+export const KEY_PREFIX = 'sk-or-';
 
 /** Trims whitespace, a pasted `Bearer ` prefix and surrounding quotes. */
 export function normalizeKeyInput(input: string): string {

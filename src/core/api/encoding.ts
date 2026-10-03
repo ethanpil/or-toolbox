@@ -1,19 +1,20 @@
-/** Binary helpers for request and response bodies (base64 and data URLs, format detection). */
+/** Binary helpers for request and response bodies (base64 to Blob, format detection, Content-Type). */
 
-import { fromBase64, toBase64 } from '../crypto';
+import { fromBase64 } from '../crypto';
+import { sniffMime } from '../files';
 
-/** Detects common image types from magic bytes; falls back to `fallback`. */
-export function sniffImageType(bytes: Uint8Array, fallback = 'image/png'): string {
-  const b = (i: number): number => bytes[i] ?? -1;
-  if (b(0) === 0x89 && b(1) === 0x50 && b(2) === 0x4e && b(3) === 0x47) return 'image/png';
-  if (b(0) === 0xff && b(1) === 0xd8 && b(2) === 0xff) return 'image/jpeg';
-  if (b(0) === 0x52 && b(1) === 0x49 && b(2) === 0x46 && b(3) === 0x46 && b(8) === 0x57)
-    return 'image/webp';
-  if (b(0) === 0x47 && b(1) === 0x49 && b(2) === 0x46) return 'image/gif';
+/** `<svg` (optionally after an XML prolog) at the start of the bytes. */
+function looksLikeSvg(bytes: Uint8Array): boolean {
   const head = new TextDecoder().decode(bytes.subarray(0, 256)).trimStart();
-  if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg')))
-    return 'image/svg+xml';
-  return fallback;
+  return head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'));
+}
+
+/**
+ * Type of a generated image from its bytes. SVG is checked locally until `sniffMime` recognises it; anything
+ * unrecognised is treated as PNG (OpenRouter omits `media_type` only when it could not tell either).
+ */
+export function imageType(bytes: Uint8Array): string {
+  return sniffMime(bytes) ?? (looksLikeSvg(bytes) ? 'image/svg+xml' : 'image/png');
 }
 
 /** Decodes base64 (or a `data:` URL) into a Blob. `type` wins; otherwise the data URL's or a sniffed type. */
@@ -29,21 +30,8 @@ export function base64ToBlob(
     declared ??= match[1];
   }
   const bytes = fromBase64(base64.replace(/\s+/g, ''));
-  const mediaType = declared || sniffImageType(bytes);
+  const mediaType = declared || imageType(bytes);
   return { blob: new Blob([bytes], { type: mediaType }), mediaType, bytes: bytes.length };
-}
-
-/** Raw base64 of a Blob (no `data:` prefix), as STT `input_audio.data` wants it. */
-export async function blobToBase64(blob: Blob): Promise<string> {
-  return toBase64(new Uint8Array(await blob.arrayBuffer()));
-}
-
-/**
- * A `data:` URL for image references (`/images` `input_references`, video `frame_images`). OpenRouter accepts
- * data URLs for images only; audio and video references must be public HTTPS URLs.
- */
-export async function blobToDataUrl(blob: Blob): Promise<string> {
-  return `data:${blob.type || 'application/octet-stream'};base64,${await blobToBase64(blob)}`;
 }
 
 const AUDIO_FORMATS: Record<string, string> = {
@@ -77,7 +65,7 @@ export function audioFormat(blob: Blob, filename?: string): string {
   return 'mp3';
 }
 
-/** Splits `audio/pcm;rate=24000;channels=1` into its base type and numeric parameters. */
+/** Splits `audio/pcm;rate=24000;channels=1` into its base type and parameters (names lower-cased). */
 export function parseContentType(header: string | null): {
   type: string;
   params: Record<string, string>;
