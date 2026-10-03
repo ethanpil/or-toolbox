@@ -1,6 +1,7 @@
 import { createReadStream, cpSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Plugin } from 'vite';
+import { ISOLATION_HEADERS } from './site.ts';
 
 /**
  * Self-hosts the ffmpeg.wasm core files.
@@ -81,7 +82,9 @@ export function ffmpegAssets(): Plugin {
       outDir = join(config.root, config.build.outDir);
     },
 
-    // Dev: serve the files from node_modules at the URLs the build will use.
+    // Dev: serve the files from node_modules at the URLs the build will use,
+    // with the isolation headers every other dev response gets (server.headers
+    // does not reach a middleware that answers by itself).
     configureServer(server) {
       const sources = Object.values(coreSources(root));
       server.middlewares.use((req, res, next) => {
@@ -92,6 +95,8 @@ export function ffmpegAssets(): Plugin {
           const name = path.slice(prefix.length);
           if (!source.files.includes(name)) break;
           const file = join(source.from, name);
+          for (const [header, value] of Object.entries(ISOLATION_HEADERS))
+            res.setHeader(header, value);
           res.setHeader('Content-Type', CONTENT_TYPES[name.split('.').pop() ?? ''] ?? '');
           res.setHeader('Content-Length', statSync(file).size);
           createReadStream(file).pipe(res);

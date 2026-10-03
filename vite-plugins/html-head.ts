@@ -1,5 +1,5 @@
 import type { HtmlTagDescriptor, Plugin } from 'vite';
-import { contentSecurityPolicy } from './csp.ts';
+import { contentSecurityPolicy, devContentSecurityPolicy } from './csp.ts';
 
 const APP_NAME = 'ORtoolbox';
 /** Keep in sync with $primary in src/styles/_variables.scss and public/manifest.webmanifest. */
@@ -18,12 +18,15 @@ const THEME_COLOR = '#4f46e5';
  * <meta name="view-transition"> form no longer exists).
  */
 export function htmlHead(): Plugin {
-  let isBuild = false;
+  let policy = contentSecurityPolicy();
 
   return {
     name: 'ortoolbox:html-head',
     configResolved(config) {
-      isBuild = config.command === 'build';
+      if (config.command === 'serve') {
+        const port = config.server.port;
+        policy = devContentSecurityPolicy([`ws://localhost:${port}`, `ws://127.0.0.1:${port}`]);
+      }
     },
     transformIndexHtml: {
       order: 'pre',
@@ -31,19 +34,8 @@ export function htmlHead(): Plugin {
         const tags: HtmlTagDescriptor[] = [
           { tag: 'meta', attrs: { charset: 'utf-8' } },
           // The policy only governs what the parser meets after this tag, so
-          // it comes before every script and stylesheet. Build only: the dev
-          // server relies on inline styles and a WebSocket for HMR.
-          ...(isBuild
-            ? [
-                {
-                  tag: 'meta',
-                  attrs: {
-                    'http-equiv': 'Content-Security-Policy',
-                    content: contentSecurityPolicy(),
-                  },
-                },
-              ]
-            : []),
+          // it comes before every script and stylesheet.
+          { tag: 'meta', attrs: { 'http-equiv': 'Content-Security-Policy', content: policy } },
           {
             tag: 'meta',
             attrs: { name: 'viewport', content: 'width=device-width, initial-scale=1' },

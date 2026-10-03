@@ -14,7 +14,7 @@ import { test as base, expect, type BrowserContext } from '@playwright/test';
 import { OpenRouterMock } from './openrouter.ts';
 
 export { expect };
-export { OpenRouterMock, OPENROUTER_ORIGIN } from './openrouter.ts';
+export { MEDIA_FIXTURES_DIR, OpenRouterMock, OPENROUTER_ORIGIN } from './openrouter.ts';
 export type { RecordedCall } from './openrouter.ts';
 
 /** A syntactically plausible key that is obviously not real. */
@@ -122,6 +122,9 @@ export const test = base.extend<{ mock: OpenRouterMock }>({
       await mock.install(context);
       await use(mock);
       expect(mock.unmocked, 'requests to openrouter.ai that no mock answered').toEqual([]);
+      expect(mock.refusedByCors, "requests openrouter.ai's CORS preflight would refuse").toEqual(
+        [],
+      );
     },
     { auto: true },
   ],

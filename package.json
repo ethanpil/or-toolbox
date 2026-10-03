@@ -5,7 +5,7 @@
   "description": "ORtoolbox - a browser-only toolbox of AI tools on top of OpenRouter.",
   "type": "module",
   "engines": {
-    "node": ">=22.12.0"
+    "node": "^22.22.2 || ^24.15.0 || >=26"
   },
   "scripts": {
     "dev": "vite",
@@ -43,7 +43,6 @@
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.63.0",
     "@types/node": "^26.6.4",
-    "@typescript/native": "npm:typescript@^7.0.2",
     "eslint": "^10.12.0",
     "eslint-config-prettier": "^10.1.8",
     "fake-indexeddb": "^6.2.5",
@@ -51,7 +50,7 @@
     "jsdom": "^30.1.1",
     "prettier": "^3.9.9",
     "sass-embedded": "^1.105.1",
-    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "typescript": "^6.0.3",
     "typescript-eslint": "^8.71.0",
     "vite": "^8.3.2",
     "vitest": "^5.0.3"

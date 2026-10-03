@@ -20,15 +20,26 @@
  *   ignored): a string must be equal, a RegExp must match.
  * - The mock registered last wins, so a test can override the seeded
  *   defaults and its own earlier mocks.
- * - Responses carry the same CORS headers as the real API (recorded in
- *   tests/fixtures/openrouter/cors-headers.json). In particular
- *   `Retry-After` is sent but is NOT in
- *   `Access-Control-Expose-Headers`, so page code cannot read it, exactly as
- *   in production.
+ * - CORS behaves as on the real API (headers recorded in
+ *   tests/fixtures/openrouter/cors-headers.json):
+ *   - Responses carry the real `Access-Control-*` headers. `Retry-After` is
+ *     sent but is NOT in `Access-Control-Expose-Headers`, so page code cannot
+ *     read it, exactly as in production.
+ *   - Chromium and Firefox answer CORS preflights inside Playwright, so the
+ *     route never sees the OPTIONS request. The real allow-headers list is
+ *     therefore enforced on the actual request: a request carrying a header
+ *     the real preflight would refuse is aborted (the page sees a network
+ *     error, as it would live) and fails the test. WebKit does pass OPTIONS
+ *     through; it gets the real preflight answer.
  */
+import { readFileSync } from 'node:fs';
+import { extname, join } from 'node:path';
 import type { BrowserContext, Request, Route } from '@playwright/test';
 
 export const OPENROUTER_ORIGIN = 'https://openrouter.ai';
+
+/** Binary fixtures served by `mock.file()`. */
+export const MEDIA_FIXTURES_DIR = join(import.meta.dirname, '..', 'fixtures', 'media');
 
 export type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export type PathMatcher = string | RegExp;
@@ -44,7 +55,10 @@ export interface ResponseOptions {
 
 /** One response of a `sequence()`. */
 export interface SequenceResponse extends ResponseOptions {
-  /** Objects are sent as JSON, strings as-is. */
+  /**
+   * Objects are sent as JSON, strings as text, and `Uint8Array`/`Buffer` as
+   * bytes (which need an explicit `content-type` header).
+   */
   body?: unknown;
 }
 
@@ -73,18 +87,68 @@ const CORS_HEADERS = {
   'access-control-expose-headers': 'X-Generation-Id,X-Provider-Name,request-id,cf-ray',
 };
 
-/** What the real API answers to a CORS preflight. A request header missing here fails, as it would live. */
+/** The real preflight's allow-list (2026-10-02). */
+const ALLOWED_REQUEST_HEADERS =
+  'Authorization,User-Agent,X-Api-Key,X-CSRF-Token,X-Requested-With,Accept,Accept-Version,' +
+  'Content-Length,Content-MD5,Content-Type,Date,X-Api-Version,HTTP-Referer,X-Windowai-Title,' +
+  'X-Openrouter-Title,X-Title,X-Openrouter-Categories,X-Openrouter-App-Visibility,X-Session-Id,' +
+  'X-Stainless-Lang,X-Stainless-Package-Version,X-Stainless-OS,X-Stainless-Arch,' +
+  'X-Stainless-Runtime,X-Stainless-Runtime-Version,X-Stainless-Retry-Count,X-Stainless-Timeout,' +
+  'X-Stainless-Helper-Method,Protection-Key,Idempotency-Key,traceparent,tracestate,b3';
+
 const PREFLIGHT_HEADERS = {
   ...CORS_HEADERS,
   'access-control-allow-methods': 'GET,OPTIONS,PATCH,DELETE,POST,PUT',
-  'access-control-allow-headers':
-    'Authorization,User-Agent,X-Api-Key,X-CSRF-Token,X-Requested-With,Accept,Accept-Version,' +
-    'Content-Length,Content-MD5,Content-Type,Date,X-Api-Version,HTTP-Referer,X-Windowai-Title,' +
-    'X-Openrouter-Title,X-Title,X-Openrouter-Categories,X-Openrouter-App-Visibility,X-Session-Id,' +
-    'X-Stainless-Lang,X-Stainless-Package-Version,X-Stainless-OS,X-Stainless-Arch,' +
-    'X-Stainless-Runtime,X-Stainless-Runtime-Version,X-Stainless-Retry-Count,X-Stainless-Timeout,' +
-    'X-Stainless-Helper-Method,Protection-Key,Idempotency-Key,traceparent,tracestate,b3',
+  'access-control-allow-headers': ALLOWED_REQUEST_HEADERS,
   vary: 'Access-Control-Request-Headers',
+};
+
+/** Headers a page may send without a preflight allowing them. */
+const NEVER_PREFLIGHTED = new Set([
+  ...ALLOWED_REQUEST_HEADERS.toLowerCase().split(','),
+  // CORS-safelisted request headers.
+  'accept',
+  'accept-language',
+  'content-language',
+  'content-type',
+  'range',
+  // Set by the browser itself, never by page code.
+  'accept-charset',
+  'accept-encoding',
+  'cache-control',
+  'connection',
+  'cookie',
+  'date',
+  'dnt',
+  'host',
+  'keep-alive',
+  'origin',
+  'pragma',
+  'priority',
+  'referer',
+  'te',
+  'upgrade-insecure-requests',
+]);
+
+function needsPreflightApproval(name: string): boolean {
+  return !(
+    NEVER_PREFLIGHTED.has(name) ||
+    name.startsWith(':') ||
+    name.startsWith('sec-') ||
+    name.startsWith('proxy-')
+  );
+}
+
+const CONTENT_TYPES: Record<string, string> = {
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
 };
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -96,6 +160,9 @@ export class OpenRouterMock {
   /** Requests that had no mock, as `METHOD url`. The fixture fails the test if this is not empty. */
   readonly unmocked: string[] = [];
 
+  /** Requests the real CORS preflight would refuse, as `METHOD url: header`. Also fails the test. */
+  readonly refusedByCors: string[] = [];
+
   /** Starts intercepting. Called by the fixture. */
   async install(context: BrowserContext): Promise<void> {
     await context.route(`${OPENROUTER_ORIGIN}/**`, (route, request) => this.handle(route, request));
@@ -104,6 +171,32 @@ export class OpenRouterMock {
   /** Answers `method path` with a JSON body. */
   json(method: Method, path: PathMatcher, body: unknown, options: ResponseOptions = {}): this {
     return this.add(method, path, () => ({ ...options, body }));
+  }
+
+  /**
+   * Answers `method path` with the bytes of a file in tests/fixtures/media/,
+   * e.g. TTS audio or a video job's content:
+   *
+   * ```ts
+   * mock.file('GET', '/api/v1/videos/job-1/content', 'video-1s.mp4');
+   * mock.file('POST', '/api/v1/audio/speech', 'speech.mp3');
+   * ```
+   *
+   * The content type comes from the extension unless `headers` sets one.
+   */
+  file(method: Method, path: PathMatcher, fileName: string, options: ResponseOptions = {}): this {
+    const bytes = readFileSync(join(MEDIA_FIXTURES_DIR, fileName));
+    const contentType = CONTENT_TYPES[extname(fileName).toLowerCase()];
+    if (!contentType && !options.headers?.['content-type']) {
+      throw new Error(
+        `mock.file(): no content type known for ${fileName}; pass headers['content-type']`,
+      );
+    }
+    return this.add(method, path, () => ({
+      ...options,
+      body: bytes,
+      headers: { ...(contentType ? { 'content-type': contentType } : {}), ...options.headers },
+    }));
   }
 
   /**
@@ -208,6 +301,14 @@ export class OpenRouterMock {
       return;
     }
 
+    const headers = await request.allHeaders();
+    const refused = Object.keys(headers).filter(needsPreflightApproval);
+    if (refused.length > 0) {
+      this.refusedByCors.push(`${method} ${request.url()}: ${refused.join(', ')}`);
+      await route.abort('failed');
+      return;
+    }
+
     const url = new URL(request.url());
     const handler = this.handlers.findLast(
       (candidate) =>
@@ -225,29 +326,44 @@ export class OpenRouterMock {
       url: request.url(),
       path: url.pathname,
       query: Object.fromEntries(url.searchParams),
-      headers: await request.allHeaders(),
+      headers,
       body: parseBody(request.postData()),
     };
     this.recorded.push(call);
 
-    const { status = 200, headers = {}, delayMs, body } = handler.respond(call);
-    if (delayMs) await delay(delayMs);
+    const response = handler.respond(call);
+    if (response.delayMs) await delay(response.delayMs);
 
-    const isText = typeof body === 'string';
     try {
       await route.fulfill({
-        status,
-        headers: {
-          'content-type': isText ? 'text/plain; charset=utf-8' : 'application/json',
-          ...CORS_HEADERS,
-          ...headers,
-        },
-        body: body === undefined ? '' : isText ? body : JSON.stringify(body),
+        status: response.status ?? 200,
+        ...encodeBody(response),
       });
     } catch {
       // The page navigated away or closed while we were waiting: nothing to answer.
     }
   }
+}
+
+/** Turns a mocked body into what route.fulfill() takes, with the CORS headers added. */
+function encodeBody({ body, headers = {} }: SequenceResponse): {
+  body: string | Buffer;
+  headers: Record<string, string>;
+} {
+  const withCors = (contentType: string): Record<string, string> => ({
+    'content-type': contentType,
+    ...CORS_HEADERS,
+    ...headers,
+  });
+  if (body instanceof Uint8Array) {
+    if (!headers['content-type']) throw new Error('A binary mock body needs a content-type header');
+    return { body: Buffer.from(body), headers: withCors(headers['content-type']) };
+  }
+  if (typeof body === 'string') return { body, headers: withCors('text/plain; charset=utf-8') };
+  return {
+    body: body === undefined ? '' : JSON.stringify(body),
+    headers: withCors('application/json'),
+  };
 }
 
 function matches(matcher: PathMatcher, path: string): boolean {

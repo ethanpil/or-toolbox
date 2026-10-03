@@ -8,7 +8,7 @@ are placeholders. Site: <https://ethanpil.github.io/or-toolbox/>
 
 ## Development
 
-Requires Node.js 22.12 or newer.
+Requires Node.js 22.22.2+, 24.15+ or 26+ (the range jsdom supports).
 
 ```sh
 npm install

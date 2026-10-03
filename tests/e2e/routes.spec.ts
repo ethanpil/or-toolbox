@@ -1,30 +1,22 @@
 /**
- * Stage 0 gate: every page of the site loads cleanly.
+ * Stage 0 gate: every page of the site loads cleanly and passes axe.
  *
  * "Cleanly" means HTTP 200, its heading rendered, the stylesheet applied, and
  * no console errors, uncaught exceptions, failed requests or CSP violations.
  * Against the production build this is what proves the CSP is not too tight.
  */
 import type { Page } from '@playwright/test';
+import { TOOL_IDS } from '../../src/tools/types.ts';
 import { expect, seedSettings, test } from '../mock/index.ts';
-import { SITE_PAGES, watchForProblems } from './support.ts';
+import {
+  expectNoSeriousA11yViolations,
+  expectStyledWithIcons,
+  SITE_PAGES,
+  watchForProblems,
+} from './support.ts';
 
-const TOOL_IDS = [
-  'chat',
-  'ocr',
-  'data-extractor',
-  'table-extractor',
-  'speech-to-text',
-  'text-to-speech',
-  'music-generation',
-  'image-generation',
-  'image-editor',
-  'isolated-image',
-  'video-studio',
-  'decision',
-  'bot-to-bot',
-  'model-arena',
-];
+const theme = (page: Page): Promise<string | null> =>
+  page.evaluate(() => document.documentElement.getAttribute('data-bs-theme'));
 
 test('the site has the expected pages', () => {
   expect(SITE_PAGES.map((page) => page.route)).toEqual(
@@ -43,8 +35,9 @@ test('the site has the expected pages', () => {
 });
 
 for (const { route, title } of SITE_PAGES) {
-  test(`/${route} loads cleanly`, async ({ page }) => {
+  test(`/${route} loads cleanly and passes axe in light and dark`, async ({ page }) => {
     const problems = await watchForProblems(page);
+    await page.emulateMedia({ colorScheme: 'light' });
 
     const response = await page.goto(route);
     expect(response?.status()).toBe(200);
@@ -52,14 +45,19 @@ for (const { route, title } of SITE_PAGES) {
     await expect(page.locator('h1')).toHaveCount(1);
     await expect(page.getByTestId('page-title')).toHaveText(title);
     await expect(page).toHaveTitle(title === 'ORtoolbox' ? title : `${title} · ORtoolbox`);
-
-    // The stylesheet is applied, with our primary colour.
     const primary = await page.evaluate(() =>
       getComputedStyle(document.documentElement).getPropertyValue('--bs-primary').trim(),
     );
     expect(primary).toBe('#4f46e5');
-
     await page.waitForLoadState('networkidle');
+
+    expect(await theme(page)).toBe('light');
+    await expectNoSeriousA11yViolations(page);
+    // The page follows the operating system while the theme is "system".
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await expect(page.locator('html')).toHaveAttribute('data-bs-theme', 'dark');
+    await expectNoSeriousA11yViolations(page);
+
     expect(problems).toEqual([]);
   });
 }
@@ -71,12 +69,8 @@ test('the icon font is self-hosted and loads', async ({ page }) => {
   });
 
   await page.goto('tools/chat/');
-  const loaded = await page.evaluate(async () => {
-    await document.fonts.ready;
-    return document.fonts.check('16px bootstrap-icons');
-  });
+  await expectStyledWithIcons(page);
 
-  expect(loaded).toBe(true);
   expect(fontRequests.length).toBeGreaterThan(0);
   for (const url of fontRequests) expect(new URL(url).origin).toBe(new URL(page.url()).origin);
 });
@@ -94,15 +88,20 @@ test('Home links to every tool', async ({ page }) => {
 });
 
 test.describe('theme', () => {
-  const theme = (page: Page): Promise<string | null> =>
-    page.evaluate(() => document.documentElement.getAttribute('data-bs-theme'));
-
-  test('uses the saved theme', async ({ page, context }) => {
+  test('uses the saved theme, and ignores the system while one is saved', async ({
+    page,
+    context,
+  }) => {
     await page.emulateMedia({ colorScheme: 'light' });
     await seedSettings(context, { appearance: { theme: 'dark' } });
     await page.goto('');
     expect(await theme(page)).toBe('dark');
     await page.goto('settings/');
+    expect(await theme(page)).toBe('dark');
+
+    await page.emulateMedia({ colorScheme: 'light' });
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await page.emulateMedia({ colorScheme: 'light' });
     expect(await theme(page)).toBe('dark');
   });
 

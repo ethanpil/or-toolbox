@@ -89,16 +89,12 @@ async function environmentRows(): Promise<Row[]> {
       ok: swHealthy,
     },
     {
-      label: 'COEP mode',
+      label: 'Cross-Origin-Embedder-Policy',
       testId: 'diag-coep-mode',
-      value: sw.worker?.coepMode ?? 'none',
-      text: sw.worker?.coepMode ?? 'None (no service worker is serving this page)',
-    },
-    {
-      label: 'Offline shell',
-      testId: 'diag-sw-version',
-      value: sw.worker?.version ?? 'none',
-      text: sw.worker ? `Build ${sw.worker.version}, ${sw.worker.precached} files` : 'None',
+      value: isolated ? 'require-corp' : 'none',
+      text: isolated
+        ? `require-corp, ${import.meta.env.PROD ? 'added by the service worker' : 'sent by the dev server'}`
+        : 'None (no service worker is serving this page)',
     },
     await storageRow(),
     {
@@ -133,8 +129,8 @@ function environmentTable(rows: Row[]): HTMLElement {
             {
               class: [
                 'text-break',
-                row.ok === true && 'text-success',
-                row.ok === false && 'text-danger',
+                row.ok === true && 'text-success-emphasis',
+                row.ok === false && 'text-danger-emphasis',
               ],
               'data-testid': row.testId,
               'data-value': row.value,
@@ -199,7 +195,11 @@ function ffmpegPanel(): HTMLElement {
     status.dataset.value = value;
     status.textContent = text;
     status.className =
-      value === 'passed' ? 'text-success' : value === 'failed' ? 'text-danger' : '';
+      value === 'passed'
+        ? 'text-success-emphasis'
+        : value === 'failed'
+          ? 'text-danger-emphasis'
+          : '';
   };
   const setValue = (el: HTMLElement, value: string, text = value): void => {
     el.dataset.value = value;
@@ -270,16 +270,25 @@ function ffmpegPanel(): HTMLElement {
     );
   };
 
+  // While a run is in progress the buttons are aria-disabled rather than
+  // disabled: a disabled button drops keyboard focus to <body>.
   const buttons: HTMLButtonElement[] = [];
+  let running = false;
+  const setRunning = (value: boolean): void => {
+    running = value;
+    for (const b of buttons) b.setAttribute('aria-disabled', String(value));
+  };
   const button = (label: string, testId: string, singleThread: boolean): HTMLButtonElement => {
     const el = h(
       'button',
       {
         type: 'button',
-        class: singleThread ? 'btn btn-outline-secondary' : 'btn btn-primary',
+        class: singleThread ? 'btn btn-secondary' : 'btn btn-primary',
+        'aria-disabled': 'false',
         'data-testid': testId,
         onclick: () => {
-          for (const b of buttons) b.disabled = true;
+          if (running) return;
+          setRunning(true);
           run(singleThread)
             .catch((error: unknown) => {
               setStatus(
@@ -288,7 +297,7 @@ function ffmpegPanel(): HTMLElement {
               );
             })
             .finally(() => {
-              for (const b of buttons) b.disabled = false;
+              setRunning(false);
             });
         },
       },
@@ -340,7 +349,7 @@ function ffmpegPanel(): HTMLElement {
 
 // --- page -------------------------------------------------------------------
 
-boot();
+boot({ isolation: 'required' });
 
 const environment = h('div', { 'data-testid': 'diag-environment-loading' }, 'Checking…');
 renderStubPage(
@@ -355,6 +364,20 @@ renderStubPage(
   ffmpegPanel(),
 );
 
-void environmentRows().then((rows) => {
-  environment.replaceWith(environmentTable(rows));
-});
+environmentRows()
+  .then((rows) => {
+    environment.replaceWith(environmentTable(rows));
+  })
+  .catch((error: unknown) => {
+    environment.replaceWith(
+      environmentTable([
+        {
+          label: 'Environment check',
+          testId: 'diag-environment-error',
+          value: 'error',
+          text: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+          ok: false,
+        },
+      ]),
+    );
+  });

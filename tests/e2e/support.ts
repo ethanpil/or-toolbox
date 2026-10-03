@@ -1,16 +1,15 @@
 /**
  * Helpers shared by the e2e specs.
  */
-import { createReadStream, readFileSync, statSync } from 'node:fs';
-import { createServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
-import { extname, join, resolve } from 'node:path';
-import type { Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import AxeBuilder from '@axe-core/playwright';
+import { expect, type Page, type TestInfo } from '@playwright/test';
+import { preview } from 'vite';
 import { discoverPages } from '../../vite-plugins/pages.ts';
-import { basePath } from '../../vite-plugins/site.ts';
+import { basePath, PREVIEW_PORT } from '../../vite-plugins/site.ts';
 
 const ROOT = join(import.meta.dirname, '..', '..');
-const DIST = join(ROOT, 'dist');
 
 export interface SitePage {
   /** Path relative to the site base: `''` for Home, `'settings/'`, `'tools/chat/'`. */
@@ -26,10 +25,15 @@ export const SITE_PAGES: SitePage[] = discoverPages(ROOT).map(({ route, file }) 
   return { route, title };
 });
 
+/** True when the run targets the dev server (playwright.dev.config.ts), which isolates pages with real headers. */
+export function isDevServer(testInfo: TestInfo): boolean {
+  return testInfo.config.metadata.server === 'dev';
+}
+
 /**
  * Collects everything that should never happen on a healthy page: console
  * errors, uncaught exceptions, failed responses and CSP violations. Call
- * before `page.goto()`, then assert the returned list is empty.
+ * before the first `page.goto()`, then assert the returned list is empty.
  *
  * ```ts
  * const problems = await watchForProblems(page);
@@ -68,60 +72,101 @@ export async function watchForProblems(page: Page): Promise<string[]> {
   return problems;
 }
 
-const CONTENT_TYPES: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript',
-  '.css': 'text/css',
-  '.json': 'application/json',
-  '.webmanifest': 'application/manifest+json',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.wasm': 'application/wasm',
-};
-
-/**
- * Serves the production build (`dist/`) the way a static host does (no
- * special headers, directories serve their index.html), on a port of its own.
- * `stop()` takes the host down, which is how the offline tests go offline:
- * Playwright's `context.setOffline()` cannot be used because in WebKit it
- * also fails requests the service worker answers from its cache.
- */
-export async function serveBuild(): Promise<{ baseURL: string; stop: () => Promise<void> }> {
-  const base = basePath();
-  const server = createServer((request, response) => {
-    const pathname = decodeURIComponent(new URL(request.url ?? '/', 'http://host').pathname);
-    const relative = pathname.startsWith(base) ? pathname.slice(base.length) : null;
-    const file =
-      relative === null
-        ? null
-        : resolve(DIST, relative + (pathname.endsWith('/') ? 'index.html' : ''));
-    if (!file?.startsWith(DIST) || !statSync(file, { throwIfNoEntry: false })?.isFile()) {
-      response.writeHead(404, { 'content-type': 'text/plain' }).end('Not found');
-      return;
-    }
-    response.writeHead(200, {
-      'content-type': CONTENT_TYPES[extname(file)] ?? 'application/octet-stream',
-    });
-    createReadStream(file).pipe(response);
-  });
-
-  // 127.0.0.1 counts as a secure context, so service workers are allowed.
-  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
-  const { port } = server.address() as AddressInfo;
-
-  return {
-    baseURL: `http://127.0.0.1:${port}${base}`,
-    stop: () =>
-      new Promise<void>((done) => {
-        server.closeAllConnections();
-        server.close(() => done());
-      }),
-  };
-}
-
-/** Resolves once the page reports `crossOriginIsolated`, riding out the automatic reload. */
+/** Resolves once the page reports `crossOriginIsolated`, riding out an automatic reload. */
 export async function waitUntilIsolated(page: Page, timeout = 30_000): Promise<void> {
   await page.waitForFunction(() => window.crossOriginIsolated, null, { timeout });
+}
+
+/** Resolves once a service worker controls the page. */
+export async function waitUntilControlled(page: Page, timeout = 30_000): Promise<void> {
+  await page.waitForFunction(() => navigator.serviceWorker.controller !== null, null, { timeout });
+}
+
+/** Asserts the stylesheet (our primary colour) and the self-hosted icon font are in effect. */
+export async function expectStyledWithIcons(page: Page): Promise<void> {
+  const primary = await page.evaluate(() =>
+    getComputedStyle(document.documentElement).getPropertyValue('--bs-primary').trim(),
+  );
+  expect(primary).toBe('#4f46e5');
+  const iconFont = await page.evaluate(async () => {
+    await document.fonts.ready;
+    return document.fonts.check('16px bootstrap-icons');
+  });
+  expect(iconFont).toBe(true);
+}
+
+/** Every URL in this origin's caches whose cache name starts with `cachePrefix`. */
+export function cachedUrls(page: Page, cachePrefix = 'ortoolbox-'): Promise<string[]> {
+  return page.evaluate(async (prefix) => {
+    const urls: string[] = [];
+    for (const name of await caches.keys()) {
+      if (!name.startsWith(prefix)) continue;
+      for (const request of await (await caches.open(name)).keys()) urls.push(request.url);
+    }
+    return urls;
+  }, cachePrefix);
+}
+
+/**
+ * Clicks one of the diagnostics page's ffmpeg buttons and waits for the
+ * result. Returns the core that ran; fails the test if the run failed.
+ */
+export async function runFfmpegSmokeTest(
+  page: Page,
+  button: 'diag-ffmpeg-run' | 'diag-ffmpeg-run-single',
+): Promise<string | null> {
+  // By keyboard: the path where keeping focus on the button matters (and
+  // WebKit does not focus buttons on click).
+  await page.getByTestId(button).focus();
+  await page.keyboard.press('Enter');
+  const status = page.getByTestId('diag-ffmpeg-status');
+  // Downloads and compiles a 32 MB WebAssembly module, then encodes video.
+  await expect(status).toHaveAttribute('data-value', /passed|failed/, { timeout: 150_000 });
+  await expect(status).toHaveAttribute('data-value', 'passed');
+  await expect(page.getByTestId('diag-ffmpeg-output')).not.toHaveAttribute('data-value', '');
+  await expect(page.getByTestId('diag-ffmpeg-preview').locator('video')).toBeVisible();
+  return page.getByTestId('diag-ffmpeg-core').getAttribute('data-value');
+}
+
+/** Runs axe (WCAG 2.2 A/AA) and fails on serious or critical violations. */
+export async function expectNoSeriousA11yViolations(page: Page): Promise<void> {
+  const results = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
+    .analyze();
+  const serious = results.violations
+    .filter((violation) => violation.impact === 'serious' || violation.impact === 'critical')
+    .map((violation) => ({
+      rule: violation.id,
+      impact: violation.impact,
+      targets: violation.nodes.map((node) => node.target.join(' ')),
+    }));
+  expect(serious).toEqual([]);
+}
+
+/**
+ * A private `vite preview` of the build on a port of its own, which a test
+ * can shut down to take the host offline. (Playwright's
+ * `context.setOffline()` is not usable for this: in WebKit it also fails the
+ * requests the service worker would answer from its cache.)
+ */
+export async function startPrivatePreview(
+  testInfo: TestInfo,
+): Promise<{ baseURL: string; stop: () => Promise<void> }> {
+  const port = PREVIEW_PORT + 10 + testInfo.parallelIndex;
+  const server = await preview({
+    configFile: join(ROOT, 'vite.config.ts'),
+    logLevel: 'silent',
+    preview: { host: '127.0.0.1', port, strictPort: true },
+  });
+  let stopped = false;
+  return {
+    // 127.0.0.1 counts as a secure context, so service workers are allowed.
+    baseURL: `http://127.0.0.1:${port}${basePath()}`,
+    stop: async () => {
+      if (stopped) return;
+      stopped = true;
+      if ('closeAllConnections' in server.httpServer) server.httpServer.closeAllConnections();
+      await server.close();
+    },
+  };
 }

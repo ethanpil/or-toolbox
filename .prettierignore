@@ -1,9 +1,4 @@
-# Build and test output
-dist/
-coverage/
-test-results/
-playwright-report/
-blob-report/
+# Prettier also skips everything in .gitignore (build and test output).
 
 # Generated or third-party
 package-lock.json

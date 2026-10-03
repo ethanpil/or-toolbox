@@ -6,7 +6,8 @@
  *
  * - multi-threaded: needs SharedArrayBuffer, which browsers only provide on
  *   cross-origin isolated pages (the service worker arranges that);
- * - single-threaded: works everywhere, slower. The fallback.
+ * - single-threaded: works everywhere, slower. The fallback, also used for
+ *   the rest of the page session once the multi-threaded core has failed.
  *
  * How the pieces load, and why no CSP exception beyond 'wasm-unsafe-eval' is
  * needed:
@@ -51,17 +52,24 @@ export interface LoadedFfmpeg {
   multiThreaded: boolean;
 }
 
+/** How long the core may take to start once downloaded (compiling 32 MB of wasm, starting threads). */
+const INIT_TIMEOUT_MS = 60_000;
+
 /** True if this page can run the multi-threaded core. */
 export function threadsAvailable(): boolean {
   return globalThis.crossOriginIsolated === true && typeof SharedArrayBuffer === 'function';
 }
 
-/** One instance per core per page; ffmpeg is expensive to load. */
+/** One instance per core per page; ffmpeg is expensive to load. Never holds a rejected load. */
 const instances = new Map<boolean, Promise<LoadedFfmpeg>>();
+
+/** Set once the multi-threaded core has failed to start; the page then sticks to the other one. */
+let multiThreadFailed = false;
 
 /**
  * Returns a ready ffmpeg instance: the multi-threaded core when the page is
- * cross-origin isolated, the single-threaded core otherwise.
+ * cross-origin isolated, the single-threaded core otherwise (or when the
+ * multi-threaded one fails to start).
  *
  * ```ts
  * const { ffmpeg, multiThreaded } = await loadFfmpeg({ onProgress });
@@ -69,19 +77,48 @@ const instances = new Map<boolean, Promise<LoadedFfmpeg>>();
  * await ffmpeg.exec(['-i', 'in.webm', 'out.mp4']);
  * const mp4 = await ffmpeg.readFile('out.mp4');
  * ```
+ *
+ * Calling `ffmpeg.terminate()` on the instance, or an `exec` that crashes the
+ * core, retires it; the next `loadFfmpeg()` starts a fresh one.
  */
-export function loadFfmpeg(options: LoadFfmpegOptions = {}): Promise<LoadedFfmpeg> {
-  const multiThreaded = !options.singleThread && threadsAvailable();
-
-  let instance = instances.get(multiThreaded);
-  if (!instance) {
-    instance = load(multiThreaded, options.onProgress).catch((error: unknown) => {
-      instances.delete(multiThreaded); // let the next call try again
-      throw error;
-    });
-    instances.set(multiThreaded, instance);
+export async function loadFfmpeg(options: LoadFfmpegOptions = {}): Promise<LoadedFfmpeg> {
+  const wantThreads = !options.singleThread && !multiThreadFailed && threadsAvailable();
+  if (!wantThreads) return instance(false, options.onProgress);
+  try {
+    return await instance(true, options.onProgress);
+  } catch {
+    multiThreadFailed = true;
+    return instance(false, options.onProgress);
   }
-  return instance;
+}
+
+/** Terminates every ffmpeg instance of this page and frees its memory. */
+export function disposeFfmpeg(): void {
+  const pending = [...instances.values()];
+  instances.clear();
+  for (const loading of pending) {
+    loading.then(({ ffmpeg }) => ffmpeg.terminate()).catch(() => undefined);
+  }
+}
+
+/** The cached instance for one core, or a new one if there is none or it is no longer usable. */
+async function instance(
+  multiThreaded: boolean,
+  onProgress: LoadFfmpegOptions['onProgress'],
+): Promise<LoadedFfmpeg> {
+  const existing = instances.get(multiThreaded);
+  if (existing) {
+    const loaded = await existing.catch(() => null);
+    if (loaded?.ffmpeg.loaded) return loaded;
+    if (instances.get(multiThreaded) === existing) instances.delete(multiThreaded);
+  }
+
+  const loading = load(multiThreaded, onProgress);
+  instances.set(multiThreaded, loading);
+  loading.catch(() => {
+    if (instances.get(multiThreaded) === loading) instances.delete(multiThreaded);
+  });
+  return loading;
 }
 
 async function load(
@@ -100,20 +137,59 @@ async function load(
   const ffmpeg = new FFmpeg();
   const wasmURL = URL.createObjectURL(wasm);
   try {
-    await ffmpeg.load({
-      coreURL: file('ffmpeg-core.js'),
-      wasmURL,
-      ...(multiThreaded ? { workerURL: file('ffmpeg-core.worker.js') } : {}),
-    });
+    await ffmpeg.load(
+      {
+        coreURL: file('ffmpeg-core.js'),
+        wasmURL,
+        ...(multiThreaded ? { workerURL: file('ffmpeg-core.worker.js') } : {}),
+      },
+      { signal: AbortSignal.timeout(INIT_TIMEOUT_MS) },
+    );
   } catch (error) {
     ffmpeg.terminate();
-    // The worker reports failures as plain strings.
-    throw error instanceof Error ? error : new Error(`ffmpeg failed to load: ${String(error)}`);
+    throw asError(error, 'ffmpeg failed to start');
   } finally {
     URL.revokeObjectURL(wasmURL);
   }
 
+  retireOnFailure(ffmpeg, multiThreaded);
   return { ffmpeg, multiThreaded };
+}
+
+/**
+ * Makes sure a dead instance is never handed out again: `terminate()` drops
+ * it from the cache, and an `exec`/`ffprobe` that fails (rather than merely
+ * returning a non-zero exit code) means the core crashed, so it is terminated.
+ */
+function retireOnFailure(ffmpeg: FFmpeg, multiThreaded: boolean): void {
+  const terminate = ffmpeg.terminate;
+  ffmpeg.terminate = () => {
+    void instances.get(multiThreaded)?.then(
+      (loaded) => {
+        if (loaded.ffmpeg === ffmpeg) instances.delete(multiThreaded);
+      },
+      () => undefined,
+    );
+    terminate();
+  };
+
+  for (const method of ['exec', 'ffprobe'] as const) {
+    const run = ffmpeg[method];
+    ffmpeg[method] = async (...args: Parameters<FFmpeg['exec']>) => {
+      try {
+        return await run(...args);
+      } catch (error) {
+        const aborted = error instanceof DOMException && error.name === 'AbortError';
+        if (!aborted && ffmpeg.loaded) ffmpeg.terminate();
+        throw asError(error, `ffmpeg ${method} failed`);
+      }
+    };
+  }
+}
+
+/** The worker reports failures as plain strings. */
+function asError(error: unknown, context: string): Error {
+  return error instanceof Error ? error : new Error(`${context}: ${String(error)}`);
 }
 
 /** Downloads a file, reporting progress against a size known at build time. */

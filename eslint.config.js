@@ -6,25 +6,46 @@ import tseslint from 'typescript-eslint';
 
 /**
  * Architecture rules from CLAUDE.md that are cheap to enforce mechanically.
- * `no-restricted-syntax` entries are plain ESLint selectors.
+ * `no-restricted-syntax` entries are ESLint selectors. tests/lint/ proves each
+ * one fires.
  */
+const HTML_SINK = /^(innerHTML|outerHTML)$/;
+const htmlSinkMessage =
+  'Never parse HTML strings into the page. Build DOM with h() from src/ui/dom.ts; render model Markdown with renderMarkdown().';
 const noHtmlStrings = [
   {
-    selector:
-      "AssignmentExpression[left.type='MemberExpression'][left.property.name=/^(innerHTML|outerHTML)$/]",
-    message:
-      'Never assign innerHTML/outerHTML. Build DOM with h() from src/ui/dom.ts; render model Markdown with renderMarkdown().',
+    // el.innerHTML = …, el.outerHTML += …
+    selector: `AssignmentExpression > MemberExpression.left[computed=false][property.name=${HTML_SINK}]`,
+    message: htmlSinkMessage,
   },
   {
-    selector: "CallExpression[callee.property.name='insertAdjacentHTML']",
-    message: 'Never use insertAdjacentHTML. Build DOM with h() from src/ui/dom.ts.',
+    // el['innerHTML'] = …
+    selector: `AssignmentExpression > MemberExpression.left[computed=true][property.value=${HTML_SINK}]`,
+    message: htmlSinkMessage,
+  },
+  {
+    // Object.assign(el, { innerHTML: … }) and { 'innerHTML': … }
+    selector: `CallExpression[callee.object.name='Object'][callee.property.name='assign'] > ObjectExpression > Property[key.name=${HTML_SINK}], CallExpression[callee.object.name='Object'][callee.property.name='assign'] > ObjectExpression > Property[key.value=${HTML_SINK}]`,
+    message: htmlSinkMessage,
+  },
+  {
+    // insertAdjacentHTML, setHTMLUnsafe, Document.parseHTMLUnsafe, Range#createContextualFragment
+    selector:
+      'CallExpression[callee.property.name=/^(insertAdjacentHTML|setHTMLUnsafe|parseHTMLUnsafe|createContextualFragment)$/]',
+    message: htmlSinkMessage,
+  },
+  {
+    selector: "CallExpression[callee.object.name='document'][callee.property.name=/^write(ln)?$/]",
+    message: htmlSinkMessage,
   },
 ];
 
-const storageGlobals = ['localStorage', 'sessionStorage', 'indexedDB'].map((name) => ({
-  name,
-  message: 'Only src/core may touch browser storage (CLAUDE.md, architecture rule 1).',
-}));
+const storageMessage = 'Only src/core may touch browser storage (CLAUDE.md, architecture rule 1).';
+const STORAGE = ['localStorage', 'sessionStorage', 'indexedDB'];
+const storageGlobals = STORAGE.map((name) => ({ name, message: storageMessage }));
+const storageProperties = ['window', 'globalThis', 'self', 'top', 'parent', 'frames'].flatMap(
+  (object) => STORAGE.map((property) => ({ object, property, message: storageMessage })),
+);
 
 export default defineConfig(
   globalIgnores([
@@ -57,13 +78,7 @@ export default defineConfig(
     ignores: ['src/core/**', 'src/sw/**', 'src/**/*.test.ts'],
     rules: {
       'no-restricted-globals': ['error', ...storageGlobals],
-      'no-restricted-properties': [
-        'error',
-        ...storageGlobals.flatMap(({ name, message }) => [
-          { object: 'window', property: name, message },
-          { object: 'globalThis', property: name, message },
-        ]),
-      ],
+      'no-restricted-properties': ['error', ...storageProperties],
     },
   },
 

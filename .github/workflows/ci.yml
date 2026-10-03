@@ -1,5 +1,8 @@
 name: CI
 
+# One gated pipeline: check → e2e on every browser → deploy (main only).
+# Repository settings → Pages → Source must be "GitHub Actions".
+
 on:
   push:
     branches: [main]
@@ -10,13 +13,15 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded pull-request runs are cancelled; runs on main queue up, so a
+  # deployment is never cut off half-way.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
-    name: Check, build, e2e (Chromium)
+    name: Check and build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -30,23 +35,99 @@ jobs:
       # Typecheck + lint + unit tests.
       - run: npm run check
 
+      # The build that is tested below is the build that is deployed.
       - run: npm run build
 
-      - name: Install Chromium for Playwright
-        run: npx playwright install --with-deps chromium
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist
+          # dist/.nojekyll is a dotfile, which the action drops by default.
+          include-hidden-files: true
+          retention-days: 7
+
+  e2e:
+    name: E2E (${{ matrix.browser }})
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Install ${{ matrix.browser }} for Playwright
+        run: npx playwright install --with-deps ${{ matrix.browser }}
 
       # The default suite (service workers blocked) and the service-worker
-      # suite (isolation, offline shell, multi-threaded ffmpeg) on Chromium,
-      # against `vite preview` of the build above.
-      - name: E2E (Chromium)
-        run: npx playwright test --project=chromium --project=sw-chromium
+      # suite (isolation, offline shell, multi-threaded ffmpeg), against
+      # `vite preview` of the build.
+      - name: E2E
+        run: npx playwright test --project=${{ matrix.browser }} --project=sw-${{ matrix.browser }}
 
       - name: Upload Playwright report
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: playwright-report
+          name: playwright-report-${{ matrix.browser }}
           path: |
             playwright-report/
             test-results/
           retention-days: 7
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: [check, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - id: pages
+        uses: actions/configure-pages@v6
+
+      # The site is built for /or-toolbox/ (BASE_PATH in the check job
+      # overrides it). Refuse to deploy a build whose links would not work.
+      - name: Check the base path
+        env:
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          if [ "$PAGES_BASE_PATH/" != "/or-toolbox/" ]; then
+            echo "::error::Pages serves the site at '$PAGES_BASE_PATH/' but it was built for /or-toolbox/. Set BASE_PATH for the build."
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+          include-hidden-files: true
+
+      - id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,19 +1,11 @@
-import { createHash } from 'node:crypto';
 import { defineConfig } from 'vite';
 import { ffmpegAssets, ffmpegAssetsInfo } from './vite-plugins/ffmpeg-assets.ts';
 import { htmlHead } from './vite-plugins/html-head.ts';
 import { discoverPages } from './vite-plugins/pages.ts';
 import { serviceWorker } from './vite-plugins/service-worker.ts';
-import { basePath, DEV_PORT, PREVIEW_PORT } from './vite-plugins/site.ts';
+import { basePath, DEV_PORT, ISOLATION_HEADERS, PREVIEW_PORT } from './vite-plugins/site.ts';
 
 const root = import.meta.dirname;
-
-const ffmpeg = ffmpegAssetsInfo(root);
-/** Changes whenever an ffmpeg core package is upgraded; names the worker's vendor cache. */
-const vendorVersion = createHash('sha256')
-  .update(ffmpeg.singleThread.dir + ffmpeg.multiThread.dir)
-  .digest('hex')
-  .slice(0, 8);
 
 export default defineConfig({
   base: basePath(),
@@ -25,10 +17,10 @@ export default defineConfig({
 
   define: {
     // Declared in src/env.d.ts.
-    __FFMPEG_ASSETS__: JSON.stringify(ffmpeg),
+    __FFMPEG_ASSETS__: JSON.stringify(ffmpegAssetsInfo(root)),
   },
 
-  plugins: [htmlHead(), ffmpegAssets(), serviceWorker({ vendorVersion })],
+  plugins: [htmlHead(), ffmpegAssets(), serviceWorker()],
 
   css: {
     preprocessorOptions: {
@@ -46,6 +38,9 @@ export default defineConfig({
     // Never inline assets as data: URLs. The CSP has `font-src 'self'`, and
     // an inlined font would violate it.
     assetsInlineLimit: 0,
+    // .vite/manifest.json tells the service-worker plugin which chunks each
+    // page loads eagerly (the offline shell). The plugin deletes it afterwards.
+    manifest: true,
   },
 
   optimizeDeps: {
@@ -54,6 +49,9 @@ export default defineConfig({
     exclude: ['@ffmpeg/ffmpeg'],
   },
 
-  server: { port: DEV_PORT, strictPort: true },
-  preview: { port: PREVIEW_PORT, strictPort: true },
+  // The dev server isolates pages itself (no service worker in dev).
+  server: { port: DEV_PORT, strictPort: true, headers: ISOLATION_HEADERS },
+  // `vite preview` behaves like GitHub Pages: no special headers (it would
+  // otherwise inherit server.headers), so isolation comes from the worker.
+  preview: { port: PREVIEW_PORT, strictPort: true, headers: {} },
 });

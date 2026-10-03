@@ -1,12 +1,13 @@
 /**
- * Stage 0 gate: the service worker makes pages cross-origin isolated.
+ * Stage 0 gate: the service worker makes pages cross-origin isolated, and
+ * only the pages that need threads ever reload for it.
  *
  * Each test starts in a fresh browser context, i.e. as a first-time visitor
  * with no service worker installed.
  */
 import type { Page } from '@playwright/test';
 import { expect, test } from '../../mock/index.ts';
-import { waitUntilIsolated, watchForProblems } from '../support.ts';
+import { waitUntilControlled, waitUntilIsolated, watchForProblems } from '../support.ts';
 
 /** Counts documents loaded in the main frame: 1 for the first load, +1 per reload or navigation. */
 function countDocuments(page: Page): () => number {
@@ -17,60 +18,87 @@ function countDocuments(page: Page): () => number {
   return () => documents;
 }
 
-/**
- * Automatic reloads a first visit needs before it is isolated: one where the
- * browser honours `COEP: credentialless`, two where the worker has to fall
- * back to `require-corp`.
- */
-const FIRST_VISIT_RELOADS: Record<string, number> = { chromium: 1, firefox: 1, webkit: 2 };
+const isolated = (page: Page): Promise<boolean> => page.evaluate(() => window.crossOriginIsolated);
 
-test('a first visit becomes isolated after the automatic reload, and never reloads again', async ({
+test('a page that needs threads reloads exactly once on a first visit, then is isolated', async ({
   page,
-  browserName,
 }) => {
   const documents = countDocuments(page);
-
-  await page.goto('');
-  expect(await page.evaluate(() => window.crossOriginIsolated)).toBe(false);
-
+  await page.goto('diagnostics/');
   await waitUntilIsolated(page);
-  const afterIsolation = documents();
-  expect(afterIsolation - 1).toBe(FIRST_VISIT_RELOADS[browserName]);
+  expect(documents()).toBe(2);
 
   // No reload loop: the page stays put.
   await page.waitForTimeout(3000);
-  expect(documents()).toBe(afterIsolation);
-  expect(await page.evaluate(() => window.crossOriginIsolated)).toBe(true);
-  await expect(page.getByTestId('page-title')).toHaveText('ORtoolbox');
+  expect(documents()).toBe(2);
+  expect(await isolated(page)).toBe(true);
+  await expect(page.getByTestId('page-title')).toHaveText('Diagnostics');
 });
 
-test('later pages are isolated from the first byte, with no reload', async ({ page }) => {
+test('other pages never reload; the next page they open is isolated', async ({ page }) => {
+  const documents = countDocuments(page);
   await page.goto('');
+  await waitUntilControlled(page);
+  await page.waitForTimeout(2000);
+  expect(documents()).toBe(1);
+  expect(await isolated(page)).toBe(false);
+
+  await page.goto('settings/');
+  expect(await isolated(page)).toBe(true);
+  expect(documents()).toBe(2);
+});
+
+test('the OAuth callback never reloads, even on a first visit', async ({ page }) => {
+  const documents = countDocuments(page);
+  const callback = 'auth/callback/?code=single-use-code&state=abc';
+  await page.goto(callback);
+  await waitUntilControlled(page);
+  await page.waitForTimeout(2000);
+
+  expect(documents()).toBe(1);
+  expect(page.url()).toContain(callback);
+});
+
+test('the isolation reload happens at most once per tab', async ({ page, context }) => {
+  // As if this tab had already reloaded once without becoming isolated.
+  await context.addInitScript(() => {
+    sessionStorage.setItem('ortoolbox:isolation-reload', '1');
+  });
+  const documents = countDocuments(page);
+  await page.goto('diagnostics/');
+  await waitUntilControlled(page);
+  await page.waitForTimeout(2000);
+
+  expect(documents()).toBe(1);
+  expect(await isolated(page)).toBe(false);
+});
+
+test('once the worker is in control, every page is isolated from the first byte', async ({
+  page,
+}) => {
+  await page.goto('diagnostics/');
   await waitUntilIsolated(page);
 
   const documents = countDocuments(page);
   const problems = await watchForProblems(page);
-  for (const route of ['settings/', 'tools/video-studio/', 'diagnostics/']) {
+  for (const route of ['', 'settings/', 'tools/video-studio/', 'auth/callback/']) {
     await page.goto(route);
-    expect(await page.evaluate(() => window.crossOriginIsolated)).toBe(true);
+    expect(await isolated(page), route).toBe(true);
   }
   await page.waitForTimeout(2000);
 
-  expect(documents()).toBe(3);
+  expect(documents()).toBe(4);
   expect(problems).toEqual([]);
 });
 
-test('the diagnostics page reports the worker and the isolation', async ({ page, browserName }) => {
+test('the diagnostics page reports the worker and the isolation', async ({ page }) => {
   await page.goto('diagnostics/');
   await waitUntilIsolated(page);
 
   await expect(page.getByTestId('diag-isolated')).toHaveAttribute('data-value', 'true');
   await expect(page.getByTestId('diag-sab')).toHaveAttribute('data-value', 'true');
   await expect(page.getByTestId('diag-sw-state')).toHaveAttribute('data-value', 'controlling');
-  await expect(page.getByTestId('diag-coep-mode')).toHaveAttribute(
-    'data-value',
-    browserName === 'webkit' ? 'require-corp' : 'credentialless',
-  );
+  await expect(page.getByTestId('diag-coep-mode')).toHaveAttribute('data-value', 'require-corp');
 });
 
 test('the worker leaves OpenRouter requests alone, so mocks still apply', async ({
@@ -83,7 +111,7 @@ test('the worker leaves OpenRouter requests alone, so mocks still apply', async 
     'Playwright cannot intercept requests from a page controlled by a service worker in WebKit ' +
       '(the request bypasses context.route). Specs in tests/e2e/sw/ must not call OpenRouter.',
   );
-  await page.goto('');
+  await page.goto('diagnostics/');
   await waitUntilIsolated(page);
 
   const status = await page.evaluate(async () => {
@@ -93,37 +121,4 @@ test('the worker leaves OpenRouter requests alone, so mocks still apply', async 
 
   expect(status).toBe(200);
   expect(mock.calls('/api/v1/models')).toHaveLength(1);
-});
-
-test('a user who is already interacting is not interrupted by the reload', async ({
-  page,
-  browserName,
-}) => {
-  // A real click can lose the race against a fast worker install, so press a
-  // key the moment the page registers the worker (sw-register.ts starts
-  // listening for input just before that call). First document only.
-  await page.addInitScript(() => {
-    const container = navigator.serviceWorker;
-    const register = container.register.bind(container);
-    container.register = (...args: Parameters<ServiceWorkerContainer['register']>) => {
-      if (!sessionStorage.getItem('test:pressed')) {
-        sessionStorage.setItem('test:pressed', '1');
-        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' }));
-      }
-      return register(...args);
-    };
-  });
-  const documents = countDocuments(page);
-  await page.goto('');
-
-  await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
-  await page.waitForTimeout(2000);
-  expect(documents()).toBe(1);
-
-  // The next page they open comes through the worker. Where the browser
-  // honours COEP credentialless it is isolated straight away; elsewhere the
-  // remaining reload (switching to require-corp) happens on that page.
-  await page.goto('settings/');
-  await waitUntilIsolated(page);
-  expect(documents() - 2).toBe(FIRST_VISIT_RELOADS[browserName]! - 1);
 });

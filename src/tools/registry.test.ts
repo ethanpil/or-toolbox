@@ -1,6 +1,10 @@
+import iconNames from 'bootstrap-icons/font/bootstrap-icons.json?raw';
 import { describe, expect, it } from 'vitest';
-import { getTool, tools, toolsInCategory } from './registry';
+import pkg from '../../package.json';
+import { getTool, tools, toolsInCategory, validateManifest } from './registry';
 import { TOOL_CATEGORIES, TOOL_IDS } from './types';
+
+const VALID = getTool('ocr');
 
 describe('tool registry', () => {
   it('has exactly one manifest per tool id, in canonical order', () => {
@@ -11,20 +15,6 @@ describe('tool registry', () => {
   it('looks tools up by id', () => {
     expect(getTool('ocr').name).toBe('OCR');
     expect(getTool('video-studio').usesJobs).toBe(true);
-  });
-
-  it('gives every tool the fields the shell needs', () => {
-    for (const tool of tools) {
-      expect(tool.name, tool.id).not.toBe('');
-      expect(tool.description, tool.id).not.toBe('');
-      expect(tool.icon, tool.id).toMatch(/^[a-z0-9-]+$/);
-      expect(tool.capabilities.length, tool.id).toBeGreaterThan(0);
-      expect(Array.isArray(tool.accepts), tool.id).toBe(true);
-      expect(tool.produces.length, tool.id).toBeGreaterThan(0);
-      expect(typeof tool.usesJobs, tool.id).toBe('boolean');
-      expect(Array.isArray(tool.lazyLibs), tool.id).toBe(true);
-      expect(typeof tool.defaults, tool.id).toBe('object');
-    }
   });
 
   it('groups tools into the five categories', () => {
@@ -40,14 +30,52 @@ describe('tool registry', () => {
     });
   });
 
-  it('only names lazy libraries that are installed', async () => {
-    const pkg = (await import('../../package.json')).default as {
-      dependencies: Record<string, string>;
-    };
+  it('only uses icons that exist in Bootstrap Icons', () => {
+    const icons = JSON.parse(iconNames) as Record<string, number>;
+    for (const tool of tools)
+      expect(Object.hasOwn(icons, tool.icon), `${tool.id}: ${tool.icon}`).toBe(true);
+  });
+
+  it('only names lazy libraries that are installed', () => {
+    const dependencies = Object.keys(pkg.dependencies);
     for (const tool of tools) {
-      for (const lib of tool.lazyLibs) {
-        expect(Object.keys(pkg.dependencies), `${tool.id}: ${lib}`).toContain(lib);
-      }
+      for (const lib of tool.lazyLibs) expect(dependencies, `${tool.id}: ${lib}`).toContain(lib);
     }
+  });
+});
+
+describe('validateManifest', () => {
+  const broken = (changes: Record<string, unknown>) => () =>
+    validateManifest('ocr', { ...VALID, ...changes });
+
+  it('accepts a valid manifest', () => {
+    expect(validateManifest('ocr', { ...VALID })).toEqual(VALID);
+  });
+
+  it.each([
+    [{ id: 'chat' }, /"id" is "chat" but the folder is "ocr"/],
+    [{ id: 'nope' }, /"id" must be one of/],
+    [{ name: '' }, /"name" must be a non-empty string/],
+    [{ description: 42 }, /"description" must be a non-empty string/],
+    [{ category: 'misc' }, /"category" must be one of documents/],
+    [{ icon: 'bi-x' }, /"icon" must be a Bootstrap Icons name/],
+    [{ capabilities: [] }, /"capabilities" must be a non-empty list/],
+    [{ capabilities: ['vision', 'telepathy'] }, /"capabilities" must be/],
+    [{ accepts: 'image/png' }, /"accepts" must be a list of MIME types/],
+    [{ produces: [] }, /"produces" must be a non-empty list/],
+    [{ usesJobs: 'no' }, /"usesJobs" must be true or false/],
+    [{ lazyLibs: [1] }, /"lazyLibs" must be a list/],
+    [{ defaults: [] }, /"defaults" must be an object/],
+    [{ entry: './main.ts' }, /unknown field "entry"/],
+  ])('rejects %o', (changes, message) => {
+    expect(broken(changes)).toThrow(message);
+    expect(broken(changes)).toThrow(/^src\/tools\/ocr\/manifest\.json: /);
+  });
+
+  it('rejects missing fields and non-objects', () => {
+    const withoutJobs: Record<string, unknown> = { ...VALID };
+    delete withoutJobs.usesJobs;
+    expect(() => validateManifest('ocr', withoutJobs)).toThrow(/"usesJobs" is missing/);
+    expect(() => validateManifest('ocr', [])).toThrow(/must be a JSON object/);
   });
 });

@@ -2,8 +2,17 @@
  * The mocked OpenRouter itself: every helper later stages rely on, exercised
  * from a real page (so CORS and, in the production build, the CSP apply).
  */
-import type { Page } from '@playwright/test';
-import { expect, OPENROUTER_ORIGIN, OpenRouterMock, test, TEST_API_KEY } from '../mock/index.ts';
+import { statSync } from 'node:fs';
+import { join } from 'node:path';
+import type { Browser, Page } from '@playwright/test';
+import {
+  expect,
+  MEDIA_FIXTURES_DIR,
+  OPENROUTER_ORIGIN,
+  OpenRouterMock,
+  test,
+  TEST_API_KEY,
+} from '../mock/index.ts';
 
 interface PageResponse {
   status: number;
@@ -32,6 +41,19 @@ function pageFetch(
   );
 }
 
+/**
+ * A context with its own mock, outside the shared fixture, for tests whose
+ * point is a request the fixture would (rightly) fail the test for.
+ */
+async function privateMock(browser: Browser, baseURL: string | undefined) {
+  const context = await browser.newContext({ baseURL, serviceWorkers: 'block' });
+  const mock = new OpenRouterMock();
+  await mock.install(context);
+  const page = await context.newPage();
+  await page.goto('');
+  return { context, mock, page };
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto('');
 });
@@ -43,8 +65,13 @@ test('seeds the model catalog and key status', async ({ page, mock }) => {
     'test/text-model:free',
   );
 
+  // The headers the API client will send; all on the real CORS allow-list.
   const key = await pageFetch(page, '/api/v1/key', {
-    headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    headers: {
+      Authorization: `Bearer ${TEST_API_KEY}`,
+      'HTTP-Referer': 'https://ethanpil.github.io/or-toolbox/',
+      'X-OpenRouter-Title': 'ORtoolbox',
+    },
   });
   expect(key.status).toBe(200);
 
@@ -158,14 +185,49 @@ test('delayMs delays the answer', async ({ page, mock }) => {
   expect(Date.now() - started).toBeGreaterThanOrEqual(400);
 });
 
+test('file() serves binary fixtures byte for byte', async ({ page, mock }) => {
+  mock.file('GET', '/api/v1/videos/job-1/content', 'video-1s.mp4');
+
+  const video = await page.evaluate(async (url) => {
+    const response = await fetch(url);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return {
+      contentType: response.headers.get('content-type'),
+      size: bytes.byteLength,
+      boxType: String.fromCharCode(...bytes.subarray(4, 8)),
+    };
+  }, `${OPENROUTER_ORIGIN}/api/v1/videos/job-1/content`);
+
+  expect(video).toEqual({
+    contentType: 'video/mp4',
+    size: statSync(join(MEDIA_FIXTURES_DIR, 'video-1s.mp4')).size,
+    boxType: 'ftyp',
+  });
+});
+
+test('a request header the real CORS preflight refuses is blocked and reported', async ({
+  browser,
+  baseURL,
+}) => {
+  const { context, mock, page } = await privateMock(browser, baseURL);
+
+  const result = await page.evaluate(
+    (url) =>
+      fetch(url, { headers: { 'X-Debug-Token': '1' } }).then(
+        () => 'fetched',
+        () => 'blocked',
+      ),
+    `${OPENROUTER_ORIGIN}/api/v1/models`,
+  );
+
+  expect(result).toBe('blocked');
+  expect(mock.refusedByCors).toEqual([`GET ${OPENROUTER_ORIGIN}/api/v1/models: x-debug-token`]);
+  expect(mock.calls()).toHaveLength(0);
+  await context.close();
+});
+
 test('a request with no mock is blocked and reported', async ({ browser, baseURL }) => {
-  // A private context and mock, so this deliberate failure does not fail the
-  // test through the shared fixture.
-  const context = await browser.newContext({ baseURL, serviceWorkers: 'block' });
-  const mock = new OpenRouterMock();
-  await mock.install(context);
-  const page = await context.newPage();
-  await page.goto('');
+  const { context, mock, page } = await privateMock(browser, baseURL);
 
   const failure = await page.evaluate(
     (url) =>

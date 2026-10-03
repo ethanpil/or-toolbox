@@ -7,6 +7,16 @@
  */
 import { registerServiceWorker } from './sw-register';
 
-export function boot(): void {
-  registerServiceWorker();
+export interface BootOptions {
+  /**
+   * `'required'` for pages that need SharedArrayBuffer (multi-threaded
+   * ffmpeg): on a first visit they reload once to become cross-origin
+   * isolated. Only Diagnostics and Video studio use it; never set it on a
+   * page that holds state in its URL (the OAuth callback).
+   */
+  isolation?: 'required';
+}
+
+export function boot(options: BootOptions = {}): void {
+  registerServiceWorker(options);
 }

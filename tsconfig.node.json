@@ -10,5 +10,11 @@
     // Node itself and Vite's native config loader expect.
     "allowImportingTsExtensions": true
   },
-  "include": ["*.config.ts", "vite-plugins/**/*.ts", "tests/e2e/**/*.ts", "tests/mock/**/*.ts"]
+  "include": [
+    "*.config.ts",
+    "vite-plugins/**/*.ts",
+    "tests/e2e/**/*.ts",
+    "tests/mock/**/*.ts",
+    "tests/lint/**/*.ts"
+  ]
 }

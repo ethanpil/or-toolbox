@@ -1,20 +1,25 @@
 /**
  * Stage 0 gate: after one online visit the site shell loads offline.
  *
- * Each test serves the build from a host of its own and shuts that host down
- * to go offline (see `serveBuild()` for why not `context.setOffline()`).
+ * Each test serves the build from a private `vite preview` and shuts it down
+ * to go offline (see `startPrivatePreview()` for why not
+ * `context.setOffline()`).
  */
 import { expect, test } from '../../mock/index.ts';
-import { serveBuild, waitUntilIsolated } from '../support.ts';
+import {
+  cachedUrls,
+  expectStyledWithIcons,
+  startPrivatePreview,
+  waitUntilControlled,
+} from '../support.ts';
 
-let host: Awaited<ReturnType<typeof serveBuild>>;
+let host: Awaited<ReturnType<typeof startPrivatePreview>>;
 
-test.beforeEach(async ({ page }) => {
-  host = await serveBuild();
+test.beforeEach(async ({ page }, testInfo) => {
+  host = await startPrivatePreview(testInfo);
   await page.goto(host.baseURL);
-  // Isolated means the worker is installed (the whole shell is precached
-  // before it activates) and in control.
-  await waitUntilIsolated(page);
+  // In control means installed: the whole shell is cached before activation.
+  await waitUntilControlled(page);
   await host.stop();
 });
 
@@ -35,19 +40,8 @@ test('the shell loads offline after one online visit', async ({ page }) => {
   await page.reload();
   await expect(page.getByTestId('page-title')).toHaveText('History');
 
-  // Styled, with icons: CSS and the icon font came from the cache too.
-  const primary = await page.evaluate(() =>
-    getComputedStyle(document.documentElement).getPropertyValue('--bs-primary').trim(),
-  );
-  expect(primary).toBe('#4f46e5');
   await page.goto(`${host.baseURL}tools/chat/`);
-  expect(
-    await page.evaluate(async () => {
-      await document.fonts.ready;
-      return document.fonts.check('16px bootstrap-icons');
-    }),
-  ).toBe(true);
-
+  await expectStyledWithIcons(page);
   // Still isolated offline: cached responses carry the headers as well.
   expect(await page.evaluate(() => window.crossOriginIsolated)).toBe(true);
 });
@@ -57,15 +51,16 @@ test('an unknown address falls back to Home while offline', async ({ page }) => 
   await expect(page.getByTestId('page-title')).toHaveText('ORtoolbox');
 });
 
-test('the ffmpeg cores are not part of the offline shell', async ({ page }) => {
-  const cached = await page.evaluate(async () => {
-    const urls: string[] = [];
-    for (const name of await caches.keys()) {
-      for (const request of await (await caches.open(name)).keys()) urls.push(request.url);
-    }
-    return urls;
-  });
+test('the offline shell is pages and eager assets only', async ({ page }) => {
+  const pages = await cachedUrls(page, 'ortoolbox-pages-');
+  const assets = await cachedUrls(page, 'ortoolbox-assets');
 
-  expect(cached.some((url) => url.endsWith('/settings/index.html'))).toBe(true);
-  expect(cached.filter((url) => url.includes('/vendor/'))).toEqual([]);
+  expect(pages.some((url) => url.endsWith('/settings/index.html'))).toBe(true);
+  expect(pages.some((url) => url.endsWith('/theme-init.js'))).toBe(true);
+  expect(assets.some((url) => /\/assets\/.+\.css$/.test(url))).toBe(true);
+  expect(assets.some((url) => url.endsWith('.woff2'))).toBe(true);
+  // Lazy chunks and the ffmpeg cores are cached on first use, never up front.
+  expect(
+    [...pages, ...assets].filter((url) => /\/vendor\/|\/assets\/(esm|worker)-/.test(url)),
+  ).toEqual([]);
 });
