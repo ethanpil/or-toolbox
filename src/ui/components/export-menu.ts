@@ -26,6 +26,8 @@ export interface ExportFormat {
   extension: string;
   build: () => Blob | Promise<Blob>;
   icon?: string;
+  /** File name without extension for this format only; default the menu's `filename`. */
+  filename?: string | (() => string);
 }
 
 export interface ExportMenuOptions {
@@ -45,7 +47,8 @@ export function exportMenu(options: ExportMenuOptions): HTMLElement {
     trigger.disabled = true;
     try {
       const blob = await format.build();
-      const stem = typeof options.filename === 'function' ? options.filename() : options.filename;
+      const name = format.filename ?? options.filename;
+      const stem = typeof name === 'function' ? name() : name;
       downloadBlob(blob, `${stem || 'ortoolbox'}.${format.extension}`);
       const results = getCore().results;
       for (const id of options.resultIds?.() ?? []) results.markDownloaded(id);

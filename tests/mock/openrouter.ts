@@ -216,20 +216,26 @@ export class OpenRouterMock {
     chunks: readonly unknown[],
     options: ResponseOptions & { done?: boolean } = {},
   ): this {
-    const events = chunks.map((chunk) =>
-      typeof chunk === 'string' ? chunk : `data: ${JSON.stringify(chunk)}`,
-    );
-    if (options.done !== false) events.push('data: [DONE]');
-    const body = events.map((event) => `${event}\n\n`).join('');
-    return this.add('POST', path, () => ({
-      ...options,
-      body,
-      headers: {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        ...options.headers,
-      },
-    }));
+    const response = sseResponse(chunks, options);
+    return this.add('POST', path, () => response);
+  }
+
+  /**
+   * Answers `method path` with whatever `respond` returns for each request, for answers that depend on the
+   * request (`call.body` is its parsed JSON), such as one OCR page out of many sent in parallel:
+   *
+   * ```ts
+   * mock.respond('POST', '/api/v1/chat/completions', (call) =>
+   *   pageOf(call.body) === 7 ? { status: 400 } : sseResponse(chunksFor(call.body)),
+   * );
+   * ```
+   */
+  respond(
+    method: Method,
+    path: PathMatcher,
+    respond: (call: RecordedCall) => SequenceResponse,
+  ): this {
+    return this.add(method, path, respond);
   }
 
   /**
@@ -343,6 +349,29 @@ export class OpenRouterMock {
       // The page navigated away or closed while we were waiting: nothing to answer.
     }
   }
+}
+
+/**
+ * A server-sent event stream as `sse()` sends it: objects as `data: <json>`, strings verbatim, then
+ * `data: [DONE]` unless `done` is false. For `respond()` handlers.
+ */
+export function sseResponse(
+  chunks: readonly unknown[],
+  options: ResponseOptions & { done?: boolean } = {},
+): SequenceResponse {
+  const events = chunks.map((chunk) =>
+    typeof chunk === 'string' ? chunk : `data: ${JSON.stringify(chunk)}`,
+  );
+  if (options.done !== false) events.push('data: [DONE]');
+  return {
+    ...options,
+    body: events.map((event) => `${event}\n\n`).join(''),
+    headers: {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      ...options.headers,
+    },
+  };
 }
 
 /** Turns a mocked body into what route.fulfill() takes, with the CORS headers added. */

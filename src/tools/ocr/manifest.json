@@ -12,8 +12,8 @@
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
   ],
   "usesJobs": false,
-  "lazyLibs": ["pdfjs-dist", "docx"],
+  "lazyLibs": ["pdfjs-dist", "docx", "marked"],
   "defaults": {
-    "mode": "standard"
+    "mode": "printed"
   }
 }
