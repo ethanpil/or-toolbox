@@ -79,9 +79,10 @@ jobs:
       - name: E2E
         run: npx playwright test --project=${{ matrix.browser }} --project=sw-${{ matrix.browser }}
 
-      # Browser-only core modules (media, export) are exercised through the dev server, which serves /src.
-      - name: E2E media modules (dev server)
-        run: npx playwright test --config playwright.dev.config.ts tests/e2e/media --project=${{ matrix.browser }}
+      # Browser-only core modules (media, export) and shell states that need the page's core (tests/e2e/dev)
+      # are exercised through the dev server, which serves /src.
+      - name: E2E dev-server specs
+        run: npx playwright test --config playwright.dev.config.ts tests/e2e/media tests/e2e/dev --project=${{ matrix.browser }}
 
       - name: Upload Playwright report
         if: failure()

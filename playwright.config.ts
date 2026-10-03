@@ -23,15 +23,25 @@ import { basePath, PREVIEW_PORT } from './vite-plugins/site.ts';
 
 export const SW_SPECS = '**/sw/**';
 /**
- * tests/e2e/media/ imports TypeScript modules straight from /src inside the page, which only the dev server
- * serves, so those specs run in `npm run e2e:dev` (and the CI media job), never against the build.
+ * tests/e2e/media/ and tests/e2e/dev/ import TypeScript modules straight from /src inside the page, which only
+ * the dev server serves, so those specs run in `npm run e2e:dev` (and the CI dev-server step), never against
+ * the build. (dev/ reaches the page's own core this way to create states no built tool can yet, such as a
+ * pending result or a run that needs a budget confirmation; nothing of it ships in the bundles.)
  */
-export const DEV_ONLY_SPECS = '**/media/**';
+export const DEV_ONLY_SPECS = /[\\/]e2e[\\/](media|dev)[\\/]/;
 
 const BROWSERS = [
   { name: 'chromium', device: devices['Desktop Chrome'] },
   { name: 'firefox', device: devices['Desktop Firefox'] },
-  { name: 'webkit', device: devices['Desktop Safari'] },
+  {
+    name: 'webkit',
+    device: {
+      ...devices['Desktop Safari'],
+      // Playwright's WebKit on Windows crashes its renderer during cross-document view transitions (measured on
+      // the Stage 1 and Stage 2 builds alike); reduced motion turns them off there. CI (Linux) keeps them.
+      ...(process.platform === 'win32' ? { reducedMotion: 'reduce' as const } : {}),
+    },
+  },
 ];
 
 const skipped = new Set(

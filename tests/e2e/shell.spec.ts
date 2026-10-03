@@ -1,0 +1,228 @@
+/**
+ * Stage 2 gate: the shell. Keyboard-only walk-through, theme persistence and cross-tab sync, the command
+ * palette, and the free-only notice on a tool whose capability has no free model.
+ */
+import type { Page } from '@playwright/test';
+import { expect, test } from '../mock/index.ts';
+import { seedApp, tabTo } from './app.ts';
+import { watchForProblems } from './support.ts';
+
+const theme = (page: Page) => page.locator('html');
+
+test('keyboard only: Home → palette → a tool → prompts panel → drawer → back', async ({
+  page,
+  context,
+  browserName,
+}) => {
+  test.slow(); // a long journey; WebKit on a busy machine needs the room
+  await seedApp(context);
+  const problems = await watchForProblems(page);
+  await page.goto('');
+
+  // The first Tab stop is the skip link, and it moves focus to <main>. (WebKit, like Safari by default, keeps
+  // links out of the Tab order, so there the link is focused directly.)
+  const skip = page.getByRole('link', { name: 'Skip to main content' });
+  if (browserName === 'webkit') await skip.focus();
+  else await page.keyboard.press('Tab');
+  await expect(skip).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#main')).toBeFocused();
+
+  // Ctrl+K opens the palette with focus in its search box; arrows move, Enter opens.
+  await page.keyboard.press('Control+k');
+  const input = page.getByTestId('palette-input');
+  await expect(input).toBeFocused();
+  await input.pressSequentially('ocr');
+  await expect(page.getByTestId('palette-option-tool:ocr')).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(input).toHaveAttribute('aria-activedescendant', /tool_ocr$/);
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(/\/tools\/ocr\/$/);
+  await expect(page.getByTestId('page-title')).toHaveText('OCR');
+
+  // Prompts panel: open with the keyboard, Escape closes it and focus returns to the button.
+  await tabTo(page, 'prompts-button');
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('prompts-panel')).toBeVisible();
+  await expect(page.getByTestId('prompts-panel')).toContainText('No recent prompts');
+  await expect(page.getByTestId('prompts-tab-recent')).toBeFocused();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.getByTestId('prompts-tab-saved')).toBeFocused();
+  await expect(page.getByTestId('prompts-tab-saved')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('prompts-panel')).toBeHidden();
+  await expect(page.getByTestId('prompts-button')).toBeFocused();
+
+  // Settings drawer, the same way.
+  await tabTo(page, 'drawer-button');
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('settings-drawer')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('settings-drawer')).toBeHidden();
+  await expect(page.getByTestId('drawer-button')).toBeFocused();
+
+  // And back to Home through the palette.
+  await page.keyboard.press('Control+k');
+  await page.getByTestId('palette-input').pressSequentially('home');
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(/\/or-toolbox\/$/);
+  await expect(page.getByTestId('page-title')).toHaveText('ORtoolbox');
+  expect(problems).toEqual([]);
+});
+
+test('the palette closes with Escape and gives focus back to its button', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context);
+  await page.goto('privacy/');
+  // Opened from the keyboard: WebKit does not focus buttons on click, so a click leaves nothing to return to.
+  await page.getByTestId('palette-button').focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('palette-input')).toBeFocused();
+  await page.getByTestId('palette-input').fill('zzqqxx');
+  // Nothing local matches; the catalog search is still offered.
+  await expect(page.getByTestId('palette-list').getByRole('option')).toHaveText([
+    'Search models for “zzqqxx”',
+  ]);
+  await page.getByTestId('palette-input').fill('z');
+  await expect(page.getByTestId('palette')).toContainText('No results for “z”.');
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('palette')).toHaveCount(0);
+  await expect(page.getByTestId('palette-button')).toBeFocused();
+});
+
+test('Home search filters the tools and Enter opens the best match', async ({ page, context }) => {
+  await seedApp(context);
+  await page.goto('');
+  const search = page.getByTestId('home-search');
+  await search.fill('speech');
+  const results = page.getByTestId('search-results');
+  await expect(results).toBeVisible();
+  await expect(results.getByRole('heading', { level: 3 })).toHaveText([
+    'Speech-to-text',
+    'Text-to-speech',
+  ]);
+  await expect(page.getByTestId('categories')).toBeHidden();
+  await search.press('Enter');
+  await expect(page).toHaveURL(/\/tools\/speech-to-text\/$/);
+});
+
+test('a starred tool appears in Favourites', async ({ page, context }) => {
+  await seedApp(context);
+  await page.goto('');
+  await expect(page.getByTestId('favourites-empty')).toBeVisible();
+  const star = page.getByTestId('category-audio').getByTestId('star-text-to-speech');
+  await star.focus();
+  await page.keyboard.press('Enter');
+  await expect(star).toHaveAttribute('aria-pressed', 'true');
+  await expect(star).toBeFocused();
+  await expect(page.getByTestId('fav-tool-link-text-to-speech')).toBeVisible();
+  await page.reload();
+  await expect(page.getByTestId('fav-tool-link-text-to-speech')).toBeVisible();
+});
+
+test.describe('theme', () => {
+  test('the navbar choice persists across pages', async ({ page, context }) => {
+    await seedApp(context);
+    await page.emulateMedia({ colorScheme: 'light' });
+    await page.goto('');
+    await expect(theme(page)).toHaveAttribute('data-bs-theme', 'light');
+    await page.getByTestId('theme-menu').click();
+    await page.getByTestId('theme-dark').click();
+    await expect(theme(page)).toHaveAttribute('data-bs-theme', 'dark');
+    await expect(page.getByTestId('theme-menu')).toHaveAttribute('aria-label', 'Theme: Dark');
+
+    await page.goto('tools/chat/');
+    await expect(theme(page)).toHaveAttribute('data-bs-theme', 'dark');
+    await page.goto('privacy/');
+    await expect(theme(page)).toHaveAttribute('data-bs-theme', 'dark');
+  });
+
+  test('a change in one tab applies live in another', async ({ page, context }) => {
+    await seedApp(context);
+    await page.emulateMedia({ colorScheme: 'light' });
+    const other = await context.newPage();
+    await other.emulateMedia({ colorScheme: 'light' });
+    await page.goto('');
+    await other.goto('tools/ocr/');
+    await expect(theme(other)).toHaveAttribute('data-bs-theme', 'light');
+
+    await page.getByTestId('theme-menu').click();
+    await page.getByTestId('theme-dark').click();
+    await expect(theme(other)).toHaveAttribute('data-bs-theme', 'dark');
+
+    await page.getByTestId('theme-menu').click();
+    await page.getByTestId('theme-system').click();
+    await expect(theme(other)).toHaveAttribute('data-bs-theme', 'light');
+  });
+
+  test('appearance settings apply: accent colour, density and reduced motion', async ({
+    page,
+    context,
+  }) => {
+    await seedApp(context, {
+      settings: {
+        appearance: { theme: 'light', accent: '#0f766e', density: 'compact', reducedMotion: true },
+      },
+    });
+    await page.goto('');
+    const html = page.locator('html');
+    await expect(html).toHaveAttribute('data-density', 'compact');
+    await expect(html).toHaveAttribute('data-reduced-motion', '');
+    await expect(html).toHaveAttribute('data-accent', '');
+    const primary = await page.evaluate(() =>
+      getComputedStyle(document.documentElement).getPropertyValue('--bs-primary').trim(),
+    );
+    expect(primary).toBe('#0f766e');
+    const runButton = await page.evaluate(async () => {
+      const button = document.createElement('button');
+      button.className = 'btn btn-primary';
+      document.body.append(button);
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      return getComputedStyle(button).backgroundColor;
+    });
+    expect(runButton).toBe('rgb(15, 118, 110)');
+  });
+});
+
+test('free-only mode explains why a tool cannot run when no free model exists', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context, { settings: { freeOnly: true } });
+  const problems = await watchForProblems(page);
+  await page.goto('tools/video-studio/');
+  await expect(page.getByTestId('free-only-badge')).toBeVisible();
+  const notice = page.getByTestId('free-only-notice');
+  await expect(notice).toBeVisible();
+  await expect(notice).toContainText('No free video model exists');
+  await expect(notice.getByRole('link')).toHaveAttribute('href', /settings\/#models$/);
+  await expect(page.getByTestId('run-button')).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.getByTestId('run-hint')).toHaveText('No model is available in free-only mode.');
+
+  // A capability with a free model swaps to it and says so.
+  await page.goto('tools/chat/');
+  await expect(page.getByTestId('free-only-notice')).toHaveCount(0);
+  await expect(page.getByTestId('model-chip')).toContainText('Free');
+  await expect(page.getByTestId('model-note')).toContainText('Free-only mode: using');
+  expect(problems).toEqual([]);
+});
+
+test('every page has one h1, a skip link and no horizontal scroll at 320 px', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context);
+  await page.setViewportSize({ width: 320, height: 720 });
+  for (const route of ['', 'tools/image-editor/', 'privacy/', 'settings/']) {
+    await page.goto(route);
+    await expect(page.locator('h1')).toHaveCount(1);
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow, `horizontal scroll on /${route}`).toBeLessThanOrEqual(0);
+  }
+});

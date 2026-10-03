@@ -89,7 +89,10 @@ test('once the worker is in control, every page is isolated from the first byte'
 
   const documents = countDocuments(page);
   const problems = await watchForProblems(page);
-  for (const route of ['', 'settings/', 'tools/video-studio/', 'auth/callback/']) {
+  // No tool page here: tool pages read the model catalog from openrouter.ai, and WebKit lets requests from a
+  // worker-controlled page escape the mock (see the skipped test below). Diagnostics, visited above, is the
+  // page that needs threads.
+  for (const route of ['', 'settings/', 'privacy/', 'auth/callback/']) {
     await page.goto(route);
     expect(await isolated(page), route).toBe(true);
   }
