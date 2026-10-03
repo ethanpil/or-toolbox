@@ -31,6 +31,20 @@ describe('tool state store', () => {
     expect(await chat.get('decider')).toBeUndefined();
   });
 
+  it('tells the bus about every stored change, and nothing about a refused one', async () => {
+    const events: unknown[] = [];
+    const store = createToolStateStore('chat', { emit: (event) => events.push(event) });
+    await store.set('thread:a', { x: 1 });
+    await store.delete('thread:a');
+    await store.set('thread:b', new Blob(['x'])).catch(() => undefined);
+    await store.get('thread:a');
+    await store.keys();
+    expect(events).toEqual([
+      { type: 'tool-state-changed', tool: 'chat', key: 'thread:a' },
+      { type: 'tool-state-changed', tool: 'chat', key: 'thread:a' },
+    ]);
+  });
+
   it('stores a detached copy', async () => {
     const store = createToolStateStore('chat');
     const value = { list: [1] };

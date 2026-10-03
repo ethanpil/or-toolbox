@@ -44,7 +44,7 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | Member | What it is |
 | --- | --- |
 | `manifest` | Your manifest. |
-| `state` | `ToolStateStore` for this tool (IndexedDB `kv`): JSON-safe, persistent, e.g. saved deciders or a video sequence. Never binaries. |
+| `state` | `ToolStateStore` for this tool (IndexedDB `kv`): JSON-safe, persistent, e.g. saved deciders or a video sequence. Never binaries. Every `set` and `delete` emits `{ type: 'tool-state-changed', tool, key }` on `ctx.bus`, in this tab and the others: a page showing stored values stays in step with `ctx.bus.on('tool-state-changed', (e) => e.tool === ctx.manifest.id && reread(e.key))` (your own writes arrive too). |
 | `options` | `{ get(), set(patch), reset() }`: `manifest.defaults` merged with the user's saved options (`settings.tools[id].options`). `set` stores only what you pass. |
 | `ui` | The zones and helpers below. |
 | `model(cap?)` | `ResolvedModel` for a capability (default: the primary one, `capabilities[0]`), with free-only applied. `model === null` means nothing may run; for the primary capability the framework already shows the notice and disables Run. See Models per capability. |
@@ -194,6 +194,8 @@ const stream = streamMarkdown(bubble, { onRender: () => scrollToEnd() });
 await ctx.api.chatStream(body, { run, onEvent: (e) => e.type === 'text' && stream.append(e.text) });
 await stream.finish();
 ```
+
+`chatStream` resolves with the assembled `ChatStreamResult`. Its `annotations` (present only when some came) are the streamed `delta.annotations`: for a PDF sent through the `file-parser` plugin, `{ type: 'file', file: { name, content } }` with the parser's text. Keep that text and send it on later turns instead of the PDF (no upload, no parsing, no parser charge), as Chat does.
 
 ## Cost estimates
 

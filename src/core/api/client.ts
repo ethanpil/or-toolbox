@@ -598,6 +598,7 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
                   reasoning: choice?.message.reasoning ?? undefined,
                   images: choice?.message.images,
                   audio: choice?.message.audio,
+                  annotations: choice?.message.annotations,
                 },
                 finish_reason: choice?.finish_reason ?? null,
               },

@@ -1,9 +1,12 @@
 /**
  * Per-tool persistent state in IndexedDB `kv` under `tool:<toolId>:<key>` (video sequences, saved deciders,
  * chat threads, …). Values must be JSON-safe: binaries belong in session results, never in storage.
+ *
+ * Every `set` and `delete` emits `{ type: 'tool-state-changed', tool, key }` on the bus once stored, in this tab
+ * and in the others, so a page that shows the value can read it again (Chat threads open in two tabs).
  */
 
-import type { ToolId, ToolStateStore } from '../types';
+import type { Bus, ToolId, ToolStateStore } from '../types';
 import { NotJsonSafeError } from '../errors';
 import { getDb } from '../storage/db';
 import { isPlainObject } from '../util';
@@ -46,8 +49,9 @@ export function assertJsonSafe(value: unknown, path = 'value'): void {
   );
 }
 
-export function createToolStateStore(tool: ToolId): ToolStateStore {
+export function createToolStateStore(tool: ToolId, bus?: Pick<Bus, 'emit'>): ToolStateStore {
   const prefix = `${TOOL_STATE_PREFIX}${tool}:`;
+  const changed = (key: string): void => bus?.emit({ type: 'tool-state-changed', tool, key });
   return {
     async get<T>(key: string) {
       return (await (await getDb()).get('kv', prefix + key))?.value as T | undefined;
@@ -56,9 +60,11 @@ export function createToolStateStore(tool: ToolId): ToolStateStore {
       assertJsonSafe(value);
       const stored = JSON.parse(JSON.stringify(value)) as unknown;
       await (await getDb()).put('kv', { key: prefix + key, value: stored, updatedAt: Date.now() });
+      changed(key);
     },
     async delete(key) {
       await (await getDb()).delete('kv', prefix + key);
+      changed(key);
     },
     async keys() {
       const keys = await (await getDb()).getAllKeys('kv', prefixRange(prefix));

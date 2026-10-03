@@ -254,6 +254,6 @@ export function createTestCore(opts: { keys?: KeyInfo[]; locked?: boolean } = {}
   core.results = createResultsService(core);
   core.backup = createBackupService(core);
   core.data = createDataService(core);
-  core.toolState = createToolStateStore;
+  core.toolState = (tool) => createToolStateStore(tool, core.bus);
   return { core, keyState };
 }

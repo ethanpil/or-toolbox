@@ -7,6 +7,7 @@
  * - Audio arrives as base64 fragments in `delta.audio.data`; Lyria sends the whole MP3 as one fragment. Fragments
  *   are kept as-is (never concatenated here) so a 6 MB chunk is not copied.
  * - An `error` object on a chunk is a mid-stream failure: `push` throws an ApiError with `detail.midStream`.
+ * - `delta.annotations` (the PDF parser's text, citations) are collected for the result, not emitted as events.
  */
 
 import type { ApiError } from '../errors';
@@ -24,6 +25,7 @@ export class ChatStreamAssembler {
   private images: string[] = [];
   private audioChunks: string[] = [];
   private transcript: string[] = [];
+  private annotations: Record<string, unknown>[] = [];
   private finishReason: string | null = null;
   private usage: WireUsage | null = null;
   private readonly onEvent: (event: ChatStreamEvent) => void;
@@ -106,6 +108,7 @@ export class ChatStreamAssembler {
       audioTranscript: this.transcript.join(''),
       finishReason: this.finishReason,
       usage: this.usage,
+      ...(this.annotations.length > 0 ? { annotations: [...this.annotations] } : {}),
     };
   }
 
@@ -131,6 +134,8 @@ export class ChatStreamAssembler {
         }
       }
     }
+    const annotations = delta['annotations'];
+    if (Array.isArray(annotations)) this.annotations.push(...annotations.filter(isRecord));
     const audio = delta['audio'];
     if (isRecord(audio)) {
       const data = isString(audio['data']) ? audio['data'] : '';

@@ -1,12 +1,11 @@
 /**
  * Markdown for chat replies: a cache of rendered (sanitised) replies, so re-drawing a conversation does not parse
- * every reply again, a Copy button on every code block, and a streaming renderer that draws complete blocks once
- * and re-renders only the unfinished tail (the output panel's approach, `stableBoundary`).
+ * every reply again, and a Copy button on every code block. A reply that is still arriving streams through the
+ * shared `streamMarkdown` (src/ui/components/stream-markdown.ts); chat.ts adds the Copy buttons after each draw.
  *
  * Code-block Copy buttons carry `data-copy-code`; the conversation handles their clicks by delegation, so cloned
  * fragments from the cache work without listeners of their own.
  */
-import { stableBoundary } from '../../ui/components/output-panel';
 import { h } from '../../ui/dom';
 import { icon } from '../../ui/icon';
 import { renderMarkdown } from '../../ui/markdown';
@@ -78,75 +77,4 @@ export function fillReply(target: HTMLElement, key: string, text: string): void 
       if (wanted.get(target) === text) target.replaceChildren(fragment);
     })
     .catch(() => undefined);
-}
-
-export interface StreamingView {
-  /** The whole text so far. */
-  update(text: string): void;
-  /** Stops drawing (the caller draws the final text). */
-  close(): void;
-}
-
-const MIN_GAP_MS = 50;
-const MAX_GAP_MS = 500;
-
-/** Draws streamed Markdown into `target`: stable blocks once, the unfinished tail again, paced by render cost. */
-export function streamingView(target: HTMLElement): StreamingView {
-  let text = '';
-  let stableUpTo = 0;
-  let dirty = false;
-  let running = false;
-  let closed = false;
-  const stable = h('div');
-  const tail = h('div');
-  const caret = h('span', { class: 'or-caret', 'aria-hidden': 'true' });
-  target.replaceChildren(stable, tail, caret);
-
-  const drawOnce = async (): Promise<void> => {
-    const boundary = stableBoundary(text, stableUpTo);
-    if (boundary > stableUpTo) {
-      const fragment = await renderMarkdown(text.slice(stableUpTo, boundary));
-      if (closed) return;
-      addCodeCopyButtons(fragment);
-      stable.append(fragment);
-      stableUpTo = boundary;
-    }
-    const rest = await renderMarkdown(text.slice(stableUpTo));
-    if (closed) return;
-    addCodeCopyButtons(rest);
-    tail.replaceChildren(rest);
-  };
-
-  const loop = async (): Promise<void> => {
-    running = true;
-    try {
-      while (dirty && !closed) {
-        dirty = false;
-        const started = performance.now();
-        try {
-          await drawOnce();
-        } catch {
-          if (!closed) tail.textContent = text.slice(stableUpTo);
-        }
-        if (dirty && !closed) {
-          const gap = Math.min(MAX_GAP_MS, Math.max(MIN_GAP_MS, (performance.now() - started) * 2));
-          await new Promise((resolve) => setTimeout(resolve, gap));
-        }
-      }
-    } finally {
-      running = false;
-    }
-  };
-
-  return {
-    update(next) {
-      text = next;
-      dirty = true;
-      if (!running) void loop();
-    },
-    close() {
-      closed = true;
-      caret.remove();
-    },
-  };
 }

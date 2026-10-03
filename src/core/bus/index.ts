@@ -20,6 +20,7 @@ const EVENT_TYPES = new Set<BusEvent['type']>([
   'stats-changed',
   'models-refreshed',
   'data-reset',
+  'tool-state-changed',
 ]);
 
 function isBusEvent(value: unknown): value is BusEvent {

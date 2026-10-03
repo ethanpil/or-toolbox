@@ -144,6 +144,11 @@ export interface ChatStreamResult {
   audioTranscript: string;
   finishReason: string | null;
   usage: WireUsage | null;
+  /**
+   * `delta.annotations` in arrival order, when any came: the PDF parser's text (`{ type: 'file', file }`; echo or
+   * reuse it to skip parsing again [§2.5]) or web citations. Absent when there were none.
+   */
+  annotations?: Array<Record<string, unknown>>;
 }
 
 // --- images [§3] -----------------------------------------------------------------------------------

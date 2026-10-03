@@ -182,7 +182,25 @@ export async function readAttachment(file: File): Promise<ReadAttachment> {
     return { ref: { ...ref, text } };
   }
   const blob = file.type ? file : file.slice(0, file.size, ref.type);
-  return { ref, data: await readAsDataUrl(blob) };
+  const data = await readAsDataUrl(blob);
+  if (kind === 'pdf') {
+    const pages = countPdfPages(atob(data.slice(data.indexOf(',') + 1)));
+    if (pages > 0) ref.pages = pages;
+  }
+  return { ref, data };
+}
+
+/** Page objects (`/Type /Page`, not `/Pages`) in a PDF's bytes; 0 when they sit in compressed object streams. */
+function countPdfPages(binary: string): number {
+  return binary.match(/\/Type\s*\/Page(?![A-Za-z])/g)?.length ?? 0;
+}
+
+/** Bytes per page assumed for a PDF whose pages could not be counted: low, so the guess errs high. */
+const BYTES_PER_PAGE = 30_000;
+
+/** The pages a PDF parser bills for this PDF: counted when attached, else guessed high from its size. */
+export function pdfPages(ref: Pick<AttachmentRef, 'pages' | 'size'>): number {
+  return ref.pages ?? Math.max(1, Math.ceil(ref.size / BYTES_PER_PAGE));
 }
 
 /** A text item from "Send to…" as a text attachment. */

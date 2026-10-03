@@ -2,7 +2,6 @@ import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   ChatRequest,
-  ChatResponse,
   ChatStreamEvent,
   ChatStreamResult,
   RawModel,
@@ -582,12 +581,13 @@ describe('review fixes', () => {
     await settle(b);
     await settle();
 
-    // A version stored without telling anyone (as if the notice was missed): A merges when it writes.
+    // A version stored past the store (no bus event, as if it was missed): A merges when it writes.
     const [stored] = await storedThreads();
     const theirs = stored!;
     appendUser(theirs, 'Written elsewhere');
     theirs.rev += 1;
-    await t!.ctx.state.set(`thread:${theirs.id}`, theirs);
+    const value = JSON.parse(JSON.stringify(theirs)) as unknown;
+    await (await getDb()).put('kv', { key: `tool:chat:thread:${theirs.id}`, value, updatedAt: 1 });
     await send('Again from A');
     await vi.waitFor(() => expect($('chat-merged')).not.toBeNull());
     await eventually(async () => {
@@ -615,55 +615,42 @@ describe('review fixes', () => {
     expect(set).not.toHaveBeenCalled();
   });
 
-  it('reads a PDF once: later turns send the parser text instead of the file', async () => {
-    const chat = vi.fn((body: ChatRequest): Promise<ChatResponse> =>
-      Promise.resolve({
-        id: 'gen-pdf',
-        model: body.model,
-        choices: [
-          {
-            index: 0,
-            finish_reason: 'stop',
-            message: {
-              role: 'assistant',
-              content: 'The total is 12.',
-              annotations: [
-                {
-                  type: 'file',
-                  file: {
-                    hash: 'h',
-                    name: 'bill.pdf',
-                    content: [
-                      { type: 'text', text: '<file name="bill.pdf">' },
-                      { type: 'text', text: 'Total 12' },
-                      { type: 'text', text: '</file>' },
-                    ],
-                  },
-                },
-              ],
-            },
-          },
-        ],
-      }),
+  it('reads a PDF once: the stream brings the parser text, later turns send it instead', async () => {
+    const annotations = [
+      {
+        type: 'file',
+        file: {
+          hash: 'h',
+          name: 'bill.pdf',
+          content: [
+            { type: 'text', text: '<file name="bill.pdf">' },
+            { type: 'text', text: 'Total 12' },
+            { type: 'text', text: '</file>' },
+          ],
+        },
+      },
+    ];
+    const { bodies, chatStream: plain } = fakeStream(() =>
+      bodies.length === 1 ? 'The total is 12.' : 'It is from May.',
     );
-    const { bodies, chatStream } = fakeStream(() => 'It is from May.');
-    const { tool } = await mount({ chat, chatStream });
+    const chatStream = vi.fn(async (body: ChatRequest, opts: StreamOptions) => {
+      const result = await plain(body, opts);
+      return bodies.length === 1 ? { ...result, annotations } : result;
+    });
+    const { tool } = await mount({ chatStream });
     tool.onFiles!([pdfFile()]);
     await vi.waitFor(() => expect($$('composer-attachment')).toHaveLength(1));
     await send('Total?');
-    expect(chatStream).not.toHaveBeenCalled();
-    expect(chat.mock.calls[0]?.[0].plugins).toEqual([
-      { id: 'file-parser', pdf: { engine: 'cloudflare-ai' } },
-    ]);
+    expect(bodies[0]?.plugins).toEqual([{ id: 'file-parser', pdf: { engine: 'cloudflare-ai' } }]);
+    expect((bodies[0]?.messages[0]?.content as { type: string }[])[1]?.type).toBe('file');
     await vi.waitFor(() => expect(contents()[1]).toBe('The total is 12.'));
 
     await send('And the date?');
-    expect(chat).toHaveBeenCalledTimes(1);
-    expect(bodies[0]?.messages[0]?.content).toEqual([
+    expect(bodies[1]?.messages[0]?.content).toEqual([
       { type: 'text', text: 'Total?' },
       { type: 'text', text: '<file name="bill.pdf">\nTotal 12\n</file>' },
     ]);
-    expect(bodies[0]?.plugins).toBeUndefined();
+    expect(bodies[1]?.plugins).toBeUndefined();
     expect($$('attachment-missing')).toHaveLength(0);
     await eventually(async () => {
       const [stored] = await storedThreads();
@@ -671,9 +658,28 @@ describe('review fixes', () => {
     });
   });
 
+  it('declares the paid PDF parser as a run add-on', async () => {
+    const { chatStream } = fakeStream();
+    const { tool } = await mount({ chatStream });
+    tool.onFiles!([pdfFile()]);
+    await vi.waitFor(() => expect($$('composer-attachment')).toHaveLength(1));
+    expect(tool.addons!()).toEqual([]); // Cloudflare AI is free
+    tool.applyState({
+      prompt: 'Read it',
+      settings: { ...tool.getState().settings, pdfEngine: 'mistral-ocr' },
+    });
+    const addon = { id: 'pdf-engine:mistral-ocr', label: 'Mistral OCR (PDF parser)' };
+    expect(tool.addons!()).toEqual([expect.objectContaining(addon)]);
+    const begin = vi.spyOn(t!.ctx, 'beginRun');
+    await t!.runners[0]!.trigger();
+    expect(begin.mock.calls[0]?.[0].addons).toEqual([
+      { ...addon, estimateUsd: expect.any(Number) as number },
+    ]);
+  });
+
   it('refuses the paid Mistral OCR reader in free-only mode', async () => {
-    const chat = vi.fn();
-    const { tool } = await mount({ chat });
+    const chatStream = vi.fn();
+    const { tool } = await mount({ chatStream });
     t!.core.settings.update((draft) => {
       draft.freeOnly = true;
       draft.tools.chat = { model: 'f/free:free' };
@@ -686,7 +692,7 @@ describe('review fixes', () => {
     await vi.waitFor(() => expect($$('composer-attachment')).toHaveLength(1));
     await t!.runners[0]!.trigger();
     await vi.waitFor(() => expect($('error-toast')?.textContent).toContain('Mistral OCR'));
-    expect(chat).not.toHaveBeenCalled();
+    expect(chatStream).not.toHaveBeenCalled();
     expect(composer().value).toBe('Read it');
     expect(messages()).toHaveLength(0);
   });

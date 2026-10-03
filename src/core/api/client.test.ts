@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import chatRecorded from '../../../tests/fixtures/openrouter/chat-completion.recorded.json';
+import chatPdf from '../../../tests/fixtures/openrouter/chat-completion-pdf.recorded.json';
 import chatError200 from '../../../tests/fixtures/openrouter/chat-completion-error-200.documented.json';
 import chatStreamText from '../../../tests/fixtures/openrouter/chat-stream.recorded.sse.txt?raw';
 import midStream from '../../../tests/fixtures/openrouter/chat-stream-midstream-error.documented.json';
@@ -531,6 +532,14 @@ describe('chatStream', () => {
     });
     expect(result.text).toBe('pong');
     expect(events.map((e) => e.type)).toEqual(['meta', 'reasoning', 'text', 'finish', 'usage']);
+    expect(result.annotations).toBeUndefined();
+  });
+
+  it('keeps the PDF parser’s annotations of a JSON answer (recorded)', async () => {
+    const s = setup([json(chatPdf.response)]);
+    const result = await s.client.chatStream(chatBody, { run: s.run, onEvent: () => undefined });
+    expect(result.annotations).toEqual(chatPdf.response.choices[0]?.message.annotations);
+    expect(result.annotations?.[0]).toMatchObject({ type: 'file', file: { name: 'invoice.pdf' } });
   });
 });
 

@@ -141,4 +141,15 @@ describe('ChatStreamAssembler', () => {
     expect(assembler.result().images).toEqual(['data:image/png;base64,AA==']);
     expect(events).toContainEqual({ type: 'image', url: 'data:image/png;base64,AA==' });
   });
+
+  it('keeps the annotations of streamed deltas (the PDF parser’s text), in order', () => {
+    const assembler = new ChatStreamAssembler(() => undefined);
+    const file = { type: 'file', file: { hash: 'h', name: 'a.pdf', content: [] } };
+    const cite = { type: 'url_citation', url_citation: { url: 'https://example.com' } };
+    assembler.push({ id: 'g', model: 'm', choices: [{ delta: { content: 'Hi' } }] });
+    expect(assembler.result().annotations).toBeUndefined();
+    assembler.push({ choices: [{ delta: { annotations: [file, 'junk'] } }] });
+    assembler.push({ choices: [{ delta: { annotations: [cite] } }] });
+    expect(assembler.result().annotations).toEqual([file, cite]);
+  });
 });
