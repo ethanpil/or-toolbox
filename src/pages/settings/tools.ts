@@ -5,26 +5,23 @@
  */
 import type { CoreServices, ToolManifest } from '../../core/types';
 import { tools } from '../../tools/registry';
+import { CAPABILITY_INFO } from '../../core/models/capabilities';
+import { dataTable } from '../../ui/components/data-table';
 import { modelPicker } from '../../ui/components/model-picker';
 import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { presentError } from '../../ui/feedback/errors';
 import { icon } from '../../ui/icon';
+import { setToolBinding } from '../../ui/settings-actions';
 import { toolUrl } from '../../ui/shell/links';
 import { capabilityDefault } from './logic';
-import { CAPABILITY_INFO } from './models';
-import { card, rerender, saveSettings, type SectionView } from './ui';
+import { card, rerender, type SectionView } from './ui';
 
 export function toolsSection(core: CoreServices): SectionView {
   const body = h('tbody');
 
   const setKey = (tool: ToolManifest, keyId: string): void => {
-    saveSettings(core, (draft) => {
-      const binding = { ...draft.tools[tool.id] };
-      if (keyId) binding.keyId = keyId;
-      else delete binding.keyId;
-      draft.tools[tool.id] = binding;
-    });
+    setToolBinding(core, tool.id, { keyId });
   };
 
   const chooseModel = async (tool: ToolManifest): Promise<void> => {
@@ -36,24 +33,13 @@ export function toolsSection(core: CoreServices): SectionView {
       title: `Model for ${tool.name}`,
     });
     if (!chosen) return;
-    if (
-      saveSettings(core, (draft) => {
-        draft.tools[tool.id] = { ...draft.tools[tool.id], model: chosen };
-      })
-    ) {
+    if (setToolBinding(core, tool.id, { model: chosen })) {
       announce(`${tool.name} now uses ${chosen}.`);
     }
   };
 
   const reset = (tool: ToolManifest): void => {
-    if (
-      saveSettings(core, (draft) => {
-        const binding = { ...draft.tools[tool.id] };
-        delete binding.keyId;
-        delete binding.model;
-        draft.tools[tool.id] = binding;
-      })
-    ) {
+    if (setToolBinding(core, tool.id, { keyId: null, model: null })) {
       announce(`${tool.name} uses the default key and model again.`);
     }
   };
@@ -75,7 +61,7 @@ export function toolsSection(core: CoreServices): SectionView {
               class: 'form-select form-select-sm',
               'aria-label': `Key for ${tool.name}`,
               'data-testid': 'tool-key',
-              'data-focus': `tool:${tool.id}:key`,
+              'data-focus-key': `tool:${tool.id}:key`,
               onchange: (event: Event) => setKey(tool, (event.target as HTMLSelectElement).value),
             },
             h('option', { value: '' }, `Default key${defaultKey ? ` (${defaultKey.name})` : ''}`),
@@ -132,7 +118,7 @@ export function toolsSection(core: CoreServices): SectionView {
               class: 'btn btn-sm btn-outline-secondary text-nowrap',
               'aria-label': `Choose the model for ${tool.name}`,
               'data-testid': 'tool-model-change',
-              'data-focus': `tool:${tool.id}:model`,
+              'data-focus-key': `tool:${tool.id}:model`,
               onclick: () =>
                 void chooseModel(tool).catch((error: unknown) => void presentError(error)),
             },
@@ -152,7 +138,7 @@ export function toolsSection(core: CoreServices): SectionView {
             title: 'Reset to defaults',
             disabled: !binding.keyId && !binding.model,
             'data-testid': 'tool-reset',
-            'data-focus': `tool:${tool.id}:reset`,
+            'data-focus-key': `tool:${tool.id}:reset`,
             onclick: () => reset(tool),
           },
           icon('arrow-counterclockwise'),
@@ -170,32 +156,13 @@ export function toolsSection(core: CoreServices): SectionView {
       text: 'Pin a key or a model to one tool; everything else follows the defaults. A tool’s own model chip sets the same thing.',
       testId: 'tool-bindings',
     },
-    h(
-      'div',
-      // Positioned, so the visually hidden header (absolute) scrolls with the table instead of widening the page.
-      { class: 'table-responsive position-relative' },
-      h(
-        'table',
-        { class: 'table align-middle mb-0 or-bindings' },
-        h(
-          'thead',
-          null,
-          h(
-            'tr',
-            null,
-            h('th', { scope: 'col' }, 'Tool'),
-            h('th', { scope: 'col' }, 'Key'),
-            h('th', { scope: 'col' }, 'Model'),
-            h(
-              'th',
-              { scope: 'col', class: 'text-end' },
-              h('span', { class: 'visually-hidden' }, 'Reset'),
-            ),
-          ),
-        ),
-        body,
-      ),
-    ),
+    dataTable({
+      scrollerLabel: 'Key and model per tool',
+      class: 'table align-middle mb-0 or-bindings',
+      head: ['Tool', 'Key', 'Model', h('span', { class: 'visually-hidden' }, 'Reset')],
+      numericFrom: 3,
+      body,
+    }),
   );
 
   core.settings.subscribe((next, prev) => {

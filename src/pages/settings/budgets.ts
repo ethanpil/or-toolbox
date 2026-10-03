@@ -6,20 +6,20 @@
 import { MAX_MONTHLY_USD, MAX_PER_RUN_USD } from '../../core/settings/schema';
 import type { BudgetMode, CoreServices, KeyInfo } from '../../core/types';
 import { keyDot } from '../../ui/components/key-picker';
+import { meter } from '../../ui/components/meter';
 import { type Child, h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { formatUsd } from '../../ui/format';
 import { icon } from '../../ui/icon';
+import { saveSettings } from '../../ui/settings-actions';
 import { parseUsd, spendMeter, usdFieldValue } from './logic';
 import {
   card,
   type Field,
   loadingLine,
-  meter,
   numberField,
   radioCards,
   rerender,
-  saveSettings,
   type SectionView,
 } from './ui';
 
@@ -149,7 +149,7 @@ export function budgetsSection(core: CoreServices): SectionView {
             else draft.budgets.perKeyMonthlyUsd[key.id] = value;
           }),
       });
-      field.input.dataset.focus = `budget:${key.id}`;
+      field.input.dataset.focusKey = `budget:${key.id}`;
       keyFields.set(key.id, field);
     } else {
       field.setLabel(keyLabel(key));

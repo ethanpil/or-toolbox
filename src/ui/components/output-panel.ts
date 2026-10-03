@@ -24,8 +24,8 @@ import { h } from '../dom';
 import { userMessage } from '../../core/errors';
 import { announce } from '../feedback/announce';
 import { isStop, markPresented, needsAction } from '../feedback/errors';
-import { toast } from '../feedback/toast';
-import { copyText } from '../clipboard';
+import { copyWithToast } from '../clipboard';
+import { formatInt } from '../format';
 import { icon } from '../icon';
 import { renderMarkdown } from '../markdown';
 import type { SendItem } from '../tool/types';
@@ -127,15 +127,7 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
       type: 'button',
       class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
       'data-testid': 'output-copy',
-      onclick: () => {
-        void copyText(buffer).then((ok) =>
-          toast(
-            ok
-              ? { message: 'Copied to the clipboard.', variant: 'success' }
-              : { message: 'Copying was blocked by the browser.', variant: 'warning' },
-          ),
-        );
-      },
+      onclick: () => void copyWithToast(buffer, 'Copied to the clipboard.'),
     },
     icon('clipboard'),
     'Copy',
@@ -357,9 +349,7 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
       void renderFinal(generation);
       const done =
         status ??
-        (buffer
-          ? `Done · ${words().toLocaleString('en-US')} words`
-          : 'Done, but the model returned no text.');
+        (buffer ? `Done · ${formatInt(words())} words` : 'Done, but the model returned no text.');
       setStatus(done);
       announce(done);
       setActionsEnabled(buffer.length > 0);

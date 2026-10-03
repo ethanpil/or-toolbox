@@ -62,15 +62,3 @@ export const SHIPPED_DEFAULTS: Readonly<Record<Capability, ShippedDefault>> = {
       'Jev 1.13: $0.042 per million input tokens (output is free), the model the decisions schema is written for; Mercury Decide accepts the same schema for free (probed).',
   },
 };
-
-/** Words used in free-only notes, e.g. "No free video model exists". */
-export const CAPABILITY_LABELS: Readonly<Record<Capability, string>> = {
-  text: 'text',
-  vision: 'vision',
-  image: 'image',
-  tts: 'text-to-speech',
-  stt: 'speech-to-text',
-  video: 'video',
-  music: 'music',
-  decisions: 'decision',
-};

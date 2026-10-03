@@ -3,31 +3,22 @@
  * model picker, reset per row) and the global free-only switch with what it costs: which capabilities have no
  * free model, which tools it blocks, and how many free requests were used today.
  */
+import { CAPABILITY_INFO } from '../../core/models/capabilities';
 import type { Capability, CoreServices } from '../../core/types';
 import { tools } from '../../tools/registry';
 import { CAPABILITIES } from '../../tools/types';
+import { accountFreeDaily } from '../../ui/components/key-balance';
 import { modelPicker } from '../../ui/components/model-picker';
+import { switchField } from '../../ui/components/switch-field';
 import { type Child, h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { presentError } from '../../ui/feedback/errors';
-import { formatModelPrice, plural } from '../../ui/format';
+import { formatInt, formatModelPrice, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
+import { saveSettings } from '../../ui/settings-actions';
 import { modelsUrl } from '../../ui/shell/links';
-import { accountFreeDaily } from './keys';
 import { capabilityDefault, freeOnlyImpact, freeOnlyModel } from './logic';
-import { card, rerender, saveSettings, type SectionView, switchField } from './ui';
-
-/** Display names and icons per capability (CAPABILITY_LABELS are the lower-case words used in sentences). */
-export const CAPABILITY_INFO: Readonly<Record<Capability, { title: string; icon: string }>> = {
-  text: { title: 'Text', icon: 'chat-left-text' },
-  vision: { title: 'Vision', icon: 'eye' },
-  image: { title: 'Image generation', icon: 'image' },
-  tts: { title: 'Text-to-speech', icon: 'megaphone' },
-  stt: { title: 'Speech-to-text', icon: 'mic' },
-  video: { title: 'Video', icon: 'camera-reels' },
-  music: { title: 'Music', icon: 'music-note-beamed' },
-  decisions: { title: 'Decisions', icon: 'signpost-split' },
-};
+import { card, rerender, type SectionView } from './ui';
 
 const usedBy = (capability: Capability): string =>
   tools
@@ -156,7 +147,7 @@ export function modelsSection(core: CoreServices): SectionView {
               class: 'btn btn-sm btn-outline-primary',
               'aria-label': `Change the ${info.title.toLowerCase()} model`,
               'data-testid': 'default-model-change',
-              'data-focus': `model:${capability}:change`,
+              'data-focus-key': `model:${capability}:change`,
               onclick: () =>
                 void choose(capability).catch((error: unknown) => void presentError(error)),
             },
@@ -170,7 +161,7 @@ export function modelsSection(core: CoreServices): SectionView {
               'aria-label': `Reset the ${info.title.toLowerCase()} model to the shipped default`,
               disabled: !current.custom && settings.defaultModels[capability] === undefined,
               'data-testid': 'default-model-reset',
-              'data-focus': `model:${capability}:reset`,
+              'data-focus-key': `model:${capability}:reset`,
               onclick: () => reset(capability),
             },
             'Reset',
@@ -231,7 +222,7 @@ export function modelsSection(core: CoreServices): SectionView {
     void accountFreeDaily(core).then((daily) => {
       accountSlot.replaceChildren(
         daily
-          ? ` OpenRouter reports ${daily.used.toLocaleString('en-US')} of ${daily.limit.toLocaleString('en-US')} used on your account (${daily.remaining.toLocaleString('en-US')} left; its counter can lag).`
+          ? ` OpenRouter reports ${formatInt(daily.used)} of ${formatInt(daily.limit)} used on your account (${formatInt(daily.remaining)} left; its counter can lag).`
           : '',
       );
     });

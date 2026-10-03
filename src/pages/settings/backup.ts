@@ -13,6 +13,7 @@ import { errorCode, userMessage } from '../../core/errors';
 import { downloadBlob } from '../../core/files';
 import type { BackupPreview, CoreServices } from '../../core/types';
 import { dropZone } from '../../ui/components/drop-zone';
+import { switchField } from '../../ui/components/switch-field';
 import { type Child, h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
@@ -29,7 +30,6 @@ import {
   radioCards,
   rerender,
   type SectionView,
-  switchField,
   validNewPassphrase,
 } from './ui';
 

@@ -10,7 +10,8 @@
 import type { RawImageModel, RawModel, RawModelEndpoint, RawVideoModel } from '../api/types';
 import { getDb } from '../storage/db';
 import type { CoreServices, ModelInfo, ModelsService, ResolvedModel } from '../types';
-import { CAPABILITY_LABELS, SHIPPED_DEFAULTS } from './defaults';
+import { CAPABILITY_INFO } from './capabilities';
+import { SHIPPED_DEFAULTS } from './defaults';
 import {
   estimateDecision,
   estimateImage,
@@ -373,7 +374,7 @@ export function createModelsService(
       return {
         model: null,
         source: 'none',
-        note: `No free ${CAPABILITY_LABELS[cap]} model exists; free-only mode blocks this tool.`,
+        note: `No free ${CAPABILITY_INFO[cap].label} model exists; free-only mode blocks this tool.`,
       };
     },
 

@@ -1,12 +1,12 @@
 /**
- * Building blocks shared by the Settings sections: cards, switches, validated number fields, radio cards,
- * progress meters, settings writes, and re-rendering that keeps keyboard focus. Plain Bootstrap markup through
- * h(); the look follows the Privacy page (cards with an icon-tile heading).
+ * Building blocks shared by the Settings sections: cards, validated number fields, radio cards, passphrase
+ * fields, and re-rendering that keeps keyboard focus. Plain Bootstrap markup through h(); the look follows the
+ * Privacy page (cards with an icon-tile heading). Switches, meters, external links and settings writes are
+ * shared with the other pages (src/ui/components/, src/ui/settings-actions.ts).
  */
-import type { CoreServices, Settings } from '../../core/types';
-import { type Child, h, replace } from '../../ui/dom';
-import { announce } from '../../ui/feedback/announce';
+import { type Child, FOCUS_KEY, h, replace } from '../../ui/dom';
 import { presentError } from '../../ui/feedback/errors';
+import { setFieldError } from '../../ui/feedback/field-error';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { MIN_PASSPHRASE_LENGTH, type Parsed, passphraseStrength } from './logic';
@@ -15,17 +15,6 @@ import { MIN_PASSPHRASE_LENGTH, type Parsed, passphraseStrength } from './logic'
 export interface SectionView {
   element: HTMLElement;
   onShow?: () => void;
-}
-
-/** Applies a settings change; shows the error (e.g. storage full) and returns false when it fails. */
-export function saveSettings(core: CoreServices, mutate: (draft: Settings) => void): boolean {
-  try {
-    core.settings.update(mutate);
-    return true;
-  } catch (error) {
-    void presentError(error);
-    return false;
-  }
 }
 
 /** Runs a synchronous write (keys service); errors go through presentError. */
@@ -42,35 +31,32 @@ export function attempt(action: () => void): boolean {
 export interface RerenderOptions {
   /**
    * Where focus goes when the control that had it is gone or cannot take focus any more (now disabled). Gets
-   * that control's `data-focus` key (null without one).
+   * that control's `data-focus-key` (null without one).
    */
   fallback?: (lostKey: string | null) => HTMLElement | null | undefined;
 }
 
 /**
- * Replaces the children of `container` and gives focus back to the element that had it, matched by
- * `data-focus` (or else `data-testid`), or else to `options.fallback`, so live re-renders never throw keyboard
- * users back to the top of the page.
+ * Replaces the children of `container` (`replace()` gives focus back to the control with the same
+ * `data-focus-key`), or else to `options.fallback`, so live re-renders never throw keyboard users back to the
+ * top of the page. Pass a function as `content` when building it moves existing elements (which would drop
+ * their focus before it is noticed).
  */
 export function rerender(
   container: HTMLElement,
-  content?: Child,
+  content?: Child | (() => Child),
   options: RerenderOptions = {},
 ): void {
   const active = document.activeElement;
   const hadFocus = active instanceof HTMLElement && container.contains(active);
-  const byFocusKey = hadFocus && active.dataset.focus !== undefined;
-  const key = hadFocus ? (active.dataset.focus ?? active.dataset.testid ?? null) : null;
-  replace(container, content);
-  if (!hadFocus) return;
-  const target = key
-    ? container.querySelector<HTMLElement>(
-        `[${byFocusKey ? 'data-focus' : 'data-testid'}="${CSS.escape(key)}"]`,
-      )
+  const lostKey = hadFocus
+    ? (active.closest(`[${FOCUS_KEY}]`)?.getAttribute(FOCUS_KEY) ?? null)
     : null;
-  target?.focus();
-  if (target && document.activeElement === target) return;
-  options.fallback?.(byFocusKey ? key : null)?.focus();
+  replace(container, typeof content === 'function' ? content() : content);
+  if (!hadFocus) return;
+  const now = document.activeElement;
+  if (now instanceof HTMLElement && now !== document.body && container.contains(now)) return;
+  options.fallback?.(lostKey)?.focus();
 }
 
 /** Focuses a Settings section's heading (`#<section>-title`, focusable by script). */
@@ -124,51 +110,6 @@ export function card(options: CardOptions, ...body: Child[]): HTMLElement {
       body,
     ),
   );
-}
-
-/** A link that opens in a new tab and says so to screen readers. */
-export function externalLink(href: string, text: string, className?: string): HTMLElement {
-  return h(
-    'a',
-    { href, target: '_blank', rel: 'noopener noreferrer', class: className },
-    text,
-    h('span', { class: 'visually-hidden' }, ' (opens in a new tab)'),
-  );
-}
-
-export interface SwitchOptions {
-  label: Child;
-  help?: Child;
-  checked: boolean;
-  testId: string;
-  onChange: (checked: boolean, input: HTMLInputElement) => void;
-}
-
-/** A Bootstrap switch with its label and help text wired up. */
-export function switchField(options: SwitchOptions): {
-  element: HTMLElement;
-  input: HTMLInputElement;
-} {
-  const id = uid('switch');
-  const helpId = options.help ? uid('switch-help') : undefined;
-  const input = h('input', {
-    id,
-    type: 'checkbox',
-    role: 'switch',
-    class: 'form-check-input',
-    'aria-describedby': helpId,
-    'data-testid': options.testId,
-    checked: options.checked,
-    onchange: () => options.onChange(input.checked, input),
-  });
-  const element = h(
-    'div',
-    { class: 'form-check form-switch' },
-    input,
-    h('label', { class: 'form-check-label fw-semibold', htmlFor: id }, options.label),
-    options.help && h('div', { id: helpId, class: 'form-text mt-1' }, options.help),
-  );
-  return { element, input };
 }
 
 export interface FieldOptions<T> {
@@ -225,26 +166,18 @@ export function numberField<T>(options: FieldOptions<T>): Field {
     'data-testid': options.testId,
   });
 
-  const setInvalid = (message: string | null): void => {
-    input.classList.toggle('is-invalid', message !== null);
-    if (message === null) input.removeAttribute('aria-invalid');
-    else input.setAttribute('aria-invalid', 'true');
-    feedback.textContent = message ?? '';
-  };
-
   /** Text the user typed that is not saved yet. */
   let dirty = false;
-  let announced: string | null = null;
+  /** The message on show: announced once each time it changes, not on every keystroke. */
+  let shown: string | null = null;
+  const show = (message: string | null): void => {
+    if (message === shown) return;
+    shown = message;
+    setFieldError(input, feedback, message);
+  };
   const validate = (): Parsed<T> => {
     const parsed = options.parse(input.value);
-    if (parsed.ok) {
-      setInvalid(null);
-      announced = null;
-    } else {
-      setInvalid(parsed.error);
-      if (announced !== parsed.error) announce(parsed.error, { assertive: true });
-      announced = parsed.error;
-    }
+    show(parsed.ok ? null : parsed.error);
     return parsed;
   };
 
@@ -284,8 +217,7 @@ export function numberField<T>(options: FieldOptions<T>): Field {
     sync(text) {
       if (document.activeElement === input || dirty) return;
       input.value = text;
-      setInvalid(null);
-      announced = null;
+      show(null);
     },
     setLabel(content) {
       replace(label, content);
@@ -442,44 +374,6 @@ export function segmented<T extends string>(options: {
   };
 }
 
-/** A labelled progress bar (`role=progressbar` with a text value), coloured by tone. */
-export function meter(options: {
-  percent: number;
-  tone: 'success' | 'warning' | 'danger' | 'primary';
-  label: string;
-  text: string;
-  testId?: string;
-}): HTMLElement {
-  return h(
-    'div',
-    { 'data-testid': options.testId },
-    h(
-      'div',
-      {
-        class: 'progress or-settings-meter',
-        role: 'progressbar',
-        'aria-label': options.label,
-        'aria-valuenow': options.percent,
-        'aria-valuemin': 0,
-        'aria-valuemax': 100,
-        'aria-valuetext': options.text,
-      },
-      h('div', {
-        class: ['progress-bar', `bg-${options.tone}`],
-        style: { width: `${options.percent}%` },
-      }),
-    ),
-    h(
-      'div',
-      {
-        class: 'small text-body-secondary mt-1',
-        'data-testid': options.testId && `${options.testId}-text`,
-      },
-      options.text,
-    ),
-  );
-}
-
 export interface PassphraseInput {
   element: HTMLElement;
   input: HTMLInputElement;
@@ -531,12 +425,7 @@ export function passphraseInput(options: {
     strengthText.textContent = input.value ? result.label : '—';
     strengthHint.textContent = result.hint;
   };
-  const invalid = (message: string | null): void => {
-    input.classList.toggle('is-invalid', message !== null);
-    if (message === null) input.removeAttribute('aria-invalid');
-    else input.setAttribute('aria-invalid', 'true');
-    feedback.textContent = message ?? '';
-  };
+  const invalid = (message: string | null): void => setFieldError(input, feedback, message);
   input.addEventListener('input', () => {
     if (options.strength) updateStrength();
     if (input.classList.contains('is-invalid')) invalid(null);

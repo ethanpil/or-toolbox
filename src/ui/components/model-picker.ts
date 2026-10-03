@@ -8,17 +8,19 @@
  * const id = await modelPicker(core, { capability: 'text', selected: current });
  * ```
  */
+import { CAPABILITY_INFO } from '../../core/models/capabilities';
 import type { Capability, CoreServices, ModelInfo } from '../../core/types';
-import { CAPABILITY_LABELS } from '../../core/models/defaults';
+import { debounce, SEARCH_DEBOUNCE_MS } from '../../core/util';
 import { h, replace } from '../dom';
-import { presentError } from '../feedback/errors';
 import { openModal } from '../feedback/modal';
 import { formatContext, formatModelPrice } from '../format';
-import { icon } from '../icon';
 import { uid } from '../id';
-import { rank } from '../shell/palette-search';
+import { toggleFavouriteModel } from '../settings-actions';
+import { rankBy, type SearchItem } from '../shell/palette-search';
 import { settingsUrl } from '../shell/links';
 import { emptyState } from './empty-state';
+import { listSkeleton, loadInto } from './load-into';
+import { setStarred, starButton } from './star-button';
 
 export interface ModelPickerOptions {
   capability: Capability;
@@ -29,6 +31,13 @@ export interface ModelPickerOptions {
 
 const MAX_ROWS = 80;
 
+/** What the search box matches in a model: the name, then the id, then the author. */
+const searchable = (model: ModelInfo): SearchItem => ({
+  label: model.name,
+  detail: model.id,
+  keywords: model.author,
+});
+
 export function modelPicker(
   core: CoreServices,
   options: ModelPickerOptions,
@@ -36,7 +45,7 @@ export function modelPicker(
   let chosen: string | null = null;
   let models: ModelInfo[] | null = null;
   const searchId = uid('model-search');
-  const capabilityLabel = CAPABILITY_LABELS[options.capability];
+  const capabilityLabel = CAPABILITY_INFO[options.capability].label;
 
   const search = h('input', {
     id: searchId,
@@ -53,19 +62,9 @@ export function modelPicker(
   const isFavourite = (id: string): boolean => core.settings.get().models.favourites.includes(id);
 
   const toggleFavourite = (model: ModelInfo, button: HTMLButtonElement): void => {
-    const next = !isFavourite(model.id);
-    try {
-      core.settings.update((draft) => {
-        draft.models.favourites = next
-          ? [...draft.models.favourites, model.id]
-          : draft.models.favourites.filter((id) => id !== model.id);
-      });
-    } catch (error) {
-      void presentError(error);
-      return;
-    }
-    button.setAttribute('aria-pressed', String(next));
-    button.replaceChildren(icon(next ? 'star-fill' : 'star'));
+    const next = toggleFavouriteModel(core, model.id);
+    if (next === null) return;
+    setStarred(button, next);
     status.textContent = next
       ? `${model.name} added to favourites.`
       : `${model.name} removed from favourites.`;
@@ -75,18 +74,12 @@ export function modelPicker(
     const selected = model.id === options.selected;
     const favourite = isFavourite(model.id);
     const context = formatContext(model.contextLength);
-    const star = h(
-      'button',
-      {
-        type: 'button',
-        class: 'btn btn-sm btn-link or-star',
-        'aria-pressed': String(favourite),
-        'aria-label': `Favourite: ${model.name}`,
-        'data-testid': 'model-favourite',
-        onclick: () => toggleFavourite(model, star),
-      },
-      icon(favourite ? 'star-fill' : 'star'),
-    );
+    const star = starButton({
+      pressed: favourite,
+      label: `Favourite: ${model.name}`,
+      testId: 'model-favourite',
+      onToggle: () => toggleFavourite(model, star),
+    });
     return h(
       'div',
       { class: ['list-group-item d-flex align-items-center gap-2 p-0', selected && 'or-selected'] },
@@ -158,15 +151,7 @@ export function modelPicker(
     }
     const query = search.value.trim();
     if (query) {
-      const matches = rank(
-        models.map((model) => ({
-          label: model.name,
-          detail: model.id,
-          keywords: model.author,
-          model,
-        })),
-        query,
-      ).map((entry) => entry.model);
+      const matches = rankBy(models, query, searchable);
       if (matches.length === 0) {
         results.replaceChildren(
           emptyState({
@@ -217,52 +202,48 @@ export function modelPicker(
     status.textContent = `${models.length} models.`;
   };
 
-  const skeleton = (): HTMLElement =>
-    h(
-      'div',
-      { class: 'list-group placeholder-glow mt-3', 'aria-hidden': 'true' },
-      [0, 1, 2, 3, 4].map(() =>
-        h(
-          'div',
-          { class: 'list-group-item py-3' },
-          h('span', { class: 'placeholder col-5 d-block mb-2' }),
-          h('span', { class: 'placeholder placeholder-sm col-8 d-block' }),
-        ),
-      ),
-    );
-
   const load = (): void => {
-    results.replaceChildren(skeleton());
-    status.textContent = 'Loading models…';
-    core.models
-      .forCapability(options.capability)
-      .then((list) => {
-        models = list;
+    void loadInto(
+      results,
+      async () => {
+        models = await core.models.forCapability(options.capability);
         render();
-      })
-      .catch(() => {
-        results.replaceChildren(
-          emptyState({
-            icon: 'wifi-off',
-            title: 'The model list could not be loaded',
-            text: 'Check your connection and try again.',
-            action: h(
-              'button',
-              { type: 'button', class: 'btn btn-sm btn-outline-primary', onclick: load },
-              'Try again',
-            ),
-            compact: true,
-            testId: 'model-error',
-          }),
-        );
-        status.textContent = 'The model list could not be loaded.';
-      });
+      },
+      {
+        skeleton: listSkeleton(5, 'list-group mt-3'),
+        status: (text) => (status.textContent = text),
+        messages: { loading: 'Loading models…', failed: 'The model list could not be loaded.' },
+        error: {
+          icon: 'wifi-off',
+          title: 'The model list could not be loaded',
+          text: 'Check your connection and try again.',
+          compact: true,
+          testId: 'model-error',
+        },
+        retry: load,
+      },
+    );
   };
 
-  search.addEventListener('input', render);
+  /** True while typed text has not been searched yet. */
+  let stale = false;
+  const renderSoon = debounce(() => {
+    stale = false;
+    render();
+  }, SEARCH_DEBOUNCE_MS);
+  search.addEventListener('input', () => {
+    stale = true;
+    renderSoon();
+  });
   // Arrow keys move between the choices (the star buttons stay reachable with Tab).
   const moveFocus = (event: KeyboardEvent): void => {
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    // Typing straight into an arrow key must act on the results of what was typed, not on the ones before.
+    if (stale) {
+      renderSoon.cancel();
+      stale = false;
+      render();
+    }
     const choices = [...results.querySelectorAll<HTMLButtonElement>('.or-model-option')];
     if (choices.length === 0) return;
     const index = choices.indexOf(document.activeElement as HTMLButtonElement);
@@ -300,5 +281,8 @@ export function modelPicker(
   });
   modal.body.addEventListener('keydown', moveFocus);
   load();
-  return modal.closed.then(() => chosen);
+  return modal.closed.then(() => {
+    renderSoon.cancel();
+    return chosen;
+  });
 }
