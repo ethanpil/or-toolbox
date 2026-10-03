@@ -5,13 +5,21 @@
  *
  * - Scope `settings`: settings and saved prompts (plus keys when opted in). Scope `all` adds history,
  *   recent prompts, jobs, tool state and stats rows.
- * - Keys are included only on request, always as a passphrase envelope (crypto.ts) around the exact JSON
- *   stored under `ortoolbox:keys`. With the key lock on, the secrets inside are encrypted a second time.
- * - Import `merge`: imported settings win field by field; records are upserted by id. `replace`: the
- *   backup's scope is wiped first, then imported. Keys are wiped only when the backup carries keys, so a
- *   settings restore never deletes keys it cannot replace.
- * - Everything is decoded and validated before the first write: a wrong passphrase imports nothing.
- *   Without a passphrase, the keys are skipped and the rest is imported.
+ * - Keys are included only on request, always as a passphrase envelope (crypto.ts) around the keys file
+ *   from `core.keys.exportFile()`. With the key lock on, the secrets inside are encrypted a second time.
+ * - Every record is validated field by field; invalid ones are skipped and counted in the preview.
+ * - Import `merge`: only the settings present in the file override current ones. Records are added when
+ *   missing; existing ones are replaced only by a newer copy (runs by `finishedAt`, jobs by `updatedAt`),
+ *   a final run or job never goes back to an earlier state, a run that is running here is never touched,
+ *   and stats rows keep the larger value of each field (a backup of this same device must not double
+ *   count). Keys are merged only when both sides use the same passphrase lock (or there is no lock and no
+ *   key here yet): a merge never removes or swaps a lock.
+ * - Import `replace`: the backup's scope is replaced. Keys are replaced only when the backup carries keys.
+ * - Runs that were `running` when the backup was made arrive as `aborted`.
+ * - Atomic: everything is decoded, validated and planned first (a wrong passphrase imports nothing). Then
+ *   keys (through `core.keys.replaceFile`, refused if another tab changed them since the preview) and
+ *   settings are written, then every IndexedDB change in one transaction; if that fails, keys and settings
+ *   are rolled back. Without a passphrase, keys are skipped and the rest is imported.
  */
 
 import type {
@@ -19,35 +27,33 @@ import type {
   BackupService,
   CoreServices,
   JobRecord,
+  JobState,
+  ModelUsageTotals,
   PromptEntry,
   RunRecord,
+  RunStatus,
   Settings,
   StoredKeysFile,
+  UsageTotals,
 } from '../types';
-import { TOOL_IDS } from '../../tools/types';
+import { TOOL_IDS, type ToolId } from '../../tools/types';
+import { BackupError, WrongPassphraseError } from '../errors';
 import { decryptWithPassphrase, encryptWithPassphrase, type PassphraseEnvelope } from '../crypto';
 import { getDb, type KvEntry, type StoredStatsRow } from '../storage/db';
-import {
-  LS_KEYS,
-  SS_KEYS,
-  local,
-  readJson,
-  removeItem,
-  session,
-  writeJson,
-} from '../storage/local';
-import { deepMerge, isPlainObject, jsonCopy } from '../settings/merge';
-import { normalizeSettings } from '../settings/schema';
+import { deepMerge, jsonCopy } from '../settings/merge';
+import { migrateSettings, normalizeSettings } from '../settings/schema';
+import { statsKey } from '../stats';
 import { TOOL_STATE_PREFIX, prefixRange } from '../tool-state';
+import { isFinalState } from '../jobs';
+import { isFiniteNumber, isPlainObject, isString, parseJsonSafe, stripUnsafeKeys } from '../util';
 import { version as APP_VERSION } from '../../../package.json';
+
+export { BackupError };
 
 export const BACKUP_FORMAT = 'ortoolbox-backup';
 export const BACKUP_VERSION = 1;
-
-/** A backup that cannot be read or decrypted. `message` is safe to show. */
-export class BackupError extends Error {
-  override readonly name = 'BackupError';
-}
+/** Files may set their own PBKDF2 cost; anything above this would freeze the page (or be an attack). */
+export const MAX_PBKDF2_ITERATIONS = 2_000_000;
 
 export interface BackupFile {
   format: typeof BACKUP_FORMAT;
@@ -65,101 +71,325 @@ export interface BackupFile {
   stats?: StoredStatsRow[];
 }
 
-const EMPTY_KEYS: StoredKeysFile = { version: 1, keys: [], lock: null };
+// --- nouns and change lines ------------------------------------------------------------------------
 
-// --- validation ------------------------------------------------------------------------------------
+type Noun = [one: string, many: string];
+const N = {
+  setting: ['setting', 'settings'],
+  key: ['key', 'keys'],
+  saved: ['saved prompt', 'saved prompts'],
+  recent: ['recent prompt', 'recent prompts'],
+  run: ['run', 'runs'],
+  job: ['job', 'jobs'],
+  toolState: ['tool state entry', 'tool state entries'],
+  stats: ['stats row', 'stats rows'],
+  keyPin: ['tool key pin', 'tool key pins'],
+  keyBudget: ['per-key budget', 'per-key budgets'],
+} satisfies Record<string, Noun>;
 
-const isString = (value: unknown): value is string => typeof value === 'string';
-const isNumber = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isFinite(value);
-const isToolId = (value: unknown): boolean =>
+const plural = (count: number, [one, many]: Noun): string => `${count} ${count === 1 ? one : many}`;
+
+function replaceLine(current: number, incoming: number, noun: Noun): string | null {
+  if (current === 0 && incoming === 0) return null;
+  if (current === 0) return `Add ${plural(incoming, noun)}`;
+  if (incoming === 0) return `Delete ${plural(current, noun)}`;
+  return `Replace ${plural(current, noun)} with ${incoming} from the backup`;
+}
+
+function mergeLines(added: number, updated: number, noun: Noun): string[] {
+  const lines: string[] = [];
+  if (added > 0) lines.push(`Add ${plural(added, noun)}`);
+  if (updated > 0) lines.push(`Update ${plural(updated, noun)}`);
+  return lines;
+}
+
+const skipLine = (count: number, noun: Noun): string[] =>
+  count > 0 ? [`Skip ${plural(count, noun)} (invalid records)`] : [];
+
+const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+
+/** Dotted paths of the leaves that differ (arrays count as one leaf). */
+function diffPaths(a: unknown, b: unknown, path = ''): string[] {
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
+    return keys.flatMap((key) => diffPaths(a[key], b[key], path ? `${path}.${key}` : key));
+  }
+  return same(a, b) ? [] : [path];
+}
+
+function listPaths(paths: string[], max = 6): string {
+  const shown = paths.slice(0, max).join(', ');
+  return paths.length > max ? `${shown} and ${paths.length - max} more` : shown;
+}
+
+// --- validation of imported records ----------------------------------------------------------------
+
+const RUN_STATUSES: readonly RunStatus[] = ['running', 'ok', 'error', 'aborted'];
+const JOB_STATES: readonly JobState[] = ['queued', 'running', 'succeeded', 'failed', 'cancelled'];
+const INTERRUPTED = 'Interrupted: this run was still going when the backup was made.';
+
+const isToolId = (value: unknown): value is ToolId =>
   isString(value) && (TOOL_IDS as readonly string[]).includes(value);
+const isId = (value: unknown): value is string => isString(value) && value !== '';
+const isCount = (value: unknown): value is number => isFiniteNumber(value) && value >= 0;
+const orNull =
+  <T>(check: (value: unknown) => value is T) =>
+  (value: unknown): value is T | null =>
+    value === null || check(value);
+const stringOrNull = orNull(isString);
+const numberOrNull = orNull(isFiniteNumber);
+const isStringList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every(isString);
+/** A JSON-ish plain object, copied without unsafe keys. */
+const plain = (value: unknown): Record<string, unknown> | null =>
+  isPlainObject(value) ? stripUnsafeKeys(value) : null;
 
-function validPrompt(value: unknown): value is PromptEntry {
-  return (
-    isPlainObject(value) &&
-    isString(value['id']) &&
-    isToolId(value['tool']) &&
-    (value['kind'] === 'recent' || value['kind'] === 'saved') &&
-    (value['name'] === null || isString(value['name'])) &&
-    isString(value['text']) &&
-    isPlainObject(value['settings']) &&
-    isNumber(value['createdAt']) &&
-    isNumber(value['usedAt'])
-  );
+function toModelTotals(value: unknown): ModelUsageTotals | null {
+  if (!isPlainObject(value)) return null;
+  const { requests, promptTokens, completionTokens, costUsd, latencyMsTotal } = value;
+  if (![requests, promptTokens, completionTokens, costUsd, latencyMsTotal].every(isCount)) {
+    return null;
+  }
+  return { requests, promptTokens, completionTokens, costUsd, latencyMsTotal } as ModelUsageTotals;
 }
 
-function validRun(value: unknown): value is RunRecord {
-  return (
-    isPlainObject(value) &&
-    isString(value['id']) &&
-    isToolId(value['tool']) &&
-    ['running', 'ok', 'error', 'aborted'].includes(value['status'] as string) &&
-    isString(value['model']) &&
-    Array.isArray(value['models']) &&
-    isNumber(value['startedAt']) &&
-    isPlainObject(value['usage'])
-  );
+function toUsage(value: unknown): UsageTotals | null {
+  const totals = toModelTotals(value);
+  if (!totals || !isPlainObject(value) || !isPlainObject(value['byModel'])) return null;
+  const { costEstimated, costUnknown = false } = value;
+  if (typeof costEstimated !== 'boolean' || typeof costUnknown !== 'boolean') return null;
+  const byModel: Record<string, ModelUsageTotals> = {};
+  for (const [model, entry] of Object.entries(stripUnsafeKeys(value['byModel']))) {
+    const parsed = toModelTotals(entry);
+    if (!parsed) return null;
+    byModel[model] = parsed;
+  }
+  return { ...totals, costEstimated, costUnknown, byModel };
 }
 
-function validJob(value: unknown): value is JobRecord {
-  return (
-    isPlainObject(value) &&
-    isString(value['id']) &&
-    isToolId(value['tool']) &&
-    isString(value['type']) &&
-    ['queued', 'running', 'succeeded', 'failed', 'cancelled'].includes(value['state'] as string) &&
-    isNumber(value['createdAt'])
-  );
+function toPrompt(value: unknown, kind: PromptEntry['kind']): PromptEntry | null {
+  if (!isPlainObject(value)) return null;
+  const { id, tool, name, text, createdAt, usedAt } = value;
+  const settings = plain(value['settings']);
+  if (
+    !isId(id) ||
+    !isToolId(tool) ||
+    value['kind'] !== kind ||
+    !stringOrNull(name) ||
+    !isString(text) ||
+    !settings ||
+    !isFiniteNumber(createdAt) ||
+    !isFiniteNumber(usedAt)
+  ) {
+    return null;
+  }
+  return { id, tool, kind, name, text, settings, createdAt, usedAt };
 }
 
-function validToolState(value: unknown): value is KvEntry {
-  return (
-    isPlainObject(value) &&
-    isString(value['key']) &&
-    value['key'].startsWith(TOOL_STATE_PREFIX) &&
-    'value' in value
-  );
+function toRun(value: unknown): RunRecord | null {
+  if (!isPlainObject(value)) return null;
+  const v = value;
+  const usage = toUsage(v['usage']);
+  const meta = plain(v['meta']);
+  const settings = v['settings'] === null ? null : plain(v['settings']);
+  const reservedUsd = v['reservedUsd'] ?? 0;
+  const jobId = v['jobId'] ?? null;
+  if (
+    !isId(v['id']) ||
+    !isToolId(v['tool']) ||
+    !RUN_STATUSES.includes(v['status'] as RunStatus) ||
+    !isString(v['model']) ||
+    !isStringList(v['models']) ||
+    !isString(v['keyId']) ||
+    !isString(v['keyName']) ||
+    !isFiniteNumber(v['startedAt']) ||
+    !numberOrNull(v['finishedAt']) ||
+    !numberOrNull(v['latencyMs']) ||
+    !isString(v['title']) ||
+    !stringOrNull(v['prompt']) ||
+    (v['settings'] !== null && !settings) ||
+    !stringOrNull(v['output']) ||
+    !stringOrNull(v['error']) ||
+    !usage ||
+    !isCount(reservedUsd) ||
+    !stringOrNull(jobId) ||
+    !meta ||
+    typeof v['starred'] !== 'boolean' ||
+    !stringOrNull(v['groupId'])
+  ) {
+    return null;
+  }
+  const run: RunRecord = {
+    id: v['id'],
+    tool: v['tool'],
+    status: v['status'] as RunStatus,
+    model: v['model'],
+    models: v['models'],
+    keyId: v['keyId'],
+    keyName: v['keyName'],
+    startedAt: v['startedAt'],
+    finishedAt: v['finishedAt'],
+    latencyMs: v['latencyMs'],
+    title: v['title'],
+    prompt: v['prompt'],
+    settings,
+    output: v['output'],
+    error: v['error'],
+    usage,
+    reservedUsd,
+    jobId,
+    meta,
+    starred: v['starred'],
+    groupId: v['groupId'],
+  };
+  // A run cannot continue in another browser (or after a restore): it arrives finished.
+  if (run.status === 'running') {
+    Object.assign(run, {
+      status: 'aborted',
+      finishedAt: run.startedAt,
+      latencyMs: 0,
+      error: INTERRUPTED,
+    });
+  }
+  return run;
 }
 
-function validStatsRow(value: unknown): value is StoredStatsRow {
-  return (
-    isPlainObject(value) &&
-    isString(value['key']) &&
-    isString(value['day']) &&
-    /^\d{4}-\d{2}-\d{2}$/.test(value['day']) &&
-    isToolId(value['tool']) &&
-    isString(value['model']) &&
-    isString(value['keyId']) &&
-    ['runs', 'errors', 'requests', 'promptTokens', 'completionTokens', 'costUsd', 'latencyMsTotal']
-      .map((field) => value[field])
-      .every(isNumber)
-  );
+function toJob(value: unknown): JobRecord | null {
+  if (!isPlainObject(value)) return null;
+  const v = value;
+  if (
+    !isId(v['id']) ||
+    !isToolId(v['tool']) ||
+    !isString(v['type']) ||
+    !JOB_STATES.includes(v['state'] as JobState) ||
+    !stringOrNull(v['runId']) ||
+    !isString(v['keyId']) ||
+    !stringOrNull(v['remoteId']) ||
+    !stringOrNull(v['groupId']) ||
+    !('payload' in v) ||
+    !numberOrNull(v['progress']) ||
+    !stringOrNull(v['remoteStatus']) ||
+    !stringOrNull(v['error']) ||
+    !isFiniteNumber(v['createdAt']) ||
+    !isFiniteNumber(v['updatedAt']) ||
+    !isCount(v['attempts'])
+  ) {
+    return null;
+  }
+  return {
+    id: v['id'],
+    tool: v['tool'],
+    type: v['type'],
+    state: v['state'] as JobState,
+    runId: v['runId'],
+    keyId: v['keyId'],
+    remoteId: v['remoteId'],
+    groupId: v['groupId'],
+    payload: stripUnsafeKeys(v['payload']),
+    result: stripUnsafeKeys(v['result'] ?? null),
+    progress: v['progress'],
+    remoteStatus: v['remoteStatus'],
+    error: v['error'],
+    createdAt: v['createdAt'],
+    updatedAt: v['updatedAt'],
+    attempts: v['attempts'],
+  };
+}
+
+function toToolState(value: unknown): KvEntry | null {
+  if (!isPlainObject(value)) return null;
+  const { key, updatedAt } = value;
+  if (!isString(key) || !key.startsWith(TOOL_STATE_PREFIX) || !('value' in value)) return null;
+  if (!isFiniteNumber(updatedAt)) return null;
+  return { key, value: stripUnsafeKeys(value['value']), updatedAt };
+}
+
+const STATS_NUMBERS = [
+  'runs',
+  'errors',
+  'requests',
+  'promptTokens',
+  'completionTokens',
+  'costUsd',
+  'latencyMsTotal',
+] as const;
+
+function toStatsRow(value: unknown): StoredStatsRow | null {
+  if (!isPlainObject(value)) return null;
+  const { key, day, tool, model, keyId, free } = value;
+  if (
+    !isString(day) ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(day) ||
+    !isToolId(tool) ||
+    !isString(model) ||
+    !isString(keyId) ||
+    typeof free !== 'boolean' ||
+    !STATS_NUMBERS.every((field) => isCount(value[field])) ||
+    key !== statsKey({ day, tool, model, keyId })
+  ) {
+    return null;
+  }
+  const row = { key, day, tool, model, keyId, free } as StoredStatsRow;
+  for (const field of STATS_NUMBERS) row[field] = value[field] as number;
+  return row;
+}
+
+interface Checked<T> {
+  items: T[];
+  skipped: number;
+}
+
+/** Valid records of an optional list; a present value that is not a list makes the file damaged. */
+function check<T>(value: unknown, convert: (item: unknown) => T | null): Checked<T> {
+  if (value === undefined) return { items: [], skipped: 0 };
+  if (!Array.isArray(value)) throw new BackupError('This backup file is damaged.');
+  const items = value.map(convert).filter((item): item is T => item !== null);
+  return { items, skipped: value.length - items.length };
 }
 
 function validEnvelope(value: unknown): value is PassphraseEnvelope {
   return (
     isPlainObject(value) &&
     isString(value['salt']) &&
-    isNumber(value['iterations']) &&
+    Number.isInteger(value['iterations']) &&
+    (value['iterations'] as number) >= 1 &&
+    (value['iterations'] as number) <= MAX_PBKDF2_ITERATIONS &&
     isString(value['iv']) &&
     isString(value['ct'])
   );
 }
 
 function validKeysFile(value: unknown): value is StoredKeysFile {
-  return isPlainObject(value) && value['version'] === 1 && Array.isArray(value['keys']);
+  return (
+    isPlainObject(value) &&
+    value['version'] === 1 &&
+    Array.isArray(value['keys']) &&
+    value['keys'].every((key) => isPlainObject(key) && isId(key['id'])) &&
+    (value['lock'] === null || isPlainObject(value['lock']))
+  );
 }
 
-/** Records of an optional list that pass `valid`; anything else in the list is dropped. */
-function records<T>(value: unknown, valid: (item: unknown) => item is T): T[] | undefined {
-  return Array.isArray(value) ? value.filter(valid) : undefined;
+// --- parsing ---------------------------------------------------------------------------------------
+
+interface ParsedBackup {
+  createdAt: number;
+  appVersion: string;
+  scope: 'all' | 'settings';
+  /** As stored in the file (migrated, unsafe keys removed): only these fields override on merge. */
+  settings: Record<string, unknown>;
+  keys?: PassphraseEnvelope;
+  savedPrompts: Checked<PromptEntry>;
+  recentPrompts: Checked<PromptEntry>;
+  runs: Checked<RunRecord>;
+  jobs: Checked<JobRecord>;
+  toolState: Checked<KvEntry>;
+  stats: Checked<StoredStatsRow>;
 }
 
-async function parseBackup(blob: Blob): Promise<BackupFile> {
+async function parseBackup(blob: Blob): Promise<ParsedBackup> {
   let data: unknown;
   try {
-    data = JSON.parse(await blob.text());
+    data = parseJsonSafe(await blob.text());
   } catch {
     throw new BackupError('This file is not an ORtoolbox backup: it is not valid JSON.');
   }
@@ -167,7 +397,7 @@ async function parseBackup(blob: Blob): Promise<BackupFile> {
     throw new BackupError('This file is not an ORtoolbox backup.');
   }
   const version = data['version'];
-  if (isNumber(version) && version > BACKUP_VERSION) {
+  if (isFiniteNumber(version) && version > BACKUP_VERSION) {
     throw new BackupError(
       'This backup was made by a newer version of ORtoolbox. Reload the page to update, then try again.',
     );
@@ -182,45 +412,45 @@ async function parseBackup(blob: Blob): Promise<BackupFile> {
   ) {
     throw new BackupError('This backup file is damaged.');
   }
-  const prompts = (value: unknown, kind: PromptEntry['kind']) =>
-    records(value, validPrompt)?.filter((entry) => entry.kind === kind);
-
+  const all = scope === 'all';
+  const none = { items: [], skipped: 0 };
   return {
-    format: BACKUP_FORMAT,
-    version: BACKUP_VERSION,
-    createdAt: isNumber(data['createdAt']) ? data['createdAt'] : 0,
+    createdAt: isFiniteNumber(data['createdAt']) ? data['createdAt'] : 0,
     appVersion: isString(data['appVersion']) ? data['appVersion'] : 'unknown',
     scope,
-    settings: normalizeSettings(data['settings']),
-    savedPrompts: prompts(data['savedPrompts'], 'saved') ?? [],
+    settings: migrateSettings(data['settings']),
     keys: data['keys'],
-    ...(scope === 'all' && {
-      runs: records(data['runs'], validRun) ?? [],
-      recentPrompts: prompts(data['recentPrompts'], 'recent') ?? [],
-      jobs: records(data['jobs'], validJob) ?? [],
-      toolState: records(data['toolState'], validToolState) ?? [],
-      stats: records(data['stats'], validStatsRow) ?? [],
-    }),
+    savedPrompts: check(data['savedPrompts'], (v) => toPrompt(v, 'saved')),
+    recentPrompts: all ? check(data['recentPrompts'], (v) => toPrompt(v, 'recent')) : none,
+    runs: all ? check(data['runs'], toRun) : none,
+    jobs: all ? check(data['jobs'], toJob) : none,
+    toolState: all ? check(data['toolState'], toToolState) : none,
+    stats: all ? check(data['stats'], toStatsRow) : none,
   };
 }
 
 /** The decrypted keys file; null when the backup has none or no passphrase was given. */
 async function decodeKeys(
-  file: BackupFile,
+  envelope: PassphraseEnvelope | undefined,
   passphrase: string | undefined,
 ): Promise<StoredKeysFile | null> {
-  if (!file.keys || !passphrase) return null;
-  let plain: string;
+  if (!envelope || !passphrase) return null;
+  let plainText: string;
   try {
-    plain = await decryptWithPassphrase(passphrase, file.keys);
-  } catch {
-    throw new BackupError(
-      'Wrong passphrase: the keys in this backup could not be decrypted. Nothing was imported.',
-    );
+    plainText = await decryptWithPassphrase(passphrase, envelope);
+  } catch (error) {
+    // AES-GCM authentication failure: the passphrase (or the data) is wrong. Name check, not instanceof:
+    // WebCrypto's DOMException may come from another realm.
+    if ((error as { name?: unknown } | null)?.name === 'OperationError') {
+      throw new WrongPassphraseError(
+        'Wrong passphrase: the keys in this backup could not be decrypted. Nothing was imported.',
+      );
+    }
+    throw new BackupError('The keys in this backup are damaged.', { cause: error });
   }
   let keys: unknown;
   try {
-    keys = JSON.parse(plain);
+    keys = parseJsonSafe(plainText);
   } catch {
     keys = null;
   }
@@ -228,168 +458,268 @@ async function decodeKeys(
   return keys;
 }
 
-// --- change descriptions ---------------------------------------------------------------------------
+const lockName = (lock: StoredKeysFile['lock']): string => JSON.stringify(lock);
 
-type Noun = [one: string, many: string];
-const N = {
-  setting: ['setting', 'settings'],
-  key: ['key', 'keys'],
-  saved: ['saved prompt', 'saved prompts'],
-  recent: ['recent prompt', 'recent prompts'],
-  run: ['run', 'runs'],
-  job: ['job', 'jobs'],
-  toolState: ['tool state entry', 'tool state entries'],
-  stats: ['stats row', 'stats rows'],
-} satisfies Record<string, Noun>;
-
-const plural = (count: number, [one, many]: Noun): string => `${count} ${count === 1 ? one : many}`;
-
-function replaceLine(current: number, incoming: number, noun: Noun): string | null {
-  if (current === 0 && incoming === 0) return null;
-  if (current === 0) return `Add ${plural(incoming, noun)}`;
-  if (incoming === 0) return `Delete ${plural(current, noun)}`;
-  return `Replace ${plural(current, noun)} with ${incoming} from the backup`;
-}
-
-function mergeLines(currentIds: Set<string>, incomingIds: string[], noun: Noun): string[] {
-  const existing = incomingIds.filter((id) => currentIds.has(id)).length;
-  const added = incomingIds.length - existing;
-  const lines: string[] = [];
-  if (added > 0) lines.push(`Add ${plural(added, noun)}`);
-  if (existing > 0) lines.push(`Overwrite ${plural(existing, noun)} with the backup's copy`);
-  return lines;
-}
-
-/** Number of differing leaves between two settings objects (arrays count as one leaf). */
-function diffCount(a: unknown, b: unknown): number {
-  if (isPlainObject(a) && isPlainObject(b)) {
-    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-    return [...keys].reduce((sum, key) => sum + diffCount(a[key], b[key]), 0);
+/**
+ * Removes tool key pins, per-key budgets and the default key that refer to keys missing from `keyIds` (the
+ * keys this browser will have after the import), and describes what was removed.
+ */
+function dropUnknownKeyIds(
+  settings: Settings,
+  keyIds: Set<string>,
+): { settings: Settings; lines: string[] } {
+  const next = structuredClone(settings);
+  let pins = 0;
+  for (const binding of Object.values(next.tools)) {
+    if (binding.keyId !== undefined && !keyIds.has(binding.keyId)) {
+      delete binding.keyId;
+      pins++;
+    }
   }
-  return JSON.stringify(a) === JSON.stringify(b) ? 0 : 1;
+  let limits = 0;
+  for (const keyId of Object.keys(next.budgets.perKeyMonthlyUsd)) {
+    if (!keyIds.has(keyId)) {
+      delete next.budgets.perKeyMonthlyUsd[keyId];
+      limits++;
+    }
+  }
+  const lines: string[] = [];
+  const because = (count: number): string =>
+    count === 1 ? 'its key is not in this browser' : 'their keys are not in this browser';
+  if (pins > 0) lines.push(`${plural(pins, N.keyPin)} removed: ${because(pins)}`);
+  if (limits > 0) lines.push(`${plural(limits, N.keyBudget)} removed: ${because(limits)}`);
+  if (next.defaultKeyId !== null && !keyIds.has(next.defaultKeyId)) {
+    next.defaultKeyId = null;
+    lines.push('Default key cleared: it is not in this browser');
+  }
+  return { settings: next, lines };
 }
-
-const sameLock = (a: StoredKeysFile['lock'], b: StoredKeysFile['lock']): boolean =>
-  JSON.stringify(a) === JSON.stringify(b);
 
 // --- service ---------------------------------------------------------------------------------------
 
+type StoreName = 'runs' | 'prompts' | 'jobs' | 'kv' | 'stats';
+
+interface Plan {
+  preview: BackupPreview;
+  apply: () => Promise<void>;
+}
+
 export function createBackupService(core: CoreServices): BackupService {
-  /** Validates and decodes the file, then describes and (optionally) applies the import. */
   const prepare = async (
     blob: Blob,
     opts: { mode: 'merge' | 'replace'; passphrase?: string },
-  ): Promise<{ preview: BackupPreview; apply: () => Promise<void> }> => {
+  ): Promise<Plan> => {
     const file = await parseBackup(blob);
-    const importedKeys = await decodeKeys(file, opts.passphrase);
+    const importedKeys = await decodeKeys(file.keys, opts.passphrase);
     const replace = opts.mode === 'replace';
     const all = file.scope === 'all';
-    const keyChanges: string[] = [];
     const changes: string[] = [];
 
     // Keys (decided first: the default key setting depends on whether they are taken).
-    const currentKeys = readJson<StoredKeysFile>(local(), LS_KEYS.keys) ?? EMPTY_KEYS;
+    const keysBefore = core.keys.exportFile();
+    const keyLines: string[] = [];
     let nextKeys: StoredKeysFile | null = null;
     if (file.keys && !importedKeys) {
-      keyChanges.push('Skip keys (enter the backup passphrase to import them)');
+      keyLines.push('Skip keys (enter the backup passphrase to import them)');
     } else if (importedKeys) {
-      if (replace || currentKeys.keys.length === 0) {
+      const sameLock = lockName(keysBefore.lock) === lockName(importedKeys.lock);
+      if (replace) {
         nextKeys = importedKeys;
-        const line = replaceLine(
-          replace ? currentKeys.keys.length : 0,
-          importedKeys.keys.length,
-          N.key,
-        );
-        if (line) keyChanges.push(line);
-      } else if (sameLock(currentKeys.lock, importedKeys.lock)) {
-        const byId = new Map(currentKeys.keys.map((key) => [key.id, key]));
-        for (const key of importedKeys.keys) byId.set(key.id, key);
-        nextKeys = { ...currentKeys, keys: [...byId.values()] };
-        keyChanges.push(
-          ...mergeLines(
-            new Set(currentKeys.keys.map((key) => key.id)),
-            importedKeys.keys.map((key) => key.id),
-            N.key,
-          ),
-        );
+        const line = replaceLine(keysBefore.keys.length, importedKeys.keys.length, N.key);
+        if (line) keyLines.push(line);
+        if (!sameLock) {
+          keyLines.push(
+            !importedKeys.lock
+              ? 'Turn off the passphrase lock'
+              : keysBefore.lock
+                ? 'Use the backup’s passphrase lock'
+                : 'Turn on the backup’s passphrase lock',
+          );
+        }
+      } else if (sameLock) {
+        const byId = new Map(keysBefore.keys.map((key) => [key.id, key]));
+        let added = 0;
+        let updated = 0;
+        for (const key of importedKeys.keys) {
+          const existing = byId.get(key.id);
+          if (!existing) added++;
+          else if (!same(existing, key)) updated++;
+          byId.set(key.id, key);
+        }
+        if (added + updated > 0) nextKeys = { ...keysBefore, keys: [...byId.values()] };
+        keyLines.push(...mergeLines(added, updated, N.key));
+      } else if (!keysBefore.lock && keysBefore.keys.length === 0) {
+        // Nothing here yet and no lock to lose: take the backup's keys (and its lock).
+        nextKeys = importedKeys;
+        keyLines.push(...mergeLines(importedKeys.keys.length, 0, N.key));
+        if (importedKeys.lock) keyLines.push('Turn on the backup’s passphrase lock');
       } else {
-        keyChanges.push(
+        keyLines.push(
           'Skip keys: the backup and this browser protect keys with different passphrase locks (use Replace to take the backup’s keys)',
         );
       }
     }
 
-    // Settings. The default key follows the backup only when its keys are taken.
+    // Settings: the default key follows the backup only when its keys are taken, and nothing may point to a
+    // key this browser will not have.
     const current = core.settings.get();
-    const takeDefaultKey = nextKeys !== null && (replace || file.settings.defaultKeyId !== null);
-    const nextSettings = normalizeSettings({
-      ...(replace
-        ? file.settings
-        : deepMerge(
-            jsonCopy(current),
-            jsonCopy(file.settings) as unknown as Record<string, unknown>,
-          )),
-      defaultKeyId: takeDefaultKey ? file.settings.defaultKeyId : current.defaultKeyId,
-    });
-    const settingsDiff = diffCount(current, nextSettings);
+    const raw = { ...file.settings };
+    const takeDefaultKey =
+      nextKeys !== null &&
+      (replace || (isString(raw['defaultKeyId']) && raw['defaultKeyId'] !== ''));
+    if (!takeDefaultKey) raw['defaultKeyId'] = current.defaultKeyId;
+    const { settings: nextSettings, lines: orphanLines } = dropUnknownKeyIds(
+      normalizeSettings(replace ? raw : deepMerge(jsonCopy(current), stripUnsafeKeys(raw))),
+      new Set((nextKeys ?? keysBefore).keys.map((key) => key.id)),
+    );
+    const settingPaths = diffPaths(current, nextSettings);
     changes.push(
-      settingsDiff === 0
+      settingPaths.length === 0
         ? 'Settings unchanged'
         : replace
-          ? `Replace all settings (${plural(settingsDiff, N.setting)} differ)`
-          : `Change ${plural(settingsDiff, N.setting)}`,
-      ...keyChanges,
+          ? `Replace all settings (${plural(settingPaths.length, N.setting)} differ)`
+          : `Change ${plural(settingPaths.length, N.setting)}: ${listPaths(settingPaths)}`,
+      ...orphanLines,
+      ...keyLines,
     );
 
-    // Records.
+    // Records: read what is here, then plan every write.
     const db = await getDb();
-    const prompts = await db.getAll('prompts');
-    const savedIds = new Set(prompts.filter((p) => p.kind === 'saved').map((p) => p.id));
-    const recentIds = new Set(prompts.filter((p) => p.kind === 'recent').map((p) => p.id));
-    const [runIds, jobIds, kvKeys, statsKeys] = await Promise.all([
-      db.getAllKeys('runs'),
-      db.getAllKeys('jobs'),
-      db.getAllKeys('kv', prefixRange(TOOL_STATE_PREFIX)),
-      db.getAllKeys('stats'),
+    const read = db.transaction(['runs', 'prompts', 'jobs', 'kv', 'stats']);
+    const localPrompts = await read.objectStore('prompts').getAll();
+    const lookup = async <T>(store: StoreName, ids: string[]): Promise<Map<string, T>> => {
+      const found = await Promise.all(ids.map((id) => read.objectStore(store).get(id)));
+      return new Map(ids.flatMap((id, i) => (found[i] === undefined ? [] : [[id, found[i] as T]])));
+    };
+    const [localRuns, localJobs, localTool, localStats, counts] = await Promise.all([
+      lookup<RunRecord>(
+        'runs',
+        file.runs.items.map((r) => r.id),
+      ),
+      lookup<JobRecord>(
+        'jobs',
+        file.jobs.items.map((j) => j.id),
+      ),
+      lookup<KvEntry>(
+        'kv',
+        file.toolState.items.map((e) => e.key),
+      ),
+      lookup<StoredStatsRow>(
+        'stats',
+        file.stats.items.map((s) => s.key),
+      ),
+      Promise.all([
+        read.objectStore('runs').count(),
+        read.objectStore('jobs').count(),
+        read.objectStore('kv').getAllKeys(prefixRange(TOOL_STATE_PREFIX)),
+        read.objectStore('stats').count(),
+      ]),
     ]);
-    const describe = (currentIds: Set<string>, incomingIds: string[], noun: Noun): void => {
+    await read.done;
+    const [runCount, jobCount, toolKeys, statsCount] = counts;
+
+    const puts = {
+      prompts: [] as PromptEntry[],
+      runs: [] as RunRecord[],
+      jobs: [] as JobRecord[],
+      kv: [] as KvEntry[],
+      stats: [] as StoredStatsRow[],
+    };
+
+    /** Plans one kind of record; `pick` returns the record to write (or null to keep the local one). */
+    const plan = <T>(
+      noun: Noun,
+      checked: Checked<T>,
+      localCount: number,
+      existing: (item: T) => T | undefined,
+      pick: (incoming: T, local: T) => T | null,
+      out: T[],
+    ): void => {
       if (replace) {
-        const line = replaceLine(currentIds.size, incomingIds.length, noun);
+        out.push(...checked.items);
+        const line = replaceLine(localCount, checked.items.length, noun);
         if (line) changes.push(line);
       } else {
-        changes.push(...mergeLines(currentIds, incomingIds, noun));
+        let added = 0;
+        let updated = 0;
+        for (const item of checked.items) {
+          const local = existing(item);
+          const next = local === undefined ? item : pick(item, local);
+          if (next === null || (local !== undefined && same(next, local))) continue;
+          out.push(next);
+          if (local === undefined) added++;
+          else updated++;
+        }
+        changes.push(...mergeLines(added, updated, noun));
       }
+      changes.push(...skipLine(checked.skipped, noun));
     };
-    describe(
-      savedIds,
-      file.savedPrompts.map((p) => p.id),
+
+    const promptsById = new Map(localPrompts.map((p) => [p.id, p]));
+    const promptsOf = (kind: PromptEntry['kind']) => localPrompts.filter((p) => p.kind === kind);
+    const takeIncoming = <T>(incoming: T): T => incoming;
+
+    plan(
       N.saved,
+      file.savedPrompts,
+      promptsOf('saved').length,
+      (p) => promptsById.get(p.id),
+      takeIncoming,
+      puts.prompts,
     );
     if (all) {
-      describe(
-        new Set(runIds),
-        (file.runs ?? []).map((r) => r.id),
+      plan(
         N.run,
+        file.runs,
+        runCount,
+        (r) => localRuns.get(r.id),
+        // Never touch a run that is going here; otherwise the later finish wins.
+        (incoming, local) =>
+          local.status !== 'running' && (incoming.finishedAt ?? 0) > (local.finishedAt ?? 0)
+            ? incoming
+            : null,
+        puts.runs,
       );
-      describe(
-        recentIds,
-        (file.recentPrompts ?? []).map((p) => p.id),
+      plan(
         N.recent,
+        file.recentPrompts,
+        promptsOf('recent').length,
+        (p) => promptsById.get(p.id),
+        takeIncoming,
+        puts.prompts,
       );
-      describe(
-        new Set(jobIds),
-        (file.jobs ?? []).map((j) => j.id),
+      plan(
         N.job,
+        file.jobs,
+        jobCount,
+        (j) => localJobs.get(j.id),
+        (incoming, local) =>
+          incoming.updatedAt > local.updatedAt &&
+          !(isFinalState(local.state) && !isFinalState(incoming.state))
+            ? incoming
+            : null,
+        puts.jobs,
       );
-      describe(
-        new Set(kvKeys),
-        (file.toolState ?? []).map((e) => e.key),
+      plan(
         N.toolState,
+        file.toolState,
+        toolKeys.length,
+        (e) => localTool.get(e.key),
+        takeIncoming,
+        puts.kv,
       );
-      describe(
-        new Set(statsKeys),
-        (file.stats ?? []).map((s) => s.key),
+      plan(
         N.stats,
+        file.stats,
+        statsCount,
+        (s) => localStats.get(s.key),
+        (incoming, local) => {
+          const merged = { ...local };
+          for (const field of STATS_NUMBERS)
+            merged[field] = Math.max(local[field], incoming[field]);
+          return merged;
+        },
+        puts.stats,
       );
     }
 
@@ -401,67 +731,108 @@ export function createBackupService(core: CoreServices): BackupService {
       keysEncrypted: file.keys !== undefined,
       counts: {
         keys: importedKeys?.keys.length ?? 0,
-        runs: file.runs?.length ?? 0,
-        prompts: file.savedPrompts.length + (file.recentPrompts?.length ?? 0),
-        jobs: file.jobs?.length ?? 0,
-        toolState: file.toolState?.length ?? 0,
-        statsRows: file.stats?.length ?? 0,
+        runs: file.runs.items.length,
+        prompts: file.savedPrompts.items.length + file.recentPrompts.items.length,
+        jobs: file.jobs.items.length,
+        toolState: file.toolState.items.length,
+        statsRows: file.stats.items.length,
       },
       changes,
     };
 
-    const apply = async (): Promise<void> => {
-      const stores: ('runs' | 'prompts' | 'jobs' | 'kv' | 'stats')[] = all
-        ? ['runs', 'prompts', 'jobs', 'kv', 'stats']
-        : ['prompts'];
+    /** Every IndexedDB change in one transaction: all of it lands, or none. */
+    const writeRecords = async (): Promise<void> => {
+      const stores: StoreName[] = all ? ['runs', 'prompts', 'jobs', 'kv', 'stats'] : ['prompts'];
       const tx = db.transaction(stores, 'readwrite');
-      const promptStore = tx.objectStore('prompts');
-      const writes: Promise<unknown>[] = [];
-      if (replace) {
-        for (const p of prompts) {
-          if (p.kind === 'saved' || all) writes.push(promptStore.delete(p.id));
-        }
-      }
-      for (const p of [...file.savedPrompts, ...(file.recentPrompts ?? [])]) {
-        writes.push(promptStore.put(p));
-      }
-      if (all) {
-        const runs = tx.objectStore('runs');
-        const jobs = tx.objectStore('jobs');
-        const kv = tx.objectStore('kv');
-        const stats = tx.objectStore('stats');
+      const done = tx.done;
+      done.catch(() => undefined); // observed below; an abort must not surface as unhandled
+      const ops: Promise<unknown>[] = [];
+      // Each request is observed at once: after an abort they all reject, and none may go unhandled.
+      const op = (request: Promise<unknown>): void => {
+        request.catch(() => undefined);
+        ops.push(request);
+      };
+      try {
+        const prompts = tx.objectStore('prompts');
         if (replace) {
-          writes.push(
-            runs.clear(),
-            jobs.clear(),
-            stats.clear(),
-            ...kvKeys.map((key) => kv.delete(key)),
-          );
+          for (const p of localPrompts) {
+            if (p.kind === 'saved' || all) op(prompts.delete(p.id));
+          }
         }
-        for (const run of file.runs ?? []) writes.push(runs.put(run));
-        for (const job of file.jobs ?? []) writes.push(jobs.put(job));
-        for (const entry of file.toolState ?? []) writes.push(kv.put(entry));
-        for (const row of file.stats ?? []) writes.push(stats.put(row));
+        for (const p of puts.prompts) op(prompts.put(p));
+        if (all) {
+          const runs = tx.objectStore('runs');
+          const jobs = tx.objectStore('jobs');
+          const kv = tx.objectStore('kv');
+          const stats = tx.objectStore('stats');
+          if (replace) {
+            op(runs.clear());
+            op(jobs.clear());
+            op(stats.clear());
+            for (const key of toolKeys) op(kv.delete(key));
+          }
+          for (const run of puts.runs) op(runs.put(run));
+          for (const job of puts.jobs) op(jobs.put(job));
+          for (const entry of puts.kv) op(kv.put(entry));
+          for (const row of puts.stats) op(stats.put(row));
+        }
+        await Promise.all(ops);
+      } catch (error) {
+        try {
+          tx.abort();
+        } catch {
+          // already finished or aborted
+        }
+        throw error;
       }
-      await Promise.all([...writes, tx.done]);
+      await done;
+    };
 
-      if (nextKeys) {
-        writeJson(local(), LS_KEYS.keys, nextKeys);
-        // Material unlocked with another passphrase cannot open the new keys.
-        if (!sameLock(currentKeys.lock, nextKeys.lock)) removeItem(session(), SS_KEYS.unlocked);
-        core.bus.emit({ type: 'keys-changed' });
+    const settingsChanged = settingPaths.length > 0;
+    const apply = async (): Promise<void> => {
+      const settingsBefore = current;
+      let keysWritten = false;
+      let settingsWritten = false;
+      try {
+        if (nextKeys) {
+          core.keys.replaceFile(nextKeys, { expected: keysBefore });
+          keysWritten = true;
+        }
+        if (settingsChanged) {
+          core.settings.update((draft) => {
+            Object.assign(draft, jsonCopy(nextSettings));
+          });
+          settingsWritten = true;
+        }
+        await writeRecords();
+      } catch (error) {
+        if (settingsWritten) {
+          try {
+            core.settings.update((draft) => {
+              Object.assign(draft, jsonCopy(settingsBefore));
+            });
+          } catch (rollbackError) {
+            console.error(rollbackError);
+          }
+        }
+        if (keysWritten && nextKeys) {
+          try {
+            core.keys.replaceFile(keysBefore, { expected: nextKeys });
+          } catch (rollbackError) {
+            console.error(rollbackError);
+          }
+        }
+        throw error;
       }
-      core.settings.update((draft) => {
-        Object.assign(draft, jsonCopy(nextSettings));
-      });
 
-      core.bus.emit({ type: 'prompts-changed', tool: 'all' });
+      if (replace || puts.prompts.length > 0)
+        core.bus.emit({ type: 'prompts-changed', tool: 'all' });
       if (all) {
-        core.bus.emit({ type: 'history-changed' });
-        core.bus.emit({ type: 'stats-changed' });
+        if (replace || puts.runs.length > 0) core.bus.emit({ type: 'history-changed' });
+        if (replace || puts.stats.length > 0) core.bus.emit({ type: 'stats-changed' });
         const touched = new Set([
-          ...(replace ? jobIds : []),
-          ...(file.jobs ?? []).map((j) => j.id),
+          ...(replace ? [...localJobs.keys()] : []),
+          ...puts.jobs.map((j) => j.id),
         ]);
         for (const id of touched) core.bus.emit({ type: 'jobs-changed', id });
       }
@@ -487,13 +858,10 @@ export function createBackupService(core: CoreServices): BackupService {
         if (!opts.passphrase) {
           throw new BackupError('Choose a passphrase to protect the keys in this backup.');
         }
-        let raw: string | null;
-        try {
-          raw = local()?.getItem(LS_KEYS.keys) ?? null;
-        } catch {
-          raw = null;
-        }
-        file.keys = await encryptWithPassphrase(opts.passphrase, raw ?? JSON.stringify(EMPTY_KEYS));
+        file.keys = await encryptWithPassphrase(
+          opts.passphrase,
+          JSON.stringify(core.keys.exportFile()),
+        );
       }
       if (opts.scope === 'all') {
         file.runs = await db.getAll('runs');

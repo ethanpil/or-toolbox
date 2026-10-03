@@ -25,7 +25,13 @@ describe('getCore', () => {
       expect(core[name], name).toBeTruthy();
     }
     expect(getCore()).toBe(core);
-    expect(core.toolState('chat')).toBe(core.toolState('chat'));
+  });
+
+  it('gives every tool state store for a tool the same data', async () => {
+    const core = getCore();
+    await core.toolState('chat').set('thread', { turns: 2 });
+    expect(await core.toolState('chat').get('thread')).toEqual({ turns: 2 });
+    expect(await core.toolState('ocr').get('thread')).toBeUndefined();
   });
 
   it('resolves cross-service dependencies lazily', () => {

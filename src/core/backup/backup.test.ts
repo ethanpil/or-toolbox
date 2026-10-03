@@ -1,9 +1,17 @@
 import 'fake-indexeddb/auto';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as CryptoModule from '../crypto';
 import { decryptWithPassphrase, type PassphraseEnvelope } from '../crypto';
 import { BackupError, type BackupFile } from '.';
-import type { BusEvent, CoreServices, StoredKeysFile } from '../types';
+import type {
+  BusEvent,
+  CoreServices,
+  JobRecord,
+  RunRecord,
+  StatsRow,
+  StoredKeysFile,
+} from '../types';
+import { KeysChangedError, WrongPassphraseError, errorCode } from '../errors';
 import { getDb } from '../storage/db';
 import { LS_KEYS, SS_KEYS } from '../storage/local';
 import { prefixRange } from '../tool-state';
@@ -113,6 +121,105 @@ beforeEach(async () => {
     core.bus.on(type, (event) => events.push(event));
   }
 });
+afterEach(() => vi.restoreAllMocks());
+
+/** A hand-made v1 backup; every list defaults to empty. */
+function backupBlob(fields: Record<string, unknown>): Blob {
+  return new Blob([
+    JSON.stringify({
+      format: 'ortoolbox-backup',
+      version: 1,
+      createdAt: 1,
+      appVersion: 'test',
+      scope: 'all',
+      settings: {},
+      savedPrompts: [],
+      runs: [],
+      recentPrompts: [],
+      jobs: [],
+      toolState: [],
+      stats: [],
+      ...fields,
+    }),
+  ]);
+}
+
+function runRecord(id: string, partial: Partial<RunRecord> = {}): RunRecord {
+  return {
+    id,
+    tool: 'chat',
+    status: 'ok',
+    model: 'm/x',
+    models: ['m/x'],
+    keyId: 'k1',
+    keyName: 'Work',
+    startedAt: 100,
+    finishedAt: 200,
+    latencyMs: 100,
+    title: id,
+    prompt: null,
+    settings: null,
+    output: null,
+    error: null,
+    usage: {
+      requests: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      costUsd: 0,
+      latencyMsTotal: 0,
+      costEstimated: false,
+      costUnknown: false,
+      byModel: {},
+    },
+    reservedUsd: 0,
+    jobId: null,
+    meta: {},
+    starred: false,
+    groupId: null,
+    ...partial,
+  };
+}
+
+function jobRecord(id: string, partial: Partial<JobRecord> = {}): JobRecord {
+  return {
+    id,
+    tool: 'video-studio',
+    type: 'video',
+    state: 'running',
+    runId: null,
+    keyId: 'k1',
+    remoteId: 'r',
+    groupId: null,
+    payload: {},
+    result: null,
+    progress: null,
+    remoteStatus: null,
+    error: null,
+    createdAt: 1,
+    updatedAt: 100,
+    attempts: 0,
+    ...partial,
+  };
+}
+
+function statsRow(partial: Partial<StatsRow> = {}): StatsRow & { key: string } {
+  const row: StatsRow = {
+    day: '2026-10-01',
+    tool: 'chat',
+    model: 'm/x',
+    keyId: 'k1',
+    free: false,
+    runs: 1,
+    errors: 0,
+    requests: 1,
+    promptTokens: 1,
+    completionTokens: 1,
+    costUsd: 0.1,
+    latencyMsTotal: 10,
+    ...partial,
+  };
+  return { ...row, key: `${row.day}|${row.tool}|${row.model}|${row.keyId}` };
+}
 
 describe('stage 1 gate: keys never leak', () => {
   it.each(['all', 'settings'] as const)(
@@ -194,7 +301,8 @@ describe('stage 1 gate: backup → wipe → restore', () => {
       () => core.backup.import(blob, opts),
     ]) {
       const error = (await call().catch((e: unknown) => e)) as Error;
-      expect(error).toBeInstanceOf(BackupError);
+      expect(error).toBeInstanceOf(WrongPassphraseError);
+      expect(errorCode(error)).toBe('wrong-passphrase');
       expect(error.message).toMatch(/^Wrong passphrase.*Nothing was imported\.$/);
     }
     expect(await snapshot()).toEqual(wiped);
@@ -251,15 +359,7 @@ describe('inspect', () => {
     await core.prompts.save({ tool: 'ocr', text: 'local only', settings: {} });
     const preview = await core.backup.inspect(blob, { mode: 'merge' });
     expect(preview.keysIncluded).toBe(false);
-    expect(preview.changes).toEqual([
-      'Settings unchanged',
-      "Overwrite 1 saved prompt with the backup's copy",
-      "Overwrite 1 run with the backup's copy",
-      "Overwrite 2 recent prompts with the backup's copy",
-      "Overwrite 1 job with the backup's copy",
-      "Overwrite 1 tool state entry with the backup's copy",
-      "Overwrite 1 stats row with the backup's copy",
-    ]);
+    expect(preview.changes).toEqual(['Settings unchanged']); // everything else is identical here
   });
 
   it.each([
@@ -316,13 +416,14 @@ describe('inspect', () => {
     };
     const preview = await core.backup.import(new Blob([JSON.stringify(file)]), { mode: 'merge' });
     expect(preview.counts.prompts).toBe(1);
+    expect(preview.changes).toContain('Skip 2 saved prompts (invalid records)');
     expect((await core.prompts.list('chat', 'saved')).map((p) => p.id)).toEqual(['ok']);
     expect(core.settings.get().appearance.theme).toBe('system');
   });
 });
 
 describe('import modes', () => {
-  it('merge: imported settings win field by field, records are upserted', async () => {
+  it('merge: imported settings win field by field, records are upserted when newer', async () => {
     await populate();
     const blob = await core.backup.export({ scope: 'all', includeKeys: false });
     const [backupRun] = await core.history.query();
@@ -347,7 +448,8 @@ describe('import modes', () => {
     expect(settings.ui).toEqual({ 'home.view': 'list' });
     const runs = await core.history.query();
     expect(runs.map((r) => r.id).sort()).toEqual([backupRun!.id, local.id].sort());
-    expect((await core.history.get(backupRun!.id))?.starred).toBe(false); // the backup's copy
+    // The backup's copy is not newer, so the local star survives.
+    expect((await core.history.get(backupRun!.id))?.starred).toBe(true);
   });
 
   it('merge: keys are upserted when both sides use the same lock', async () => {
@@ -369,7 +471,7 @@ describe('import modes', () => {
     );
 
     const preview = await core.backup.import(blob, { mode: 'merge', passphrase: 'p' });
-    expect(preview.changes).toContain("Overwrite 1 key with the backup's copy");
+    expect(preview.changes).toContain('Update 1 key');
     expect(storedKeys()).toEqual(
       keysFile([
         { id: 'k1', secret: 'new' },
@@ -466,5 +568,234 @@ describe('import modes', () => {
       createdAt: expect.any(Number) as number,
     });
     expect(file).not.toHaveProperty('runs');
+  });
+});
+
+describe('merge details', () => {
+  it('only overrides the settings present in the file, and lists them', async () => {
+    core.settings.update((d) => {
+      d.freeOnly = true;
+      d.appearance.theme = 'dark';
+    });
+    const blob = backupBlob({ scope: 'settings', settings: { appearance: { theme: 'light' } } });
+    const preview = await core.backup.inspect(blob, { mode: 'merge' });
+    expect(preview.changes[0]).toBe('Change 1 setting: appearance.theme');
+    await core.backup.import(blob, { mode: 'merge' });
+    expect(core.settings.get().appearance.theme).toBe('light');
+    expect(core.settings.get().freeOnly).toBe(true);
+  });
+
+  it('keeps the larger value of each stats field and checks row keys', async () => {
+    const local = statsRow({ costUsd: 0.5, requests: 5, runs: 2 });
+    await (await getDb()).put('stats', local);
+    const blob = backupBlob({
+      stats: [
+        statsRow({ costUsd: 0.3, requests: 7, runs: 9 }),
+        { ...statsRow({ day: '2026-10-02' }), key: 'tampered' },
+      ],
+    });
+    const preview = await core.backup.import(blob, { mode: 'merge' });
+    expect(preview.changes).toContain('Update 1 stats row');
+    expect(preview.changes).toContain('Skip 1 stats row (invalid records)');
+    expect(await (await getDb()).getAll('stats')).toEqual([
+      { ...local, requests: 7, runs: 9, costUsd: 0.5 },
+    ]);
+  });
+
+  it('runs: the newer copy wins, final runs stay final, running runs arrive aborted', async () => {
+    const db = await getDb();
+    await db.put('runs', runRecord('r1', { finishedAt: 200, output: 'local' }));
+    await db.put('runs', runRecord('r2', { finishedAt: 200, output: 'local' }));
+    await db.put('runs', runRecord('r3', { finishedAt: 300, output: 'local, newer' }));
+    const blob = backupBlob({
+      runs: [
+        runRecord('r1', { finishedAt: 250, output: 'backup, newer' }),
+        runRecord('r2', { status: 'running', finishedAt: null, output: 'backup' }),
+        runRecord('r3', { finishedAt: 250, output: 'backup, older' }),
+        runRecord('r4', { status: 'running', finishedAt: null, reservedUsd: 1 }),
+      ],
+    });
+    const preview = await core.backup.import(blob, { mode: 'merge' });
+    expect(preview.changes).toEqual(['Settings unchanged', 'Add 1 run', 'Update 1 run']);
+    expect((await db.get('runs', 'r1'))?.output).toBe('backup, newer');
+    expect((await db.get('runs', 'r2'))?.output).toBe('local');
+    expect((await db.get('runs', 'r3'))?.output).toBe('local, newer');
+    expect(await db.get('runs', 'r4')).toMatchObject({
+      status: 'aborted',
+      finishedAt: 100,
+      error: 'Interrupted: this run was still going when the backup was made.',
+    });
+    expect(await db.getAllFromIndex('runs', 'status', 'running')).toEqual([]);
+  });
+
+  it('jobs: the newer copy wins and a final job never goes back to running', async () => {
+    const db = await getDb();
+    await db.put('jobs', jobRecord('j1', { state: 'succeeded', updatedAt: 100 }));
+    await db.put('jobs', jobRecord('j2', { state: 'running', updatedAt: 100 }));
+    const blob = backupBlob({
+      jobs: [
+        jobRecord('j1', { state: 'running', updatedAt: 200 }),
+        jobRecord('j2', { state: 'running', updatedAt: 200, progress: 0.5 }),
+      ],
+    });
+    await core.backup.import(blob, { mode: 'merge' });
+    expect((await db.get('jobs', 'j1'))?.state).toBe('succeeded');
+    expect((await db.get('jobs', 'j2'))?.progress).toBe(0.5);
+  });
+
+  it('drops key pins, per-key budgets and the default key for keys this browser lacks', async () => {
+    localStorage.setItem(LS_KEYS.keys, JSON.stringify(keysFile([{ id: 'k1', secret: 's' }])));
+    const blob = backupBlob({
+      scope: 'settings',
+      settings: {
+        defaultKeyId: 'gone',
+        tools: { chat: { keyId: 'gone', model: 'm' }, ocr: { keyId: 'k1' } },
+        budgets: { perKeyMonthlyUsd: { gone: 5, lost: 1, k1: 2 } },
+      },
+    });
+    const preview = await core.backup.import(blob, { mode: 'replace' });
+    expect(preview.changes).toEqual(
+      expect.arrayContaining([
+        '1 tool key pin removed: its key is not in this browser',
+        '2 per-key budgets removed: their keys are not in this browser',
+      ]),
+    );
+    const settings = core.settings.get();
+    expect(settings.tools).toEqual({ chat: { model: 'm' }, ocr: { keyId: 'k1' } });
+    expect(settings.budgets.perKeyMonthlyUsd).toEqual({ k1: 2 });
+    expect(settings.defaultKeyId).toBeNull();
+  });
+
+  it('never removes an existing passphrase lock', async () => {
+    const lock = { salt: 'YQ==', iterations: 1, verifier: { iv: 'aQ==', ct: 'YQ==' } };
+    localStorage.setItem(LS_KEYS.keys, JSON.stringify(keysFile([{ id: 'k1', secret: 's' }])));
+    const blob = await core.backup.export({
+      scope: 'settings',
+      includeKeys: true,
+      passphrase: 'p',
+    });
+    const local = keysFile([], lock); // lock on, no keys yet
+    localStorage.setItem(LS_KEYS.keys, JSON.stringify(local));
+
+    const preview = await core.backup.import(blob, { mode: 'merge', passphrase: 'p' });
+    expect(
+      preview.changes.some((c) => c.startsWith('Skip keys: the backup and this browser')),
+    ).toBe(true);
+    expect(storedKeys()).toEqual(local);
+  });
+});
+
+describe('validation of imported files', () => {
+  it('checks every field of every record and reports what was skipped', async () => {
+    const blob = backupBlob({
+      runs: [
+        runRecord('ok'),
+        { ...runRecord('bad'), usage: 'lots' },
+        { ...runRecord('x'), title: 3 },
+      ],
+      jobs: [jobRecord('j'), { id: 'half', tool: 'chat' }],
+      toolState: [
+        { key: 'tool:chat:a', value: 1, updatedAt: 1 },
+        { key: 'tool:chat:b', value: 1, updatedAt: 'yesterday' },
+        { key: 'models:catalog', value: [], updatedAt: 1 },
+      ],
+      recentPrompts: [{ id: 'p', tool: 'chat', kind: 'recent', text: 'x', settings: {} }],
+    });
+    const preview = await core.backup.inspect(blob, { mode: 'merge' });
+    expect(preview.counts).toMatchObject({ runs: 1, jobs: 1, toolState: 1, prompts: 0 });
+    expect(preview.changes).toEqual(
+      expect.arrayContaining([
+        'Skip 2 runs (invalid records)',
+        'Skip 1 job (invalid records)',
+        'Skip 2 tool state entries (invalid records)',
+        'Skip 1 recent prompt (invalid records)',
+      ]),
+    );
+  });
+
+  it('fills fields that older backups did not have', async () => {
+    const old: Partial<RunRecord> = runRecord('old');
+    delete old.reservedUsd;
+    delete old.jobId;
+    delete (old.usage as Partial<RunRecord['usage']>).costUnknown;
+    await core.backup.import(backupBlob({ runs: [old] }), { mode: 'merge' });
+    expect(await (await getDb()).get('runs', 'old')).toEqual(runRecord('old'));
+  });
+
+  it.each([
+    ['too many', 1e9],
+    ['zero', 0],
+    ['fractional', 1.5],
+  ])('refuses %s PBKDF2 iterations without trying them', async (_label, iterations) => {
+    localStorage.setItem(LS_KEYS.keys, JSON.stringify(keysFile([{ id: 'k1', secret: 's' }])));
+    const file = await parse(
+      await core.backup.export({ scope: 'settings', includeKeys: true, passphrase: 'p' }),
+    );
+    file.keys = { ...file.keys!, iterations };
+    const error = (await core.backup
+      .inspect(new Blob([JSON.stringify(file)]), { mode: 'merge', passphrase: 'p' })
+      .catch((e: unknown) => e)) as Error;
+    expect(error).toBeInstanceOf(BackupError);
+    expect(error.message).toContain('damaged');
+  });
+
+  it('tells a damaged key envelope from a wrong passphrase', async () => {
+    localStorage.setItem(LS_KEYS.keys, JSON.stringify(keysFile([{ id: 'k1', secret: 's' }])));
+    const file = await parse(
+      await core.backup.export({ scope: 'settings', includeKeys: true, passphrase: 'p' }),
+    );
+    file.keys = { ...file.keys!, ct: '%%% not base64 %%%' };
+    const error = (await core.backup
+      .inspect(new Blob([JSON.stringify(file)]), { mode: 'merge', passphrase: 'p' })
+      .catch((e: unknown) => e)) as Error;
+    expect(error).toBeInstanceOf(BackupError);
+    expect(error).not.toBeInstanceOf(WrongPassphraseError);
+    expect(error.message).toContain('damaged');
+  });
+});
+
+describe('atomic import', () => {
+  async function changedSinceBackup(): Promise<Blob> {
+    await populate();
+    const blob = await core.backup.export({ scope: 'all', includeKeys: true, passphrase: 'pw' });
+    core.settings.update((d) => {
+      d.appearance.theme = 'light';
+    });
+    await core.prompts.save({ tool: 'ocr', text: 'made after the backup', settings: {} });
+    localStorage.setItem(LS_KEYS.keys, JSON.stringify(keysFile([{ id: 'k7', secret: 'later' }])));
+    return blob;
+  }
+
+  it('leaves everything as it was when the IndexedDB write fails', async () => {
+    const blob = await changedSinceBackup();
+    const before = await snapshot();
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- re-applied with the right `this` below
+    const original = IDBObjectStore.prototype.put;
+    vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+      this: IDBObjectStore,
+      ...args: Parameters<IDBObjectStore['put']>
+    ) {
+      if (this.name === 'stats') throw new DOMException('full', 'QuotaExceededError');
+      return original.apply(this, args);
+    });
+
+    await expect(core.backup.import(blob, { mode: 'replace', passphrase: 'pw' })).rejects.toThrow();
+    vi.restoreAllMocks();
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it('writes nothing when the keys changed in another tab meanwhile', async () => {
+    const blob = await changedSinceBackup();
+    const before = await snapshot();
+    const replaceFile = vi.spyOn(core.keys, 'replaceFile').mockImplementation(() => {
+      throw new KeysChangedError();
+    });
+    await expect(core.backup.import(blob, { mode: 'replace', passphrase: 'pw' })).rejects.toThrow(
+      KeysChangedError,
+    );
+    expect(replaceFile).toHaveBeenCalledWith(expect.any(Object), {
+      expected: keysFile([{ id: 'k7', secret: 'later' }]),
+    });
+    expect(await snapshot()).toEqual(before);
   });
 });

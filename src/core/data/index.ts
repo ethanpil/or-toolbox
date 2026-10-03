@@ -46,6 +46,7 @@ export function createDataService(core: CoreServices): DataService {
     async resetEverything() {
       const db = await getDb();
       const tx = db.transaction(['runs', 'prompts', 'jobs', 'stats', 'kv'], 'readwrite');
+      const jobIds = await tx.objectStore('jobs').getAllKeys();
       await Promise.all([
         tx.objectStore('runs').clear(),
         tx.objectStore('prompts').clear(),
@@ -54,12 +55,15 @@ export function createDataService(core: CoreServices): DataService {
         tx.objectStore('kv').clear(),
         tx.done,
       ]);
-      for (const key of [LS_KEYS.settings, LS_KEYS.keys, LS_KEYS.bus, LS_KEYS.freeRequests]) {
-        removeItem(local(), key);
+      core.keys.clear(); // keys, lock and this tab's unlocked session; emits keys-changed
+      for (const key of Object.values(LS_KEYS)) removeItem(local(), key);
+      for (const key of Object.values(SS_KEYS)) {
+        // The isolation-reload guard must survive, or a reset could start a reload loop.
+        if (key !== SS_KEYS.isolationReload) removeItem(session(), key);
       }
-      for (const key of [SS_KEYS.unlocked, SS_KEYS.oauth]) removeItem(session(), key);
       core.bus.emit({ type: 'settings-changed' });
-      core.bus.emit({ type: 'keys-changed' });
+      for (const id of jobIds) core.bus.emit({ type: 'jobs-changed', id });
+      // Every service (here and in other tabs) drops its live work: runs abort without booking, polling stops.
       core.bus.emit({ type: 'data-reset' });
     },
   };

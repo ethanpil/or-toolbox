@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createSettingsService, defaultSettings, normalizeSettings, SETTINGS_VERSION } from '.';
+import { deepMerge } from './merge';
+import { MAX_MONTHLY_USD, MAX_PER_RUN_USD, MAX_RETENTION_DAYS } from './schema';
 import { createBus } from '../bus';
 import type { CoreServices, Settings, ToolManifest } from '../types';
 import { LS_KEYS } from '../storage/local';
@@ -95,9 +97,9 @@ describe('defaults and validation', () => {
       tools: { chat: { model: 'm', options: { a: 1 } } },
       budgets: {
         mode: 'warn',
-        perRunUsd: 0.1,
+        perRunUsd: 0, // clamped
         monthlyUsd: 25,
-        perKeyMonthlyUsd: { k1: 5, k2: null },
+        perKeyMonthlyUsd: { k1: 5, k2: null, k4: 0 },
       },
       appearance: { theme: 'system', accent: '#abcdef', density: 'compact', reducedMotion: false },
       data: { retentionDays: 90, recordRecentPrompts: false },
@@ -105,6 +107,60 @@ describe('defaults and validation', () => {
       models: { favourites: ['a'], recent: Array.from({ length: 20 }, (_, i) => `m${i}`) },
       ui: { 'home.view': 'grid' },
     });
+  });
+
+  it('clamps numbers to sane ranges', () => {
+    const clamp = (budgets: object, data: object, security: object) =>
+      normalizeSettings({ version: 1, budgets, data, security });
+    const low = clamp(
+      { perRunUsd: -5, monthlyUsd: -1, perKeyMonthlyUsd: { k: -3 } },
+      { retentionDays: 0 },
+      { autoLockMinutes: 0 },
+    );
+    expect(low.budgets).toMatchObject({ perRunUsd: 0, monthlyUsd: 0, perKeyMonthlyUsd: { k: 0 } });
+    expect(low.data.retentionDays).toBe(1);
+    expect(low.security.autoLockMinutes).toBe(1);
+
+    const high = clamp(
+      { perRunUsd: 1e12, monthlyUsd: 1e12, perKeyMonthlyUsd: { k: 1e12 } },
+      { retentionDays: 1e9 },
+      { autoLockMinutes: 1e9 },
+    );
+    expect(high.budgets).toMatchObject({
+      perRunUsd: MAX_PER_RUN_USD,
+      monthlyUsd: MAX_MONTHLY_USD,
+      perKeyMonthlyUsd: { k: MAX_MONTHLY_USD },
+    });
+    expect(high.data.retentionDays).toBe(MAX_RETENTION_DAYS);
+    expect(high.security.autoLockMinutes).toBe(1440);
+  });
+
+  it('never copies prototype keys from stored or imported data', () => {
+    const hostile = JSON.parse(
+      `{"version":1,
+        "budgets":{"perKeyMonthlyUsd":{"__proto__":{"polluted":1},"constructor":5,"k1":5}},
+        "tools":{"chat":{"options":{"__proto__":{"polluted":1},"a":1}}},
+        "ui":{"__proto__":{"polluted":1},"nested":{"prototype":{"x":1},"ok":true}}}`,
+    ) as unknown;
+    const settings = normalizeSettings(hostile);
+    const perKey = settings.budgets.perKeyMonthlyUsd;
+    expect(Object.getPrototypeOf(perKey)).toBe(Object.prototype);
+    expect(Object.keys(perKey)).toEqual(['k1']);
+    expect(Object.getPrototypeOf(settings.tools.chat?.options)).toBe(Object.prototype);
+    expect(settings.tools.chat?.options).toEqual({ a: 1 });
+    expect(Object.getPrototypeOf(settings.ui)).toBe(Object.prototype);
+    expect(settings.ui).toEqual({ nested: { ok: true } });
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+
+    const merged = deepMerge(
+      { a: { b: 1 } },
+      JSON.parse('{"__proto__":{"polluted":1},"a":{"constructor":{"x":1},"c":2}}') as Record<
+        string,
+        unknown
+      >,
+    );
+    expect(merged).toEqual({ a: { b: 1, c: 2 } });
+    expect(Object.getPrototypeOf(merged)).toBe(Object.prototype);
   });
 
   it('fills a partial object from defaults', () => {
@@ -164,7 +220,7 @@ describe('update, reset, subscribe', () => {
       draft.budgets.perRunUsd = -5;
       (draft.appearance as { theme: string }).theme = 'neon';
     });
-    expect(next.budgets.perRunUsd).toBe(0.1);
+    expect(next.budgets.perRunUsd).toBe(0); // clamped
     expect(next.appearance.theme).toBe('system');
   });
 
@@ -303,5 +359,42 @@ describe('cross-tab', () => {
     a.bus.emit({ type: 'data-reset' });
     await Promise.resolve();
     expect(b.settings.get()).toEqual(defaultSettings());
+  });
+
+  it('applies an update on top of a change another tab made moments before', () => {
+    const a = tab();
+    // Another tab wrote, but neither its storage event nor its bus message has arrived yet.
+    localStorage.setItem(
+      LS_KEYS.settings,
+      JSON.stringify({
+        ...defaultSettings(),
+        appearance: { ...defaultSettings().appearance, theme: 'dark' },
+      }),
+    );
+    a.settings.update((draft) => {
+      draft.freeOnly = true;
+    });
+    expect(stored()).toMatchObject({ freeOnly: true, appearance: { theme: 'dark' } });
+    expect(a.settings.get().appearance.theme).toBe('dark');
+  });
+
+  it.each([
+    [
+      'pageshow from the back/forward cache',
+      () => new PageTransitionEvent('pageshow', { persisted: true }),
+    ],
+    ['visibilitychange to visible', () => new Event('visibilitychange')],
+  ])('re-syncs from storage on %s', (_label, event) => {
+    const a = tab();
+    const fn = vi.fn();
+    a.settings.subscribe(fn);
+    localStorage.setItem(
+      LS_KEYS.settings,
+      JSON.stringify({ ...defaultSettings(), freeOnly: true }),
+    );
+    const target = event().type === 'visibilitychange' ? document : window;
+    target.dispatchEvent(event());
+    expect(a.settings.get().freeOnly).toBe(true);
+    expect(fn).toHaveBeenCalledOnce();
   });
 });
