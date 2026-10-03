@@ -1,9 +1,15 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   audioFormat,
+  checkText,
   classifyFile,
+  PARSED_LIMIT,
+  parsedFiles,
   readAttachment,
   SIZE_LIMITS,
+  TEXT_TOTAL_LIMIT,
   textAttachment,
   toContentPart,
 } from './attachments';
@@ -99,5 +105,59 @@ describe('content parts', () => {
       type: 'input_audio',
       input_audio: { data: 'UklGRg==', format: 'wav' },
     });
+  });
+});
+
+describe('parser text from annotations', () => {
+  it('reads each file annotation of a reply as one text, in order', () => {
+    const recorded = JSON.parse(
+      readFileSync(
+        join(process.cwd(), 'tests/fixtures/openrouter/chat-completion-pdf.recorded.json'),
+        'utf8',
+      ),
+    ) as { response: { choices: { message: { annotations: unknown } }[] } };
+    const annotations = recorded.response.choices[0]!.message.annotations;
+    const [file, ...rest] = parsedFiles(annotations);
+    expect(rest).toEqual([]);
+    expect(file?.name).toBe('invoice.pdf');
+    expect(file?.text.startsWith('<file name="invoice.pdf">\n# document.pdf')).toBe(true);
+    expect(file?.text.endsWith('Invoice 4711 total 128.50 EUR\n</file>')).toBe(true);
+  });
+
+  it('ignores what it does not know, and texts over the limit', () => {
+    expect(parsedFiles(undefined)).toEqual([]);
+    expect(parsedFiles([{ type: 'url_citation' }, { type: 'file', file: {} }, 'x'])).toEqual([]);
+    const huge = [
+      {
+        type: 'file',
+        file: { name: 'a.pdf', content: [{ type: 'text', text: 'x'.repeat(PARSED_LIMIT + 1) }] },
+      },
+    ];
+    expect(parsedFiles(huge)).toEqual([]);
+    const withImage = [
+      {
+        type: 'file',
+        file: {
+          name: 'b.pdf',
+          content: [
+            { type: 'text', text: 'Page 1' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } },
+          ],
+        },
+      },
+    ];
+    expect(parsedFiles(withImage)).toEqual([{ name: 'b.pdf', text: 'Page 1' }]);
+  });
+});
+
+describe('text limits per message', () => {
+  const text = (size: number) => textAttachment('a.txt', 'x'.repeat(size));
+
+  it('refuses text that would take the message over the total', () => {
+    expect(() => checkText([text(TEXT_TOTAL_LIMIT - 10)], 'b.txt', 10)).not.toThrow();
+    expect(() => checkText([text(TEXT_TOTAL_LIMIT - 10)], 'b.txt', 11)).toThrow(
+      /b\.txt.*at most 2 MB of text/,
+    );
+    expect(() => checkText([], 'big.txt', SIZE_LIMITS.text + 1)).toThrow(/big\.txt is/);
   });
 });

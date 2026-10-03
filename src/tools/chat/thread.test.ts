@@ -1,16 +1,21 @@
 import { describe, expect, it } from 'vitest';
+import { queryWords } from '../../ui/shell/palette-search';
 import {
   activePath,
   addNode,
   appendUser,
+  attachmentIds,
+  baseOf,
   createThread,
   deleteBranch,
   editUser,
   leaf,
   matchesQuery,
+  mergeInto,
   parseThread,
   pathTo,
   regenerate,
+  restoreBranch,
   selectSibling,
   siblingInfo,
   type Thread,
@@ -89,13 +94,56 @@ describe('thread tree', () => {
     const trip = activePath(thread)[2]!;
     const edited = editUser(thread, trip.id, 'Edited');
     const removed = deleteBranch(thread, edited.id);
-    expect(removed).toEqual([edited.id]);
+    expect(removed).toMatchObject({ parent: trip.parent, index: 1, selected: true });
+    expect(removed?.nodes.map((node) => node.id)).toEqual([edited.id]);
     expect(texts(thread)).toEqual(['Hi', 'Hello', 'Plan a trip', 'Where to?']);
 
     const removedAll = deleteBranch(thread, activePath(thread)[1]!.id);
-    expect(removedAll).toHaveLength(3);
+    expect(removedAll?.nodes.map((node) => node.content)).toEqual([
+      'Hello',
+      'Plan a trip',
+      'Where to?',
+    ]);
     expect(texts(thread)).toEqual(['Hi']);
     expect(Object.keys(thread.nodes)).toHaveLength(1);
+    expect(deleteBranch(thread, 'nope')).toBeNull();
+  });
+
+  it('restores just the deleted branch into the thread as it is now', () => {
+    const thread = conversation();
+    const [, hello, trip] = activePath(thread);
+    const removed = deleteBranch(thread, trip!.id)!;
+    // Meanwhile the conversation went on from the same point.
+    const later = appendUser(thread, 'Something else');
+    expect(later.parent).toBe(hello!.id);
+
+    expect(restoreBranch(thread, removed)).toBe(true);
+    expect(texts(thread)).toEqual(['Hi', 'Hello', 'Plan a trip', 'Where to?']);
+    expect(siblingInfo(thread, trip!.id)).toEqual({ index: 0, count: 2 });
+    expect(thread.nodes[later.id]?.content).toBe('Something else');
+  });
+
+  it('refuses to restore a branch that is back already or whose parent is gone', () => {
+    const thread = conversation();
+    const [, hello, trip] = activePath(thread);
+    const removed = deleteBranch(thread, trip!.id)!;
+    expect(restoreBranch(thread, removed)).toBe(true);
+    expect(restoreBranch(thread, removed)).toBe(false);
+
+    const again = deleteBranch(thread, trip!.id)!;
+    deleteBranch(thread, hello!.id);
+    const before = JSON.stringify(thread);
+    expect(restoreBranch(thread, again)).toBe(false);
+    expect(JSON.stringify(thread)).toBe(before);
+  });
+
+  it('lists the attachment ids of every branch', () => {
+    const thread = createThread();
+    const ref = { id: 'a1', name: 'x.png', type: 'image/png', size: 3, kind: 'image' as const };
+    const first = appendUser(thread, 'One', [ref]);
+    editUser(thread, first.id, 'Two');
+    appendUser(thread, 'Three', [{ ...ref, id: 'a2' }]);
+    expect([...attachmentIds(thread)].sort()).toEqual(['a1', 'a2']);
   });
 
   it('adds up usage of every reply on every branch', () => {
@@ -119,12 +167,16 @@ describe('thread tree', () => {
     });
   });
 
-  it('searches titles and every message', () => {
+  it('searches titles and every message, ignoring case and accents', () => {
     const thread = conversation();
-    expect(matchesQuery(thread, 'where')).toBe(true);
-    expect(matchesQuery(thread, '  HI ')).toBe(true);
-    expect(matchesQuery(thread, 'rome')).toBe(false);
-    expect(matchesQuery(thread, '')).toBe(true);
+    const matches = (query: string): boolean => matchesQuery(thread, queryWords(query));
+    expect(matches('where')).toBe(true);
+    expect(matches('  HI ')).toBe(true);
+    expect(matches('trip where')).toBe(true);
+    expect(matches('rome')).toBe(false);
+    expect(matches('')).toBe(true);
+    appendUser(thread, 'Café in Zürich?');
+    expect(matches('cafe zurich')).toBe(true);
   });
 
   it('makes short titles from the first line', () => {
@@ -234,5 +286,110 @@ describe('parseThread', () => {
     raw.nodes['b'] = { id: 'b', parent: 'a', role: 'assistant', content: 'b', children: ['a'] };
     const parsed = parseThread(raw)!;
     expect(Object.keys(parsed.nodes)).toHaveLength(4);
+  });
+});
+
+describe('merging another tab’s changes', () => {
+  /** What another tab reads back from storage. */
+  const copy = (thread: Thread): Thread => parseThread(JSON.parse(JSON.stringify(thread)))!;
+
+  it('keeps what both tabs added, and the title and system prompt each side changed', () => {
+    const stored = conversation();
+    stored.rev = 3;
+    const ours = copy(stored);
+    const base = baseOf(ours);
+    const theirs = copy(stored);
+
+    const ourQuestion = appendUser(ours, 'Ours');
+    addNode(ours, ourQuestion.id, { role: 'assistant', content: 'Our answer', status: 'done' });
+    ours.system = 'Be brief.';
+    const trip = activePath(theirs)[2]!;
+    const theirEdit = editUser(theirs, trip.id, 'Theirs');
+    theirs.title = 'Renamed there';
+    theirs.named = true;
+    theirs.rev = 4;
+
+    mergeInto(ours, base, theirs);
+    expect(texts(ours)).toEqual(['Hi', 'Hello', 'Plan a trip', 'Where to?', 'Ours', 'Our answer']);
+    expect(siblingInfo(ours, theirEdit.id)).toEqual({ index: 1, count: 2 });
+    expect(ours).toMatchObject({
+      title: 'Renamed there',
+      named: true,
+      system: 'Be brief.',
+      rev: 4,
+    });
+  });
+
+  it('keeps deletions on either side deleted', () => {
+    const stored = conversation();
+    const ours = copy(stored);
+    const base = baseOf(ours);
+    const theirs = copy(stored);
+    const [, hello, trip] = activePath(theirs);
+    // They deleted the trip; we deleted nothing but answered "Hello" again.
+    deleteBranch(theirs, trip!.id);
+    theirs.rev = 1;
+    regenerate(ours, ours.nodes[hello!.id]!.id, 'a/model');
+    mergeInto(ours, base, theirs);
+    expect(ours.nodes[trip!.id]).toBeUndefined();
+    expect(siblingInfo(ours, hello!.id).count).toBe(2);
+
+    // Now we delete "Hi" and its subtree; they still have it and added a message under it.
+    const base2 = baseOf(ours);
+    const theirs2 = copy(ours);
+    deleteBranch(ours, activePath(ours)[0]!.id);
+    appendUser(theirs2, 'Added there');
+    theirs2.rev = 2;
+    mergeInto(ours, base2, theirs2);
+    expect(Object.keys(ours.nodes)).toEqual([]);
+  });
+
+  it('keeps the most final version of a reply, and never touches one streaming here', () => {
+    const stored = conversation();
+    const question = appendUser(stored, 'Long question');
+    const reply = addNode(stored, question.id, {
+      role: 'assistant',
+      content: '',
+      status: 'streaming',
+    });
+    // Our tab stored the reply as it started; the other tab read it (as stopped) and continued after it.
+    const ours = copy(stored);
+    ours.nodes[reply.id]!.status = 'streaming';
+    const base = baseOf(ours);
+    const theirs = copy(stored);
+    expect(theirs.nodes[reply.id]?.status).toBe('stopped');
+    appendUser(theirs, 'Follow-up there');
+    theirs.rev = 1;
+
+    mergeInto(ours, base, theirs);
+    expect(ours.nodes[reply.id]).toMatchObject({ status: 'streaming', content: '' });
+
+    // Finished here: our answer stays; finished there (and stopped here): theirs comes in.
+    ours.nodes[reply.id]!.status = 'done';
+    ours.nodes[reply.id]!.content = 'Full answer';
+    mergeInto(ours, baseOf(ours), copy(theirs));
+    expect(ours.nodes[reply.id]).toMatchObject({ status: 'done', content: 'Full answer' });
+
+    const there = copy(ours);
+    there.nodes[reply.id]!.content = 'Full answer, revised there';
+    there.rev = 9;
+    ours.nodes[reply.id]!.status = 'stopped';
+    mergeInto(ours, baseOf(ours), there);
+    expect(ours.nodes[reply.id]).toMatchObject({
+      status: 'done',
+      content: 'Full answer, revised there',
+    });
+    expect(ours.rev).toBe(9);
+  });
+
+  it('stores the revision and the parser text of PDFs', () => {
+    const thread = createThread({ id: 't' });
+    thread.rev = 7;
+    appendUser(thread, 'Read this', [
+      { id: 'p', name: 'a.pdf', type: 'application/pdf', size: 9, kind: 'pdf', parsed: 'Page 1' },
+    ]);
+    const parsed = copy(thread);
+    expect(parsed.rev).toBe(7);
+    expect(activePath(parsed)[0]?.attachments?.[0]?.parsed).toBe('Page 1');
   });
 });

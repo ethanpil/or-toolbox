@@ -2,6 +2,12 @@
  * Drawing one message of the conversation: author and model, branch navigation (‹ 1/3 ›), the text (plain for
  * the user, sanitised Markdown for replies), attachments, reasoning, errors and the per-message actions. Pure
  * DOM building; every decision about what an action does lives in chat.ts.
+ *
+ * chat.ts redraws a message only when its `messageSignature` changed, so a conversation is never rebuilt as a
+ * whole. Whether a run is in progress does not rebuild anything either: `applyBusy` switches the buttons that
+ * a run turns off. Buttons are turned off with `aria-disabled` (they keep focus), and their focus keys name the
+ * place, not the message (`regen:<parent>`), so focus stays put when a sibling, a regenerated reply or a retry
+ * takes the message's place.
  */
 import { h } from '../../ui/dom';
 import { formatBytes, formatCount, formatMs, formatUsd } from '../../ui/format';
@@ -75,10 +81,53 @@ export function usageLine(node: ChatNode, free: boolean): string {
     .join(' · ');
 }
 
-/** "via …" when the reply came from another model than asked (a fallback); dated snapshots don't count. */
+/** "via …" when another model than the one asked for answered (a fallback, a router, a dated snapshot). */
 function servedNote(node: ChatNode, name: (id: string) => string): string | null {
-  if (!node.servedModel || !node.model || node.servedModel.startsWith(node.model)) return null;
+  if (!node.servedModel || !node.model || node.servedModel === node.model) return null;
   return `via ${name(node.servedModel)}`;
+}
+
+/** A focus key for a message's place: its parent and role (siblings share it). */
+const place = (node: ChatNode): string => `${node.parent ?? 'root'}`;
+
+/** Sets a button off or on, keeping it focusable (`aria-disabled`); clicks on an off button do nothing. */
+function setOff(button: HTMLElement, off: boolean): void {
+  button.setAttribute('aria-disabled', String(off));
+  button.classList.toggle('disabled', off);
+}
+
+/**
+ * A button that `applyBusy` turns off during a run (`busy`), and that may be off for a reason of its own
+ * (`off`). The handler runs only while the button is on.
+ */
+function guardedButton(
+  attrs: Record<string, unknown>,
+  onclick: () => void,
+  state: { off?: boolean; busy?: boolean },
+  ...children: (Node | string)[]
+): HTMLButtonElement {
+  const button = h(
+    'button',
+    {
+      ...attrs,
+      type: 'button',
+      'data-off': state.off ? 'true' : null,
+      'data-busy': state.busy ? 'off' : null,
+      onclick: () => {
+        if (button.getAttribute('aria-disabled') !== 'true') onclick();
+      },
+    },
+    ...children,
+  );
+  setOff(button, state.off ?? false);
+  return button;
+}
+
+/** Turns the buttons a run turns off (`data-busy`) off or back on, inside `root`. */
+export function applyBusy(root: ParentNode, busy: boolean): void {
+  for (const button of root.querySelectorAll<HTMLElement>('[data-busy]')) {
+    setOff(button, busy || button.dataset['off'] === 'true');
+  }
 }
 
 const actionButton = (
@@ -86,22 +135,24 @@ const actionButton = (
   iconName: string,
   focusKey: string,
   onclick: () => void,
-  options: { disabled?: boolean; testId: string },
+  options: { off?: boolean; busy?: boolean; testId: string },
 ): HTMLButtonElement =>
-  h(
-    'button',
+  guardedButton(
     {
-      type: 'button',
       class: 'btn btn-sm btn-link or-chat-action',
       'aria-label': label,
       title: label,
-      disabled: options.disabled ?? false,
       'data-focus-key': focusKey,
       'data-testid': options.testId,
-      onclick,
     },
+    onclick,
+    options,
     icon(iconName),
   );
+
+/** An attachment whose bytes are gone (after a reload) and that has no text to send instead. */
+const isMissing = (ref: AttachmentRef, data: (id: string) => string | undefined): boolean =>
+  ref.kind !== 'text' && ref.parsed === undefined && !data(ref.id);
 
 /** Attachment chips of a sent message; binaries gone after a reload say so. */
 export function attachmentList(
@@ -113,7 +164,7 @@ export function attachmentList(
     { class: 'list-unstyled d-flex flex-wrap gap-2 mb-0 mt-2', 'aria-label': 'Attachments' },
     refs.map((ref) => {
       const url = data(ref.id);
-      const missing = ref.kind !== 'text' && !url;
+      const missing = isMissing(ref, data);
       return h(
         'li',
         {
@@ -151,12 +202,9 @@ function siblingNav(node: ChatNode, ctx: MessageContext): HTMLElement | null {
     actionButton(
       `Previous ${what}`,
       'chevron-left',
-      `prev:${node.id}`,
+      `prev:${place(node)}`,
       () => ctx.actions.sibling(node, -1),
-      {
-        disabled: ctx.busy || index === 0,
-        testId: 'sibling-prev',
-      },
+      { off: index === 0, busy: true, testId: 'sibling-prev' },
     ),
     h(
       'span',
@@ -167,15 +215,16 @@ function siblingNav(node: ChatNode, ctx: MessageContext): HTMLElement | null {
     actionButton(
       `Next ${what}`,
       'chevron-right',
-      `next:${node.id}`,
+      `next:${place(node)}`,
       () => ctx.actions.sibling(node, 1),
-      {
-        disabled: ctx.busy || index === count - 1,
-        testId: 'sibling-next',
-      },
+      { off: index === count - 1, busy: true, testId: 'sibling-next' },
     ),
   );
 }
+
+/** True while an input method is composing: Enter and Escape belong to it. */
+export const composing = (event: KeyboardEvent): boolean =>
+  event.isComposing || event.keyCode === 229;
 
 function editor(node: ChatNode, ctx: MessageContext): HTMLElement {
   const id = uid('edit');
@@ -189,11 +238,12 @@ function editor(node: ChatNode, ctx: MessageContext): HTMLElement {
   });
   const submit = (): void => ctx.actions.submitEdit(node, area.value);
   area.addEventListener('keydown', (event) => {
+    if (composing(event)) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       event.stopPropagation();
       ctx.actions.cancelEdit(node);
-    } else if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.isComposing) {
+    } else if (event.key === 'Enter' && !event.shiftKey && !event.altKey) {
       // Ctrl/Cmd+Enter always submits; plain Enter when Enter sends. Never the page's Run shortcut.
       if (event.ctrlKey || event.metaKey || ctx.enterSends) {
         event.preventDefault();
@@ -210,15 +260,10 @@ function editor(node: ChatNode, ctx: MessageContext): HTMLElement {
     h(
       'div',
       { class: 'd-flex flex-wrap gap-2' },
-      h(
-        'button',
-        {
-          type: 'button',
-          class: 'btn btn-sm btn-primary',
-          disabled: ctx.busy,
-          'data-testid': 'edit-save',
-          onclick: submit,
-        },
+      guardedButton(
+        { class: 'btn btn-sm btn-primary', 'data-testid': 'edit-save' },
+        submit,
+        { busy: true },
         'Save and send',
       ),
       h(
@@ -240,6 +285,40 @@ function editor(node: ChatNode, ctx: MessageContext): HTMLElement {
   );
 }
 
+/**
+ * Everything `messageView` draws from, as a string: a message is redrawn only when this changes. The text of a
+ * reply still streaming is left out (the streaming view draws it), and so is whether a run is going
+ * (`applyBusy`).
+ */
+export function messageSignature(node: ChatNode, ctx: MessageContext): string {
+  const streaming = ctx.streamingId === node.id;
+  const editing = ctx.editingId === node.id;
+  const { index, count } = siblingInfo(ctx.thread, node.id);
+  const served = node.servedModel ?? node.model ?? '';
+  return JSON.stringify([
+    node.role,
+    streaming,
+    streaming ? Boolean(node.content) : node.content,
+    ctx.showReasoning ? (streaming ? Boolean(node.reasoning) : (node.reasoning ?? '')) : '',
+    node.status ?? '',
+    node.error ?? '',
+    node.usage ?? null,
+    node.trimmed ?? 0,
+    node.model ? ctx.modelName(node.model) : '',
+    node.servedModel ? [node.servedModel, ctx.modelName(node.servedModel)] : '',
+    node.usage ? ctx.isFree(served) : false,
+    (node.attachments ?? []).map((ref) => [
+      ref.id,
+      ref.parsed !== undefined,
+      isMissing(ref, ctx.data),
+    ]),
+    index,
+    count,
+    editing,
+    editing && ctx.enterSends,
+  ]);
+}
+
 export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
   const user = node.role === 'user';
   const streaming = ctx.streamingId === node.id;
@@ -247,6 +326,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
   const modelId = node.model ?? '';
   const author = user ? 'You' : modelId ? ctx.modelName(modelId) : 'Assistant';
   const served = user ? null : servedNote(node, ctx.modelName);
+  const at = place(node);
 
   const body = h('div', {
     class: ['or-chat-body', user ? 'or-plain-text' : 'or-markdown'],
@@ -272,35 +352,26 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
   const actions: HTMLElement[] = [];
   if (!editing) {
     actions.push(
-      actionButton('Copy message', 'clipboard', `copy:${node.id}`, () => ctx.actions.copy(node), {
-        disabled: !node.content,
+      actionButton('Copy message', 'clipboard', `copy:${at}`, () => ctx.actions.copy(node), {
+        off: !node.content,
         testId: 'message-copy',
       }),
     );
     if (user) {
       actions.push(
-        actionButton(
-          'Edit message',
-          'pencil',
-          `edit-button:${node.id}`,
-          () => ctx.actions.edit(node),
-          {
-            disabled: ctx.busy,
-            testId: 'message-edit',
-          },
-        ),
+        actionButton('Edit message', 'pencil', `edit-button:${at}`, () => ctx.actions.edit(node), {
+          busy: true,
+          testId: 'message-edit',
+        }),
       );
     } else {
       actions.push(
         actionButton(
           'Regenerate reply',
           'arrow-repeat',
-          `regen:${node.id}`,
+          `regen:${at}`,
           () => ctx.actions.regenerate(node),
-          {
-            disabled: ctx.busy,
-            testId: 'message-regenerate',
-          },
+          { busy: true, testId: 'message-regenerate' },
         ),
       );
     }
@@ -308,12 +379,9 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
       actionButton(
         'Delete this and what follows',
         'trash',
-        `delete:${node.id}`,
+        `delete:${at}`,
         () => ctx.actions.remove(node),
-        {
-          disabled: ctx.busy,
-          testId: 'message-delete',
-        },
+        { busy: true, testId: 'message-delete' },
       ),
     );
   }
@@ -366,28 +434,24 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
           },
           icon('exclamation-octagon'),
           h('span', { class: 'flex-grow-1' }, node.error ?? 'The reply failed.'),
-          h(
-            'button',
+          guardedButton(
             {
-              type: 'button',
               class: 'btn btn-sm btn-outline-danger',
-              disabled: ctx.busy,
-              'data-focus-key': `retry:${node.id}`,
+              'data-focus-key': `retry:${at}`,
               'data-testid': 'message-retry',
-              onclick: () => ctx.actions.regenerate(node),
             },
+            () => ctx.actions.regenerate(node),
+            { busy: true },
             'Retry',
           ),
-          h(
-            'button',
+          guardedButton(
             {
-              type: 'button',
               class: 'btn btn-sm btn-outline-danger',
-              disabled: ctx.busy,
-              'data-focus-key': `retry-with:${node.id}`,
+              'data-focus-key': `retry-with:${at}`,
               'data-testid': 'message-retry-with',
-              onclick: () => ctx.actions.retryWith(node),
             },
+            () => ctx.actions.retryWith(node),
+            { busy: true },
             'Retry with another model',
           ),
         )
@@ -414,5 +478,6 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
           actions,
         ),
   );
+  applyBusy(element, ctx.busy);
   return { element, body, reasoning };
 }
