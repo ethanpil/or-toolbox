@@ -8,9 +8,8 @@
   "accepts": ["image/png", "image/jpeg", "image/webp"],
   "produces": ["audio/mpeg", "audio/wav"],
   "usesJobs": false,
-  "lazyLibs": [],
+  "lazyLibs": ["@ffmpeg/ffmpeg"],
   "defaults": {
-    "format": "mp3",
-    "instrumental": false
+    "variations": 1
   }
 }
