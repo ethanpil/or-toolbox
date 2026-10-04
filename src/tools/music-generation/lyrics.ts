@@ -19,18 +19,24 @@ const WORDLESS_SECTION = /^(intro|interlude|instrumental|break|solo|drop|outro)/
 /** Sung lines that comfortably fit Lyria 3 Clip's 30 seconds (the probe sang 4 lines twice in 30 s). */
 const CLIP_LINES = 8;
 
+/** An edit to the lyrics: replace `[from, to)` with `text`, then select `[selectionStart, selectionEnd)`. */
+export interface TextEdit {
+  from: number;
+  to: number;
+  text: string;
+  selectionStart: number;
+  selectionEnd: number;
+}
+
 /**
- * Inserts `[tag]` on a line of its own in place of the selection `[start, end)`, after a blank line when the
- * text before it has words, and returns the new text with the cursor on the line after the tag.
+ * Puts `[tag]` on a line of its own at the caret, after a blank line when there are words before it. Selected
+ * text is never replaced: the tag goes before it and the selection stays on it. Returned as an edit, so the
+ * editor can apply it in a way the browser's undo understands.
  */
-export function insertTag(
-  value: string,
-  start: number,
-  end: number,
-  tag: string,
-): { value: string; cursor: number } {
-  const before = value.slice(0, start).replace(/[ \t]+$/, '');
-  const after = value.slice(end).replace(/^[ \t]*\n?/, '');
+export function insertTag(value: string, start: number, end: number, tag: string): TextEdit {
+  // Spaces just before the caret would be left at the end of the line above the tag: they go.
+  const from = start - (/[ \t]*$/.exec(value.slice(0, start))?.[0].length ?? 0);
+  const before = value.slice(0, from);
   const lead =
     before.trim() === ''
       ? ''
@@ -39,9 +45,25 @@ export function insertTag(
         : before.endsWith('\n')
           ? '\n'
           : '\n\n';
-  const head = `${before.trim() === '' ? '' : before}${lead}[${tag}]\n`;
-  return { value: head + after, cursor: head.length };
+  const text = `${lead}[${tag}]\n`;
+  if (end > start) {
+    return {
+      from,
+      to: start,
+      text,
+      selectionStart: from + text.length,
+      selectionEnd: from + text.length + (end - start),
+    };
+  }
+  // At a caret: the line break (and spaces) right after it would leave an empty line under the tag.
+  const to = start + (/^[ \t]*\n?/.exec(value.slice(start))?.[0].length ?? 0);
+  const cursor = from + text.length;
+  return { from, to, text, selectionStart: cursor, selectionEnd: cursor };
 }
+
+/** "an Intro", "a Verse": the article for a section name. */
+export const withArticle = (word: string): string =>
+  `${/^[aeiou]/i.test(word) ? 'an' : 'a'} ${word}`;
 
 export interface LyricsIssue {
   /** 1-based line, or 0 for the lyrics as a whole. */
@@ -218,6 +240,20 @@ export function activeLine(lines: readonly LyricLine[], time: number): number {
     if (line.start <= time) return time < line.end ? i : -1;
   }
   return -1;
+}
+
+/**
+ * The lyrics of a song cut at `seconds`: lines that start after the cut are dropped (they are not in the audio)
+ * and a line the cut lands in ends there. Also returns how many lines were dropped.
+ */
+export function trimLyrics(
+  lyrics: TimedLyrics,
+  seconds: number,
+): { lyrics: TimedLyrics; dropped: number } {
+  const lines = lyrics.lines
+    .filter((line) => line.start < seconds)
+    .map((line) => ({ ...line, end: Math.min(line.end, seconds) }));
+  return { lyrics: { ...lyrics, lines }, dropped: lyrics.lines.length - lines.length };
 }
 
 /** The lyrics as plain text for History: one line per sung line, a blank line between sections. */

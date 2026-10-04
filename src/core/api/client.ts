@@ -44,7 +44,7 @@ import {
   sleep,
   throwIfAborted,
 } from '../util';
-import { ChatStreamAssembler } from './chat-stream';
+import { ChatStreamAssembler, withPartialResult } from './chat-stream';
 import { audioFormat, base64ToBlob, parseContentType } from './encoding';
 import { apiErrorFromBody, bodyError, statusFromCode } from './error-map';
 import { DEFAULT_RETRY_POLICY, retryDelay, type RetryPolicy } from './retry';
@@ -641,7 +641,8 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
         generationId: generationId ?? (result.id || null),
         allFree: spec.bill.allFree,
       });
-      if (failure) throw failure;
+      // The error is the outcome; what arrived before it stays readable through `partialStreamResult`.
+      if (failure) throw withPartialResult(failure, result);
       return result;
     },
 

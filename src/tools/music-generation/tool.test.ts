@@ -8,7 +8,9 @@ import type {
   ChatStreamResult,
   RawModel,
 } from '../../core/api/types';
-import { ApiError } from '../../core/errors';
+import { withPartialResult } from '../../core/api/chat-stream';
+import { ApiError, NetworkError } from '../../core/errors';
+import type * as AudioModule from '../../core/media/audio';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { CallOptions } from '../../core/types';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
@@ -25,8 +27,27 @@ vi.mock('../../core/media/ffmpeg-ops', () => ({
     return Promise.resolve(new Blob([SPEECH], { type: 'audio/mpeg' }));
   },
 }));
-vi.mock('../../core/media/image', () => ({
-  toDataUrl: (file: File) => Promise.resolve(`data:image/png;base64,${file.name}`),
+vi.mock('../../core/media/image', async () => {
+  const { InvalidInputError } = await import('../../core/errors');
+  return {
+    toDataUrl: (file: File) =>
+      file.name.startsWith('broken')
+        ? Promise.reject(new InvalidInputError('This image cannot be decoded.'))
+        : Promise.resolve(`data:image/png;base64,${file.name}`),
+  };
+});
+/** Audio too short to be an MP3 stands for audio whose length cannot be read. */
+vi.mock('../../core/media/audio', async (original) => {
+  const real = await original<typeof AudioModule>();
+  return {
+    ...real,
+    getAudioDuration: (blob: Blob) =>
+      blob.size < 64 ? Promise.reject(new Error('unreadable')) : real.getAudioDuration(blob),
+  };
+});
+const announced = vi.hoisted(() => [] as string[]);
+vi.mock('../../ui/feedback/announce', () => ({
+  announce: (text: string) => announced.push(text),
 }));
 
 const lyria = (id: string, description: string): RawModel => ({
@@ -45,29 +66,47 @@ const CATALOG = [
 
 const LYRICS = '[0.0:1.5] HELLO WORLD\n[1.6:3.0] HELLO DAY';
 
+type StreamOptions = CallOptions & { onEvent: (event: ChatStreamEvent) => void };
+
+/** A Lyria result: `lyrics`, then the MP3 as one base64 fragment (`copies` times the fixture, or `audio`). */
+function lyriaResult(
+  options: { copies?: number; lyrics?: string; audio?: Buffer | null } = {},
+): ChatStreamResult {
+  const { copies = 1, lyrics = LYRICS } = options;
+  const audio =
+    options.audio === undefined
+      ? Buffer.concat(Array.from({ length: copies }, () => SPEECH))
+      : options.audio;
+  return {
+    id: 'gen-1',
+    model: 'google/lyria-3-clip-preview',
+    text: lyrics,
+    reasoning: '',
+    images: [],
+    audioChunks: audio ? [audio.toString('base64')] : [],
+    audioTranscript: '',
+    finishReason: 'stop',
+    usage: { cost: 0.04 },
+  };
+}
+
 /** A streamed Lyria answer: lyrics, then the MP3 as one base64 fragment (`copies` times the fixture). */
-function answer(copies = 1) {
-  return (
-    _body: ChatRequest,
-    opts: CallOptions & { onEvent: (event: ChatStreamEvent) => void },
-  ) => {
-    const data = Buffer.concat(Array.from({ length: copies }, () => SPEECH)).toString('base64');
-    opts.onEvent({ type: 'text', text: LYRICS });
-    opts.onEvent({ type: 'audio', data });
-    const result: ChatStreamResult = {
-      id: 'gen-1',
-      model: 'google/lyria-3-clip-preview',
-      text: LYRICS,
-      reasoning: '',
-      images: [],
-      audioChunks: [data],
-      audioTranscript: '',
-      finishReason: 'stop',
-      usage: { cost: 0.04 },
-    };
+function answer(copies = 1, lyrics = LYRICS) {
+  return (_body: ChatRequest, opts: StreamOptions) => {
+    const result = lyriaResult({ copies, lyrics });
+    opts.onEvent({ type: 'text', text: lyrics });
+    opts.onEvent({ type: 'audio', data: result.audioChunks[0]! });
     return Promise.resolve(result);
   };
 }
+
+const musicContext = (
+  chatStream?: (body: ChatRequest, opts: StreamOptions) => Promise<ChatStreamResult>,
+) =>
+  createToolTestContext(getTool('music-generation'), {
+    catalog: CATALOG,
+    ...(chatStream ? { api: { chatStream } } : {}),
+  });
 
 const $ = (root: ParentNode, testId: string): HTMLElement | null =>
   root.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
@@ -76,15 +115,19 @@ const $$ = (root: ParentNode, testId: string): HTMLElement[] => [
 ];
 
 let t: ToolTestContext | null = null;
+/** jsdom has no media playback: `pause` records which element it was called on. */
+const pause = vi.fn<(this: HTMLMediaElement) => void>();
 beforeEach(async () => {
   isolateChannels();
   await resetDb();
   localStorage.clear();
   trims.calls.length = 0;
+  announced.length = 0;
   URL.createObjectURL = vi.fn(() => 'blob:x');
   URL.revokeObjectURL = vi.fn();
   // jsdom implements neither media playback nor canvas drawing (the waveform).
-  HTMLMediaElement.prototype.pause = vi.fn();
+  pause.mockClear();
+  HTMLMediaElement.prototype.pause = pause;
   HTMLCanvasElement.prototype.getContext = () => null;
 });
 afterEach(() => {
@@ -171,7 +214,7 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
       'HELLO WORLD',
       'HELLO DAY',
     ]);
-    expect($(cards[0]!, 'music-meta')?.textContent).toMatch(/^0:03 · /);
+    expect($(cards[0]!, 'music-result-meta')?.textContent).toMatch(/^0:03 · /);
     expect(t.core.results.pending().map((result) => result.name)).toEqual([
       expect.stringMatching(/^music-.*-1\.mp3$/),
       expect.stringMatching(/^music-.*-2\.mp3$/),
@@ -198,7 +241,9 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
       5,
       expect.objectContaining({ kind: 'audio', fadeOut: 2, bitrate: 192 }),
     ]);
-    expect($(t.zones.output, 'music-meta')?.textContent).toMatch(/^0:03 · cut from 0:1[23] · /);
+    expect($(t.zones.output, 'music-result-meta')?.textContent).toMatch(
+      /^0:03 · cut from 0:1[23] · /,
+    );
   });
 
   it('keeps the variation that worked when another fails', async () => {
@@ -265,5 +310,233 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
     expect($(t.zones.input, 'music-lyrics-warnings')?.textContent).toContain(
       '[Chorus] has no lyrics',
     );
+  });
+
+  it('puts a tag before selected lyrics, keeps them selected and says what it did', async () => {
+    t = musicContext();
+    await t.mount(setup);
+    const lyrics = $(t.zones.input, 'music-lyrics') as HTMLTextAreaElement;
+    lyrics.value = 'Hello world\nSing along';
+    lyrics.setSelectionRange(12, 22);
+    const intro = $(t.zones.input, 'music-tag-intro')!;
+    expect(intro.getAttribute('aria-label')).toBe('Insert an Intro tag');
+    expect($(t.zones.input, 'music-tag-verse')?.getAttribute('aria-label')).toBe(
+      'Insert a Verse tag',
+    );
+    intro.click();
+    expect(lyrics.value).toBe('Hello world\n\n[Intro]\nSing along');
+    expect(lyrics.value.slice(lyrics.selectionStart, lyrics.selectionEnd)).toBe('Sing along');
+    expect(document.activeElement).toBe(lyrics);
+    expect(announced).toContain('Inserted the [Intro] tag.');
+  });
+
+  it('keeps a song whose audio arrived before the stream broke', async () => {
+    const chatStream = vi.fn((_body: ChatRequest, opts: StreamOptions) => {
+      const result = lyriaResult();
+      opts.onEvent({ type: 'audio', data: result.audioChunks[0]! });
+      return Promise.reject(
+        withPartialResult(new NetworkError('The connection dropped.'), { ...result, usage: null }),
+      );
+    });
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'A jingle', settings: {} });
+    await t.runners[0]!.trigger();
+    const card = $(t.zones.output, 'music-variation')!;
+    expect(card.dataset['status']).toBe('done');
+    expect($(card, 'music-player')).not.toBeNull();
+    expect($(card, 'music-note')?.textContent).toBe(
+      'The connection ended after the song arrived (The connection dropped.); it is kept.',
+    );
+    const [record] = await t.core.history.query({ tool: 'music-generation' });
+    expect(record?.status).toBe('ok');
+  });
+
+  it('still fails when the stream broke before any audio', async () => {
+    const chatStream = vi.fn(() =>
+      Promise.reject(
+        withPartialResult(new NetworkError('The connection dropped.'), {
+          ...lyriaResult({ audio: null }),
+          usage: null,
+        }),
+      ),
+    );
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'A jingle', settings: {} });
+    await t.runners[0]!.trigger();
+    expect($(t.zones.output, 'music-variation')?.dataset['status']).toBe('failed');
+    expect($(t.zones.output, 'music-retry')).not.toBeNull();
+  });
+
+  it('stops at an image that cannot be read: nothing sent, no cards left waiting', async () => {
+    const chatStream = vi.fn(answer());
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'x', settings: {} });
+    tool.onFiles?.([new File(['png'], 'broken.png', { type: 'image/png' })]);
+    await t.runners[0]!.trigger();
+    expect(chatStream).not.toHaveBeenCalled();
+    expect($$(t.zones.output, 'music-variation')).toHaveLength(0);
+    expect($(t.zones.output, 'music-empty')?.hidden).toBe(false);
+    expect(t.status()).toBe('The reference image could not be read.');
+    expect(await t.core.history.query({ tool: 'music-generation' })).toHaveLength(0);
+  });
+
+  it('retries a failed variation on its own, in its card; Remove keeps focus nearby', async () => {
+    let calls = 0;
+    const ok = answer();
+    const chatStream = vi.fn((body: ChatRequest, opts: StreamOptions) => {
+      calls += 1;
+      return calls === 2 ? Promise.reject(new ApiError('Lyria is busy', 503, {})) : ok(body, opts);
+    });
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Two please', settings: { variations: 2 } });
+    await t.runners[0]!.trigger();
+    const failed = $$(t.zones.output, 'music-variation').find(
+      (card) => card.dataset['status'] === 'failed',
+    )!;
+    const retry = $(failed, 'music-retry')!;
+    expect(retry.getAttribute('aria-disabled')).toBe('false');
+    retry.click();
+    await vi.waitFor(() => expect(failed.dataset['status']).toBe('done'));
+    expect(chatStream).toHaveBeenCalledTimes(3);
+    expect(chatStream.mock.calls[2]![0].messages[0]?.content).toBe(
+      chatStream.mock.calls[0]![0].messages[0]?.content,
+    );
+    const [record] = await t.core.history.query({ tool: 'music-generation' });
+    expect(record).toMatchObject({ title: 'Retry: variation 2', prompt: '', status: 'ok' });
+    expect(t.status()).toBe('Variation 2 ready');
+
+    // Removing a card moves focus to its neighbour, and the last one to the empty state.
+    const cards = $$(t.zones.output, 'music-variation');
+    $(cards[0]!, 'music-remove')!.click();
+    expect(document.activeElement).toBe($(cards[1]!, 'music-remove'));
+    $(cards[1]!, 'music-remove')!.click();
+    expect(document.activeElement).toBe($(t.zones.output, 'music-empty'));
+    expect(t.core.results.pending()).toHaveLength(0);
+  });
+
+  it('shows what Lyria said when it answers with words and no music, and offers no paid retry', async () => {
+    const chatStream = vi.fn(() =>
+      Promise.resolve(
+        lyriaResult({ audio: null, lyrics: 'I cannot create music based on that request.' }),
+      ),
+    );
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Something odd', settings: {} });
+    await t.runners[0]!.trigger();
+    expect($(t.zones.output, 'music-failed')?.textContent).toBe(
+      'Lyria answered without music: “I cannot create music based on that request.”',
+    );
+    expect($(t.zones.output, 'music-retry')).toBeNull();
+    expect($(t.zones.output, 'music-remove')).not.toBeNull();
+  });
+
+  it('never lets the timer overwrite the final status', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      t = musicContext(vi.fn(answer()));
+      const tool = await t.mount(setup);
+      tool.applyState({ prompt: 'Tick tock', settings: {} });
+      const ctx = t.ctx;
+      const beginRun = Reflect.get(ctx, 'beginRun');
+      vi.spyOn(t.ctx, 'beginRun').mockImplementation(async (...args) => {
+        const handle = await beginRun(...args);
+        return new Proxy(handle, {
+          get(target, prop) {
+            if (prop === 'finish') {
+              return (result: Parameters<typeof handle.finish>[0]) => {
+                vi.advanceTimersByTime(3000); // the History write takes a while
+                return target.finish(result);
+              };
+            }
+            const value: unknown = Reflect.get(target, prop, target);
+            return typeof value === 'function' ? (value as () => unknown).bind(target) : value;
+          },
+        });
+      });
+      await t.runners[0]!.trigger();
+      expect(t.status()).toBe('1 variation ready');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('opens the drawer at an invalid target length and focuses it', async () => {
+    const chatStream = vi.fn(answer());
+    t = musicContext(chatStream);
+    await t.mount(setup);
+    const openDrawer = vi.spyOn(t.ctx.ui, 'openDrawer');
+    const target = $(t.zones.drawer, 'music-target') as HTMLInputElement;
+    target.value = '3';
+    target.dispatchEvent(new Event('change'));
+    await t.runners[0]!.trigger();
+    expect(chatStream).not.toHaveBeenCalled();
+    expect(openDrawer).toHaveBeenCalled();
+    expect(document.activeElement).toBe(target);
+  });
+
+  it('drops lyrics after the cut, and says when a song was shorter than the target', async () => {
+    const chatStream = vi.fn(answer(4, '[0.0:2.0] ONE\n[2.0:4.0] TWO\n[6.0:8.0] THREE'));
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Cut me', settings: { targetSeconds: 5 } });
+    await t.runners[0]!.trigger();
+    const card = $(t.zones.output, 'music-variation')!;
+    expect($$(card, 'music-lyric-line').map((line) => line.textContent)).toEqual(['ONE', 'TWO']);
+    expect($(card, 'music-note')?.textContent).toBe(
+      'Lyrics after 0:05 are not in this audio (1 line).',
+    );
+    expect($(t.zones.output, 'music-group')?.textContent).toContain('target 0:05');
+    expect($(t.zones.output, 'music-group')?.textContent).not.toContain('cut to');
+    const [record] = await t.core.history.query({ tool: 'music-generation' });
+    expect(record?.output).toContain('ONE\nTWO');
+    expect(record?.output).not.toContain('THREE');
+
+    // A song shorter than the target is not cut, and says so.
+    tool.applyState({ prompt: 'Short', settings: { targetSeconds: 10 } });
+    chatStream.mockImplementation(answer(1));
+    await t.runners[0]!.trigger();
+    const newest = $(t.zones.output, 'music-variation')!;
+    expect(trims.calls).toHaveLength(1);
+    expect($(newest, 'music-result-meta')?.textContent).not.toContain('cut from');
+    expect($(newest, 'music-note')?.textContent).toBe('Shorter than the 0:10 target: kept whole.');
+  });
+
+  it('never shows 0:00 for a song whose length cannot be read', async () => {
+    const chatStream = vi.fn(() =>
+      Promise.resolve(lyriaResult({ audio: Buffer.from([0xff, 0xfb, 0x90, 0xc4]) })),
+    );
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Odd', settings: { targetSeconds: 10 } });
+    await t.runners[0]!.trigger();
+    const card = $(t.zones.output, 'music-variation')!;
+    expect($(card, 'music-result-meta')?.textContent).toMatch(/^Length unknown · /);
+    expect(card.textContent).not.toContain('0:00');
+    expect($(card, 'music-note')?.textContent).toBe(
+      'Its length could not be read, so it was not cut.',
+    );
+    expect(trims.calls).toHaveLength(0);
+  });
+
+  it('shows at most two variations side by side, and one playing pauses the others', async () => {
+    t = musicContext(vi.fn(answer()));
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Three', settings: { variations: 3 } });
+    await t.runners[0]!.trigger();
+    const row = $(t.zones.output, 'music-variation')!.parentElement!;
+    expect(row.className).toContain('row-cols-xl-2');
+    expect(row.className).not.toMatch(/row-cols-\w+-3/);
+    const audios = $$(t.zones.output, 'music-player').map(
+      (player) => player.querySelector('audio') ?? (player as unknown as HTMLAudioElement),
+    );
+    pause.mockClear();
+    audios[0]!.dispatchEvent(new Event('play'));
+    expect(pause.mock.contexts).toEqual(expect.arrayContaining([audios[1], audios[2]]));
+    expect(pause.mock.contexts).not.toContain(audios[0]);
   });
 });

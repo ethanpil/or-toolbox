@@ -44,6 +44,7 @@ import {
   mayRetry,
   type ApiClientOptions,
 } from './client';
+import { partialStreamResult } from './chat-stream';
 import type { FreeModelThrottle } from './throttle';
 import { fakeRun, isolateChannels, testCore, type FakeRun } from './test-fakes';
 import type { ChatRequest, ChatStreamEvent } from './types';
@@ -480,6 +481,34 @@ describe('chatStream', () => {
     expect(s.run.usages).toEqual([
       expect.objectContaining({ costUsd: 0, costUnknown: true, promptTokens: 0 }),
     ]);
+  });
+
+  it('keeps what a failed stream delivered readable from the error (audio before a cut or an error chunk)', async () => {
+    const audio =
+      'data: {"id":"g","model":"google/lyria-3-clip-preview","choices":[{"delta":{"content":"[0.0:1.0] LA"}}]}\n\n' +
+      'data: {"id":"g","model":"google/lyria-3-clip-preview","choices":[{"delta":{"content":"","audio":{"data":"SUQz"}}}]}\n\n';
+    const cut = setup([sse(audio)]);
+    const dropped: unknown = await cut.client
+      .chatStream(chatBody, { run: cut.run, onEvent: () => undefined })
+      .catch((e: unknown) => e);
+    expect(dropped).toBeInstanceOf(NetworkError);
+    expect(partialStreamResult(dropped)).toMatchObject({
+      text: '[0.0:1.0] LA',
+      audioChunks: ['SUQz'],
+    });
+
+    const errorChunk =
+      'data: {"id":"g","object":"chat.completion.chunk","error":{"code":502,"message":"Provider disconnected"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}\n\n';
+    const failed = setup([sse(audio + errorChunk)]);
+    const midStream: unknown = await failed.client
+      .chatStream(chatBody, { run: failed.run, onEvent: () => undefined })
+      .catch((e: unknown) => e);
+    expect(midStream).toBeInstanceOf(ApiError);
+    expect(partialStreamResult(midStream)?.audioChunks).toEqual(['SUQz']);
+
+    // Any other error carries nothing.
+    expect(partialStreamResult(new Error('x'))).toBeNull();
+    expect(partialStreamResult(undefined)).toBeNull();
   });
 
   it('accepts a complete stream without a usage chunk, with unknown cost', async () => {

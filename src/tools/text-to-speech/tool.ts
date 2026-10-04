@@ -1,24 +1,29 @@
 /**
  * Text-to-speech: text (typed, pasted, a TXT/MD file or sent from another tool) read aloud in a chosen voice.
  *
- * One run per Run press. Long text is split under the model's limit (text.ts), the chunks are synthesised a few
- * at a time with `runItems`, and the pieces are joined gaplessly with `stitchAudio` into one MP3 or WAV (PCM-only
- * models are wrapped as WAV first). A chunk that fails, or that Stop left unmade, can be retried on its own:
- * the chunks already made are kept until the audio is complete. Voice previews read a short sentence, once per
- * model, voice and speed, and stay in memory for the session.
+ * One run per Run press. Long text is split into parts of about a minute of speech (text.ts, voices.ts), the
+ * parts are synthesised a few at a time with `runItems`, and the pieces are joined gaplessly with `stitchAudio`
+ * into one MP3 or WAV (PCM-only models are wrapped as WAV first).
+ *
+ * Paid parts are never thrown away or paid for twice: the plan (the parts and the settings they were made with)
+ * stays in memory until the joined audio exists. A part that fails, comes back without audio, or that Stop left
+ * unmade can be retried on its own; Read aloud (or the error toast's Retry) with the same text, model, voice and
+ * speed continues the plan instead of starting again; a join that fails or is stopped is offered again without
+ * making any part twice. Voice previews read a short sentence in the voice's language, once per model, voice
+ * and speed, and stay in memory for the session.
  */
 import { defaultSpeechFormat } from '../../core/api/client';
 import type { SpeechResult } from '../../core/api/types';
-import { userMessage } from '../../core/errors';
-import { readAsText, sanitizeFilename } from '../../core/files';
-import { getAudioDuration } from '../../core/media/audio';
+import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
+import { readAsText, sanitizeFilename, sniffMime } from '../../core/files';
+import { decodeAudio, getAudioDuration } from '../../core/media/audio';
 import { pcmToWav } from '../../core/media/wav';
 import type { ModelInfo, RunHandle } from '../../core/types';
 import { debounce } from '../../core/util';
-import { audioPlayer, type AudioPlayer } from '../../ui/components/audio-player';
+import { audioResultCard } from '../../ui/components/audio-result-card';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
-import { exportMenu } from '../../ui/components/export-menu';
+import { progressBar } from '../../ui/components/progress-bar';
 import { h, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { isStop, presentError } from '../../ui/feedback/errors';
@@ -26,15 +31,10 @@ import { formatBytes, formatDuration, formatInt, formatUsd, plural } from '../..
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { type ItemStatus, runItems } from '../../ui/tool/batch';
-import type {
-  ResultHandle,
-  RunnerState,
-  SendItem,
-  ToolContext,
-  ToolInstance,
-} from '../../ui/tool/index';
-import { countWords, normalizeText, splitText, stripMarkdown } from './text';
-import { chunkLimit, PREVIEW_TEXT, speedSupported, voiceLabel } from './voices';
+import type { ToolContext, ToolInstance } from '../../ui/tool/index';
+import { retryGate } from '../../ui/tool/retry-gate';
+import { countWords, fileStem, normalizeText, splitText, stripMarkdown } from './text';
+import { chunkLimit, previewText, speedSupported, voiceLabel } from './voices';
 
 type Format = 'mp3' | 'wav';
 
@@ -50,6 +50,8 @@ const CONCURRENCY = 3;
 const DEFAULT_PCM_RATE = 24000;
 const SPEED_MIN = 0.5;
 const SPEED_MAX = 2;
+/** Sample rate used only to check that a part decodes (cheap; the join decodes at the real rate). */
+const PROBE_RATE = 8000;
 
 interface Chunk {
   key: string;
@@ -60,21 +62,34 @@ interface Chunk {
   error: string | null;
 }
 
-/** What one Read aloud press asked for; a retry finishes it with exactly these settings. */
+/**
+ * What one Read aloud press asked for; a retry, a continued Read aloud and Join again finish it with exactly
+ * these settings, and the parts stay here until the joined audio exists.
+ */
 interface Plan {
   model: string;
   voice: string | null;
   speed: number | null;
+  /** The format the parts are joined into (the only setting that may change without remaking a part). */
   format: Format;
   /** File name stem, from the first words of the text. */
   stem: string;
+  /** The normalised text the parts were made from. */
+  source: string;
   chunks: Chunk[];
+  /** Set when every part was made but the join did not finish: what happened, for the notice. */
+  joinNote: string | null;
 }
 
-interface Take {
-  handle: ResultHandle;
-  player: AudioPlayer;
-  element: HTMLElement;
+/** The runner's argument: retry these parts, or join the parts already made. */
+type RunArg = { parts: string[] } | { join: true };
+
+/** What a take's card shows: plain values, so nothing in it keeps a plan (and its part audio) alive. */
+interface TakeInfo {
+  stem: string;
+  format: Format;
+  voice: string | null;
+  seconds: number | null;
 }
 
 const isTextFile = (type: string, name: string): boolean =>
@@ -83,23 +98,28 @@ const isText = (file: File): boolean => isTextFile(file.type, file.name);
 const isMarkdown = (type: string | undefined, name = ''): boolean =>
   type === 'text/markdown' || /\.(md|markdown)$/i.test(name);
 
-/** `speech-hello-there-friend`: a file name stem from the first words. */
-function stemFor(text: string): string {
-  const words = text
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim()
-    .split(' ')
-    .slice(0, 4)
-    .join('-');
-  return sanitizeFilename(words ? `speech-${words}` : 'speech', 'speech');
-}
-
 /** A chunk's audio as something `stitchAudio` decodes: MP3 as it came, raw PCM wrapped as WAV. */
 async function toSegment(result: SpeechResult): Promise<Blob> {
   if (result.mimeType !== 'audio/pcm') return result.blob;
   const bytes = new Uint8Array(await result.blob.arrayBuffer());
   return pcmToWav(bytes, result.sampleRate ?? DEFAULT_PCM_RATE, result.channels ?? 1);
+}
+
+/**
+ * Throws when a speech response is not audio: empty, or (for anything but raw PCM, which has no header) bytes
+ * that are not a known audio format, such as an error page or JSON sent with a 200.
+ */
+async function checkAudio(result: SpeechResult): Promise<void> {
+  if (result.blob.size === 0) throw new InvalidInputError('The part came back empty.');
+  const head = new Uint8Array(await result.blob.slice(0, 64).arrayBuffer());
+  if (result.mimeType === 'audio/pcm') {
+    const start = String.fromCharCode(...head.slice(0, 16)).trimStart();
+    if (/^[{<]/.test(start)) throw new InvalidInputError('The part came back as text, not audio.');
+    return;
+  }
+  if (!/^(audio|video)\//.test(sniffMime(head) ?? '')) {
+    throw new InvalidInputError('The part came back without audio.');
+  }
 }
 
 export function setup(ctx: ToolContext): ToolInstance {
@@ -142,6 +162,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       type: 'button',
       class: 'btn btn-outline-secondary d-inline-flex align-items-center gap-2 text-nowrap',
       'aria-describedby': ids.previewNote,
+      'aria-disabled': 'false',
       'data-testid': 'tts-preview',
       onclick: () => void preview(),
     },
@@ -200,6 +221,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     FORMATS.map((entry) => h('option', { value: entry.id }, entry.label)),
   );
   format.value = isFormat(saved['format']) ? saved['format'] : 'mp3';
+  const currentFormat = (): Format => (isFormat(format.value) ? format.value : 'mp3');
 
   const speedValue = h('output', { id: ids.speedValue, class: 'small text-body-secondary' });
   const speed = h('input', {
@@ -214,6 +236,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     oninput: () => {
       showSpeed();
       updatePreviewNote();
+      updateCounts();
     },
     onchange: () => ctx.options.set({ speed: Number(speed.value) }),
   });
@@ -268,9 +291,12 @@ export function setup(ctx: ToolContext): ToolInstance {
   // --- model and voices -----------------------------------------------------------------------------------
   let modelId: string | null = null;
   let modelInfo: ModelInfo | undefined;
+  /** False while the catalog has not answered for `modelId` yet. */
+  let modelKnown = false;
   /** The chosen voice id ('' when the model lists none). */
   let voiceValue = '';
   let modelGeneration = 0;
+  let modelLoad: Promise<void> = Promise.resolve();
 
   const savedVoices = (): Record<string, string> => {
     const value = ctx.options.get()['voices'];
@@ -278,19 +304,32 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
   const voices = (): readonly string[] => modelInfo?.supportedVoices ?? [];
   const canSpeed = (): boolean => (modelInfo ? speedSupported(modelInfo) : false);
-  const currentVoice = (): string | null => (voices().length > 0 ? voiceValue : null);
-  const currentSpeed = (): number | null => {
-    const value = Number(speed.value);
-    return canSpeed() && value !== 1 ? value : null;
+
+  /**
+   * The voice a request for a model with `info` sends: the chosen one when the model lists it, else the one
+   * remembered for that model, else its first (a model that lists voices needs one); none when it lists none.
+   */
+  const voiceFor = (info: ModelInfo | undefined): string | null => {
+    const list = info?.supportedVoices ?? [];
+    if (!info || list.length === 0) return null;
+    if (list.includes(voiceValue)) return voiceValue;
+    const remembered = savedVoices()[info.id];
+    return remembered && list.includes(remembered) ? remembered : list[0]!;
   };
+  const speedFor = (info: ModelInfo | undefined): number | null => {
+    const value = Number(speed.value);
+    return info && speedSupported(info) && value !== 1 ? value : null;
+  };
+  const currentVoice = (): string | null => voiceFor(modelInfo);
+  const currentSpeed = (): number | null => speedFor(modelInfo);
 
   const renderVoices = (): void => {
     const list = voices();
-    if (list.length > 0) {
-      const remembered = modelId ? savedVoices()[modelId] : undefined;
-      if (!list.includes(voiceValue)) {
-        voiceValue = remembered && list.includes(remembered) ? remembered : list[0]!;
-      }
+    if (!modelKnown) {
+      voice.replaceChildren(h('option', { value: '' }, 'Loading voices…'));
+      voice.disabled = true;
+    } else if (list.length > 0) {
+      voiceValue = voiceFor(modelInfo) ?? list[0]!;
       voice.replaceChildren(...list.map((id) => h('option', { value: id }, voiceLabel(id))));
       voice.value = voiceValue;
       voice.disabled = false;
@@ -304,28 +343,49 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   /** Reloads the voices when the model changed (header chip, settings, free-only, a catalog refresh). */
-  const syncModel = async (force = false): Promise<void> => {
+  const syncModel = (force = false): Promise<void> => {
     const next = ctx.model().model;
-    if (next === modelId && !force) return;
+    if (next === modelId && !force) return modelLoad;
     const mine = ++modelGeneration;
-    modelId = next;
-    const info = next ? await ctx.models.get(next).catch(() => undefined) : undefined;
-    if (mine !== modelGeneration) return;
-    modelInfo = info;
-    renderVoices();
-    updateCounts();
+    if (next !== modelId) {
+      modelId = next;
+      modelInfo = undefined;
+      modelKnown = false;
+      renderVoices();
+    }
+    modelLoad = (async () => {
+      const info = next ? await ctx.models.get(next).catch(() => undefined) : undefined;
+      if (mine !== modelGeneration) return;
+      modelInfo = info;
+      modelKnown = true;
+      renderVoices();
+      updateCounts();
+    })();
+    return modelLoad;
   };
   ctx.settings.subscribe(() => void syncModel());
   ctx.bus.on('models-refreshed', () => void syncModel(true));
 
+  /** The catalog's entry for `model`, once it has answered: requests never go out before the voices are known. */
+  const infoFor = async (model: string): Promise<ModelInfo | undefined> => {
+    if (model === ctx.model().model) {
+      await syncModel();
+      if (model === modelId) return modelInfo;
+    }
+    return ctx.models.get(model).catch(() => undefined);
+  };
+
   // --- counts and estimate --------------------------------------------------------------------------------
+  const limitFor = (value: string, info: ModelInfo | undefined, chosenSpeed: number | null) =>
+    chunkLimit(info, { text: value, speed: chosenSpeed });
+
   const updateCounts = (): void => {
     const value = normalizeText(text.value);
     if (!value) {
       counts.textContent = 'No text yet.';
       return;
     }
-    const requests = splitText(value, chunkLimit(modelInfo)).length;
+    const requests = splitText(value, limitFor(value, modelInfo, currentSpeed())).length;
     counts.textContent = `${formatInt(value.length)} characters · ${formatInt(countWords(value))} words · ${plural(requests, 'request')}`;
   };
   const onTextChange = debounce(() => {
@@ -349,11 +409,12 @@ export function setup(ctx: ToolContext): ToolInstance {
   /** Preview audio per model, voice and speed, as object URLs (small, kept for the session). */
   const previews = new Map<string, string>();
   const previewKey = (): string | null =>
-    modelId ? `${modelId}|${currentVoice() ?? ''}|${currentSpeed() ?? 1}` : null;
+    modelId && modelKnown ? `${modelId}|${currentVoice() ?? ''}|${currentSpeed() ?? 1}` : null;
   let previewing = false;
   let noteGeneration = 0;
 
   const updatePreviewNote = (): void => {
+    if (previewing) return; // the note says what the preview is doing until it is done
     const key = previewKey();
     const mine = ++noteGeneration;
     if (!key || !modelId) {
@@ -365,10 +426,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       return;
     }
     previewNote.textContent = 'Preview reads one short sentence.';
-    void estimateText(PREVIEW_TEXT, modelId)
+    void estimateText(previewText(currentVoice()), modelId)
       .catch(() => null)
       .then((usd) => {
-        if (mine !== noteGeneration) return;
+        if (mine !== noteGeneration || previewing) return;
         const cost = usd === null ? 'cost unknown' : usd === 0 ? 'free' : `about ${formatUsd(usd)}`;
         previewNote.textContent = `Preview reads one short sentence (${cost}).`;
       });
@@ -380,80 +441,81 @@ export function setup(ctx: ToolContext): ToolInstance {
     void previewAudio.play().catch(() => undefined); // a blocked autoplay leaves the controls to the user
   };
 
+  /** Busy without `disabled`, so the button keeps focus (and a second press is simply ignored). */
+  const setPreviewBusy = (busy: boolean): void => {
+    previewButton.setAttribute('aria-disabled', String(busy));
+    previewButton.classList.toggle('disabled', busy);
+    if (busy) previewButton.setAttribute('aria-busy', 'true');
+    else previewButton.removeAttribute('aria-busy');
+  };
+
   const preview = async (): Promise<void> => {
-    const key = previewKey();
-    const model = modelId;
-    if (!key || !model || previewing) return;
-    const cached = previews.get(key);
-    if (cached) {
-      playPreview(cached);
-      announce('Playing the preview.');
-      return;
-    }
-    const chosenVoice = currentVoice();
-    const chosenSpeed = currentSpeed();
+    const model = ctx.model().model;
+    if (!model || previewing) return;
     previewing = true;
-    previewButton.disabled = true;
-    previewButton.setAttribute('aria-busy', 'true');
-    previewNote.textContent = 'Making the preview…';
+    let started = false;
     try {
+      const info = await infoFor(model);
+      const chosenVoice = voiceFor(info);
+      const chosenSpeed = speedFor(info);
+      const key = `${model}|${chosenVoice ?? ''}|${chosenSpeed ?? 1}`;
+      const cached = previews.get(key);
+      if (cached) {
+        playPreview(cached);
+        announce('Playing the preview.');
+        return;
+      }
+      const sentence = previewText(chosenVoice);
+      // Refused before anything was sent (no key, locked, budget, Cancel): the button and note stay as they were.
       const run = await ctx.beginRun({
         model,
         title: `Voice preview: ${chosenVoice ? voiceLabel(chosenVoice) : "the model's own voice"}`,
         // No prompt: a preview is not a Recent prompt.
         prompt: '',
         settings: { voice: chosenVoice ?? '', speed: chosenSpeed ?? 1, preview: true },
-        estimateUsd: await estimateText(PREVIEW_TEXT, model).catch(() => null),
+        estimateUsd: await estimateText(sentence, model).catch(() => null),
         addons: [],
       });
+      started = true;
+      setPreviewBusy(true);
+      previewNote.textContent = 'Making the preview…';
+      announce('Making the preview…');
       try {
         const result = await ctx.api.speech(
           {
             model,
-            input: PREVIEW_TEXT,
+            input: sentence,
             ...(chosenVoice ? { voice: chosenVoice } : {}),
             ...(chosenSpeed !== null ? { speed: chosenSpeed } : {}),
           },
           { run },
         );
+        await checkAudio(result);
         const url = URL.createObjectURL(await toSegment(result));
-        await run.finish({ output: PREVIEW_TEXT, meta: { preview: true } });
+        await run.finish({ output: sentence, meta: { preview: true } });
         previews.set(key, url);
+        announce('The preview is ready.');
         if (previewKey() === key) playPreview(url);
       } catch (error) {
         await run.fail(error);
         throw error;
       }
     } catch (error) {
-      if (!isStop(error)) void presentError(error, { retry: () => void preview() });
+      if (isStop(error)) {
+        if (started) announce('The preview was stopped.');
+      } else {
+        announce('The preview could not be made.');
+        void presentError(error, { retry: () => void preview() });
+      }
     } finally {
       previewing = false;
-      previewButton.disabled = false;
-      previewButton.removeAttribute('aria-busy');
+      if (started) setPreviewBusy(false);
       updatePreviewNote();
     }
   };
 
   // --- output zone ----------------------------------------------------------------------------------------
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress',
-      role: 'progressbar',
-      'aria-label': 'Progress',
-      'aria-valuemin': '0',
-      'aria-valuemax': '100',
-      'aria-valuenow': '0',
-      'data-testid': 'tts-progress',
-    },
-    progressBar,
-  );
-  const progressText = h('div', {
-    class: 'small text-body-secondary',
-    'data-testid': 'tts-progress-text',
-  });
-  const progressSection = h('div', { class: 'vstack gap-2', hidden: true }, progress, progressText);
+  const bar = progressBar({ label: 'Parts made', hidden: true, testId: 'tts-progress' });
   const notice = h('div', { hidden: true, 'data-testid': 'tts-notice' });
   const empty = emptyState({
     icon: 'volume-up',
@@ -461,124 +523,122 @@ export function setup(ctx: ToolContext): ToolInstance {
     text: 'Add text, choose a voice and press Read aloud.',
     testId: 'tts-empty',
   });
+  // Focus lands here when the last take is removed.
+  empty.tabIndex = -1;
   const takesList = h('div', { class: 'vstack gap-3', 'data-testid': 'tts-results' });
-  ui.output.append(h('div', { class: 'vstack gap-3' }, progressSection, notice, empty, takesList));
+  ui.output.append(h('div', { class: 'vstack gap-3' }, bar.element, notice, empty, takesList));
 
-  const takes: Take[] = [];
-  const setProgress = (ratio: number, label: string): void => {
-    const percent = Math.round(Math.min(1, Math.max(0, ratio)) * 100);
-    progressBar.style.width = `${percent}%`;
-    progress.setAttribute('aria-valuenow', String(percent));
-    progressText.textContent = label;
-  };
+  let takes = 0;
   const showEmpty = (): void => {
-    empty.hidden = takes.length > 0 || !progressSection.hidden;
+    empty.hidden = takes > 0 || !bar.element.hidden;
   };
 
-  const transcode = async (blob: Blob, to: Format): Promise<Blob> =>
-    (await import('../../core/media/ffmpeg-ops')).transcodeAudio(blob, to);
-
-  const addTake = (blob: Blob, plan: Plan, seconds: number): void => {
-    const name = `${plan.stem}.${plan.format}`;
-    const handle = ui.addResult({ kind: 'audio', name, blob });
-    const player = audioPlayer({
+  /** A joined take as a card. Built from plain values, so nothing in it keeps a plan (and its parts) alive. */
+  const addTake = (blob: Blob, info: TakeInfo): void => {
+    const { stem, format: madeAs, seconds } = info;
+    const card = audioResultCard({
+      ui,
       blob,
-      label: `${name}, ${formatDuration(seconds)}`,
-      testId: 'tts-player',
+      name: `${stem}.${madeAs}`,
+      ...(seconds === null ? {} : { seconds }),
+      metaParts: [
+        seconds === null ? null : formatDuration(seconds),
+        info.voice ? voiceLabel(info.voice) : "The model's own voice",
+        formatBytes(blob.size),
+      ],
+      formats: ['mp3', 'wav'],
+      onRemove: () => {
+        takes -= 1;
+        showEmpty();
+      },
+      focusFallback: () => empty,
+      testId: 'tts',
     });
-    const menu = exportMenu({
-      filename: plan.stem,
-      resultIds: () => [handle.result.id],
-      testId: 'tts-download',
-      formats: (['mp3', 'wav'] as const).map((id) => ({
-        label: id === 'mp3' ? 'MP3' : 'WAV',
-        extension: id,
-        icon: 'file-earmark-music',
-        build: () => (id === plan.format ? blob : transcode(blob, id)),
-      })),
-    });
-    const item: Take = { handle, player, element: h('div') };
-    const remove = (): void => {
-      handle.remove();
-      player.dispose();
-      item.element.remove();
-      takes.splice(takes.indexOf(item), 1);
-      showEmpty();
-      announce(`Removed ${name}.`);
-    };
-    const send: SendItem[] = [{ kind: 'file', blob, name }];
-    item.element = h(
-      'article',
-      { class: 'border rounded p-3 vstack gap-2', 'data-testid': 'tts-result' },
-      h(
-        'div',
-        { class: 'd-flex flex-wrap align-items-baseline gap-2' },
-        h('h3', { class: 'h6 mb-0 text-break me-auto' }, name),
-        h(
-          'span',
-          { class: 'small text-body-secondary', 'data-testid': 'tts-result-meta' },
-          [
-            formatDuration(seconds),
-            plan.voice ? voiceLabel(plan.voice) : "The model's own voice",
-            formatBytes(blob.size),
-          ].join(' · '),
-        ),
-      ),
-      player.element,
-      h(
-        'div',
-        { class: 'd-flex flex-wrap gap-2' },
-        menu,
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
-            'data-testid': 'tts-send',
-            onclick: () => ui.sendTo(send),
-          },
-          icon('send'),
-          'Send to…',
-        ),
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
-            'aria-label': `Remove ${name}`,
-            'data-testid': 'tts-remove',
-            onclick: remove,
-          },
-          icon('trash'),
-          'Remove',
-        ),
-      ),
-    );
-    takes.unshift(item);
-    takesList.prepend(item.element);
+    takes += 1;
+    takesList.prepend(card.element);
     showEmpty();
   };
 
   // --- running --------------------------------------------------------------------------------------------
   let plan: Plan | null = null;
   let running = false;
-  let runnerState: RunnerState = { busy: false, disabledReason: null };
 
   const missing = (current: Plan): Chunk[] =>
     current.chunks.filter((chunk) => chunk.status !== 'done');
+  const madeCount = (current: Plan): number => current.chunks.length - missing(current).length;
+  /** The plan's own settings, for History: a retry records what it made, not what the form says now. */
+  const planSettings = (current: Plan) => ({
+    voice: current.voice ?? '',
+    speed: current.speed ?? 1,
+    format: current.format,
+  });
+  /** The bar and the status line's counter (announced now and then, not on every tick). */
+  const setProgress = (ratio: number, label: string): void => {
+    bar.update(Math.round(Math.min(1, Math.max(0, ratio)) * 100), 100, label);
+    ui.progress(label);
+  };
+  /** Lets go of a plan's part audio (after the join, or when a new plan replaces it). */
+  const releasePlan = (current: Plan | null): void => {
+    for (const chunk of current?.chunks ?? []) chunk.blob = null;
+  };
+
+  /**
+   * Paid parts that are not joined yet live only in this page: leaving asks first. The hold follows the plan
+   * (its description says how many parts) and ends when the audio is joined or the plan is replaced.
+   */
+  let held: { description: string; release: () => void } | null = null;
+  const syncHold = (): void => {
+    const made = plan ? madeCount(plan) : 0;
+    const description = made > 0 ? `${plural(made, 'paid speech part')} not joined yet` : null;
+    if (description === (held?.description ?? null)) return;
+    held?.release();
+    held = description ? { description, release: ui.holdWork(description) } : null;
+  };
+
+  /** A notice button that follows Run (unavailable while it is busy or disabled, but focusable). */
+  const actionButton = (label: string, testId: string, arg: () => RunArg): HTMLElement =>
+    gate.bind(
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'btn btn-sm btn-warning',
+          'data-testid': testId,
+          onclick: () => gate.retry(arg(), 'Reading aloud cannot start now.'),
+        },
+        label,
+      ),
+    );
 
   const renderNotice = (): void => {
-    const left = plan && !running ? missing(plan) : [];
-    notice.hidden = left.length === 0;
-    if (!plan || left.length === 0) {
+    syncHold();
+    const current = plan;
+    const left = current && !running ? missing(current) : [];
+    const joinPending = current !== null && !running && left.length === 0 && current.joinNote;
+    notice.hidden = left.length === 0 && !joinPending;
+    if (!current || notice.hidden) {
       replaceWith(notice, null);
       return;
     }
+    const total = current.chunks.length;
+    if (joinPending) {
+      replaceWith(
+        notice,
+        h(
+          'div',
+          { class: 'alert alert-warning d-flex flex-wrap align-items-center gap-2 mb-0' },
+          icon('exclamation-triangle'),
+          h(
+            'span',
+            { class: 'me-auto' },
+            `All ${plural(total, 'part')} are made and kept. ${current.joinNote}`,
+          ),
+          actionButton('Join again', 'tts-join', () => ({ join: true })),
+        ),
+      );
+      return;
+    }
     const failed = left.filter((chunk) => chunk.status === 'failed');
-    const blocked = runnerState.busy
-      ? 'Wait until the current run ends.'
-      : runnerState.disabledReason;
-    const total = plan.chunks.length;
     replaceWith(
       notice,
       h(
@@ -593,23 +653,12 @@ export function setup(ctx: ToolContext): ToolInstance {
             { class: 'me-auto' },
             `${total - left.length} of ${plural(total, 'part')} made. ${failed.length > 0 ? `${failed.length} failed` : `${left.length} not made`}; the audio is joined once every part is there.`,
           ),
-          h(
-            'button',
-            {
-              type: 'button',
-              class: ['btn btn-sm btn-warning', blocked && 'disabled'],
-              'aria-disabled': String(blocked !== null),
-              title: blocked ?? '',
-              'data-focus-key': 'tts-retry',
-              'data-testid': 'tts-retry',
-              onclick: () => {
-                const keys = missing(plan!).map((chunk) => chunk.key);
-                if (!runner.trigger(keys).started) announce(blocked ?? 'Cannot start now.');
-              },
-            },
+          actionButton(
             failed.length > 0
               ? `Retry ${plural(left.length, 'part')}`
               : `Make the other ${left.length}`,
+            'tts-retry',
+            () => ({ parts: missing(current).map((chunk) => chunk.key) }),
           ),
         ),
         failed.length > 0
@@ -643,36 +692,126 @@ export function setup(ctx: ToolContext): ToolInstance {
       },
       { run, signal },
     );
+    await checkAudio(result);
     return toSegment(result);
   };
 
-  const join = async (current: Plan, signal: AbortSignal): Promise<Blob> => {
-    setProgress(0, 'Joining the parts…');
-    const { stitchAudio } = await import('../../core/media/stitch');
-    return stitchAudio(
-      current.chunks.map((chunk) => chunk.blob!),
-      current.format,
-      {
-        signal,
-        onProgress: (ratio) => setProgress(ratio, `Joining the parts… ${Math.round(ratio * 100)}%`),
-        onLoadProgress: ({ loaded, total }) =>
-          setProgress(
-            total ? loaded / total : 0,
-            `Loading the MP3 encoder… ${formatBytes(loaded)}`,
-          ),
-      },
-    );
+  /**
+   * After a join failed: the parts that do not decode on their own, marked failed so they can be made again
+   * (the others are kept). Returns how many were found.
+   */
+  const findBadParts = async (current: Plan, signal: AbortSignal): Promise<number> => {
+    let bad = 0;
+    for (const chunk of current.chunks) {
+      if (signal.aborted) break;
+      try {
+        if (!chunk.blob) throw new InvalidInputError('The part is missing.');
+        await decodeAudio(chunk.blob, { sampleRate: PROBE_RATE });
+      } catch (error) {
+        if (isAbortError(error)) break;
+        bad += 1;
+        Object.assign(chunk, {
+          status: 'failed',
+          blob: null,
+          error: 'its audio could not be decoded',
+        });
+      }
+    }
+    return bad;
   };
 
-  const planFor = async (value: string, model: string): Promise<Plan> => {
-    const info = model === modelId ? modelInfo : await ctx.models.get(model).catch(() => undefined);
+  /**
+   * Joins a plan whose parts are all made, shows the take and lets go of the parts. A failed or stopped join
+   * keeps every part (and marks any that will not decode), so Join again or a retry finishes it for free.
+   * With `handle`, the run that made the last parts is finished or failed here too.
+   */
+  const joinPlan = async (
+    current: Plan,
+    signal: AbortSignal,
+    handle: RunHandle | null,
+    meta: Record<string, unknown>,
+  ): Promise<void> => {
+    const total = current.chunks.length;
+    current.joinNote = null;
+    let blob: Blob;
+    try {
+      bar.update(0, 100, 'Joining the parts…');
+      ui.status('Joining the parts…');
+      const { stitchAudio } = await import('../../core/media/stitch');
+      blob = await stitchAudio(
+        current.chunks.map((chunk) => chunk.blob!),
+        current.format,
+        {
+          signal,
+          onProgress: (ratio) =>
+            setProgress(ratio, `Joining the parts… ${Math.round(ratio * 100)}%`),
+          onLoadProgress: ({ loaded, total: bytes }) =>
+            setProgress(
+              bytes ? loaded / bytes : 0,
+              `Loading the MP3 encoder… ${formatBytes(loaded)}`,
+            ),
+        },
+      );
+    } catch (error) {
+      if (isStop(error) || signal.aborted) {
+        current.joinNote = 'Joining was stopped.';
+        ui.status(`Stopped while joining · all ${plural(total, 'part')} kept`);
+      } else {
+        const bad = await findBadParts(current, signal);
+        current.joinNote = bad > 0 ? null : `Joining failed: ${userMessage(error)}`;
+        ui.status(
+          bad > 0
+            ? `Joining failed: ${plural(bad, 'part')} could not be decoded`
+            : 'Joining failed · every part kept',
+        );
+      }
+      if (handle) await handle.fail(error);
+      throw error;
+    }
+    // A length that cannot be read is left out, never shown as 0:00.
+    const seconds = await getAudioDuration(blob).then(
+      (value) => (Number.isFinite(value) && value > 0 ? value : null),
+      () => null,
+    );
+    addTake(blob, {
+      stem: current.stem,
+      format: current.format,
+      voice: current.voice,
+      seconds,
+    });
+    const summary =
+      seconds === null
+        ? `Generated the audio, ${plural(total, 'part')}`
+        : `Generated ${formatDuration(seconds)} of audio, ${plural(total, 'part')}`;
+    ui.status(summary);
+    // Complete: the parts are no longer needed (the take keeps only the joined audio).
+    releasePlan(current);
+    if (plan === current) plan = null;
+    if (handle) {
+      await handle.finish({
+        output: summary,
+        meta: {
+          chunks: total,
+          seconds: seconds === null ? null : Math.round(seconds * 10) / 10,
+          voice: current.voice,
+          format: current.format,
+          ...meta,
+        },
+      });
+    }
+  };
+
+  const newPlan = (value: string, model: string, info: ModelInfo | undefined): Plan => {
+    const chosenSpeed = speedFor(info);
     return {
       model,
-      voice: currentVoice(),
-      speed: currentSpeed(),
-      format: isFormat(format.value) ? format.value : 'mp3',
-      stem: stemFor(value),
-      chunks: splitText(value, chunkLimit(info)).map((chunkText, index) => ({
+      voice: voiceFor(info),
+      speed: chosenSpeed,
+      format: currentFormat(),
+      stem: sanitizeFilename(fileStem(value), 'speech'),
+      source: value,
+      joinNote: null,
+      chunks: splitText(value, limitFor(value, info, chosenSpeed)).map((chunkText, index) => ({
         key: String(index),
         index,
         text: chunkText,
@@ -683,111 +822,174 @@ export function setup(ctx: ToolContext): ToolInstance {
     };
   };
 
-  const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
-    const retry = keys !== undefined;
-    const value = normalizeText(text.value);
-    if (!retry && !value) {
-      ui.status('Add some text first.');
-      text.focus();
-      return;
-    }
-    const model = ctx.model().model;
-    if (!retry && !model) return;
-    const target = retry ? plan : await planFor(value, model!);
-    if (!target) return;
-    const todo = retry ? target.chunks.filter((chunk) => keys.includes(chunk.key)) : target.chunks;
-    if (todo.length === 0) return;
-
-    // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
-    const handle = await ctx.beginRun(
-      retry
-        ? {
-            model: target.model,
-            title: `Retry: ${plural(todo.length, 'part')} of ${target.stem}`,
-            prompt: '',
-            estimateUsd: await estimateText(
-              todo.map((chunk) => chunk.text).join(' '),
-              target.model,
-            ).catch(() => null),
-          }
-        : {},
-      signal,
-    );
-
-    plan = target;
+  /** Joins the current plan without making anything (Join again, or a continued plan with every part made). */
+  const joinOnly = async (current: Plan, signal: AbortSignal): Promise<void> => {
     running = true;
-    for (const chunk of todo) Object.assign(chunk, { status: 'queued', blob: null, error: null });
-    const total = target.chunks.length;
-    const made = (): number => target.chunks.filter((chunk) => chunk.status === 'done').length;
-    const showMade = (): void => {
-      setProgress(made() / total, `${made()} of ${plural(total, 'part')} made`);
-      ui.status(`Reading aloud: ${made()} of ${plural(total, 'part')}`);
-    };
-    progressSection.hidden = false;
+    bar.element.hidden = false;
     showEmpty();
     renderNotice();
-    showMade();
     try {
-      await runItems({
-        items: todo,
-        concurrency: CONCURRENCY,
-        signal: handle.signal,
-        work: (chunk, itemSignal) => synthesize(handle, target, chunk, itemSignal),
-        onItem: (outcome) => {
-          const chunk = outcome.item;
-          chunk.status = outcome.status;
-          if (outcome.status === 'done') chunk.blob = outcome.value ?? null;
-          if (outcome.status === 'failed') chunk.error = userMessage(outcome.error);
-          if (outcome.status === 'done' || outcome.status === 'failed') {
-            showMade();
-            void handle
-              .checkpoint({ output: () => `Made ${made()} of ${plural(total, 'part')}.` })
-              .catch(() => undefined);
-          }
-        },
-      });
-
-      const left = missing(target);
-      if (left.length > 0) {
-        const summary = `Made ${made()} of ${plural(total, 'part')}; ${left.length} failed.`;
-        ui.status(summary);
-        await handle.finish({ output: summary, meta: { parts: total, failed: left.length } });
-        return;
-      }
-
-      const blob = await join(target, handle.signal);
-      const seconds = await getAudioDuration(blob).catch(() => 0);
-      addTake(blob, target, seconds);
-      const summary = `Generated ${formatDuration(seconds)} of audio, ${plural(total, 'part')}`;
-      ui.status(summary);
-      announce('The audio is ready.');
-      plan = null; // complete: the parts are no longer needed
-      await handle.finish({
-        output: summary,
-        meta: {
-          chunks: total,
-          seconds: Math.round(seconds * 10) / 10,
-          voice: target.voice,
-          format: target.format,
-          ...(retry ? { retried: todo.length } : {}),
-        },
-      });
-    } catch (error) {
-      ui.status(isStop(error) ? `Stopped · ${made()} of ${plural(total, 'part')} made` : 'Failed');
-      await handle.fail(error);
-      throw error;
+      await joinPlan(current, signal, null, {});
     } finally {
       running = false;
-      progressSection.hidden = true;
+      bar.element.hidden = true;
       showEmpty();
       renderNotice();
     }
   };
 
-  const runner = ui.runner<string[]>({ label: 'Read aloud', icon: 'volume-up', run });
-  runner.subscribe((state) => {
-    runnerState = state;
+  const run = async (signal: AbortSignal, arg?: RunArg): Promise<void> => {
+    if (arg && 'join' in arg) {
+      if (plan && missing(plan).length === 0) await joinOnly(plan, signal);
+      return;
+    }
+
+    let target: Plan;
+    let todo: Chunk[];
+    let continued = false;
+    if (arg) {
+      if (!plan) return;
+      target = plan;
+      todo = plan.chunks.filter(
+        (chunk) => arg.parts.includes(chunk.key) && chunk.status !== 'done',
+      );
+      if (todo.length === 0) {
+        if (missing(plan).length === 0) await joinOnly(plan, signal);
+        return;
+      }
+    } else {
+      const value = normalizeText(text.value);
+      if (!value) {
+        ui.status('Add some text first.');
+        text.focus();
+        return;
+      }
+      const model = ctx.model().model;
+      if (!model) return;
+      // Wait for the catalog: a model that lists voices must be sent one.
+      const info = await infoFor(model);
+      const previous = plan;
+      if (
+        previous &&
+        madeCount(previous) > 0 &&
+        previous.source === value &&
+        previous.model === model &&
+        previous.voice === voiceFor(info) &&
+        previous.speed === speedFor(info)
+      ) {
+        // The same text and voice as the parts already made: finish those instead of paying for them again.
+        target = previous;
+        target.format = currentFormat();
+        continued = true;
+        todo = missing(target);
+        if (todo.length === 0) {
+          await joinOnly(target, signal);
+          return;
+        }
+      } else {
+        target = newPlan(value, model, info);
+        todo = target.chunks;
+      }
+    }
+
+    const total = target.chunks.length;
+    const extra = arg !== undefined || continued;
+    // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
+    const handle = await ctx.beginRun(
+      {
+        model: target.model,
+        settings: planSettings(target),
+        ...(extra
+          ? {
+              title: `${arg ? 'Retry' : 'Continue'}: ${plural(todo.length, 'part')} of ${target.stem}`,
+              prompt: '',
+              estimateUsd: await estimateText(
+                todo.map((chunk) => chunk.text).join(' '),
+                target.model,
+              ).catch(() => null),
+            }
+          : {}),
+      },
+      signal,
+    );
+
+    if (plan !== target) {
+      releasePlan(plan);
+      plan = target;
+    }
+    running = true;
+    target.joinNote = null;
+    for (const chunk of todo) Object.assign(chunk, { status: 'queued', blob: null, error: null });
+    const showMade = (first = false): void => {
+      const made = madeCount(target);
+      bar.update(made, total, `${made} of ${plural(total, 'part')} made`);
+      const text = `Reading aloud: ${made} of ${plural(total, 'part')}`;
+      if (first) ui.status(text);
+      else ui.progress(text);
+      syncHold();
+    };
+    bar.element.hidden = false;
+    showEmpty();
     renderNotice();
+    if (continued) {
+      ui.status(`Continuing: ${plural(total - todo.length, 'part')} made earlier are kept`);
+    }
+    showMade(!continued);
+    try {
+      try {
+        await runItems({
+          items: todo,
+          concurrency: CONCURRENCY,
+          signal: handle.signal,
+          work: (chunk, itemSignal) => synthesize(handle, target, chunk, itemSignal),
+          onItem: (outcome) => {
+            const chunk = outcome.item;
+            chunk.status = outcome.status;
+            if (outcome.status === 'done') chunk.blob = outcome.value ?? null;
+            if (outcome.status === 'failed') chunk.error = userMessage(outcome.error);
+            if (outcome.status === 'done' || outcome.status === 'failed') {
+              showMade();
+              void handle
+                .checkpoint({
+                  output: () => `Made ${madeCount(target)} of ${plural(total, 'part')}.`,
+                })
+                .catch(() => undefined);
+            }
+          },
+        });
+      } catch (error) {
+        ui.status(
+          isStop(error)
+            ? `Stopped · ${madeCount(target)} of ${plural(total, 'part')} made`
+            : 'Failed',
+        );
+        await handle.fail(error);
+        throw error;
+      }
+
+      const left = missing(target);
+      if (left.length > 0) {
+        const summary = `Made ${madeCount(target)} of ${plural(total, 'part')}; ${left.length} failed.`;
+        ui.status(summary);
+        await handle.finish({ output: summary, meta: { parts: total, failed: left.length } });
+        return;
+      }
+      await joinPlan(target, handle.signal, handle, {
+        ...(arg ? { retried: todo.length } : {}),
+        ...(continued ? { continued: todo.length } : {}),
+      });
+    } finally {
+      running = false;
+      bar.element.hidden = true;
+      showEmpty();
+      renderNotice();
+    }
+  };
+
+  const runner = ui.runner<RunArg>({ label: 'Read aloud', icon: 'volume-up', run });
+  // A notice button that starts a run disappears with the notice: focus goes to Stop (or back to Run).
+  const gate = retryGate(runner, {
+    fallback: () => (runner.busy ? runner.stopButton : runner.button),
   });
 
   // --- files and text in ----------------------------------------------------------------------------------
@@ -817,12 +1019,17 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const settings = () => ({
-    voice: voiceValue,
-    speed: Number(speed.value),
-    format: isFormat(format.value) ? format.value : 'mp3',
-  });
+  /** The form's settings; a voice the model does not list is left out once the catalog has answered. */
+  const settings = () => {
+    const keepVoice = voiceValue !== '' && (!modelKnown || voices().includes(voiceValue));
+    return {
+      ...(keepVoice ? { voice: voiceValue } : {}),
+      speed: Number(speed.value),
+      format: currentFormat(),
+    };
+  };
 
+  renderVoices();
   void syncModel();
 
   return {
@@ -832,7 +1039,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       if (typeof state['voice'] === 'string') {
         voiceValue = state['voice'];
         if (voices().includes(voiceValue)) voice.value = voiceValue;
-        else if (modelInfo) renderVoices();
+        else if (modelKnown) renderVoices();
       }
       const savedRate = state['speed'];
       if (typeof savedRate === 'number' && savedRate >= SPEED_MIN && savedRate <= SPEED_MAX) {

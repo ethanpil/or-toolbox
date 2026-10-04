@@ -15,6 +15,27 @@ import { isRecord, isString } from '../util';
 import { apiErrorFromBody, bodyError, statusFromCode } from './error-map';
 import type { ChatStreamEvent, ChatStreamResult, WireUsage } from './types';
 
+/** What each failed stream had delivered, keyed by the error it failed with. */
+const partials = new WeakMap<object, ChatStreamResult>();
+
+/**
+ * Records what a stream delivered before it failed on the error it failed with, and returns the error. Used by
+ * `chatStream`; test fakes call it too.
+ */
+export function withPartialResult<E>(error: E, result: ChatStreamResult): E {
+  if (typeof error === 'object' && error !== null) partials.set(error, result);
+  return error;
+}
+
+/**
+ * What a `chatStream` call had assembled when it failed (a dropped connection, a mid-stream error chunk, Stop),
+ * or null for any other error. The error is still the outcome: this is for keeping work that arrived complete
+ * before it, such as a song whose audio came in one piece before the connection broke.
+ */
+export function partialStreamResult(error: unknown): ChatStreamResult | null {
+  return typeof error === 'object' && error !== null ? (partials.get(error) ?? null) : null;
+}
+
 export class ChatStreamAssembler {
   private id = '';
   private model = '';

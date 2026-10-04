@@ -10,11 +10,14 @@
  */
 import type { Token, Tokens } from 'marked';
 
-/** Unifies line ends, trims line ends and collapses spaces and runs of blank lines. */
+/**
+ * Unifies line ends, trims line ends and collapses spaces and runs of blank lines. Every kind of space (no-break
+ * U+00A0, ideographic U+3000, the typographic ones) counts as a space: a reader pauses the same.
+ */
 export function normalizeText(text: string): string {
   return text
     .replace(/\r\n?/g, '\n')
-    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/[^\S\n]+/g, ' ')
     .replace(/ *\n */g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -94,7 +97,8 @@ function fit(text: string, max: number, level = 0): Piece[] {
   const pieces: Piece[] = [];
   for (const part of split(text)) {
     const sub = fit(part.text, max, level + 1);
-    sub[0]!.sep = part.sep;
+    if (!sub[0]) continue;
+    sub[0].sep = part.sep;
     pieces.push(...sub);
   }
   return pack(pieces, max);
@@ -109,12 +113,45 @@ export function splitText(text: string, maxChars: number): string[] {
   const max = Math.max(1, Math.floor(maxChars));
   const pieces: Piece[] = [];
   for (const paragraph of normalizeText(text).split('\n\n')) {
-    if (!paragraph) continue;
+    if (!paragraph.trim()) continue;
     const sub = fit(paragraph, max);
-    sub[0]!.sep = pieces.length === 0 ? '' : '\n\n';
+    if (!sub[0]) continue;
+    sub[0].sep = pieces.length === 0 ? '' : '\n\n';
     pieces.push(...sub);
   }
-  return pack(pieces, max).map((piece) => piece.text);
+  return pack(pieces, max)
+    .map((piece) => piece.text)
+    .filter((chunk) => chunk.trim() !== '');
+}
+
+/**
+ * `speech-hello-there-friend`: a file name stem from the first few words. Words come from the word segmenter, so
+ * Chinese, Japanese and Thai (written without spaces) give words too, and the stem stays short in any script.
+ */
+export function fileStem(text: string, maxWords = 4, maxChars = 32): string {
+  const words: string[] = [];
+  let length = 0;
+  const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  for (const segment of new Intl.Segmenter(undefined, { granularity: 'word' }).segment(
+    text.slice(0, 500),
+  )) {
+    if (!segment.isWordLike) continue;
+    // Letters, digits and combining marks (Thai and Devanagari vowels are marks): no apostrophes or dots.
+    const word = segment.segment.toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '');
+    if (!word) continue;
+    const room = maxChars - length - (words.length > 0 ? 1 : 0);
+    if (room <= 0) break;
+    let piece = '';
+    for (const { segment: grapheme } of graphemes.segment(word)) {
+      if (piece.length + grapheme.length > room) break;
+      piece += grapheme;
+    }
+    if (!piece) break;
+    words.push(piece);
+    length += piece.length + (words.length > 1 ? 1 : 0);
+    if (words.length >= maxWords || piece !== word) break;
+  }
+  return words.length > 0 ? `speech-${words.join('-')}` : 'speech';
 }
 
 // --- Markdown -------------------------------------------------------------------------------------------
@@ -154,14 +191,43 @@ function ownText(token: Token): string {
   return typeof text === 'string' ? text : '';
 }
 
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+
+/**
+ * Emphasis that is really literal text: inside a word (`3*4*5`, which CommonMark reads as `3<em>4</em>5`), or a
+ * Python-style dunder name (`__init__`, which it reads as bold "init").
+ */
+function literalEmphasis(
+  token: Token,
+  before: Token | undefined,
+  after: Token | undefined,
+): boolean {
+  if (token.type !== 'em' && token.type !== 'strong') return false;
+  if (WORD_CHAR.test(before?.raw.slice(-1) ?? '') || WORD_CHAR.test(after?.raw.charAt(0) ?? '')) {
+    return true;
+  }
+  return /^__[\p{L}\p{N}_]+__$/u.test(token.raw);
+}
+
+const OPENS_RAW_TEXT = /^<(script|style)\b[^>]*>$/i;
+const CLOSES_RAW_TEXT = /^<\/(script|style)\s*>$/i;
+
 function inline(tokens: readonly Token[] | undefined): string {
   let text = '';
-  for (const token of tokens ?? []) {
+  // Inside an inline <script> or <style>: its contents are code, never read.
+  let rawText = false;
+  const list = tokens ?? [];
+  list.forEach((token, index) => {
+    if (token.type === 'html') {
+      if (OPENS_RAW_TEXT.test(token.raw.trim())) rawText = true;
+      else if (CLOSES_RAW_TEXT.test(token.raw.trim())) rawText = false;
+      return;
+    }
+    if (rawText) return;
     switch (token.type) {
       case 'br':
         text += '\n';
         break;
-      case 'html':
       case 'checkbox':
         break;
       case 'codespan':
@@ -170,10 +236,43 @@ function inline(tokens: readonly Token[] | undefined): string {
         break;
       default:
         // text, strong, em, del, link, image (its alt text), and anything an extension adds.
-        text += ownText(token);
+        text += literalEmphasis(token, list[index - 1], list[index + 1])
+          ? token.raw
+          : ownText(token);
     }
-  }
+  });
   return text;
+}
+
+/** An HTML block's readable text: comments and the contents of script and style elements go entirely. */
+function htmlText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, ' ')
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, ' ')
+    .replace(/<[^>]*>/g, ' ');
+}
+
+/** A YAML key line (`title: Notes`, `tags:`) as front matter starts with. */
+const YAML_KEY = /^[A-Za-z_][\w.-]*[ \t]*:(?:[ \t]|$)/;
+
+/**
+ * Removes a front-matter block: only at the very start, between `---` lines, and only when it reads as YAML
+ * (key lines, indented continuations, `- ` items, comments). A Markdown file that merely opens with a `---` rule
+ * keeps its text.
+ */
+function stripFrontMatter(markdown: string): string {
+  const match = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/.exec(
+    markdown,
+  );
+  if (!match) return markdown;
+  const lines = (match[1] ?? '')
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== '' && !line.trimStart().startsWith('#'));
+  const yaml =
+    lines.length > 0 &&
+    YAML_KEY.test(lines[0]!) &&
+    lines.every((line) => YAML_KEY.test(line) || /^[ \t]+\S/.test(line) || /^-[ \t]/.test(line));
+  return yaml ? markdown.slice(match[0].length) : markdown;
 }
 
 function blocks(tokens: readonly Token[]): string[] {
@@ -188,7 +287,7 @@ function blocks(tokens: readonly Token[]): string[] {
         out.push((token as Tokens.Code).text);
         break;
       case 'html':
-        out.push((token as Tokens.HTML).text.replace(/<[^>]*>/g, ' '));
+        out.push(htmlText((token as Tokens.HTML).text));
         break;
       case 'list':
         out.push(
@@ -214,14 +313,14 @@ function blocks(tokens: readonly Token[]): string[] {
 
 /**
  * Markdown as text to read aloud: headings, paragraphs and list items each on their own line or paragraph;
- * emphasis, link targets, image addresses, tags, rules, reference definitions, footnotes and a front-matter
- * block removed; tables read row by row; code kept as text (the editor shows it, so the reader can cut it).
- * marked is imported on first use.
+ * emphasis marks (but not a `*` or `_` inside a word), link targets, image addresses, tags, HTML comments,
+ * script and style contents, rules, reference definitions, footnotes and a front-matter block removed; tables
+ * read row by row; code kept as text (the editor shows it, so the reader can cut it). marked is imported on
+ * first use.
  */
 export async function stripMarkdown(markdown: string): Promise<string> {
   const { lexer } = await import('marked');
-  const body = markdown
-    .replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)\r?\n/, '')
+  const body = stripFrontMatter(markdown)
     // Footnote definitions (GFM, which marked does not parse) would otherwise be read as a paragraph.
     .replace(/^ {0,3}\[\^[^\]\s]+\]:.*$/gm, '');
   const text = blocks(lexer(body)).join('\n\n');

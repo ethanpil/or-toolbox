@@ -41,19 +41,48 @@ const LYRICS = [
   '[9.6:12.6] THIS IS OUR LITTLE SONG',
 ].join('\n');
 
+const base = {
+  id: 'gen-1790983685-lyria',
+  object: 'chat.completion.chunk',
+  created: 1790983685,
+  model: 'google/lyria-3-clip-preview',
+  provider: 'Google AI Studio',
+};
+const chunk = (delta: Record<string, unknown>, finish: string | null) => ({
+  ...base,
+  choices: [{ index: 0, delta: { role: 'assistant', ...delta }, finish_reason: finish }],
+});
+
+/** A Lyria stream that breaks off after the audio: no finish chunk, no usage, no `[DONE]`. */
+const brokenStream = () =>
+  sseResponse(
+    [
+      chunk({ content: LYRICS }, null),
+      chunk({ content: '', audio: { data: SONG.toString('base64') } }, null),
+    ],
+    { done: false },
+  );
+
+/** A stream that fails (an error chunk) before any audio. */
+const failingStream = () =>
+  sseResponse([
+    ': OPENROUTER PROCESSING',
+    { ...chunk({ content: '' }, 'error'), error: { code: 502, message: 'Lyria is overloaded' } },
+  ]);
+
+/** Lyria declining: words, no audio. */
+const refusalStream = () =>
+  sseResponse([
+    chunk({ content: 'I cannot create music for that request.' }, null),
+    chunk({ content: '' }, 'stop'),
+    {
+      ...chunk({ content: '' }, 'stop'),
+      usage: { prompt_tokens: 20, completion_tokens: 9, cost: 0 },
+    },
+  ]);
+
 /** A Lyria stream as recorded: keep-alives, lyrics, one audio fragment, the finish chunk twice (usage last). */
 function lyriaStream(cost = 0.04) {
-  const base = {
-    id: 'gen-1790983685-lyria',
-    object: 'chat.completion.chunk',
-    created: 1790983685,
-    model: 'google/lyria-3-clip-preview',
-    provider: 'Google AI Studio',
-  };
-  const chunk = (delta: Record<string, unknown>, finish: string | null) => ({
-    ...base,
-    choices: [{ index: 0, delta: { role: 'assistant', ...delta }, finish_reason: finish }],
-  });
   return sseResponse([
     ': OPENROUTER PROCESSING',
     ': OPENROUTER PROCESSING',
@@ -156,7 +185,7 @@ test.describe('Music generation', () => {
         }),
     );
     expect(duration).toBeGreaterThan(12);
-    await expect(page.getByTestId('music-meta')).toHaveText(/^0:1[23] · /);
+    await expect(page.getByTestId('music-result-meta')).toHaveText(/^0:1[23] · /);
 
     // The line being sung is highlighted as the song plays.
     const lines = page.getByTestId('music-lyric-line');
@@ -184,9 +213,12 @@ test.describe('Music generation', () => {
     await closeDrawer(page);
     await page.getByTestId('run-button').click();
     await expect(page.getByTestId('music-group')).toHaveCount(2);
-    await expect(page.getByTestId('music-meta').first()).toHaveText(/^0:08 · cut from 0:1[23] · /, {
-      timeout: 180_000,
-    });
+    await expect(page.getByTestId('music-result-meta').first()).toHaveText(
+      /^0:08 · cut from 0:1[23] · /,
+      {
+        timeout: 180_000,
+      },
+    );
     const cut = await decodedSeconds(page, 0);
     console.info(
       `Music gate: streamed song ${full.toFixed(3)} s; cut to 8 s → ${cut.toFixed(3)} s`,
@@ -253,6 +285,65 @@ test.describe('Music generation', () => {
     await expectNoSeriousA11yViolations(page);
     await page.emulateMedia({ colorScheme: 'dark' });
     await expectNoSeriousA11yViolations(page);
+    expect(problems).toEqual([]);
+  });
+
+  test('a broken stream keeps its song, a failed variation retries alone, a refusal says why', async ({
+    page,
+    context,
+    mock,
+  }) => {
+    await seedApp(context, { key: true });
+    mock.json('GET', '/api/v1/models', { data: CATALOG });
+    const answers = [brokenStream, failingStream, lyriaStream, refusalStream];
+    mock.respond('POST', '/api/v1/chat/completions', () => (answers.shift() ?? lyriaStream)());
+    const problems = await watchForProblems(page, STREAM_CANCELS);
+    await page.goto('tools/music-generation/');
+    await openDrawer(page);
+    await page.getByTestId('music-variations').selectOption('2');
+    await closeDrawer(page);
+    await page.getByTestId('tool-prompt').fill('Two takes');
+    await page.getByTestId('run-button').click();
+
+    // One song arrived before its stream broke off: kept. The other failed: Retry makes it alone.
+    const cards = page.getByTestId('music-variation');
+    await expect(cards.locator('[data-testid="music-player"]')).toHaveCount(1, { timeout: 60_000 });
+    await expect(page.getByTestId('music-note')).toContainText(
+      'The connection ended after the song arrived',
+    );
+    const failed = cards.filter({ has: page.getByTestId('music-retry') });
+    await expect(failed.getByTestId('music-failed')).toContainText('provider returned an error');
+    await failed.getByTestId('music-retry').click();
+    await expect(cards.locator('[data-testid="music-player"]')).toHaveCount(2, { timeout: 60_000 });
+    expect(mock.calls('/api/v1/chat/completions')).toHaveLength(3);
+    await expect(page.getByTestId('tool-status')).toHaveText(/^Variation [12] ready$/);
+
+    // Removing a card leaves focus on its neighbour.
+    await cards.nth(0).getByTestId('music-remove').click();
+    await expect(cards).toHaveCount(1);
+    await expect(cards.nth(0).getByTestId('music-remove')).toBeFocused();
+
+    // Lyria declining: its words are shown, and no paid retry is offered.
+    await openDrawer(page);
+    await page.getByTestId('music-variations').selectOption('1');
+    await closeDrawer(page);
+    await page.getByTestId('run-button').click();
+    const refused = page.getByTestId('music-group').first().getByTestId('music-variation');
+    await expect(refused.getByTestId('music-failed')).toHaveText(
+      'Lyria answered without music: “I cannot create music for that request.”',
+    );
+    await expect(refused.getByTestId('music-retry')).toHaveCount(0);
+    await expect(refused.getByTestId('music-remove')).toBeVisible();
+
+    // An invalid target length (in the drawer) opens the drawer and focuses the field.
+    await openDrawer(page);
+    await page.getByTestId('music-target').fill('3');
+    await page.getByTestId('music-target').blur();
+    await closeDrawer(page);
+    await page.getByTestId('run-button').click();
+    await expect(page.locator('.or-drawer')).toBeVisible();
+    await expect(page.getByTestId('music-target')).toBeFocused();
+    expect(mock.calls('/api/v1/chat/completions')).toHaveLength(4);
     expect(problems).toEqual([]);
   });
 

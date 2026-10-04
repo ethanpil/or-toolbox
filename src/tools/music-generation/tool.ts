@@ -6,27 +6,31 @@
  * whatever the prompt says, so a target length is applied afterwards in the browser (`trimMedia`, with a short
  * fade-out). Variations are one run with one request per variation (`runItems`, all at once): one Run press is
  * one History entry and one budget decision, and the estimate is the flat price times the count. A variation
- * that fails does not take the others with it. The free-only notice comes from the framework: no music model
- * is free.
+ * that fails does not take the others with it, and can be retried on its own (a run of one). A song whose
+ * audio arrived before the stream broke is kept: it is paid for. The free-only notice comes from the
+ * framework: no music model is free.
  */
+import { partialStreamResult } from '../../core/api/chat-stream';
 import { base64ToBlob } from '../../core/api/encoding';
-import { ApiError, isAbortError, userMessage } from '../../core/errors';
+import type { ChatStreamResult } from '../../core/api/types';
+import { ApiError, InvalidInputError, isAbortError, userMessage } from '../../core/errors';
 import { getAudioDuration } from '../../core/media/audio';
 import type { RunHandle } from '../../core/types';
-import { audioPlayer, type AudioPlayer } from '../../ui/components/audio-player';
+import type { AudioPlayer } from '../../ui/components/audio-player';
+import { type AudioResultCard, audioResultCard } from '../../ui/components/audio-result-card';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
-import { exportMenu } from '../../ui/components/export-menu';
 import { h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop } from '../../ui/feedback/errors';
+import { isStop, markPresented } from '../../ui/feedback/errors';
 import { setFieldError } from '../../ui/feedback/field-error';
 import { formatBytes, formatDateTime, formatDuration, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { setToolBinding } from '../../ui/settings-actions';
 import { type ItemStatus, runItems } from '../../ui/tool/batch';
-import type { ResultHandle, ToolContext, ToolInstance } from '../../ui/tool/index';
+import type { ToolContext, ToolInstance } from '../../ui/tool/index';
+import { retryGate } from '../../ui/tool/retry-gate';
 import {
   activeLine,
   insertTag,
@@ -34,7 +38,9 @@ import {
   parseTimedLyrics,
   SECTION_TAGS,
   type TimedLyrics,
+  trimLyrics,
   validateLyrics,
+  withArticle,
 } from './lyrics';
 import { buildPrompt, isVocals, type SongForm, songRequest, type Vocals } from './prompt';
 
@@ -66,26 +72,56 @@ const FADE_SECONDS = 2;
 const MP3_BITRATE = 192;
 /** Reference images are scaled down to this before upload: plenty to set a mood. */
 const IMAGE_MAX_SIDE = 1024;
+/** How much of a text-only answer (a refusal) is shown. */
+const REFUSAL_CHARS = 300;
+
+/** Lyria answered with words and no music (a refusal): asking again the same way gets the same answer. */
+class NoMusicError extends InvalidInputError {}
 
 interface Song {
   blob: Blob;
-  seconds: number;
+  /** Null when the length could not be read. */
+  seconds: number | null;
   /** Length before the cut, when it was cut. */
   fullSeconds: number | null;
-  /** Why a cut that was asked for did not happen. */
-  trimNote: string | null;
+  /** Things worth knowing about this song: why a cut did not happen, a stream that broke after the audio. */
+  notes: string[];
   lyrics: TimedLyrics;
 }
 
+/** One Compose press: what every variation in it was asked with, so a variation can be retried alike. */
+interface Group {
+  model: string;
+  /** Variations asked for (cards keep their numbers when one is removed). */
+  count: number;
+  prompt: string;
+  imageUrl: string | null;
+  targetLength: number | null;
+  stem: string;
+  settings: Record<string, unknown>;
+  section: HTMLElement;
+  variations: Variation[];
+}
+
 interface Variation {
+  group: Group;
   index: number;
   status: ItemStatus;
   phase: string;
   song: Song | null;
   error: string | null;
+  /** The failure was Lyria declining: a retry would only be charged for the same answer. */
+  refused: boolean;
   card: HTMLElement;
-  handle: ResultHandle | null;
-  player: AudioPlayer | null;
+  /** The song as a result card (player, downloads, Send to…, Remove), once it is made. */
+  result: AudioResultCard | null;
+  /** A card without a song: its Remove button, where focus goes when a neighbouring card is removed. */
+  removeButton: HTMLButtonElement | null;
+}
+
+/** The runner's argument: retry one variation. */
+interface RetryArg {
+  retry: Variation;
 }
 
 const isVariationCount = (value: unknown): value is (typeof VARIATIONS)[number] =>
@@ -95,6 +131,14 @@ const isTarget = (value: unknown): value is number =>
   Number.isInteger(value) &&
   value >= MIN_TARGET &&
   value <= MAX_TARGET;
+const roundSeconds = (seconds: number | null): number | null =>
+  seconds === null ? null : Math.round(seconds * 10) / 10;
+/** The length of some audio, or null when it cannot be read (never a made-up 0:00). */
+const durationOf = (blob: Blob): Promise<number | null> =>
+  getAudioDuration(blob).then(
+    (seconds) => (Number.isFinite(seconds) && seconds > 0 ? seconds : null),
+    () => null,
+  );
 
 export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
@@ -113,6 +157,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     target: uid('music-target'),
     targetHelp: uid('music-target-help'),
     preview: uid('music-preview'),
+    image: uid('music-image'),
   };
 
   // --- song form ------------------------------------------------------------------------------------------
@@ -219,26 +264,35 @@ export function setup(ctx: ToolContext): ToolInstance {
     class: 'small text-warning-emphasis ps-3 mb-0 empty-hidden',
     'data-testid': 'music-lyrics-warnings',
   });
+
+  /**
+   * Inserts a section tag at the caret, keeping any selected text (the tag goes before it). The edit goes
+   * through `insertText` where the browser has it, so Ctrl+Z undoes it like typing; else `setRangeText`.
+   */
+  const addTag = (tag: string): void => {
+    const edit = insertTag(lyrics.value, lyrics.selectionStart, lyrics.selectionEnd, tag);
+    lyrics.focus();
+    lyrics.setSelectionRange(edit.from, edit.to);
+    const before = lyrics.value;
+    try {
+      document.execCommand('insertText', false, edit.text);
+    } catch {
+      // Not available (or refused): the fallback below applies the edit.
+    }
+    if (lyrics.value === before) lyrics.setRangeText(edit.text, edit.from, edit.to, 'end');
+    lyrics.setSelectionRange(edit.selectionStart, edit.selectionEnd);
+    formChanged();
+    announce(`Inserted the [${tag}] tag.`);
+  };
   const tagButtons = SECTION_TAGS.map((tag) =>
     h(
       'button',
       {
         type: 'button',
         class: 'btn btn-sm btn-outline-secondary',
-        'aria-label': `Insert a ${tag} tag`,
+        'aria-label': `Insert ${withArticle(tag)} tag`,
         'data-testid': `music-tag-${tag.toLowerCase()}`,
-        onclick: () => {
-          const { value, cursor } = insertTag(
-            lyrics.value,
-            lyrics.selectionStart,
-            lyrics.selectionEnd,
-            tag,
-          );
-          lyrics.value = value;
-          lyrics.focus();
-          lyrics.setSelectionRange(cursor, cursor);
-          formChanged();
-        },
+        onclick: () => addTag(tag),
       },
       `[${tag}]`,
     ),
@@ -264,7 +318,7 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   // --- reference image ------------------------------------------------------------------------------------
   let image: { file: File; url: string } | null = null;
-  const imageSlot = h('div', { 'data-testid': 'music-image' });
+  const imageSlot = h('div', { id: ids.image, 'data-testid': 'music-image' });
   const renderImage = (): void => {
     if (!image) {
       replace(
@@ -517,8 +571,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     shownErrors.set(input, message);
     setFieldError(input, feedback, message);
   };
-  /** Re-checks the lyrics and the target, updates the preview; returns false when something blocks a run. */
-  const check = (): boolean => {
+  /** Re-checks the lyrics and the target, updates the preview; returns the first field that blocks a run. */
+  const check = (): HTMLElement | null => {
     const issues = validateLyrics(lyrics.value, {
       instrumental: vocals() === 'instrumental',
       clip: ctx.model().model === CLIP_ID,
@@ -539,7 +593,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     showError(target, targetFeedback, targetError);
     voiceField.hidden = vocals() === 'instrumental';
     promptPreview.value = buildPrompt(form(), image !== null);
-    return lyricsError === null && targetError === null;
+    return lyricsError !== null ? lyrics : targetError !== null ? target : null;
   };
   function formChanged(): void {
     check();
@@ -556,6 +610,18 @@ export function setup(ctx: ToolContext): ToolInstance {
     input.addEventListener('input', formChanged);
   }
 
+  /** Focuses a field, opening the settings drawer first when the field is in it (focus once it is shown). */
+  const focusField = (input: HTMLElement): void => {
+    const panel = ui.drawer.contains(input) ? input.closest('.offcanvas') : null;
+    if (panel && !panel.classList.contains('show')) {
+      panel.addEventListener('shown.bs.offcanvas', () => input.focus(), { once: true });
+      ui.openDrawer();
+      return;
+    }
+    if (ui.drawer.contains(input)) ui.openDrawer();
+    input.focus();
+  };
+
   // --- output zone ----------------------------------------------------------------------------------------
   const empty = emptyState({
     icon: 'music-note-beamed',
@@ -563,14 +629,23 @@ export function setup(ctx: ToolContext): ToolInstance {
     text: 'Fill in the form and press Compose. A clip takes about 10 seconds, a full song about a minute.',
     testId: 'music-empty',
   });
-  const groups = h('div', { class: 'vstack gap-4', 'data-testid': 'music-results' });
-  ui.output.append(empty, groups);
+  // Focus lands here when the last result is removed.
+  empty.tabIndex = -1;
+  const groupsList = h('div', { class: 'vstack gap-4', 'data-testid': 'music-results' });
+  ui.output.append(empty, groupsList);
+  const groups: Group[] = [];
   const showEmpty = (): void => {
-    empty.hidden = groups.childElementCount > 0;
+    empty.hidden = groups.length > 0;
   };
 
-  const transcode = async (blob: Blob, to: 'mp3' | 'wav'): Promise<Blob> =>
-    (await import('../../core/media/ffmpeg-ops')).transcodeAudio(blob, to);
+  /** Every player on the page: starting one pauses the others. */
+  const players = new Set<AudioPlayer>();
+  const addPlayer = (player: AudioPlayer): void => {
+    players.add(player);
+    player.audio.addEventListener('play', () => {
+      for (const other of players) if (other !== player) other.audio.pause();
+    });
+  };
 
   /** The lyrics under a player, the line being sung highlighted as it plays. */
   const lyricsPanel = (
@@ -644,68 +719,103 @@ export function setup(ctx: ToolContext): ToolInstance {
     return list;
   };
 
-  const drawVariation = (variation: Variation, total: number): void => {
-    const title = total > 1 ? `Variation ${variation.index + 1}` : 'Result';
-    const song = variation.song;
+  const titleOf = (variation: Variation): string =>
+    variation.group.count > 1 ? `Variation ${variation.index + 1}` : 'Result';
+
+  /** Where focus can land in a card: its Remove button. */
+  const removeButtonOf = (variation: Variation): HTMLElement | null =>
+    variation.result
+      ? variation.result.element.querySelector<HTMLElement>('button[aria-label^="Remove "]')
+      : variation.removeButton;
+
+  /** Takes a variation off the page's books (its card, its group when it was the last). Safe to call twice. */
+  const forget = (variation: Variation): void => {
+    const group = variation.group;
+    const at = group.variations.indexOf(variation);
+    if (at < 0) return;
+    if (variation.result) players.delete(variation.result.player);
+    variation.card.remove();
+    group.variations.splice(at, 1);
+    if (group.variations.length === 0) {
+      group.section.remove();
+      groups.splice(groups.indexOf(group), 1);
+    }
+    showEmpty();
+  };
+
+  /** The card that takes a removed one's place: the next in its group, the one before, another group's. */
+  const neighbourOf = (variation: Variation): Variation | undefined => {
+    const list = variation.group.variations;
+    const at = list.indexOf(variation);
+    return (
+      list[at + 1] ??
+      list[at - 1] ??
+      groups.flatMap((group) => group.variations).find((other) => other !== variation)
+    );
+  };
+
+  /** Where focus goes when `variation` is removed and no other song card took it. */
+  const focusAfter = (variation: Variation): HTMLElement | null => {
+    const next = neighbourOf(variation);
+    forget(variation);
+    return (next && removeButtonOf(next)) ?? (empty.hidden ? null : empty);
+  };
+
+  /** Removes a card that has no song (failed or stopped). Song cards remove themselves (audioResultCard). */
+  const removeVariation = (variation: Variation): void => {
+    focusAfter(variation)?.focus();
+    announce(`Removed ${titleOf(variation).toLowerCase()}.`);
+  };
+
+  /** A finished song as a result card: player, downloads, Send to…, Remove; notes and lyrics in between. */
+  const songCard = (variation: Variation, song: Song): AudioResultCard => {
+    const group = variation.group;
+    const title = titleOf(variation);
+    const name = `${group.stem}${group.count > 1 ? `-${variation.index + 1}` : ''}.mp3`;
+    const extra = h('div', { class: 'vstack gap-2' });
+    const card = audioResultCard({
+      ui,
+      blob: song.blob,
+      name,
+      ...(song.seconds === null ? {} : { seconds: song.seconds }),
+      title: group.count > 1 ? title : name,
+      headingLevel: 4,
+      metaParts: [
+        song.seconds === null ? 'Length unknown' : formatDuration(song.seconds),
+        song.fullSeconds !== null ? `cut from ${formatDuration(song.fullSeconds)}` : null,
+        formatBytes(song.blob.size),
+      ],
+      formats: ['mp3', 'wav'],
+      extra,
+      onRemove: () => forget(variation),
+      focusFallback: () => focusAfter(variation),
+      testId: 'music',
+    });
+    extra.append(
+      ...song.notes.map((note) =>
+        h(
+          'div',
+          { class: 'small text-warning-emphasis', role: 'note', 'data-testid': 'music-note' },
+          note,
+        ),
+      ),
+    );
+    const lyricsElement = lyricsPanel(song.lyrics, card.player, `Lyrics of ${title.toLowerCase()}`);
+    if (lyricsElement) extra.append(lyricsElement);
+    addPlayer(card.player);
+    return card;
+  };
+
+  const drawVariation = (variation: Variation): void => {
+    const title = titleOf(variation);
+    variation.removeButton = null;
+    variation.card.dataset['status'] = variation.status;
+    if (variation.result) {
+      replace(variation.card, variation.result.element);
+      return;
+    }
     let body: (HTMLElement | null)[];
-    if (song && variation.player && variation.handle) {
-      const handle = variation.handle;
-      const name = handle.result.name;
-      const fileStem = name.replace(/\.mp3$/, '');
-      body = [
-        h(
-          'div',
-          { class: 'small text-body-secondary', 'data-testid': 'music-meta' },
-          [
-            formatDuration(song.seconds),
-            song.fullSeconds !== null ? `cut from ${formatDuration(song.fullSeconds)}` : null,
-            formatBytes(song.blob.size),
-          ]
-            .filter(Boolean)
-            .join(' · '),
-        ),
-        song.trimNote
-          ? h('div', { class: 'small text-warning-emphasis', role: 'note' }, song.trimNote)
-          : null,
-        variation.player.element,
-        lyricsPanel(song.lyrics, variation.player, `Lyrics of ${title.toLowerCase()}`),
-        h(
-          'div',
-          { class: 'd-flex flex-wrap gap-2 mt-auto' },
-          exportMenu({
-            filename: fileStem,
-            resultIds: () => [handle.result.id],
-            testId: 'music-download',
-            formats: [
-              {
-                label: 'MP3',
-                extension: 'mp3',
-                icon: 'file-earmark-music',
-                build: () => song.blob,
-              },
-              {
-                label: 'WAV',
-                extension: 'wav',
-                icon: 'file-earmark-music',
-                build: () => transcode(song.blob, 'wav'),
-              },
-            ],
-          }),
-          h(
-            'button',
-            {
-              type: 'button',
-              class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
-              'aria-label': `Remove ${name}`,
-              'data-testid': 'music-remove',
-              onclick: () => removeVariation(variation),
-            },
-            icon('trash'),
-            'Remove',
-          ),
-        ),
-      ];
-    } else if (variation.status === 'queued' || variation.status === 'running') {
+    if (variation.status === 'queued' || variation.status === 'running') {
       body = [
         h(
           'div',
@@ -720,6 +830,18 @@ export function setup(ctx: ToolContext): ToolInstance {
         h('div', { class: 'small text-body-secondary' }, variation.phase),
       ];
     } else {
+      variation.removeButton = h(
+        'button',
+        {
+          type: 'button',
+          class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
+          'aria-label': `Remove ${title.toLowerCase()}`,
+          'data-testid': 'music-remove',
+          onclick: () => removeVariation(variation),
+        },
+        icon('trash'),
+        'Remove',
+      );
       body = [
         h(
           'div',
@@ -727,6 +849,28 @@ export function setup(ctx: ToolContext): ToolInstance {
           variation.status === 'stopped'
             ? 'Stopped before it was ready.'
             : (variation.error ?? 'It failed.'),
+        ),
+        h(
+          'div',
+          { class: 'd-flex flex-wrap gap-2 mt-auto' },
+          // Lyria declining is not retried: the same request would be charged for the same answer.
+          variation.refused
+            ? null
+            : gate.bind(
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
+                    'aria-label': `Retry ${title.toLowerCase()}`,
+                    'data-testid': 'music-retry',
+                    onclick: () => gate.retry({ retry: variation }, 'Compose cannot start now.'),
+                  },
+                  icon('arrow-clockwise'),
+                  'Retry',
+                ),
+              ),
+          variation.removeButton,
         ),
       ];
     }
@@ -738,57 +882,38 @@ export function setup(ctx: ToolContext): ToolInstance {
         h('div', { class: 'card-body vstack gap-2' }, h('h4', { class: 'h6 mb-0' }, title), body),
       ),
     );
-    variation.card.dataset['status'] = variation.status;
-  };
-
-  const removeVariation = (variation: Variation): void => {
-    variation.handle?.remove();
-    variation.player?.dispose();
-    const group = variation.card.closest('section');
-    variation.card.remove();
-    if (group && !group.querySelector('[data-testid="music-variation"]')) group.remove();
-    showEmpty();
-    announce('Removed.');
   };
 
   // --- running --------------------------------------------------------------------------------------------
   let elapsedTimer: ReturnType<typeof setInterval> | null = null;
+  const stopTicker = (): void => {
+    if (elapsedTimer) clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  };
 
-  const compose = async (
-    run: RunHandle,
-    prompt: string,
-    imageUrl: string | null,
-    variation: Variation,
-    total: number,
+  /** The song from a finished (or broken-off) stream: its audio, lyrics and length, cut to the target. */
+  const songFrom = async (
+    result: ChatStreamResult,
+    notes: string[],
     targetLength: number | null,
+    phase: (text: string) => void,
     signal: AbortSignal,
   ): Promise<Song> => {
-    const phase = (text: string): void => {
-      variation.phase = text;
-      drawVariation(variation, total);
-    };
-    const result = await ctx.api.chatStream(songRequest(run.model, prompt, imageUrl), {
-      run,
-      signal,
-      onEvent: (event) => {
-        if (event.type === 'audio') phase('Putting the audio together…');
-      },
-    });
-    if (result.audioChunks.length === 0) {
-      throw new ApiError('Lyria answered without any audio. Try again.', 502, {});
-    }
     // Lyria sends the whole MP3 as one base64 fragment; join any others before decoding once.
     const { blob: full } = base64ToBlob(result.audioChunks.join(''), 'audio/mpeg');
     const lyricsData = parseTimedLyrics(result.text);
-    const fullSeconds = await getAudioDuration(full).catch(() => 0);
-    if (targetLength === null || !(fullSeconds > targetLength + 0.5)) {
-      return {
-        blob: full,
-        seconds: fullSeconds,
-        fullSeconds: null,
-        trimNote: null,
-        lyrics: lyricsData,
-      };
+    const fullSeconds = await durationOf(full);
+    const whole = (extra: string | null): Song => ({
+      blob: full,
+      seconds: fullSeconds,
+      fullSeconds: null,
+      notes: extra ? [...notes, extra] : notes,
+      lyrics: lyricsData,
+    });
+    if (targetLength === null) return whole(null);
+    if (fullSeconds === null) return whole('Its length could not be read, so it was not cut.');
+    if (!(fullSeconds > targetLength + 0.5)) {
+      return whole(`Shorter than the ${formatDuration(targetLength)} target: kept whole.`);
     }
     // The song is paid for: if the cut fails (or Stop lands here), keep it whole and say so.
     phase(`Cutting it to ${formatDuration(targetLength)}…`);
@@ -800,31 +925,176 @@ export function setup(ctx: ToolContext): ToolInstance {
         bitrate: MP3_BITRATE,
         signal,
       });
+      const cut = trimLyrics(lyricsData, targetLength);
       return {
         blob,
-        seconds: await getAudioDuration(blob).catch(() => targetLength),
+        seconds: (await durationOf(blob)) ?? targetLength,
         fullSeconds,
-        trimNote: null,
-        lyrics: lyricsData,
+        notes:
+          cut.dropped > 0
+            ? [
+                ...notes,
+                `Lyrics after ${formatDuration(targetLength)} are not in this audio (${plural(cut.dropped, 'line')}).`,
+              ]
+            : notes,
+        lyrics: cut.lyrics,
       };
     } catch (error) {
-      const note = isAbortError(error)
-        ? 'Stopped while cutting: kept at full length.'
-        : `Could not cut it (${userMessage(error)}); kept at full length.`;
-      return {
-        blob: full,
-        seconds: fullSeconds,
-        fullSeconds: null,
-        trimNote: note,
-        lyrics: lyricsData,
-      };
+      return whole(
+        isAbortError(error)
+          ? 'Stopped while cutting: kept at full length.'
+          : `Could not cut it (${userMessage(error)}); kept at full length.`,
+      );
     }
   };
 
-  const run = async (signal: AbortSignal): Promise<void> => {
-    if (!check()) {
+  const compose = async (
+    run: RunHandle,
+    variation: Variation,
+    signal: AbortSignal,
+  ): Promise<Song> => {
+    const group = variation.group;
+    const phase = (text: string): void => {
+      variation.phase = text;
+      drawVariation(variation);
+    };
+    let result: ChatStreamResult;
+    const notes: string[] = [];
+    try {
+      result = await ctx.api.chatStream(songRequest(group.model, group.prompt, group.imageUrl), {
+        run,
+        signal,
+        onEvent: (event) => {
+          if (event.type === 'audio') phase('Putting the audio together…');
+        },
+      });
+    } catch (error) {
+      // The audio arrives in one piece near the end; a stream that breaks after it still delivered the song.
+      const partial = partialStreamResult(error);
+      if (isAbortError(error) || !partial || partial.audioChunks.length === 0) throw error;
+      const { blob } = base64ToBlob(partial.audioChunks.join(''), 'audio/mpeg');
+      if ((await durationOf(blob)) === null) throw error;
+      result = partial;
+      notes.push(
+        `The connection ended after the song arrived (${userMessage(error)}); it is kept.`,
+      );
+    }
+    if (result.audioChunks.length === 0) {
+      const said = result.text.trim();
+      if (said) {
+        const shown = said.length > REFUSAL_CHARS ? `${said.slice(0, REFUSAL_CHARS)}…` : said;
+        throw new NoMusicError(`Lyria answered without music: “${shown}”`);
+      }
+      throw new ApiError('Lyria answered without any audio. Try again.', 502, {});
+    }
+    return songFrom(result, notes, group.targetLength, phase, signal);
+  };
+
+  /** Shows a variation's outcome in its card (and its song as a session result). */
+  const settle = (
+    variation: Variation,
+    outcome: { status: ItemStatus; value?: Song; error?: unknown },
+  ): void => {
+    variation.status = outcome.status;
+    if (outcome.status === 'failed') {
+      variation.error = userMessage(outcome.error);
+      variation.refused = outcome.error instanceof NoMusicError;
+    }
+    if (outcome.status === 'done' && outcome.value) {
+      variation.song = outcome.value;
+      variation.error = null;
+      variation.result = songCard(variation, outcome.value);
+    }
+    drawVariation(variation);
+  };
+
+  /** History's text for the songs made: a summary, then each song's lyrics (as far as the audio goes). */
+  const historyOutput = (summary: string, made: Variation[], labelled: boolean): string =>
+    [
+      `${summary}.`,
+      ...made.map((variation) => {
+        const song = variation.song!;
+        const label = labelled ? `Variation ${variation.index + 1}` : 'Lyrics';
+        const length = song.seconds === null ? '' : ` (${formatDuration(song.seconds)})`;
+        return `\n${label}${length}:\n${lyricsText(song.lyrics)}`;
+      }),
+    ].join('\n');
+
+  const startTicker = (started: number): void => {
+    stopTicker();
+    const tick = (): void => {
+      const seconds = Math.round((Date.now() - started) / 1000);
+      ui.progress(`Composing… ${seconds} s`);
+    };
+    ui.status('Composing…');
+    elapsedTimer = setInterval(tick, 1000);
+  };
+
+  /** A failed variation again, as a run of one with the same prompt, image and target. */
+  const retryVariation = async (signal: AbortSignal, variation: Variation): Promise<void> => {
+    const group = variation.group;
+    if (!group.variations.includes(variation) || variation.song) return;
+    const each = await ctx.models.estimate({ kind: 'music', model: group.model }).catch(() => null);
+    const handle = await ctx.beginRun(
+      {
+        model: group.model,
+        title: `Retry: variation ${variation.index + 1}`,
+        prompt: '',
+        settings: group.settings,
+        estimateUsd: each,
+      },
+      signal,
+    );
+    const length = LENGTHS.find((entry) => entry.id === group.model);
+    Object.assign(variation, {
+      status: 'running',
+      error: null,
+      refused: false,
+      phase: `Composing: Lyria takes ${length?.wait ?? 'a while'}…`,
+    });
+    drawVariation(variation);
+    startTicker(Date.now());
+    try {
+      let song: Song;
+      try {
+        song = await compose(handle, variation, handle.signal);
+      } catch (error) {
+        stopTicker();
+        settle(variation, { status: isStop(error) ? 'stopped' : 'failed', error });
+        ui.status(isStop(error) ? 'Stopped' : `Failed: ${userMessage(error)}`);
+        await handle.fail(error);
+        // The card shows the error (with Retry when it is worth it); no second message for it.
+        markPresented(error);
+        throw error;
+      }
+      stopTicker();
+      settle(variation, { status: 'done', value: song });
+      const summary = `Variation ${variation.index + 1} ready`;
+      ui.status(summary);
+      await handle.finish({
+        output: historyOutput(summary, [variation], true),
+        meta: {
+          variations: 1,
+          failed: 0,
+          seconds: [roundSeconds(variation.song!.seconds)],
+          retried: true,
+          ...(group.targetLength ? { targetSeconds: group.targetLength } : {}),
+        },
+      });
+    } finally {
+      stopTicker();
+    }
+  };
+
+  const run = async (signal: AbortSignal, arg?: RetryArg): Promise<void> => {
+    if (arg) {
+      await retryVariation(signal, arg.retry);
+      return;
+    }
+    const invalid = check();
+    if (invalid) {
       ui.status('Fix the highlighted fields first.');
-      (lyrics.classList.contains('is-invalid') ? lyrics : target).focus();
+      focusField(invalid);
       return;
     }
     const model = ctx.model().model;
@@ -833,119 +1103,116 @@ export function setup(ctx: ToolContext): ToolInstance {
     const targetLength = targetSeconds();
     const prompt = buildPrompt(form(), image !== null);
     const imageFile = image?.file ?? null;
+    const formSettings: Record<string, unknown> = settings();
+
+    // The image is read before anything is sent or drawn: one that cannot be read stops here, at no cost.
+    let imageUrl: string | null = null;
+    if (imageFile) {
+      try {
+        imageUrl = await (
+          await import('../../core/media/image')
+        ).toDataUrl(imageFile, { maxDimension: IMAGE_MAX_SIDE, maxBytes: 1024 * 1024 });
+      } catch (error) {
+        ui.status('The reference image could not be read.');
+        throw new InvalidInputError(
+          `The reference image ${imageFile.name} could not be read (${userMessage(error)}). Remove it or choose another.`,
+        );
+      }
+    }
 
     // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
     const handle = await ctx.beginRun({}, signal);
     const started = Date.now();
-    const stem = `music-${new Date(started).toISOString().slice(0, 19).replace(/[T:]/g, '-')}`;
     const length = LENGTHS.find((entry) => entry.id === model);
-    const group: Variation[] = Array.from({ length: count }, (_, index) => ({
+    const group: Group = {
+      model,
+      count,
+      prompt,
+      imageUrl,
+      targetLength,
+      stem: `music-${new Date(started).toISOString().slice(0, 19).replace(/[T:]/g, '-')}`,
+      settings: formSettings,
+      section: h('section', { class: 'vstack gap-2', 'data-testid': 'music-group' }),
+      variations: [],
+    };
+    group.variations = Array.from({ length: count }, (_, index) => ({
+      group,
       index,
       status: 'queued',
-      phase: 'Waiting for Lyria…',
+      phase: `Composing: Lyria takes ${length?.wait ?? 'a while'}…`,
       song: null,
       error: null,
+      refused: false,
       card: h('div', { class: 'col', 'data-testid': 'music-variation' }),
-      handle: null,
-      player: null,
+      result: null,
+      removeButton: null,
     }));
-    const columns =
-      count === 1 ? '' : count === 2 ? 'row-cols-md-2' : 'row-cols-md-2 row-cols-xl-3';
-    groups.prepend(
+    // Side by side, two at most: the output zone is about half the page.
+    replace(
+      group.section,
       h(
-        'section',
-        { class: 'vstack gap-2', 'data-testid': 'music-group' },
-        h(
-          'h3',
-          { class: 'h6 mb-0 text-body-secondary' },
-          `${formatDateTime(started)} · ${length?.model ?? model}${targetLength ? ` · cut to ${formatDuration(targetLength)}` : ''}`,
-        ),
-        h(
-          'div',
-          { class: ['row row-cols-1 g-3', columns] },
-          group.map((variation) => variation.card),
-        ),
+        'h3',
+        { class: 'h6 mb-0 text-body-secondary' },
+        `${formatDateTime(started)} · ${length?.model ?? model}${targetLength ? ` · target ${formatDuration(targetLength)}` : ''}`,
+      ),
+      h(
+        'div',
+        { class: ['row row-cols-1 g-3', count > 1 && 'row-cols-xl-2'] },
+        group.variations.map((variation) => variation.card),
       ),
     );
+    groups.unshift(group);
+    groupsList.prepend(group.section);
     showEmpty();
-    for (const variation of group) drawVariation(variation, count);
+    for (const variation of group.variations) drawVariation(variation);
 
-    const tick = (): void => {
-      const seconds = Math.round((Date.now() - started) / 1000);
-      ui.status(`Composing… ${seconds} s`);
-    };
-    tick();
-    elapsedTimer = setInterval(tick, 1000);
+    startTicker(started);
     try {
-      const imageUrl = imageFile
-        ? await (
-            await import('../../core/media/image')
-          ).toDataUrl(imageFile, {
-            maxDimension: IMAGE_MAX_SIDE,
-            maxBytes: 1024 * 1024,
-          })
-        : null;
-      for (const variation of group) {
-        variation.phase = `Composing: Lyria takes ${length?.wait ?? 'a while'}…`;
-        drawVariation(variation, count);
-      }
       const outcome = await runItems({
-        items: group,
+        items: group.variations,
         concurrency: count,
         signal: handle.signal,
-        work: (variation, itemSignal) =>
-          compose(handle, prompt, imageUrl, variation, count, targetLength, itemSignal),
-        onItem: (item) => {
-          const variation = item.item;
-          variation.status = item.status;
-          if (item.status === 'failed') variation.error = userMessage(item.error);
-          if (item.status === 'done' && item.value) {
-            const song = item.value;
-            const name = `${stem}${count > 1 ? `-${variation.index + 1}` : ''}.mp3`;
-            variation.song = song;
-            variation.handle = ui.addResult({ kind: 'audio', name, blob: song.blob });
-            variation.player = audioPlayer({
-              blob: song.blob,
-              label: `${name}, ${formatDuration(song.seconds)}`,
-              testId: 'music-player',
-            });
-          }
-          drawVariation(variation, count);
-        },
+        work: (variation, itemSignal) => compose(handle, variation, itemSignal),
+        onItem: (item) => settle(item.item, item),
       });
-      const made = group.filter((variation) => variation.song);
+      const made = group.variations.filter((variation) => variation.song);
       const summary =
         outcome.failed > 0
           ? `${made.length} of ${plural(count, 'variation')} ready; ${outcome.failed} failed`
           : `${plural(made.length, 'variation')} ready`;
+      // The ticker stops first, or a tick during the History write would overwrite the summary.
+      stopTicker();
       ui.status(summary);
-      announce('The music is ready.');
       await handle.finish({
-        output: [
-          `${summary}.`,
-          ...made.map(
-            (variation) =>
-              `\n${count > 1 ? `Variation ${variation.index + 1}` : 'Lyrics'} (${formatDuration(variation.song!.seconds)}):\n${lyricsText(variation.song!.lyrics)}`,
-          ),
-        ].join('\n'),
+        output: historyOutput(summary, made, count > 1),
         meta: {
           variations: count,
           failed: outcome.failed,
-          seconds: made.map((variation) => Math.round(variation.song!.seconds * 10) / 10),
+          seconds: made.map((variation) => roundSeconds(variation.song!.seconds)),
           ...(targetLength ? { targetSeconds: targetLength } : {}),
         },
       });
     } catch (error) {
+      stopTicker();
+      // Nothing is left spinning: cards still waiting say they were stopped (and offer Retry and Remove).
+      for (const variation of group.variations) {
+        if (variation.status === 'queued' || variation.status === 'running') {
+          settle(variation, { status: 'stopped' });
+        }
+      }
       ui.status(isStop(error) ? 'Stopped' : 'Failed');
       await handle.fail(error);
       throw error;
     } finally {
-      if (elapsedTimer) clearInterval(elapsedTimer);
-      elapsedTimer = null;
+      stopTicker();
     }
   };
 
-  ui.runner({ label: 'Compose', icon: 'music-note-beamed', run });
+  const runner = ui.runner<RetryArg>({ label: 'Compose', icon: 'music-note-beamed', run });
+  // A Retry button disappears when its card starts again: focus goes to Stop (or back to Compose).
+  const gate = retryGate(runner, {
+    fallback: () => (runner.busy ? runner.stopButton : runner.button),
+  });
 
   // --- state ----------------------------------------------------------------------------------------------
   const settings = () => ({
