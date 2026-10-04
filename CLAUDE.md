@@ -28,7 +28,7 @@ src/core/        one folder per service (api, keys, oauth, models, settings, run
                  helpers in util.ts, composition root in index.ts
 src/ui/          dom.ts, markdown.ts, format.ts, bootstrap.ts (the only Bootstrap JS imports), shell/ (mountPage,
                  navbar, palette, leave guard, appearance), feedback/ (toasts, dialogs, presentError), components/
-                 (shared parts), tool/ (mountTool and the tool contract; coming-soon.ts = stand-in until a tool is built)
+                 (shared parts), tool/ (mountTool and the tool contract)
 src/tools/<id>/  manifest.json + main.ts (+ tool-local modules and tests); registry.ts + types.ts beside them
 src/pages/       code for the platform pages
 src/styles/      main.scss (Bootstrap + Bootstrap Icons + the few variable overrides in _variables.scss)

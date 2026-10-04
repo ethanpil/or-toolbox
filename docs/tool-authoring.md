@@ -1,6 +1,6 @@
 # Building a tool
 
-How to build one of the 14 tools on the Stage 2 shell. Read [CLAUDE.md](../CLAUDE.md) first (architecture rules and conventions are binding) and [openrouter-api.md](openrouter-api.md) for the endpoint you call. Every tool page today renders through `mountTool` with the stand-in `comingSoon` instance; building a tool means replacing that instance with your own.
+How to build one of the 14 tools on the Stage 2 shell. Read [CLAUDE.md](../CLAUDE.md) first (architecture rules and conventions are binding) and [openrouter-api.md](openrouter-api.md) for the endpoint you call. Every tool page renders through `mountTool` with its own setup.
 
 ## The contract in one screen
 
@@ -558,12 +558,11 @@ export function setup(ctx: ToolContext): ToolInstance {
 mountTool(getTool('chat'), setup);
 ```
 
-## Replacing the stand-in
+## Checklist
 
 1. Write `setup` in `src/tools/<id>/` (split into modules as it grows); keep `main.ts` to the `mountTool` call, and the manifest's `accepts`, `capabilities` (primary first) and `lazyLibs` true to what the tool does.
-2. Remove the `comingSoon` import from your `main.ts`. When the last tool is done, delete `src/ui/tool/coming-soon.ts`.
-3. Main prompt field: `data-testid="tool-prompt"`. Implement `getState`/`applyState` (exact round trip), `estimate` (and call `ui.refreshEstimate()` on input changes), `sample()` (onboarding offers it), and `onFiles`/`onReceive` if the manifest accepts anything.
-4. Follow the error rule: `output.fail(error)` / `run.fail(error)` / rethrow; `presentError` outside the runner. Call `beginRun` before touching tool state; batches go through `runItems`, per-item Retry through `runner.trigger(arg)`, paid extras (the PDF parser) through `addons()`.
-5. Media: lazy imports, `stitchAudio`, `isolateImage`, `zipFiles`/`zipSync`, explicit ffmpeg `-threads`; stay inside the 80 KB budget.
-6. Tests: unit tests for the pipeline and the tool through `createToolTestContext`, and an e2e spec against the mock (run, error, Stop, files, prompts round trip).
-7. Check the page in both themes at 320 px and on a desktop, with the keyboard only.
+2. Main prompt field: `data-testid="tool-prompt"`. Implement `getState`/`applyState` (exact round trip), `estimate` (and call `ui.refreshEstimate()` on input changes), `sample()` (onboarding offers it), and `onFiles`/`onReceive` if the manifest accepts anything.
+3. Follow the error rule: `output.fail(error)` / `run.fail(error)` / rethrow; `presentError` outside the runner. Call `beginRun` before touching tool state; batches go through `runItems`, per-item Retry through `runner.trigger(arg)`, paid extras (the PDF parser) through `addons()`.
+4. Media: lazy imports, `stitchAudio`, `isolateImage`, `zipFiles`/`zipSync`, explicit ffmpeg `-threads`; stay inside the 80 KB budget.
+5. Tests: unit tests for the pipeline and the tool through `createToolTestContext`, and an e2e spec against the mock (run, error, Stop, files, prompts round trip).
+6. Check the page in both themes at 320 px and on a desktop, with the keyboard only.

@@ -4,7 +4,6 @@ import { getDb } from '../../core/storage/db';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import { getTool } from '../../tools/registry';
 import { h } from '../dom';
-import { comingSoon } from './coming-soon';
 import { createToolTestContext, type ToolTestContext } from './testing';
 import type { ToolInstance, ToolSetup } from './types';
 
@@ -46,9 +45,13 @@ describe('createToolTestContext', () => {
     expect(tool.getState()).toEqual(state);
   });
 
-  it('mounts the stand-in instance, with its disabled Run and the tool-prompt field', async () => {
+  it('mounts a tool with a disabled Run, the tool-prompt field and a sample', async () => {
     t = createToolTestContext(getTool('ocr'));
-    const tool = await t.mount(comingSoon);
+    const tool = await t.mount((ctx) => {
+      const base = tinyTool(ctx) as ToolInstance;
+      ctx.ui.runner({ run: () => Promise.resolve() }).setDisabled('Not ready');
+      return { ...base, sample: () => base.applyState({ prompt: 'A sample', settings: {} }) };
+    });
     expect(t.zones.input.querySelector('[data-testid="tool-prompt"]')).not.toBeNull();
     expect(t.runners[0]?.button.getAttribute('aria-disabled')).toBe('true');
     await tool.sample?.();
