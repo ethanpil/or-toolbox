@@ -120,8 +120,12 @@ export async function openMedia<K extends 'audio' | 'video'>(
   };
 }
 
-/** Seeks far past the end so the browser works out the real length, then rewinds. */
-async function resolveDuration(element: HTMLMediaElement): Promise<void> {
+/**
+ * Seeks far past the end so the browser works out the real length, then rewinds. For an element whose
+ * `duration` is Infinity (a MediaRecorder WebM): until then it cannot be seeked. Resolves either way (at most
+ * about 10 s).
+ */
+export async function resolveDuration(element: HTMLMediaElement): Promise<void> {
   const known = (): boolean => Number.isFinite(element.duration);
   const settled = waitForEvent(element, ['durationchange', 'timeupdate'], 5000).catch(() => '');
   element.currentTime = 1e101;

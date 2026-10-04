@@ -12,6 +12,7 @@ import { getServiceWorkerReport, type ServiceWorkerReport } from '../core/sw-reg
 import { clear, h } from '../ui/dom';
 import { formatInt } from '../ui/format';
 import { mountPage } from '../ui/shell/index';
+import { progressBar } from '../ui/components/progress-bar';
 
 // --- environment ------------------------------------------------------------
 
@@ -172,20 +173,12 @@ function ffmpegPanel(): HTMLElement {
   const loadTime = h('span', { 'data-testid': 'diag-ffmpeg-load-ms', 'data-value': '' }, '–');
   const runTime = h('span', { 'data-testid': 'diag-ffmpeg-run-ms', 'data-value': '' }, '–');
   const output = h('span', { 'data-testid': 'diag-ffmpeg-output', 'data-value': '' }, '–');
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress mb-3',
-      role: 'progressbar',
-      'aria-label': 'ffmpeg core download',
-      'aria-valuemin': 0,
-      'aria-valuemax': 100,
-      'aria-valuenow': 0,
-      'data-testid': 'diag-ffmpeg-progress',
-    },
-    progressBar,
-  );
+  const progress = progressBar({
+    label: 'ffmpeg core download',
+    class: 'mb-3',
+    testId: 'diag-ffmpeg-progress',
+  });
+  progress.update(0, 100);
   const preview = h('div', { 'data-testid': 'diag-ffmpeg-preview' });
   const log = h('pre', {
     class: 'small bg-body-tertiary border rounded p-2 mb-0',
@@ -208,8 +201,7 @@ function ffmpegPanel(): HTMLElement {
   };
   const setProgress = ({ loaded, total }: FfmpegDownloadProgress): void => {
     const percent = Math.min(100, Math.round((loaded / total) * 100));
-    progressBar.style.width = `${percent}%`;
-    progress.setAttribute('aria-valuenow', String(percent));
+    progress.update(percent, 100, `${percent}%`);
   };
 
   let previewUrl: string | undefined;
@@ -331,7 +323,7 @@ function ffmpegPanel(): HTMLElement {
         button('Run ffmpeg test', 'diag-ffmpeg-run', false),
         button('Run with the single-threaded core', 'diag-ffmpeg-run-single', true),
       ),
-      progress,
+      progress.element,
       h(
         'table',
         { class: 'table align-middle' },

@@ -19,7 +19,8 @@ import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
-import type { RunnerState, ToolContext, ToolInstance } from '../../ui/tool/index';
+import type { ToolContext, ToolInstance } from '../../ui/tool/index';
+import { retryGate } from '../../ui/tool/retry-gate';
 import {
   csvZip,
   tableCsv,
@@ -40,6 +41,7 @@ import {
   parseTables,
   toTable,
 } from './tables';
+import { progressBar } from '../../ui/components/progress-bar';
 
 interface PageState {
   key: string;
@@ -213,25 +215,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     compact: true,
     testId: 'te-empty',
   });
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress',
-      role: 'progressbar',
-      'aria-label': 'Pages read',
-      'aria-valuemin': '0',
-      hidden: true,
-      'data-testid': 'te-progress',
-    },
-    progressBar,
-  );
+  const progress = progressBar({ label: 'Pages read', hidden: true, testId: 'te-progress' });
   ui.output.append(
     h(
       'div',
       { class: 'vstack gap-3' },
       h('div', { class: 'd-flex flex-wrap align-items-center gap-2' }, summary, exportSlot),
-      progress,
+      progress.element,
       failedBox,
       truncatedBox,
       empty,
@@ -298,12 +288,12 @@ export function setup(ctx: ToolContext): ToolInstance {
         ? ''
         : `${describeTables(tables)} · ${done} of ${plural(pages.length, 'page')} read`;
     empty.hidden = tables.length > 0 || reading;
-    progress.hidden = !reading;
-    progress.setAttribute('aria-valuemax', String(pages.length));
-    progress.setAttribute('aria-valuenow', String(done + failed.length));
-    progressBar.style.width = pages.length
-      ? `${Math.round(((done + failed.length) / pages.length) * 100)}%`
-      : '0%';
+    progress.element.hidden = !reading;
+    progress.update(
+      done + failed.length,
+      pages.length,
+      `${done + failed.length} of ${plural(pages.length, 'page')}`,
+    );
     failedBox.hidden = reading || failed.length === 0;
     replaceWith(
       failedBox,
@@ -466,40 +456,26 @@ export function setup(ctx: ToolContext): ToolInstance {
           completionTokens: count * 2500,
         });
 
-  /** The runner's state, kept by `runner.subscribe`: the Retry button follows it. */
-  let runnerState: RunnerState = { busy: false, disabledReason: null };
-  /** Why a Retry cannot start now (Run busy or disabled), or null. */
-  const retryBlocked = (): string | null =>
-    runnerState.busy ? 'Wait until the current run ends.' : runnerState.disabledReason;
-  /** Shows a Retry button as available or not, with the reason; it stays focusable (aria-disabled). */
-  const setRetryState = (button: HTMLElement): void => {
-    const reason = retryBlocked();
-    button.setAttribute('aria-disabled', String(reason !== null));
-    button.classList.toggle('disabled', reason !== null);
-    button.title = reason ?? '';
-  };
-
+  /** A Retry button that follows the runner (see `retryGate`). */
   function retryButton(keys: string[]): HTMLButtonElement {
-    const button = h(
-      'button',
-      {
-        type: 'button',
-        class: 'btn btn-sm btn-warning',
-        'data-retry': '',
-        'data-focus-key': 'retry-failed',
-        'data-testid': 'te-retry-failed',
-        onclick: () => retry(keys),
-      },
-      'Retry',
+    return gate.bind(
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'btn btn-sm btn-warning',
+          'data-focus-key': 'retry-failed',
+          'data-testid': 'te-retry-failed',
+          onclick: () => retry(keys),
+        },
+        'Retry',
+      ),
     );
-    setRetryState(button);
-    return button;
   }
 
   /** Reads `keys` again (a Retry); the runner's own Retry after a refusal repeats the same pages. */
   function retry(keys: string[]): void {
-    if (keys.length === 0) return;
-    if (!runner.trigger(keys).started) announce(retryBlocked() ?? 'Reading cannot start now.');
+    if (keys.length > 0) gate.retry(keys, 'Reading cannot start now.');
   }
 
   const CUT_OFF_NOTE =
@@ -644,12 +620,8 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   const runner = ui.runner<string[]>({ label: 'Find tables', icon: 'table', run });
-  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry button.
-  runner.subscribe((state) => {
-    runnerState = state;
-    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]'))
-      setRetryState(button);
-  });
+  // The Retry button follows Run (busy, disabled by this tool or the framework).
+  const gate = retryGate(runner);
   renderSummary();
 
   const settings = () => ({

@@ -134,6 +134,10 @@ export function createToolTestContext(
     status: (text) => {
       statusText = text;
     },
+    progress: (text) => {
+      statusText = text;
+    },
+    holdWork: (description) => core.results.hold(description),
     addResult: (result) => resultHandle(core, core.results.add({ tool: manifest.id, ...result })),
     sendTo: (items) => {
       sent.push(items);

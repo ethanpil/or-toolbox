@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import AxeBuilder from '@axe-core/playwright';
-import { expect, type Page, type TestInfo } from '@playwright/test';
+import { expect, type Page, type Request, type TestInfo } from '@playwright/test';
 import { preview } from 'vite';
 import { discoverPages } from '../../vite-plugins/pages.ts';
 import { basePath, PREVIEW_PORT } from '../../vite-plugins/site.ts';
@@ -30,19 +30,41 @@ export function isDevServer(testInfo: TestInfo): boolean {
   return testInfo.config.metadata.server === 'dev';
 }
 
+export interface WatchOptions {
+  /**
+   * URL paths (exact, e.g. `'/api/v1/chat/completions'`) of requests the app aborts on purpose: Stop cancels the
+   * requests in flight, and the API client cancels a stream once it has read `data: [DONE]`, which Chromium can
+   * report before it has seen the end of the body. Their `net::ERR_ABORTED` is not a problem; any other failure
+   * of them still is.
+   */
+  allowAborted?: readonly string[];
+}
+
 /**
  * Collects everything that should never happen on a healthy page: console
  * errors, uncaught exceptions, failed responses and CSP violations. Call
  * before the first `page.goto()`, then assert the returned list is empty.
  *
+ * Always ignored: `net::ERR_ABORTED` on an `<audio>`/`<video>` read of a
+ * `blob:` URL (the element cancels range reads it no longer needs: after the
+ * metadata, on a seek). Aborts the app causes itself are opt-in per test
+ * through `allowAborted`.
+ *
  * ```ts
- * const problems = await watchForProblems(page);
- * await page.goto('settings/');
+ * const problems = await watchForProblems(page, { allowAborted: ['/api/v1/chat/completions'] });
+ * await page.goto('tools/chat/');
  * expect(problems).toEqual([]);
  * ```
  */
-export async function watchForProblems(page: Page): Promise<string[]> {
+export async function watchForProblems(
+  page: Page,
+  { allowAborted = [] }: WatchOptions = {},
+): Promise<string[]> {
   const problems: string[] = [];
+  const expectedAbort = (request: Request): boolean =>
+    request.url().startsWith('blob:')
+      ? request.resourceType() === 'media'
+      : allowAborted.includes(new URL(request.url()).pathname);
 
   page.on('console', (message) => {
     if (message.type() === 'error') problems.push(`console.error: ${message.text()}`);
@@ -54,9 +76,9 @@ export async function watchForProblems(page: Page): Promise<string[]> {
     if (response.status() >= 400) problems.push(`HTTP ${response.status()}: ${response.url()}`);
   });
   page.on('requestfailed', (request) => {
-    problems.push(
-      `request failed: ${request.url()} (${request.failure()?.errorText ?? 'unknown'})`,
-    );
+    const errorText = request.failure()?.errorText ?? 'unknown';
+    if (errorText === 'net::ERR_ABORTED' && expectedAbort(request)) return;
+    problems.push(`request failed: ${request.url()} (${errorText})`);
   });
 
   // Browsers word CSP console messages differently (or not at all), so report

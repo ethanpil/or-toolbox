@@ -1,7 +1,8 @@
 /**
  * Session results: images, audio, video and files produced in this page. They live in memory only (never
- * in storage). While anything is not downloaded, a `beforeunload` handler asks the browser to confirm
- * leaving; the shell adds its own in-app dialog on top.
+ * in storage). While anything is not downloaded, or a tool holds unsaved work (`hold()`: a recording in
+ * progress, paid parts not joined), a `beforeunload` handler asks the browser to confirm leaving; the shell adds
+ * its own in-app dialog on top.
  */
 
 import type { CoreServices, ResultKind, ResultsService, SessionResult } from '../types';
@@ -30,6 +31,8 @@ export function createResultsService(_core: CoreServices): ResultsService {
   const results = new Map<string, SessionResult>();
   const urls = new Map<string, string>();
   const listeners = new Set<() => void>();
+  /** Unsaved work tools hold, by token (insertion order = oldest first). */
+  const held = new Map<symbol, string>();
   let guarded = false;
 
   const onBeforeUnload = (event: BeforeUnloadEvent): void => {
@@ -39,7 +42,7 @@ export function createResultsService(_core: CoreServices): ResultsService {
   };
 
   const changed = (): void => {
-    const needGuard = [...results.values()].some((result) => !result.downloaded);
+    const needGuard = held.size > 0 || [...results.values()].some((result) => !result.downloaded);
     if (typeof window !== 'undefined' && needGuard !== guarded) {
       if (needGuard) window.addEventListener('beforeunload', onBeforeUnload);
       else window.removeEventListener('beforeunload', onBeforeUnload);
@@ -119,6 +122,20 @@ export function createResultsService(_core: CoreServices): ResultsService {
         return `${count} ${NOUNS[kind][count === 1 ? 0 : 1]}`;
       });
       return `${joinList(parts)} not downloaded`;
+    },
+    hold(description) {
+      const token = Symbol(description);
+      held.set(token, description);
+      changed();
+      return () => {
+        if (held.delete(token)) changed();
+      };
+    },
+    holds: () => [...held.values()],
+    releaseHolds() {
+      if (held.size === 0) return;
+      held.clear();
+      changed();
     },
     async downloadAll() {
       const todo = pending();

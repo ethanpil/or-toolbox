@@ -828,6 +828,15 @@ export interface ResultsService {
   summary(): string | null;
   /** Downloads every pending result (one ZIP when more than one). */
   downloadAll(): Promise<void>;
+  /**
+   * Marks unsaved in-memory work that is not a downloadable result (a recording in progress, paid parts not
+   * joined yet): leaving the page asks first, naming `description`. Returns the release (idempotent).
+   */
+  hold(description: string): () => void;
+  /** Descriptions of the work held now, oldest first. */
+  holds(): string[];
+  /** Drops every hold (the user chose to leave anyway). */
+  releaseHolds(): void;
   subscribe(fn: () => void): () => void;
 }
 

@@ -152,8 +152,19 @@ export interface ToolUi {
    * `refreshEstimate`; a value set here is what `beginRun` books until the next refresh.
    */
   setEstimate: (usd: number | null, note?: string) => void;
-  /** Short status text, announced politely (e.g. "Page 3 of 20"). Empty string clears it. */
+  /** A state change in the status line, announced politely ("Reading 3 pages…", "Done"). Empty string clears it. */
   status: (text: string) => void;
+  /**
+   * A ticking counter in the same line ("Composing… 12 s", "18 of 75 parts", "40%"): shown at once, announced at
+   * most once every 10 s, so screen readers are not flooded. Use `status` for the start and the end of a phase.
+   */
+  progress: (text: string) => void;
+  /**
+   * Marks unsaved in-memory work that is not a downloadable result (a recording in progress, paid parts not
+   * joined): leaving the page asks first, naming `description`. Call the returned function when the work is
+   * saved or discarded (safe to call twice). Downloadable results use `addResult` instead.
+   */
+  holdWork: (description: string) => () => void;
   /** Registers a binary result with the leave guard and returns download helpers. */
   addResult: (input: { kind: ResultKind; name: string; blob: Blob }) => ResultHandle;
   /** Opens the "Send to…" chooser for these items (tools whose `accepts` match). */

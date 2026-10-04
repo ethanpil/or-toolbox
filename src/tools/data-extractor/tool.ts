@@ -21,7 +21,6 @@ import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
 import { imageViewer } from '../../ui/components/image-viewer';
 import { focusKey, h, replace } from '../../ui/dom';
 import { confirmDialog, promptDialog } from '../../ui/feedback/dialogs';
-import { announce } from '../../ui/feedback/announce';
 import { isStop, presentError } from '../../ui/feedback/errors';
 import { openModal } from '../../ui/feedback/modal';
 import { toast } from '../../ui/feedback/toast';
@@ -29,7 +28,8 @@ import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
-import type { RunnerState, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
+import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
+import { retryGate } from '../../ui/tool/retry-gate';
 import { schemaBuilder } from './builder';
 import {
   buildRequest,
@@ -54,6 +54,7 @@ import {
 import { DEFAULT_PRESET, presetById, PRESETS } from './presets';
 import { reviewGrid } from './review';
 import { type FieldDef, fieldLabel, readFields } from './schema';
+import { progressBar } from '../../ui/components/progress-bar';
 
 interface SavedSchema {
   id: string;
@@ -476,7 +477,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     },
     onRetry: (doc) => retry([doc.key]),
     onSource: (doc) => void showSource(doc),
-    retryBlocked: () => retryBlocked(),
+    bindRetry: (button) => gate.bind(button),
   });
   const gridBox = h('div', { hidden: true }, grid.element);
   const empty = emptyState({
@@ -497,7 +498,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       type: 'button',
       class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
       hidden: true,
-      'data-retry': '',
       'data-testid': 'de-retry-failed',
       onclick: () =>
         retry(
@@ -509,19 +509,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     icon('arrow-clockwise'),
     'Retry failed',
   );
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress',
-      role: 'progressbar',
-      'aria-label': 'Documents extracted',
-      'aria-valuemin': '0',
-      hidden: true,
-      'data-testid': 'de-progress',
-    },
-    progressBar,
-  );
+  const progress = progressBar({
+    label: 'Documents extracted',
+    hidden: true,
+    testId: 'de-progress',
+  });
   ui.output.append(
     h(
       'div',
@@ -533,7 +525,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         retryFailed,
         exportSlot,
       ),
-      progress,
+      progress.element,
       empty,
       gridBox,
     ),
@@ -615,12 +607,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
             .filter(Boolean)
             .join(' · ');
     retryFailed.hidden = failed.length === 0 || reading;
-    progress.hidden = total === 0 || !reading;
-    progress.setAttribute('aria-valuemax', String(total));
-    progress.setAttribute('aria-valuenow', String(done.length + failed.length));
-    progressBar.style.width = total
-      ? `${Math.round(((done.length + failed.length) / total) * 100)}%`
-      : '0%';
+    progress.element.hidden = total === 0 || !reading;
+    progress.update(
+      done.length + failed.length,
+      total,
+      `${done.length + failed.length} of ${plural(total, 'document')}`,
+    );
     // The formats change with the batch's fields only; the menu is updated in place (an open one stays open).
     if (menuFields !== gridFields || menuDisabled !== (done.length === 0)) {
       menuFields = gridFields;
@@ -791,17 +783,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     doc.edited = [];
   };
 
-  /** The runner's state, kept by `runner.subscribe`: Retry buttons follow it. */
-  let runnerState: RunnerState = { busy: false, disabledReason: null };
-  /** Why a Retry cannot start now (Run busy or disabled), or null. */
-  function retryBlocked(): string | null {
-    return runnerState.busy ? 'Wait until the current run ends.' : runnerState.disabledReason;
-  }
-
   /** Extracts `keys` again (a Retry); the runner's own Retry after a refusal repeats the same documents. */
   function retry(keys: string[]): void {
-    if (keys.length === 0) return;
-    if (!runner.trigger(keys).started) announce(retryBlocked() ?? 'Extracting cannot start now.');
+    if (keys.length > 0) gate.retry(keys, 'Extracting cannot start now.');
   }
 
   const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
@@ -915,16 +899,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   };
 
   const runner = ui.runner<string[]>({ label: 'Extract', icon: 'braces', run });
-  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry buttons.
-  runner.subscribe((state) => {
-    runnerState = state;
-    const reason = retryBlocked();
-    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]')) {
-      button.setAttribute('aria-disabled', String(reason !== null));
-      button.classList.toggle('disabled', reason !== null);
-      button.title = reason ?? '';
-    }
-  });
+  // Retry buttons follow Run (busy, disabled by this tool or the framework).
+  const gate = retryGate(runner);
+  gate.bind(retryFailed);
   renderSchemaBar();
   renderSummary();
 

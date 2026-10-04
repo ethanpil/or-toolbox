@@ -4,8 +4,9 @@
  * A tool computes it in `ToolInstance.estimate(model)` (from its current input); the framework asks for it when the
  * model changes (header chip, settings, a catalog refresh) and whenever the tool calls `ui.refreshEstimate()`
  * because its input changed. Answers can arrive out of order (catalog reads are async), so only the newest request
- * may update the badge. `current()` is what `ctx.beginRun` books when the spec has no `estimateUsd`: the latest
- * estimate if it was computed for this model and nothing changed since, else a fresh one.
+ * may update the badge. `current()` is what `ctx.beginRun` books when the spec has no `estimateUsd`: always a fresh
+ * computation for the current input and model (a paste followed by Ctrl+Enter must not book the estimate of the
+ * text before it, whatever the tool's debounce), unless the tool set its own value with `ui.setEstimate`.
  */
 
 import { withAddons } from '../../core/runs/addons';
@@ -31,7 +32,7 @@ export interface EstimateTrackerOptions {
 export interface EstimateTracker {
   /** Recomputes now; resolves with the value (or null), also when a newer request overtook it. */
   refresh(): Promise<number | null>;
-  /** The latest estimate when still valid for the current model and input, otherwise a fresh one. */
+  /** A fresh estimate for the current input and model (shown too), or the tool's own value from `set`. */
   current(): Promise<number | null>;
   /** A value set by the tool itself (`ui.setEstimate`): shown, and current until the next change. */
   set(usd: number | null, note?: string): void;
@@ -40,7 +41,12 @@ export interface EstimateTracker {
 export function createEstimateTracker(options: EstimateTrackerOptions): EstimateTracker {
   /** Bumped by every refresh and manual set; a result is applied only if its request is still the newest. */
   let version = 0;
-  let latest: { version: number; model: string | null; usd: number | null } | null = null;
+  let latest: {
+    version: number;
+    model: string | null;
+    usd: number | null;
+    manual: boolean;
+  } | null = null;
 
   const refresh = async (): Promise<number | null> => {
     const mine = ++version;
@@ -55,7 +61,7 @@ export function createEstimateTracker(options: EstimateTrackerOptions): Estimate
       }
     }
     if (mine === version) {
-      latest = { version: mine, model, usd };
+      latest = { version: mine, model, usd, manual: false };
       options.show(usd);
     }
     return usd;
@@ -64,14 +70,15 @@ export function createEstimateTracker(options: EstimateTrackerOptions): Estimate
   return {
     refresh,
     async current() {
-      if (latest && latest.version === version && latest.model === options.model()) {
+      // Only a value the tool set itself is taken as is; a computed one may predate the input.
+      if (latest?.manual && latest.version === version && latest.model === options.model()) {
         return latest.usd;
       }
       return refresh();
     },
     set(usd, note) {
       version++;
-      latest = { version, model: options.model(), usd };
+      latest = { version, model: options.model(), usd, manual: true };
       options.show(usd, note);
     },
   };

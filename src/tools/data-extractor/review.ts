@@ -28,8 +28,8 @@ export interface ReviewGridOptions {
   onEdit: (doc: DocResult) => void;
   onRetry: (doc: DocResult) => void;
   onSource: (doc: DocResult) => void;
-  /** Why Retry cannot start now (Run busy or disabled); its buttons show it and stay inactive. */
-  retryBlocked?: () => string | null;
+  /** Keeps a Retry button in step with the runner (`retryGate(runner).bind`). */
+  bindRetry?: (button: HTMLButtonElement) => HTMLButtonElement;
 }
 
 /**
@@ -235,22 +235,19 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
   };
 
   const retryButton = (doc: DocResult, label: string): HTMLButtonElement => {
-    const blocked = options.retryBlocked?.() ?? null;
-    return h(
+    const button = h(
       'button',
       {
         type: 'button',
-        class: ['btn btn-sm btn-outline-primary', blocked !== null && 'disabled'],
+        class: 'btn btn-sm btn-outline-primary',
         'aria-label': `Retry ${label}`,
-        'aria-disabled': String(blocked !== null),
-        title: blocked ?? '',
-        'data-retry': '',
         'data-focus-key': `retry:${doc.key}`,
         'data-testid': 'de-retry',
         onclick: () => options.onRetry(doc),
       },
       icon('arrow-clockwise'),
     );
+    return options.bindRetry?.(button) ?? button;
   };
 
   const detailId = (doc: DocResult, field: FieldDef): string =>

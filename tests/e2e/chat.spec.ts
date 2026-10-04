@@ -81,6 +81,39 @@ async function send(page: Page, text: string): Promise<void> {
   await composer(page).press('Enter');
 }
 
+/**
+ * Waits until the stored threads hold `count` finished replies. A reply's text shows while it streams, before the
+ * run ends and the thread's last (queued) write lands; a reload before that finds the reply unfinished ("Stopped
+ * before any text arrived").
+ */
+async function repliesStored(page: Page, count: number): Promise<void> {
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        type Row = {
+          key: string;
+          value: { nodes: Record<string, { role: string; status?: string }> };
+        };
+        const db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('ortoolbox');
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error ?? new Error('open failed'));
+        });
+        const rows = await new Promise<Row[]>((resolve, reject) => {
+          const request = db.transaction('kv').objectStore('kv').getAll();
+          request.onsuccess = () => resolve(request.result as Row[]);
+          request.onerror = () => reject(request.error ?? new Error('read failed'));
+        });
+        db.close();
+        return rows
+          .filter((row) => row.key.startsWith('tool:chat:thread:'))
+          .flatMap((row) => Object.values(row.value.nodes))
+          .filter((node) => node.role === 'assistant' && node.status === 'done').length;
+      }),
+    )
+    .toBe(count);
+}
+
 test.beforeEach(async ({ context }) => {
   await seedApp(context, {
     key: true,
@@ -92,7 +125,8 @@ test('sends a message and streams the reply, with reasoning, usage and the reque
   page,
   mock,
 }) => {
-  const problems = await watchForProblems(page);
+  // The API client cancels the stream once it has read `[DONE]`; Chromium may report that as an aborted request.
+  const problems = await watchForProblems(page, { allowAborted: [CHAT] });
   mock.sse(CHAT, RECORDED_STREAM.trim().split('\n\n'), { done: false });
   await openChat(page);
   await send(page, 'Say hi in exactly three words.');
@@ -290,6 +324,7 @@ test('a pasted PDF is read once; later messages send the parser text', async ({ 
   expect(body(next)['plugins']).toBeUndefined();
 
   // The text is kept with the thread: after a reload the PDF still counts.
+  await repliesStored(page, 2);
   await page.reload();
   await expect(content(page, 3)).toHaveText('It has no date.');
   await expect(page.getByTestId('attachment-missing')).toHaveCount(0);
@@ -316,6 +351,7 @@ test('two tabs on one chat: each takes in what the other sent', async ({ page, c
   expect(messagesOf(mock.calls(CHAT, 'POST')[2])).toHaveLength(5);
   await expect(content(other, 5)).toHaveText('Third answer.');
 
+  await repliesStored(page, 3);
   await page.reload();
   await expect(messages(page)).toHaveCount(6);
 });
@@ -333,6 +369,7 @@ test('a thread persists across a reload; its attachments are marked as not kept'
   await expect(content(page, 1)).toHaveText('A test pattern.');
   await expect(page.getByTestId('attachment-missing')).toHaveCount(0);
 
+  await repliesStored(page, 1);
   await page.reload();
   await expect(content(page, 0)).toHaveText('Describe it');
   await expect(content(page, 1)).toHaveText('A test pattern.');

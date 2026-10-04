@@ -65,7 +65,9 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `runner<A>({ label, icon, run(signal, arg?), hint, container })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter. Returns `Runner<A>`: `trigger(arg?)` (see Runner arguments), `stop()`, `setDisabled(reason)`, `busy`, `disabledReason`, `subscribe(fn)`. |
 | `refreshEstimate()` | Recomputes the estimate through `ToolInstance.estimate` and shows it; resolves with the value. Call it when the input changes. |
 | `setEstimate(usd \| null, note?)` | Sets the badge directly (`≈ $0.0012`, `Free` for 0, `Unknown` for null), for tools without `estimate`. |
-| `status(text)` | A short, politely announced status in the output header ("Page 3 of 20"). |
+| `status(text)` | A state change in the output header ("Reading 3 pages…", "Done"), announced politely. |
+| `progress(text)` | A ticking counter in the same line ("Composing… 12 s", "18 of 75 parts", "40%"): shown at once, announced at most once every 10 s. Use `status` for the start and end of a phase, `progress` for everything in between. |
+| `holdWork(description)` | Marks unsaved in-memory work that is not a downloadable result (a recording in progress, paid parts not joined yet): leaving asks first (in-app dialog and the browser's prompt), naming `description`. Returns the release; call it when the work is saved or discarded. |
 | `addResult({ kind, name, blob })` | Registers an in-memory binary result (leave guard) and returns `{ result, button(label?), download(), remove() }`. |
 | `sendTo(items)` | Opens the "Send to…" chooser for these items. |
 | `openPrompts()`, `openDrawer()` | What the header buttons do. |
@@ -127,6 +129,17 @@ runner.subscribe(({ busy, disabledReason }) => {
   for (const button of retryButtons()) button.disabled = busy || disabledReason !== null;
 });
 ```
+
+**`retryGate(runner)`** (`src/ui/tool/retry-gate.ts`) is that pattern in one place, and every tool with per-item Retry uses it:
+
+```ts
+const runner = ui.runner<string[]>({ label: 'Read', run });
+const gate = retryGate(runner);                    // optional: { fallback: () => heading }
+const retryButton = (keys: string[]) =>
+  gate.bind(h('button', { type: 'button', onclick: () => gate.retry(keys, 'Reading cannot start now.') }, 'Retry'));
+```
+
+`bind(button)` keeps the button in step with Run (shown unavailable while Run is busy or disabled, with the reason as its title, but still focusable); `retry(arg, fallbackMessage?)` triggers the runner and announces why when it cannot start; `blocked()` is the current reason or null. When a focused Retry button disappears (its item re-rendered as running) and nothing else took focus, focus goes to `fallback()` (default: Run).
 
 ### Batches: `runItems`
 
@@ -206,7 +219,7 @@ estimate: (model) =>
   ctx.models.estimate({ kind: 'tokens', model, promptTokens: approxTokens(text.value), completionTokens: maxTokens }),
 ```
 
-The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it) and books it: `ctx.beginRun` without `estimateUsd` uses it, recomputing first if the input changed since. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
+The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it), and `ctx.beginRun` without `estimateUsd` always computes it afresh for the input as it is at that moment (so a paste followed by Ctrl+Enter, before your debounced `refreshEstimate`, books the right amount); only a value set with `ui.setEstimate` is booked as is. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
 
 ## Results, downloads and the leave guard
 
@@ -282,7 +295,7 @@ ctx.jobs.subscribe((record) => {
 });
 ```
 
-Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`. Handed-off runs do not count for the leave guard: the job carries on without the page.
+Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`. Work that only lives in this page until a later step (a sequence being assembled, parts not yet joined) is protected with `ui.holdWork(description)`. Handed-off runs do not count for the leave guard: the job carries on without the page.
 
 ## Prompts, History and the form state
 
@@ -314,7 +327,9 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 | `streamMarkdown(target, options)` | The output panel's streaming renderer without the panel, for custom layouts. |
 | `exportMenu({ filename, formats, resultIds })` | Lazily built downloads in several formats; `update(…)` changes it in place. |
 | `imageViewer({ src \| blob, alt })` | Fit/zoom, checkerboard behind transparency. |
-| `audioPlayer({ src \| blob, peaks?, label })` | Native controls plus a waveform (`peaks()` from `src/core/media/audio`, or decoded lazily at 8 kHz mono; none beyond 30 minutes). |
+| `audioResultCard({ ui, blob, name, seconds?, peaks?, metaParts, formats, onRemove, ... })` | One audio result (a recording, joined speech, a song): player, downloads (the file as it is plus converted `formats`), Send to…, Remove with focus management, registered with the leave guard through `ui.addResult`. Returns `{ element, handle, player, remove() }`. |
+| `progressBar({ label, hidden?, class?, testId? })` | A labelled `role="progressbar"`; `update(done, total, text?)` (text becomes `aria-valuetext`). Pair it with `ui.progress`. |
+| `audioPlayer({ src \| blob, peaks?, label })` | Native controls plus a waveform (`peaks()` from `src/core/media/audio`, or decoded lazily at 8 kHz mono; none beyond 30 minutes). Pass `seconds` when you know the length (nothing is measured); recordings whose duration reads as Infinity are probed before seeking. |
 | `videoPlayer({ src \| blob, label })` | Native controls in a letterboxed frame. |
 | `jobList(options)` + `bindJobList(...)` | Persistent jobs with progress. |
 | `emptyState({ icon, title, text, action, compact, inline })` | Every "nothing yet" place. |
@@ -328,7 +343,7 @@ Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` 
 
 - **Lazy only.** Anything heavy loads with `import()` when first needed, and the manifest lists it in `lazyLibs` (a unit test checks they are dependencies). Budget: each tool adds at most 80 KB gzipped JS to the shell's 150 KB; check the `npm run build` output.
 - **PDF:** import `src/core/media/pdf.ts` dynamically only (`const { openPdf } = await import('../../core/media/pdf')`); it brings about 5 MB of pdf.js assets.
-- **Audio:** join TTS or audio segments with `stitchAudio(segments, 'mp3' | 'wav')` (`src/core/media/stitch.ts`: decode → PCM → encode once). Plain MP3 concatenation leaves gaps at the seams.
+- **Audio:** join TTS or audio segments with `stitchAudio(segments, 'mp3' | 'wav')` (`src/core/media/stitch.ts`: decode → PCM → encode once; a single segment already in the target format comes back as it is, without loading anything). Plain MP3 concatenation leaves gaps at the seams. Convert a file with `transcode(blob, 'mp3' | 'wav')` (`src/core/media/transcode.ts`, loads ffmpeg only when called).
 - **Isolated image:** run the pipeline through `isolateImage()` (`src/core/media/image-async.ts`, a module worker with a fallback), never the raster functions on the main thread.
 - **ZIP:** `zipFiles()` from `src/core/export`, or fflate's `zipSync`. Never fflate's async API (`zip`, `unzip`, `deflate`): it starts `blob:` workers that the CSP blocks, and then never settles.
 - **ffmpeg:** go through `src/core/media/ffmpeg-ops.ts`; any `exec` of your own passes explicit `-threads` limits (multi-threaded ffmpeg crashes on H.264 encodes with the default count).
@@ -374,7 +389,7 @@ Every control has a visible label (or `aria-label` for icon buttons), everything
   ```
 
   Options: `catalog` (models the models service serves), `api` (calls to mock), `modelOverride` (`?model=`), `noKey`. The result also exposes `core`, `keyState`, `zones`, `sent` (Send to… items) and `status()`.
-- **E2E** (`tests/e2e/<id>.spec.ts`): import `test`/`expect` from `tests/mock/index.ts`; mock every OpenRouter call (`mock.json`, `mock.sse` for streams, `mock.file` for media, `mock.sequence` for polling), seed state with `seedApp(context, { key: true })` from `tests/e2e/app.ts`, and assert `watchForProblems(page)` is empty. Cover: a run end to end with the output, the error path (`mock.json(..., { status: 429 })`), Stop, drop/paste of an accepted file, and the prompts round trip (save current → Use restores the form). `tests/e2e/routes.spec.ts` already runs axe on your page in light and dark.
+- **E2E** (`tests/e2e/<id>.spec.ts`): `watchForProblems(page, { allowAborted: ['/api/v1/…'] })` lists the paths whose aborts the app causes on purpose (Stop, a stream cancelled after `[DONE]`); `<audio>`/`<video>` aborts of `blob:` reads are ignored for every spec. import `test`/`expect` from `tests/mock/index.ts`; mock every OpenRouter call (`mock.json`, `mock.sse` for streams, `mock.file` for media, `mock.sequence` for polling), seed state with `seedApp(context, { key: true })` from `tests/e2e/app.ts`, and assert `watchForProblems(page)` is empty. Cover: a run end to end with the output, the error path (`mock.json(..., { status: 429 })`), Stop, drop/paste of an accepted file, and the prompts round trip (save current → Use restores the form). `tests/e2e/routes.spec.ts` already runs axe on your page in light and dark.
 
 ## Worked example
 

@@ -56,6 +56,7 @@ export function atStake(core: Pick<CoreServices, 'results' | 'runs'>): string[] 
   const lines: string[] = [];
   const summary = core.results.summary();
   if (summary) lines.push(summary);
+  lines.push(...core.results.holds());
   // A run handed off to a job (video) is finished by the job, also after this page is gone.
   const running = core.runs.active().filter((run) => run.jobId === null).length;
   if (running > 0) lines.push(`${plural(running, 'run')} in progress`);
@@ -81,6 +82,7 @@ export async function guardedNavigate(
     const leave = await askToLeave(core);
     if (!leave) return false;
     for (const result of core.results.pending()) core.results.remove(result.id);
+    core.results.releaseHolds();
     location.assign(href);
     return true;
   } finally {

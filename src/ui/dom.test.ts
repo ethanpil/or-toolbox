@@ -42,13 +42,17 @@ describe('h: children', () => {
     expect(el.textContent).toBe('x');
   });
 
-  it('handles very large and very deep child lists without overflowing the stack', () => {
-    const many = Array.from({ length: 200_000 }, (_, i) => i % 10);
-    expect(h('div', null, many).childNodes).toHaveLength(200_000);
-
+  it('handles very deep child lists without overflowing the stack', () => {
     let deep: unknown[] = ['leaf'];
     for (let level = 0; level < 20_000; level++) deep = [deep];
     expect(h('div', null, deep as never).textContent).toBe('leaf');
+  });
+
+  // Longer than V8 takes as spread arguments (about 125,000), so `append(...children)` would throw. Inserting
+  // 200,000 nodes into jsdom takes about 2 s alone and more under a full parallel run: hence its own timeout.
+  it('handles very large child lists without overflowing the stack', { timeout: 30_000 }, () => {
+    const many = Array.from({ length: 200_000 }, (_, i) => i % 10);
+    expect(h('div', null, many).childNodes).toHaveLength(200_000);
   });
 
   it('never interprets strings as markup', () => {
