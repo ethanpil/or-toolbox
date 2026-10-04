@@ -7,7 +7,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Page } from '@playwright/test';
+import type { BrowserContext, Page } from '@playwright/test';
 import { expect, MEDIA_FIXTURES_DIR, type RecordedCall, test } from '../mock/index.ts';
 import { seedApp } from './app.ts';
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
@@ -157,7 +157,8 @@ const srtTime = (seconds: number, separator: ',' | '.' = ','): string => {
  * Accepts the aborted requests the page causes on purpose; everything else still counts:
  * - Stop aborts the transcription requests in flight;
  * - the player's `<audio preload="metadata">` stops reading a large recording's `blob:` URL once it has the
- *   metadata, which Chromium reports as an aborted request.
+ *   metadata, and the duration probe of a recording releases its media element while (under load) the read is
+ *   still going; Chromium reports both as an aborted request (resource type media).
  */
 const withoutAborted = (problems: string[], stopped = false): string[] =>
   problems.filter(
@@ -241,6 +242,96 @@ test('a short upload goes as it is: transcript, exports, Send to, light and dark
   expect(problems).toEqual([]);
 });
 
+/**
+ * A stubbed microphone: a tone (or silence) through a real MediaStream, so MediaRecorder records for real in every
+ * browser. `window.__mic` lets a test change the named microphones (`devices`, ids `mic-<index>`) and make some
+ * refuse to open (`refuse`, as an unplugged device does); `asked` lists the constraints each request used.
+ */
+async function stubMicrophone(
+  context: BrowserContext,
+  options: { silent?: boolean } = {},
+): Promise<void> {
+  await context.addInitScript((silent: boolean) => {
+    if (!navigator.mediaDevices) return;
+    const mic = {
+      devices: ['Desk microphone', 'Headset'],
+      refuse: [] as string[],
+      asked: [] as unknown[],
+    };
+    (window as unknown as { __mic: typeof mic }).__mic = mic;
+    navigator.mediaDevices.getUserMedia = (constraints) => {
+      const audio = constraints?.audio;
+      mic.asked.push(audio ?? null);
+      const wanted =
+        typeof audio === 'object' && audio !== null
+          ? (audio.deviceId as { exact?: string } | undefined)?.exact
+          : undefined;
+      if (wanted && mic.refuse.includes(wanted)) {
+        return Promise.reject(
+          Object.assign(new Error('Device gone'), { name: 'OverconstrainedError' }),
+        );
+      }
+      const context = new AudioContext();
+      const out = context.createMediaStreamDestination();
+      if (!silent) {
+        // A tone whose level swells three times a second, so every meter reading differs.
+        const tone = context.createOscillator();
+        const level = context.createGain();
+        level.gain.value = 0.5;
+        const swell = context.createOscillator();
+        swell.frequency.value = 3;
+        const depth = context.createGain();
+        depth.gain.value = 0.45;
+        swell.connect(depth).connect(level.gain);
+        tone.connect(level).connect(out);
+        tone.start();
+        swell.start();
+      }
+      return Promise.resolve(out.stream);
+    };
+    navigator.mediaDevices.enumerateDevices = () =>
+      Promise.resolve(
+        mic.devices.map(
+          (label, i) =>
+            ({ deviceId: `mic-${i}`, groupId: 'g', kind: 'audioinput', label }) as MediaDeviceInfo,
+        ),
+      );
+  }, options.silent ?? false);
+}
+
+/** Skips a test in a browser build without MediaRecorder (Playwright's WebKit on Windows). */
+async function needsMediaRecorder(page: Page): Promise<void> {
+  test.skip(
+    await page.evaluate(() => typeof MediaRecorder === 'undefined'),
+    'This browser build has no MediaRecorder',
+  );
+}
+
+/** The recorder's timer in seconds ("1:05" is 65). */
+async function recordedSeconds(page: Page): Promise<number> {
+  const text = (await page.getByTestId('stt-record-time').textContent()) ?? '';
+  const [minutes = '0', seconds = '0'] = (/^(\d+):(\d\d)/.exec(text) ?? []).slice(1);
+  return Number(minutes) * 60 + Number(seconds);
+}
+
+/**
+ * Waits until at least `seconds` are recorded. Never waits for one exact timer text: under load the timer can
+ * move past it between two looks (the Stage 4 gate failure).
+ */
+async function recordUntil(page: Page, seconds: number): Promise<void> {
+  await expect
+    .poll(() => recordedSeconds(page), { timeout: 30_000 })
+    .toBeGreaterThanOrEqual(seconds);
+}
+
+/** Dispatches `beforeunload` and says whether the page asked to confirm leaving. */
+const leavingAsks = (page: Page): Promise<boolean> =>
+  page.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+
 test('a recording from the microphone, paused and resumed, is transcribed', async ({
   page,
   context,
@@ -249,45 +340,42 @@ test('a recording from the microphone, paused and resumed, is transcribed', asyn
   await seedApp(context, { key: true });
   mock.json('GET', '/api/v1/models', CATALOG);
   mock.json('POST', PATH, fixture('audio-transcriptions-verbose.recorded.json').response);
-  // A microphone that plays a tone, and two named microphones to choose from.
-  await context.addInitScript(() => {
-    if (!navigator.mediaDevices) return;
-    navigator.mediaDevices.getUserMedia = () => {
-      const audio = new AudioContext();
-      const tone = audio.createOscillator();
-      const out = audio.createMediaStreamDestination();
-      tone.connect(out);
-      tone.start();
-      return Promise.resolve(out.stream);
-    };
-    navigator.mediaDevices.enumerateDevices = () =>
-      Promise.resolve(
-        ['Desk microphone', 'Headset'].map(
-          (label, i) =>
-            ({ deviceId: `mic-${i}`, groupId: 'g', kind: 'audioinput', label }) as MediaDeviceInfo,
-        ),
-      );
-  });
+  await stubMicrophone(context);
   const problems = await watchForProblems(page);
   await page.goto('tools/speech-to-text/');
-  test.skip(
-    await page.evaluate(() => typeof MediaRecorder === 'undefined'),
-    'This browser build has no MediaRecorder',
-  );
+  await needsMediaRecorder(page);
   await expect(page.getByTestId('stt-mic')).toBeVisible();
   await page.getByTestId('stt-mic').selectOption('mic-1');
 
-  await page.getByTestId('stt-record').click();
+  // By keyboard (WebKit does not focus a clicked button): Record turns into Stop, and focus follows.
+  await page.getByTestId('stt-record').focus();
+  await page.keyboard.press('Enter');
   await expect(page.getByTestId('stt-record-stop')).toBeFocused();
-  await expect(page.getByTestId('stt-record-time')).toHaveText('0:01');
+  const time = page.getByTestId('stt-record-time');
+  await expect(time).toHaveAttribute('role', 'timer');
+  await expect(time).toHaveAttribute('aria-label', 'Recorded time');
+  await recordUntil(page, 1);
+
   await page.getByTestId('stt-record-pause').click();
   await expect(page.getByTestId('stt-record-pause')).toHaveText('Resume');
   await expect(page.getByTestId('run-button')).toHaveAttribute('aria-disabled', 'true');
+  // Paused: the timer stands still and the level meter is at rest (its loop is stopped).
+  const paused = await recordedSeconds(page);
+  await page.waitForTimeout(1500);
+  expect(await recordedSeconds(page)).toBe(paused);
+  expect(
+    await page
+      .getByTestId('stt-record-level')
+      .locator('.or-level-bar')
+      .evaluate((bar: HTMLElement) => bar.style.transform),
+  ).toBe('scaleX(0)');
   await page.getByTestId('stt-record-pause').click();
-  await expect(page.getByTestId('stt-record-time')).toHaveText('0:02');
-  await page.getByTestId('stt-record-stop').click();
+  await recordUntil(page, paused + 1);
+  await page.getByTestId('stt-record-stop').focus();
+  await page.keyboard.press('Enter');
 
-  await expect(page.getByTestId('stt-source-name')).toHaveText(/^recording-[\d-]+\.webm$/);
+  const name = page.getByTestId('stt-source-name');
+  await expect(name).toHaveText(/^recording-[\d-]+\.(webm|ogg|m4a)$/);
   await expect(page.getByTestId('stt-record')).toBeFocused();
   await expect(page.getByTestId('result-download')).toHaveText('Download recording');
   await expect(page.getByTestId('run-button')).toHaveAttribute('aria-disabled', 'false');
@@ -295,12 +383,205 @@ test('a recording from the microphone, paused and resumed, is transcribed', asyn
   await expect(page.getByTestId('stt-segment-text')).toHaveValue(
     'The quick brown fox jumps over the lazy dog.',
   );
+  // The container the browser recorded in is the format sent (WebM in Chromium and Firefox).
+  const extension = /\.(\w+)$/.exec((await name.textContent()) ?? '')?.[1];
   const body = bodyOf(mock.calls(PATH)[0]!);
-  expect(body.input_audio.format).toBe('webm');
-  expect(Buffer.from(body.input_audio.data, 'base64').subarray(0, 4)).toEqual(
-    Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+  expect(body.input_audio.format).toBe(extension);
+  if (extension === 'webm') {
+    expect(Buffer.from(body.input_audio.data, 'base64').subarray(0, 4)).toEqual(
+      Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+    );
+  }
+  expect(withoutAborted(problems)).toEqual([]);
+});
+
+test('a recording in progress is protected from leaving the page', async ({ page, context }) => {
+  await seedApp(context, { key: true });
+  await stubMicrophone(context);
+  const problems = await watchForProblems(page);
+  await page.goto('tools/speech-to-text/');
+  await needsMediaRecorder(page);
+  expect(await leavingAsks(page)).toBe(false);
+  await page.getByTestId('stt-record').click();
+  await recordUntil(page, 1);
+  expect(await leavingAsks(page)).toBe(true);
+
+  // An in-app link: the browser asks (beforeunload); staying keeps the recording going.
+  const dialogs: string[] = [];
+  page.on('dialog', (dialog) => {
+    dialogs.push(dialog.type());
+    void dialog.dismiss();
+  });
+  await page.getByTestId('history-link').click();
+  await expect.poll(() => dialogs).toEqual(['beforeunload']);
+  await expect(page.getByTestId('stt-record-stop')).toBeVisible();
+  const before = await recordedSeconds(page);
+  await recordUntil(page, before + 1);
+
+  // Stopped, the recording is a result not yet downloaded: the in-app guard asks now.
+  await page.getByTestId('stt-record-stop').click();
+  await expect(page.getByTestId('stt-source-name')).toHaveText(/^recording-/);
+  await page.getByTestId('history-link').click();
+  await expect(page.getByTestId('leave-guard')).toBeVisible();
+  await expect(page.getByTestId('leave-guard-list')).toContainText('not downloaded');
+  await page.getByTestId('leave-guard-stay').click();
+  await expect(page).toHaveURL(/\/tools\/speech-to-text\/$/);
+  expect(withoutAborted(problems)).toEqual([]);
+});
+
+test('under Reduced motion the level meter moves four times a second, not every frame', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context, { key: true, settings: { appearance: { reducedMotion: true } } });
+  await stubMicrophone(context);
+  const problems = await watchForProblems(page);
+  await page.goto('tools/speech-to-text/');
+  await needsMediaRecorder(page);
+  await page.getByTestId('stt-record').click();
+  await recordUntil(page, 1);
+  const updates = await page
+    .getByTestId('stt-record-level')
+    .locator('.or-level-bar')
+    .evaluate(
+      (bar) =>
+        new Promise<number>((resolve) => {
+          let count = 0;
+          const observer = new MutationObserver((records) => {
+            count += records.length;
+          });
+          observer.observe(bar, { attributes: true, attributeFilter: ['style'] });
+          setTimeout(() => {
+            observer.disconnect();
+            resolve(count);
+          }, 2000);
+        }),
+    );
+  // About eight in two seconds (a frame-paced meter makes over a hundred).
+  expect(updates).toBeGreaterThan(0);
+  expect(updates).toBeLessThanOrEqual(10);
+  await page.getByTestId('stt-record-stop').click();
+  await expect(page.getByTestId('stt-source-name')).toHaveText(/^recording-/);
+  expect(withoutAborted(problems)).toEqual([]);
+});
+
+test('no signal from the microphone is noticed and announced', async ({ page, context }) => {
+  await seedApp(context, { key: true });
+  await stubMicrophone(context, { silent: true });
+  const problems = await watchForProblems(page);
+  await page.goto('tools/speech-to-text/');
+  await needsMediaRecorder(page);
+  await page.getByTestId('stt-record').click();
+  const warning = page.getByTestId('stt-record-silence');
+  await expect(warning).toBeVisible({ timeout: 15_000 });
+  await expect(warning).toHaveText('No sound detected — check your microphone.');
+  await expect(page.getByTestId('announcer-polite')).toHaveText(
+    'No sound detected — check your microphone.',
   );
-  expect(problems).toEqual([]);
+  await page.getByTestId('stt-record-stop').click();
+  await expect(warning).toBeHidden();
+  expect(withoutAborted(problems)).toEqual([]);
+});
+
+test('the chosen microphone going away falls back to the default one', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context, { key: true });
+  await stubMicrophone(context);
+  const problems = await watchForProblems(page);
+  await page.goto('tools/speech-to-text/');
+  await needsMediaRecorder(page);
+  const picker = page.getByTestId('stt-mic');
+  await picker.selectOption('mic-1');
+
+  // The headset is unplugged: the default microphone is used again, and the page says so.
+  await page.evaluate(() => {
+    (window as unknown as { __mic: { devices: string[] } }).__mic.devices = ['Desk microphone'];
+    navigator.mediaDevices.dispatchEvent(new Event('devicechange'));
+  });
+  const note = page.getByTestId('stt-record-note');
+  await expect(note).toHaveText(
+    'The chosen microphone is no longer available, so the default microphone is used.',
+  );
+  await expect(page.getByTestId('announcer-polite')).toHaveText(
+    'The chosen microphone is no longer available, so the default microphone is used.',
+  );
+  // Plugged in again, the picker is back and usable, on the default.
+  await page.evaluate(() => {
+    (window as unknown as { __mic: { devices: string[] } }).__mic.devices = [
+      'Desk microphone',
+      'Headset',
+    ];
+    navigator.mediaDevices.dispatchEvent(new Event('devicechange'));
+  });
+  await expect(picker).toBeEnabled();
+  await expect(picker).toHaveValue('mic-0');
+
+  // Chosen, but it refuses to open (gone between two device lists): Record falls back to the default.
+  await picker.selectOption('mic-1');
+  await page.evaluate(() => {
+    (window as unknown as { __mic: { refuse: string[] } }).__mic.refuse = ['mic-1'];
+  });
+  await page.getByTestId('stt-record').click();
+  await expect(page.getByTestId('stt-record-stop')).toBeVisible();
+  await expect(note).toBeVisible();
+  expect(
+    await page.evaluate(() => (window as unknown as { __mic: { asked: unknown[] } }).__mic.asked),
+  ).toEqual([{ deviceId: { exact: 'mic-1' } }, true]);
+  await expect(page.getByTestId('stt-record-error')).toBeHidden();
+  await recordUntil(page, 1);
+  await page.getByTestId('stt-record-stop').click();
+  await expect(page.getByTestId('stt-source-name')).toHaveText(/^recording-/);
+  expect(withoutAborted(problems)).toEqual([]);
+});
+
+test('a time in the transcript of a recording plays from there', async ({
+  page,
+  context,
+  mock,
+}) => {
+  await seedApp(context, { key: true });
+  mock.json('GET', '/api/v1/models', CATALOG);
+  mock.json('POST', PATH, {
+    text: 'One. Two. Three.',
+    duration: 4,
+    segments: [
+      { start: 0, end: 1, text: 'One.' },
+      { start: 1.5, end: 2.4, text: 'Two.' },
+      { start: 2.8, end: 3.5, text: 'Three.' },
+    ],
+  });
+  await stubMicrophone(context);
+  const problems = await watchForProblems(page);
+  await page.goto('tools/speech-to-text/');
+  await needsMediaRecorder(page);
+  await page.getByTestId('stt-record').click();
+  await recordUntil(page, 4);
+  await page.getByTestId('stt-record-stop').click();
+  await expect(page.getByTestId('stt-source-name')).toHaveText(/^recording-/);
+  await page.getByTestId('run-button').click();
+  await expect(page.getByTestId('stt-segment')).toHaveCount(3);
+
+  // MediaRecorder's WebM has no duration in its header (the browser reports Infinity) and no seek index. Where
+  // the seek lands is read when it lands, so playback that merely started from 0 and ran on cannot pass.
+  const audio = page.getByTestId('stt-player').locator('audio');
+  await audio.evaluate((element: HTMLAudioElement) => {
+    element.addEventListener(
+      'seeked',
+      () => {
+        element.dataset['seekedAt'] = String(element.currentTime);
+      },
+      { once: true },
+    );
+  });
+  await page.getByTestId('stt-seek').nth(1).click();
+  await expect(audio).toHaveAttribute('data-seeked-at', /^\d/);
+  const landed = Number(await audio.getAttribute('data-seeked-at'));
+  expect(landed).toBeGreaterThan(1.4);
+  expect(landed).toBeLessThan(1.6);
+  await expect(page.getByTestId('stt-segment').nth(1)).toHaveAttribute('aria-current', 'true');
+  expect(withoutAborted(problems)).toEqual([]);
 });
 
 test('speaker labels go through the Deepgram provider option; names apply everywhere', async ({
