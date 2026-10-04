@@ -22,6 +22,7 @@ import { copyWithToast } from '../../ui/clipboard';
 import { type AudioPlayer, audioPlayer } from '../../ui/components/audio-player';
 import { dropZone } from '../../ui/components/drop-zone';
 import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
+import { progressBar } from '../../ui/components/progress-bar';
 import { focusedKey, focusKey, h, replace, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
@@ -29,7 +30,9 @@ import { isStop, presentError } from '../../ui/feedback/errors';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
+import { motionReduced } from '../../ui/shell/appearance';
 import { batchSummary, type ItemStatus, runItems } from '../../ui/tool/batch';
+import { type RetryGate, retryGate } from '../../ui/tool/retry-gate';
 import type {
   ResultHandle,
   RunnerState,
@@ -39,7 +42,7 @@ import type {
   ToolSnapshot,
 } from '../../ui/tool/index';
 import { transcriptEditor } from './editor';
-import { parseKeyterms, partSeconds, sttSupport } from './model-support';
+import { parseKeyterms, partSeconds, partsUnfitFor, sttSupport } from './model-support';
 import { recorder } from './recorder';
 import sampleUrl from './sample-speech.mp3';
 import {
@@ -53,6 +56,9 @@ import {
 import {
   EMPTY_TRANSCRIPT,
   mergeParts,
+  mixedModelsNote,
+  modelsUsed,
+  type PartMeta,
   subtitleSegments,
   transcriptJson,
   transcriptMarkdown,
@@ -62,6 +68,8 @@ interface PartState extends AudioPart {
   status: ItemStatus;
   error: string | null;
   result: TranscriptionResult | null;
+  /** How it was transcribed (set when done): a retry may use another model or other options. */
+  meta: PartMeta | null;
 }
 
 export const PART_MINUTES = [1, 2, 5, 8] as const;
@@ -123,14 +131,18 @@ export function setup(ctx: ToolContext): ToolInstance {
   let source: AudioSource | null = null;
   let recording: ResultHandle | null = null;
   let player: AudioPlayer | null = null;
-  /** The cut parts of the current source, kept for a retry and for a second run with the same part length. */
-  let prepared: { sourceId: string; seconds: number; parts: AudioPart[] } | null = null;
+  /** The cut parts of the current source, kept for a retry and for a second run with the same cut. */
+  let prepared: {
+    sourceId: string;
+    seconds: number;
+    pcmWavOnly: boolean;
+    parts: AudioPart[];
+  } | null = null;
   let parts: PartState[] = [];
-  /** Which source and model the transcript on screen belongs to. */
+  /** Which source the transcript on screen belongs to (the models are per part). */
   let transcriptOf: {
     sourceId: string;
     name: string;
-    model: string;
     duration: number | null;
   } | null = null;
   /** True while a run transcribes (the runner's own flag is still set while its `run` returns). */
@@ -265,6 +277,8 @@ export function setup(ctx: ToolContext): ToolInstance {
   const sourceArea = h('div', { class: 'vstack gap-2', 'data-testid': 'stt-source' });
   const rec = recorder({
     maxSeconds: MAX_RECORDING_SECONDS,
+    reducedMotion: () => motionReduced(ctx.settings.get()),
+    holdWork: (description) => ui.holdWork(description),
     beforeStart: async () => {
       if (runnerState.busy) {
         announce('Wait until the transcription ends, or press Stop.');
@@ -332,10 +346,11 @@ export function setup(ctx: ToolContext): ToolInstance {
   const stem = (): string =>
     `${(transcriptOf?.name ?? 'recording').replace(/\.[^.]+$/, '')}-transcript`;
   const current = () => editor.transcript();
+  const partMetas = (): PartMeta[] => parts.flatMap((part) => (part.meta ? [part.meta] : []));
   const jsonMeta = () => ({
     source: transcriptOf?.name ?? '',
-    model: transcriptOf?.model ?? '',
     duration: transcriptOf?.duration ?? null,
+    parts: partMetas(),
   });
   const formats = (): ExportFormat[] => [
     {
@@ -424,21 +439,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     } else downloads.update({ disabled: !has });
   }
 
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress flex-grow-1',
-      role: 'progressbar',
-      'aria-label': 'Parts transcribed',
-      'aria-valuemin': '0',
-      'aria-valuemax': '0',
-      'aria-valuenow': '0',
-      hidden: true,
-      'data-testid': 'stt-progress',
-    },
-    progressBar,
-  );
+  const progress = progressBar({
+    label: 'Parts transcribed',
+    hidden: true,
+    class: 'flex-grow-1',
+    testId: 'stt-progress',
+  });
   const partsList = h('ol', {
     class: 'list-unstyled d-flex flex-wrap gap-2 mb-0',
     'aria-label': 'Parts',
@@ -446,6 +452,11 @@ export function setup(ctx: ToolContext): ToolInstance {
     'data-testid': 'stt-parts',
   });
   const failedNotice = h('div', { hidden: true, 'data-testid': 'stt-failed' });
+  const mixedNotice = h('div', {
+    class: 'alert alert-info small py-2 mb-0',
+    hidden: true,
+    'data-testid': 'stt-mixed-models',
+  });
 
   ui.output.append(
     h(
@@ -454,11 +465,12 @@ export function setup(ctx: ToolContext): ToolInstance {
       h(
         'div',
         { class: 'd-flex flex-wrap align-items-center gap-2' },
-        progress,
+        progress.element,
         h('div', { class: 'd-flex flex-wrap gap-2 ms-auto' }, copyButton, downloads, sendButton),
       ),
       partsList,
       failedNotice,
+      mixedNotice,
       editor.element,
     ),
   );
@@ -466,17 +478,37 @@ export function setup(ctx: ToolContext): ToolInstance {
   // --- parts --------------------------------------------------------------------------------------------------
   const partItems = new Map<number, HTMLElement>();
 
-  const retryBlocked = (): string | null =>
-    runnerState.busy ? 'Wait until the current run ends.' : runnerState.disabledReason;
-  const setRetryState = (button: HTMLElement): void => {
-    const reason = retryBlocked();
-    button.setAttribute('aria-disabled', String(reason !== null));
-    button.classList.toggle('disabled', reason !== null);
-    button.title = reason ?? '';
+  /**
+   * Why the parts on screen cannot be retried as they are, or null: the recording was replaced, or the model now
+   * chosen cannot take the parts as they were cut (too long, or a format it does not read).
+   */
+  const retryProblem = (): string | null => {
+    if (!transcriptOf) return null;
+    if (source?.id !== transcriptOf.sourceId) {
+      return 'This transcript belongs to a recording that is no longer loaded, so its parts cannot be retried.';
+    }
+    const model = ctx.model().model;
+    const open = parts.filter((part) => part.status !== 'done');
+    return model ? partsUnfitFor(model, open, Number(partMinutes.value)) : null;
+  };
+  /** Keeps the Retry buttons in step with Run (set once the runner exists, below). */
+  let gate: RetryGate<number[]> | null = null;
+  /** On top of the gate's state: a button whose parts cannot be retried shows why. */
+  const paintProblem = (button: HTMLElement): void => {
+    const problem = retryProblem();
+    if (!problem) return;
+    button.setAttribute('aria-disabled', 'true');
+    button.classList.add('disabled');
+    button.title = problem;
   };
   const retry = (indexes: number[]): void => {
     if (indexes.length === 0) return;
-    if (!runner.trigger(indexes).started) announce(retryBlocked() ?? 'This cannot start now.');
+    const problem = retryProblem();
+    if (problem) {
+      announce(problem);
+      return;
+    }
+    gate?.retry(indexes, 'This cannot start now.');
   };
   const retryButton = (
     attributes: Record<string, string>,
@@ -488,7 +520,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       { type: 'button', ...attributes, 'data-retry': '', onclick: () => retry(indexes()) },
       ...children,
     );
-    setRetryState(button);
+    gate?.bind(button);
+    paintProblem(button);
     return button;
   };
 
@@ -532,6 +565,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   const renderFailed = (): void => {
     const failed = parts.filter((part) => part.status === 'failed' || part.status === 'stopped');
     failedNotice.hidden = failed.length === 0 || transcribing;
+    const problem = retryProblem();
     replaceWith(
       failedNotice,
       failed.length === 0
@@ -556,9 +590,17 @@ export function setup(ctx: ToolContext): ToolInstance {
               () => failed.map((part) => part.index),
               failed.length === 1 ? 'Retry' : 'Retry them',
             ),
+            problem
+              ? h('div', { class: 'w-100 small', 'data-testid': 'stt-retry-note' }, problem)
+              : null,
           ),
       { fallback: () => copyButton },
     );
+    const mixed = mixedModelsNote(partMetas());
+    mixedNotice.hidden = mixed === null;
+    mixedNotice.textContent = mixed
+      ? `Parts were transcribed with different models: ${mixed}.`
+      : '';
   };
 
   const renderParts = (): void => {
@@ -586,11 +628,9 @@ export function setup(ctx: ToolContext): ToolInstance {
   const updateProgress = (): void => {
     const total = parts.length;
     const done = parts.filter((part) => part.status === 'done').length;
-    progress.hidden = total < 2;
-    progress.setAttribute('aria-valuemax', String(total));
-    progress.setAttribute('aria-valuenow', String(done));
-    progressBar.style.width = total ? `${Math.round((done / total) * 100)}%` : '0%';
-    if (transcribing && total > 1) ui.status(`Transcribed ${done} of ${plural(total, 'part')}`);
+    progress.element.hidden = total < 2;
+    progress.update(done, total, `${done} of ${plural(total, 'part')}`);
+    if (transcribing && total > 1) ui.progress(`Transcribed ${done} of ${plural(total, 'part')}`);
   };
 
   // --- merging --------------------------------------------------------------------------------------------
@@ -637,6 +677,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       ? 'Sent to the model as key terms, so they are spelled as you write them here.'
       : 'This model does not take a vocabulary list, so it is not sent. Deepgram and AssemblyAI models do.';
     renderSource();
+    // The parts on screen may not fit the new model: Retry says so.
+    renderParts();
   };
 
   const confirmReplace = async (): Promise<boolean> => {
@@ -663,7 +705,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   function renderSource(): void {
     const model = ctx.model().model;
     const seconds = partSeconds(Number(partMinutes.value), model);
-    const limit = sttSupport(model).maxPartSeconds;
+    const { maxPartSeconds: limit, pcmWavOnly } = sttSupport(model);
     partNote.textContent = `Long recordings are cut at pauses into parts of at most this length; each part is one request.${
       limit
         ? ` This model takes at most ${formatDuration(limit)} per request, so parts are shorter.`
@@ -682,11 +724,11 @@ export function setup(ctx: ToolContext): ToolInstance {
     ]
       .filter(Boolean)
       .join(' · ');
-    const plan = sentAsIs(source, seconds)
+    const plan = sentAsIs(source, seconds, pcmWavOnly)
       ? 'Sent as it is, in one request.'
       : source.duration === null
         ? `Decoded and cut at pauses into parts of up to ${formatDuration(seconds)}.`
-        : `Decoded and cut at pauses into about ${plural(expectedParts(source, seconds), 'part')} of up to ${formatDuration(seconds)}.`;
+        : `Decoded and cut at pauses into about ${plural(expectedParts(source, seconds, pcmWavOnly), 'part')} of up to ${formatDuration(seconds)}.`;
     const glyph =
       source.origin === 'recording'
         ? 'mic-fill'
@@ -767,7 +809,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     source = next;
     prepared = null;
     if (next) {
-      player = audioPlayer({ blob: next.blob, label: next.name, testId: 'stt-player' });
+      // The length is known (measured once, or the recorder's): the player does not measure again.
+      player = audioPlayer({
+        blob: next.blob,
+        label: next.name,
+        ...(next.duration === null ? {} : { seconds: next.duration }),
+        testId: 'stt-player',
+      });
       const follow = (): void => {
         if (transcriptOf?.sourceId === next.id && player) editor.setTime(player.audio.currentTime);
       };
@@ -775,6 +823,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       player.audio.addEventListener('seeked', follow);
     }
     renderSource();
+    // Retry buttons of a transcript for another recording now say why they are off.
+    renderParts();
     void ui.refreshEstimate();
   };
 
@@ -784,7 +834,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     origin: AudioSource['origin'],
     options: { confirmed?: boolean; seconds?: number } = {},
   ): Promise<void> {
-    if (runnerState.busy) {
+    if (origin === 'recording') {
+      // A result at once, before anything is awaited: the recorder's hold on the page has just been released.
+      // It replaces any earlier recording (the user agreed before recording).
+      recording?.remove();
+      recording = ui.addResult({ kind: 'audio', name, blob });
+    } else if (runnerState.busy) {
       announce('Wait until the transcription ends, or press Stop.');
       return;
     }
@@ -792,11 +847,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     ui.status('Reading the file…');
     const inspected = await inspectSource(blob, name, origin);
     if (inspected.duration === null && options.seconds) inspected.duration = options.seconds;
-    if (origin === 'recording') {
-      // Replaces any earlier recording (the user agreed before recording).
-      recording?.remove();
-      recording = ui.addResult({ kind: 'audio', name, blob });
-    }
     setSource(inspected);
     ui.status(
       `${origin === 'recording' ? 'Recorded' : 'Added'} ${name}${
@@ -841,7 +891,16 @@ export function setup(ctx: ToolContext): ToolInstance {
     const retryParts = retryIndexes
       ? parts.filter((part) => retryIndexes.includes(part.index) && part.status !== 'done')
       : null;
-    if (retryParts && (retryParts.length === 0 || transcriptOf?.sourceId !== input.id)) return;
+    if (retryParts) {
+      if (retryParts.length === 0) return;
+      // Also for the error toast's Retry: say why instead of doing nothing.
+      const problem = retryProblem();
+      if (problem) {
+        ui.status(problem);
+        announce(problem);
+        return;
+      }
+    }
 
     // Refused here (no key, locked, free-only, budget, Cancel): nothing on the page changes.
     const runHandle = await ctx.beginRun(
@@ -873,6 +932,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           part.status = 'queued';
           part.error = null;
           part.result = null;
+          part.meta = null;
           for (const id of [...editor.edits.keys()]) {
             if (id.startsWith(`${part.index}:`)) editor.edits.delete(id);
           }
@@ -883,19 +943,26 @@ export function setup(ctx: ToolContext): ToolInstance {
         // A new transcript: the last one goes only now that the run is on.
         editor.reset();
         parts = [];
-        transcriptOf = { sourceId: input.id, name: input.name, model, duration: input.duration };
+        transcriptOf = { sourceId: input.id, name: input.name, duration: input.duration };
         editor.set(EMPTY_TRANSCRIPT);
         updateActions();
         renderParts();
         updateProgress();
-        if (!prepared || prepared.sourceId !== input.id || prepared.seconds !== seconds) {
+        if (
+          !prepared ||
+          prepared.sourceId !== input.id ||
+          prepared.seconds !== seconds ||
+          prepared.pcmWavOnly !== support.pcmWavOnly
+        ) {
           prepared = null;
           const cut = await prepareParts(input, {
             partSeconds: seconds,
+            pcmWavOnly: support.pcmWavOnly,
             signal: runHandle.signal,
             onStatus: (text) => ui.status(text),
+            onProgress: (text) => ui.progress(text),
           });
-          prepared = { sourceId: input.id, seconds, parts: cut };
+          prepared = { sourceId: input.id, seconds, pcmWavOnly: support.pcmWavOnly, parts: cut };
         }
         const last = prepared.parts.at(-1);
         if (last && transcriptOf) transcriptOf.duration = last.start + last.duration;
@@ -904,6 +971,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           status: 'queued',
           error: null,
           result: null,
+          meta: null,
         }));
         work = parts;
         renderParts();
@@ -932,6 +1000,16 @@ export function setup(ctx: ToolContext): ToolInstance {
             { run: runHandle, signal: itemSignal },
           );
           part.result = result;
+          part.meta = {
+            index: part.index,
+            start: part.start,
+            duration: part.duration,
+            model,
+            language: request.language || null,
+            timestamps: request.timestamps,
+            diarize: request.diarize,
+            keyterms: request.keyterms.length,
+          };
           return result;
         },
         onItem: (outcome) => {
@@ -958,6 +1036,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         output: editor.text(),
         meta: {
           duration: transcriptOf?.duration ?? null,
+          models: modelsUsed(partMetas()),
           parts: parts.length,
           failedParts: parts.filter((part) => part.status !== 'done').map((part) => part.index + 1),
           language: current().language,
@@ -977,10 +1056,12 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   const runner = ui.runner<number[]>({ label: 'Transcribe', icon: 'mic', run });
+  gate = retryGate(runner);
+  // After the gate's own subscription: a part that cannot be retried keeps saying why.
   runner.subscribe((state) => {
     runnerState = state;
     for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]'))
-      setRetryState(button);
+      paintProblem(button);
   });
   renderSource();
   applyModel(ctx.model().model);
@@ -1016,7 +1097,11 @@ export function setup(ctx: ToolContext): ToolInstance {
       applyModel(model);
       if (!source || source.duration === null) return Promise.resolve(null);
       const seconds = partSeconds(Number(partMinutes.value), model);
-      return estimateSeconds(model, source.duration, expectedParts(source, seconds));
+      return estimateSeconds(
+        model,
+        source.duration,
+        expectedParts(source, seconds, sttSupport(model).pcmWavOnly),
+      );
     },
     onFiles: (files) => takeFiles(files),
     onReceive: receive,

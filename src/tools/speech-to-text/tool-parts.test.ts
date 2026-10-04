@@ -33,15 +33,21 @@ vi.mock('../../core/media/audio', async (importOriginal) => {
   };
 });
 
-const WHISPER: RawModel = {
-  id: 'openai/whisper-1',
-  name: 'Whisper',
+const sttModel = (id: string): RawModel => ({
+  id,
+  name: id,
   created: 1,
   context_length: 0,
   architecture: { input_modalities: ['audio'], output_modalities: ['transcription'] },
   pricing: { prompt: '0.0001', completion: '0' },
   supported_parameters: [],
-};
+});
+const CATALOG = [
+  'openai/whisper-1',
+  'deepgram/nova-3',
+  'assemblyai/universal-3-5-pro',
+  'meta/muse-voice-transcribe',
+].map(sttModel);
 
 /** Where the tool will cut (the same planner on the same audio), as [start, end] seconds per part. */
 const PLAN = planChunks(synth(), { maxSeconds: 59 }).map(({ start, end }): [number, number] => [
@@ -96,13 +102,21 @@ afterEach(() => {
   t = null;
 });
 
+/** Picks the model in the header (the tool binding), as the model chip does. */
+async function useModel(model: string): Promise<void> {
+  t!.core.settings.update((draft) => {
+    draft.tools['speech-to-text'] = { ...draft.tools['speech-to-text'], model };
+  });
+  await t!.ctx.ui.refreshEstimate();
+}
+
 async function mount(
   transcribe: (body: TranscriptionRequest, signal: AbortSignal) => Promise<TranscriptionResult>,
+  partMinutes = 1,
 ) {
   const calls: TranscriptionRequest[] = [];
   t = createToolTestContext(getTool('speech-to-text'), {
-    catalog: [WHISPER],
-    modelOverride: 'openai/whisper-1',
+    catalog: CATALOG,
     api: {
       transcribe: (body, opts) => {
         calls.push(body);
@@ -111,7 +125,8 @@ async function mount(
     },
   });
   const tool = await t.mount(setup);
-  tool.applyState({ prompt: '', settings: { partMinutes: 1 } });
+  await useModel('openai/whisper-1');
+  tool.applyState({ prompt: '', settings: { partMinutes } });
   tool.onFiles?.([new File(['not decoded here'], 'long.mp3', { type: 'audio/mpeg' })]);
   await vi.waitFor(() =>
     expect($(t!.zones.input, 'stt-source-name')?.textContent).toBe('long.mp3'),
@@ -189,5 +204,76 @@ describe('Speech-to-text, long recordings', { timeout: 30_000 }, () => {
     expect(t!.status()).toBe('Stopped');
     expect(starts()).toEqual([0, 10, 20, 30, 40, 50]);
     expect((await t!.core.history.query({ tool: 'speech-to-text' }))[0]?.status).toBe('aborted');
+  });
+
+  it('a retry with another model is recorded per part, and the mix is said', async () => {
+    let failSecond = true;
+    const { calls } = await mount((body) => {
+      const n = partOf(body);
+      if (n === 1 && failSecond) {
+        failSecond = false;
+        return Promise.reject(new ApiError('Provider returned error', 502));
+      }
+      return Promise.resolve(partResult(n));
+    });
+    await t!.runners[0]!.trigger();
+    expect($(t!.zones.output, 'stt-mixed-models')?.hidden).toBe(true);
+
+    await useModel('deepgram/nova-3');
+    expect($(t!.zones.output, 'stt-part-retry')?.getAttribute('aria-disabled')).toBe('false');
+    $(t!.zones.output, 'stt-part-retry')!.click();
+    await vi.waitFor(async () =>
+      expect(await t!.core.history.query({ tool: 'speech-to-text' })).toHaveLength(2),
+    );
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect(calls.map((body) => body.model)).toEqual([
+      'openai/whisper-1',
+      'openai/whisper-1',
+      'openai/whisper-1',
+      'deepgram/nova-3',
+    ]);
+    expect($(t!.zones.output, 'stt-mixed-models')?.textContent).toBe(
+      'Parts were transcribed with different models: openai/whisper-1 (parts 1 and 3), deepgram/nova-3 (part 2).',
+    );
+    const runs = await t!.core.history.query({ tool: 'speech-to-text' });
+    expect(runs[0]?.meta).toMatchObject({ models: ['openai/whisper-1', 'deepgram/nova-3'] });
+  });
+
+  it('Retry says why it cannot run: parts the model cannot take, or a replaced recording', async () => {
+    // Five-minute parts: the 150 s file goes as it is, one MP3 part.
+    const { calls, tool } = await mount(
+      () => Promise.reject(new ApiError('Provider returned error', 502)),
+      5,
+    );
+    await t!.runners[0]!.trigger();
+    expect(calls.map((body) => body.format)).toEqual(['mp3']);
+    const retryButton = () => $(t!.zones.output, 'stt-retry-failed')!;
+    expect(retryButton().getAttribute('aria-disabled')).toBe('false');
+
+    await useModel('assemblyai/universal-3-5-pro');
+    expect(retryButton().getAttribute('aria-disabled')).toBe('true');
+    expect($(t!.zones.output, 'stt-retry-note')?.textContent).toBe(
+      'assemblyai/universal-3-5-pro takes at most 1:50 per request, and these parts are longer. Transcribe the whole recording again with it.',
+    );
+    retryButton().click();
+    await useModel('meta/muse-voice-transcribe');
+    expect($(t!.zones.output, 'stt-retry-note')?.textContent).toContain('takes only WAV audio');
+    // The error toast's Retry replays the same parts: it says why too.
+    await t!.runners[0]!.trigger([0]);
+    expect(t!.status()).toContain('takes only WAV audio');
+    expect(calls).toHaveLength(1);
+
+    await useModel('openai/whisper-1');
+    expect(retryButton().getAttribute('aria-disabled')).toBe('false');
+    tool.onFiles?.([new File(['other'], 'other.mp3', { type: 'audio/mpeg' })]);
+    await vi.waitFor(() =>
+      expect($(t!.zones.input, 'stt-source-name')?.textContent).toBe('other.mp3'),
+    );
+    expect(retryButton().getAttribute('aria-disabled')).toBe('true');
+    expect($(t!.zones.output, 'stt-retry-note')?.textContent).toBe(
+      'This transcript belongs to a recording that is no longer loaded, so its parts cannot be retried.',
+    );
+    retryButton().click();
+    expect(calls).toHaveLength(1);
   });
 });

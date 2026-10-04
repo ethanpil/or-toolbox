@@ -9,6 +9,7 @@ import {
   prepareParts,
   sentAsIs,
 } from './source';
+import { partsUnfitFor, sttSupport } from './model-support';
 
 const { decodeAudio, transcodeAudio } = vi.hoisted(() => ({
   decodeAudio: vi.fn<(blob: Blob) => Promise<AudioData>>(),
@@ -19,9 +20,8 @@ vi.mock('../../core/media/audio', async (importOriginal) => ({
   ...(await importOriginal<typeof AudioModule>()),
   decodeAudio: (blob: Blob) => decodeAudio(blob),
 }));
-vi.mock('../../core/media/ffmpeg-ops', () => ({
-  transcodeAudio: (blob: Blob, format: string, options: object) =>
-    transcodeAudio(blob, format, options),
+vi.mock('../../core/media/transcode', () => ({
+  transcode: (blob: Blob, format: string, options: object) => transcodeAudio(blob, format, options),
 }));
 
 const source = (patch: Partial<AudioSource>): AudioSource => ({
@@ -64,6 +64,35 @@ describe('what is sent as it is', () => {
     expect(sentAsIs(source({ duration: null }), 60)).toBe(false);
     expect(expectedParts(source({ duration: 3600 }), 300)).toBe(13);
     expect(expectedParts(source({ duration: 20 }), 300)).toBe(1);
+  });
+
+  it('never sends a file as it is to a model that takes only PCM WAV', async () => {
+    const muse = sttSupport('meta/muse-voice-transcribe');
+    expect(muse).toMatchObject({ pcmWavOnly: true, maxPartSeconds: 590 });
+    expect(sttSupport('openai/whisper-1').pcmWavOnly).toBe(false);
+    const wav = source({ name: 'talk.wav', mime: 'audio/wav' });
+    expect(sentAsIs(wav, 300, muse.pcmWavOnly)).toBe(false);
+    decodeAudio.mockResolvedValue(tone(20));
+    const parts = await prepareParts(source({ duration: 20 }), {
+      ...options(),
+      pcmWavOnly: true,
+    });
+    expect(parts.map((part) => part.format)).toEqual(['wav']);
+    expect(decodeAudio).toHaveBeenCalledTimes(1);
+  });
+
+  it('says when parts cut for one model do not fit another', () => {
+    const parts = [
+      { duration: 299, format: 'wav' },
+      { duration: 120, format: 'wav' },
+    ];
+    expect(partsUnfitFor('openai/whisper-1', parts, 5)).toBeNull();
+    expect(partsUnfitFor('assemblyai/universal-3-5-pro', parts, 5)).toBe(
+      'assemblyai/universal-3-5-pro takes at most 1:50 per request, and these parts are longer. Transcribe the whole recording again with it.',
+    );
+    expect(partsUnfitFor('meta/muse-voice-transcribe', [{ duration: 3, format: 'mp3' }], 5)).toBe(
+      'meta/muse-voice-transcribe takes only WAV audio. Transcribe the whole recording again with it.',
+    );
   });
 });
 
