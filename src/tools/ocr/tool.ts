@@ -17,14 +17,15 @@ import {
 import type { RunAddon, RunHandle } from '../../core/types';
 import { documentInput, textImage, type PageRef } from '../../ui/components/document-input';
 import { outputPanel } from '../../ui/components/output-panel';
+import { progressBar } from '../../ui/components/progress-bar';
 import { focusedKey, focusKey, h, replaceWith } from '../../ui/dom';
-import { announce } from '../../ui/feedback/announce';
 import { isStop } from '../../ui/feedback/errors';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
-import type { RunnerState, ToolContext, ToolInstance } from '../../ui/tool/index';
+import type { ToolContext, ToolInstance } from '../../ui/tool/index';
+import { retryGate } from '../../ui/tool/retry-gate';
 import {
   combineMarkdown,
   combinePlainText,
@@ -360,21 +361,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     ],
   });
 
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress',
-      role: 'progressbar',
-      'aria-label': 'Pages read',
-      'aria-valuemin': '0',
-      'aria-valuemax': '0',
-      'aria-valuenow': '0',
-      hidden: true,
-      'data-testid': 'ocr-progress',
-    },
-    progressBar,
-  );
+  const progress = progressBar({ label: 'Pages read', hidden: true, testId: 'ocr-progress' });
 
   const pagesList = h('ol', {
     class: 'list-unstyled vstack gap-2 mb-0',
@@ -418,7 +405,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           combinedButton,
           pagesButton,
         ),
-        h('div', { class: 'flex-grow-1' }, progress),
+        h('div', { class: 'flex-grow-1' }, progress.element),
       ),
       failedNotice,
       combinedPanel,
@@ -437,33 +424,15 @@ export function setup(ctx: ToolContext): ToolInstance {
     combinedTimer ??= setTimeout(refreshCombined, 250);
   };
 
-  /** The runner's state, kept by `runner.subscribe`: Retry buttons follow it. */
-  let runnerState: RunnerState = { busy: false, disabledReason: null };
-  /** Why a Retry cannot start now (Run busy or disabled), or null. */
-  const retryBlocked = (): string | null =>
-    runnerState.busy ? 'Wait until the current run ends.' : runnerState.disabledReason;
-
-  /** Shows a Retry button as available or not, with the reason; it stays focusable (aria-disabled). */
-  const setRetryState = (button: HTMLElement): void => {
-    const reason = retryBlocked();
-    button.setAttribute('aria-disabled', String(reason !== null));
-    button.classList.toggle('disabled', reason !== null);
-    button.title = reason ?? '';
-  };
-
+  /** A Retry button that follows the runner (see `retryGate`). */
   const retryButton = (
     attributes: Record<string, string>,
     keys: () => string[],
     ...children: (HTMLElement | string)[]
-  ): HTMLButtonElement => {
-    const button = h(
-      'button',
-      { type: 'button', ...attributes, 'data-retry': '', onclick: () => retry(keys()) },
-      ...children,
+  ): HTMLButtonElement =>
+    gate.bind(
+      h('button', { type: 'button', ...attributes, onclick: () => retry(keys()) }, ...children),
     );
-    setRetryState(button);
-    return button;
-  };
 
   const pageItem = (result: PageResult): HTMLElement => {
     const text = h('div', { class: 'or-page-text', 'data-testid': 'ocr-page-text' }, result.text);
@@ -586,11 +555,10 @@ export function setup(ctx: ToolContext): ToolInstance {
   const updateProgress = (): void => {
     const total = results.length;
     const finished = results.filter((result) => result.status === 'done').length;
-    progress.hidden = total === 0;
-    progress.setAttribute('aria-valuemax', String(total));
-    progress.setAttribute('aria-valuenow', String(finished));
-    progressBar.style.width = total ? `${Math.round((finished / total) * 100)}%` : '0%';
-    if (reading && total > 0) ui.status(`Read ${finished} of ${plural(total, 'page')}`);
+    const counter = `Read ${finished} of ${plural(total, 'page')}`;
+    progress.element.hidden = total === 0;
+    progress.update(finished, total, counter);
+    if (reading && total > 0) ui.progress(counter);
   };
 
   // --- running --------------------------------------------------------------------------------------------
@@ -701,8 +669,7 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   /** Reads `keys` again (a Retry); the runner's own Retry after a refusal repeats the same pages. */
   const retry = (keys: string[]): void => {
-    if (keys.length === 0) return;
-    if (!runner.trigger(keys).started) announce(retryBlocked() ?? 'Reading cannot start now.');
+    if (keys.length > 0) gate.retry(keys, 'Reading cannot start now.');
   };
 
   const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
@@ -829,12 +796,8 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   const runner = ui.runner<string[]>({ label: 'Read', icon: 'file-earmark-text', run });
-  // Run turning busy, disabled or enabled (by this tool or the framework) updates the Retry buttons.
-  runner.subscribe((state) => {
-    runnerState = state;
-    for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]'))
-      setRetryState(button);
-  });
+  // Retry buttons follow Run (busy, disabled by this tool or the framework).
+  const gate = retryGate(runner);
   renderPages();
 
   const applyState = ({
