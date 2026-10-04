@@ -275,6 +275,12 @@ test('gate: 20 product photos come back on pure white, pass the QA and export as
     expect(body.input_references?.[0]?.image_url.url).toMatch(/^data:image\/png;base64,/);
   }
 
+  // Unsaved results are protected: leaving asks first.
+  await page.getByRole('link', { name: 'Models', exact: true }).click();
+  await expect(page.getByTestId('leave-guard-list')).toHaveText('20 images not downloaded');
+  await page.getByTestId('leave-guard-stay').click();
+  await expect(page.getByTestId('leave-guard')).toHaveCount(0);
+
   // The ZIP: 20 JPGs named by the default pattern.
   const [download] = await Promise.all([
     page.waitForEvent('download'),
@@ -284,10 +290,6 @@ test('gate: 20 product photos come back on pure white, pass the QA and export as
   const files = unzipSync(new Uint8Array(readFileSync(await download.path())));
   const names = photos.map((photo) => photo.name.replace(/\.png$/, '-white.jpg'));
   expect(Object.keys(files).sort()).toEqual([...names].sort());
-  // Downloading the ZIP counts as downloading each result.
-  await expect(page.getByTestId('result-download').filter({ hasText: 'Downloaded' })).toHaveCount(
-    20,
-  );
 
   for (const [index, photo] of photos.entries()) {
     const jpeg = files[names[index]!]!;
@@ -322,6 +324,9 @@ test('gate: 20 product photos come back on pure white, pass the QA and export as
   // The pipeline ran in the image worker (a same-origin module worker), never on the page.
   const origin = new URL(page.url()).origin;
   expect(workers.some((url) => /image-worker/.test(url) && url.startsWith(origin))).toBe(true);
+  // The ZIP counted as downloading every result: leaving no longer asks.
+  await page.getByRole('link', { name: 'Models', exact: true }).click();
+  await expect(page).toHaveURL(/\/models\/$/);
   expect(problems).toEqual([]);
 });
 
@@ -463,9 +468,10 @@ test('a JPG keeps its border pure white even with a 0.5% margin: QA holds for th
   const card = page.getByTestId('iso-card');
   await expect(card).toHaveAttribute('data-phase', 'done', { timeout: 240_000 });
   await expect(card).toHaveAttribute('data-qa', 'pass');
+  // The result card offers the file as it is (its JPG border was checked); one format: one button.
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    card.getByTestId('result-download').click(),
+    card.getByTestId('iso-download').click(),
   ]);
   expect(download.suggestedFilename()).toBe('01-box-white.jpg');
   const stats = await measure(page, new Uint8Array(readFileSync(await download.path())));
@@ -487,11 +493,15 @@ test('free-only mode: no image model is free, so the tool says so and cannot run
   await seedApp(context, { key: true, settings: { freeOnly: true } });
   mockModels(mock);
   const problems = await watchForProblems(page);
-  // The sample: a product photo drawn on a canvas, and a note for the model.
+  // The sample: a product photo drawn on a canvas, shown as a small thumbnail. No text field: the tool is
+  // promptless (its instruction is fixed).
   await page.goto('tools/isolated-image/?sample=1');
   await expect(page.getByTestId('iso-photo')).toHaveCount(1);
   await expect(page.getByTestId('iso-photo')).toContainText('sample-mug.png');
-  await expect(page.getByTestId('tool-prompt')).toHaveValue(/teal mug/);
+  const thumb = page.getByTestId('iso-photo').locator('img');
+  await expect(thumb).toHaveJSProperty('complete', true);
+  expect(await thumb.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(144);
+  await expect(page.getByTestId('tool-prompt')).toHaveCount(0);
   const notice = page.getByTestId('free-only-notice');
   await expect(notice).toContainText('This tool cannot run in free-only mode');
   await expect(notice).toContainText('No free image model exists');

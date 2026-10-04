@@ -4,8 +4,10 @@ import type { ImageRequest, ImageResult, RawImageModel, RawModel } from '../../c
 import { ApiError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { CallOptions } from '../../core/types';
+import type * as ReferencePicker from '../../ui/components/reference-picker';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
+import { buildInstruction } from './request';
 import { setup } from './tool';
 
 /**
@@ -24,6 +26,11 @@ vi.mock('../../ui/feedback/announce', () => ({
   announce: (text: string) => {
     announced.push(text);
   },
+}));
+// jsdom cannot decode images: a thumbnail is the image itself.
+vi.mock('../../ui/components/reference-picker', async (original) => ({
+  ...(await original<typeof ReferencePicker>()),
+  imageThumbnail: (blob: Blob) => Promise.resolve(blob),
 }));
 vi.mock('./raster-io', async () => {
   const { createRaster } = await import('../../core/media/image');
@@ -166,11 +173,13 @@ afterEach(() => {
 });
 
 describe('Isolated image tool', { timeout: 30_000 }, () => {
-  it('round-trips its settings and notes, ignoring what it does not know', async () => {
+  it('is promptless, and round-trips its settings, ignoring what it does not know', async () => {
     t = context();
     const tool = await t.mount(setup);
+    expect(tool.promptless).toBe(true);
+    expect($(t.zones.input, 'tool-prompt')).toBeNull();
     const state = {
-      prompt: 'The product is the left shoe.',
+      prompt: '',
       settings: {
         size: 1500,
         margin: 0.12,
@@ -189,8 +198,12 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     expect(tool.getState()).toEqual(state);
     tool.applyState(tool.getState());
     expect(tool.getState()).toEqual(state);
-    tool.applyState({ prompt: '', settings: { size: 'huge', margin: 2, other: true } });
-    expect(tool.getState()).toEqual({ ...state, prompt: '' });
+    // A text from an older snapshot is ignored: the instruction is fixed.
+    tool.applyState({
+      prompt: 'Keep the table',
+      settings: { size: 'huge', margin: 2, other: true },
+    });
+    expect(tool.getState()).toEqual(state);
     // The drawer shows the restored values.
     expect($<HTMLSelectElement>(t.zones.drawer, 'iso-size')?.value).toBe('1500');
     expect($<HTMLInputElement>(t.zones.drawer, 'iso-margin-setting')?.value).toBe('12');
@@ -212,15 +225,14 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
   it('isolates a batch: one edit request per photo, results on white that pass the QA, History text', async () => {
     t = context();
     const tool = await t.mount(setup);
-    tool.applyState({ prompt: 'Remove the price sticker.', settings: { size: 500 } });
+    tool.applyState({ prompt: '', settings: { size: 500 } });
     tool.onFiles?.([photo('a.png'), photo('b.png'), photo('c.png')]);
     await t.runners[0]!.trigger();
 
     expect(okImages).toHaveBeenCalledTimes(3);
     const body = okImages.mock.calls[0]![0];
     expect(body).toMatchObject({ model: KLEIN, n: 1, output_format: 'png' });
-    expect(body.prompt).toContain('pure white background (#FFFFFF)');
-    expect(body.prompt).toContain('About these photos: Remove the price sticker.');
+    expect(body.prompt).toBe(buildInstruction({ shadow: false }));
     expect(body.input_references).toEqual([
       { type: 'image_url', image_url: { url: 'data:image/png;base64,a.png' } },
     ]);
@@ -245,7 +257,13 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     expect(record?.status).toBe('ok');
     expect(record?.output).toBe('a.png: QA passed\nb.png: QA passed\nc.png: QA passed');
     expect(record?.settings).toMatchObject({ size: 500, format: 'jpg' });
-    expect(record?.prompt).toBe('Remove the price sticker.');
+    expect(record?.prompt).toBe('');
+    // Each result is a framework image card: the download as it is, Send to…, this tool's actions, Remove.
+    const first = cards(t)[0]!;
+    expect($(first, 'iso-result')).not.toBeNull();
+    expect($(first, 'iso-download')?.textContent).toContain('.jpg');
+    expect($(first, 'iso-send')).not.toBeNull();
+    expect($(first, 'iso-review')).not.toBeNull();
     // Nothing is left to isolate: a second press sends nothing.
     await t.runners[0]!.trigger();
     expect(okImages).toHaveBeenCalledTimes(3);
@@ -408,11 +426,11 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     const pattern = $<HTMLInputElement>(t.zones.drawer, 'iso-pattern')!;
     pattern.value = 'product-{n:2}';
     pattern.dispatchEvent(new Event('change'));
+    // Renamed (a new card each); the one already downloaded stays downloaded, so only the other is pending.
     await vi.waitFor(() =>
-      expect(
-        cards(t!).map((card) => $(card, 'result-download')?.getAttribute('aria-label')),
-      ).toEqual(['product-01.jpg, downloaded. Download again', 'Download product-02.jpg']),
+      expect(t!.core.results.pending().map((result) => result.name)).toEqual(['product-02.jpg']),
     );
+    expect(cards(t)).toHaveLength(2);
 
     const format = $<HTMLSelectElement>(t.zones.drawer, 'iso-format')!;
     format.value = 'png';
@@ -496,18 +514,29 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     tool.applyState({ prompt: '', settings: { size: 500, concurrency: 1 } });
     tool.onFiles?.([photo('a.png'), photo('b.png'), photo('c.png')]);
     const keys = $$(t.zones.input, 'iso-photo').map((row) => row.dataset['key']!);
-    // One retry argument, replayed as the runner's Retry does: a.png is made, b.png's 402 stops the batch.
-    const arg = { keys };
-    await t.runners[0]!.trigger(arg);
+    // Toasts of earlier tests may still be on the page: this test's is the one that comes next.
+    const toasts = (): HTMLButtonElement[] => [
+      ...document.querySelectorAll<HTMLButtonElement>('[data-testid="toast-retry"]'),
+    ];
+    const before = toasts().length;
+    // A retry of all three: a.png is made, then b.png's 402 stops the batch and the error toast offers Retry.
+    await t.runners[0]!.trigger({ keys });
     expect(images.mock.calls.map(([body]) => photoOf(body))).toEqual(['a.png', 'b.png']);
     refuse = false;
-    await t.runners[0]!.trigger(arg);
-    expect(images.mock.calls.map(([body]) => photoOf(body))).toEqual([
-      'a.png',
-      'b.png',
-      'b.png',
-      'c.png',
-    ]);
+    const retry = await vi.waitFor(() => {
+      expect(toasts().length).toBe(before + 1);
+      return toasts().at(-1)!;
+    });
+    retry.click(); // the runner replays the argument through replayArg (pendingOnly)
+    await vi.waitFor(() =>
+      expect(images.mock.calls.map(([body]) => photoOf(body))).toEqual([
+        'a.png',
+        'b.png',
+        'b.png',
+        'c.png',
+      ]),
+    );
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
     // A new request for a photo that has a result ("Edit again") is still sent.
     await t.runners[0]!.trigger({ keys: [keys[0]!] });
     expect(images).toHaveBeenCalledTimes(5);

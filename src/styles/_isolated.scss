@@ -16,9 +16,13 @@
   aspect-ratio: 1;
   overflow: hidden;
   background-color: #fff;
-  border-bottom: 1px solid var(--bs-border-color);
-  border-top-left-radius: var(--bs-card-inner-border-radius);
-  border-top-right-radius: var(--bs-card-inner-border-radius);
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius);
+}
+
+// The grid's result cards (imageResultCard) fill their cell like the status cards beside them.
+.or-iso-grid .or-image-result {
+  height: 100%;
 }
 
 .or-iso-result-img {
