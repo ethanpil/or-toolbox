@@ -439,6 +439,7 @@ async function buildTool(
       const runner = createRunner(runnerOptions, runners.length === 0);
       runners.push(runner);
       (runnerOptions.container ?? input).append(runner.element);
+      if (runners.length === 1) reserveRunnerSpace(runner.element);
       runner.setFrameworkReason(
         resolveModel().model === null ? 'No model is available in free-only mode.' : null,
       );
@@ -480,12 +481,49 @@ async function buildTool(
     tool: manifest.id,
     getState: () => ready.getState(),
     applyState: (state) => ready.applyState(state),
+    promptless: ready.promptless === true,
   });
   core.jobs.resume();
 
   installShortcut(runners);
 
   await applyUrlState(core, manifest, ready, params);
+}
+
+/**
+ * The primary Run bar is sticky at the bottom of the window and must never hide the control that has focus
+ * (WCAG 2.4.11). Its height goes to `--or-runner-height` on <html>, where `scroll-padding-bottom`
+ * (src/styles/_tool.scss) keeps scrollIntoView and clicks above it. Chromium ignores scroll padding when Tab moves
+ * focus, so a focused control the bar still covers is scrolled up by the overlap.
+ */
+function reserveRunnerSpace(bar: HTMLElement): void {
+  const root = document.documentElement;
+  const sync = (): void => {
+    root.style.setProperty(
+      '--or-runner-height',
+      `${Math.ceil(bar.getBoundingClientRect().height)}px`,
+    );
+  };
+  sync();
+  if (typeof ResizeObserver === 'function') new ResizeObserver(sync).observe(bar);
+  const uncover = (target: HTMLElement): void => {
+    if (document.activeElement !== target || !bar.isConnected) return;
+    const control = target.getBoundingClientRect();
+    const covering = bar.getBoundingClientRect();
+    const overlap = control.bottom - covering.top;
+    if (overlap <= 0 || control.top >= covering.bottom) return;
+    // Up by the overlap plus a little air, but never pushing the control's top out of the window.
+    window.scrollBy({
+      top: Math.min(overlap + 8, Math.max(0, control.top - 8)),
+      behavior: 'instant',
+    });
+  };
+  document.addEventListener('focusin', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || bar.contains(target)) return;
+    // The browser's own focus scroll comes after focusin: check once it has happened.
+    requestAnimationFrame(() => uncover(target));
+  });
 }
 
 /** Ctrl/Cmd+Enter runs the first (primary) runner, unless a dialog is open. */

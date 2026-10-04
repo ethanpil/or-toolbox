@@ -236,9 +236,6 @@ test.describe('Image editor', () => {
     await expect(page.getByTestId('editor-compare')).toHaveAttribute('aria-pressed', 'true');
     await page.getByTestId('editor-compare').click();
 
-    // The framework's Run bar sticks to the bottom of the window and covers whatever input control is there,
-    // which axe counts as a target too small to hit; scan with the bar in its own place (the page's end).
-    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
     await expectNoSeriousA11yViolations(page);
     await page.emulateMedia({ colorScheme: 'dark' });
     await expectNoSeriousA11yViolations(page);

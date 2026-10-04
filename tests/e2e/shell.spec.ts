@@ -226,3 +226,40 @@ test('every page has one h1, a skip link and no horizontal scroll at 320 px', as
     expect(overflow, `horizontal scroll on /${route}`).toBeLessThanOrEqual(0);
   }
 });
+
+test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context, { key: true });
+  await page.setViewportSize({ width: 1000, height: 420 }); // the input zone is longer than the window
+  await page.goto('tools/data-extractor/');
+  await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
+  const runner = page.getByTestId('runner');
+  await page.getByTestId('tool-prompt').focus();
+  let checked = 0;
+  for (let step = 0; step < 40; step++) {
+    await page.keyboard.press('Tab');
+    // The browser scrolls the focused control into view on the next frames; judge what the user then sees.
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    );
+    const state = await page.evaluate(() => {
+      const active = document.activeElement as HTMLElement | null;
+      const input = document.querySelector('[data-testid="tool-input"]');
+      const bar = document.querySelector<HTMLElement>('[data-testid="runner"]');
+      if (!active || !input?.contains(active) || !bar || bar.contains(active)) return null;
+      const a = active.getBoundingClientRect();
+      const b = bar.getBoundingClientRect();
+      return {
+        name: `${active.textContent?.trim().slice(0, 30)} a=${a.top},${a.bottom} b=${b.top},${b.bottom} y=${scrollY} max=${document.documentElement.scrollHeight - innerHeight}`,
+        covered: a.bottom > b.top + 1 && a.top < b.bottom,
+      };
+    });
+    if (!state) continue;
+    checked++;
+    expect(state.covered, state.name).toBe(false);
+  }
+  expect(checked).toBeGreaterThan(3);
+  await expect(runner).toBeVisible();
+});
