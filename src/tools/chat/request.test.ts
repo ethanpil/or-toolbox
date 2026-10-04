@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  approxTokens,
   buildRequest,
-  missingInput,
   nodeTokens,
   type RequestOptions,
   trimToBudget,
@@ -204,15 +202,6 @@ describe('context trimming', () => {
 });
 
 describe('limits', () => {
-  it('counts tokens conservatively for scripts that are not Latin', () => {
-    expect(approxTokens('abcd')).toBe(1);
-    expect(approxTokens('你好世界')).toBe(4);
-    expect(approxTokens('こんにちは')).toBe(5);
-    expect(approxTokens('안녕하세요')).toBe(5);
-    expect(approxTokens('привет')).toBe(3);
-    expect(approxTokens('')).toBe(0);
-  });
-
   it('clamps max_tokens to the model’s output cap and to what the context leaves', () => {
     const path = longPath(0, 0);
     const capped = buildRequest(
@@ -276,18 +265,6 @@ describe('what a model can read', () => {
     size: 1,
     kind,
     ...(parsed ? { parsed } : {}),
-  });
-  const has = (): boolean => true;
-
-  it('names the first attachment the model cannot take', () => {
-    expect(missingInput([ref('image')], ['text'], 'cloudflare-ai', has)).toBe('image');
-    expect(missingInput([ref('audio')], ['text', 'image'], 'cloudflare-ai', has)).toBe('audio');
-    expect(missingInput([ref('pdf')], ['text'], 'native', has)).toBe('file');
-    expect(missingInput([ref('pdf')], ['text'], 'cloudflare-ai', has)).toBeNull();
-    expect(missingInput([ref('pdf', 'text')], ['text'], 'native', has)).toBeNull();
-    expect(missingInput([ref('image')], ['text', 'image'], 'native', has)).toBeNull();
-    // Gone after a reload: sent as a note, so nothing is missing.
-    expect(missingInput([ref('image')], ['text'], 'native', () => false)).toBeNull();
   });
 
   it('turns an earlier PDF into a note for a model that cannot read files natively', () => {

@@ -9,18 +9,14 @@
  * Buttons are turned off with `aria-disabled` (they keep focus), and their focus keys name the place, not the
  * message (`regen:<parent>`), so focus stays put when a sibling, a regenerated reply or a retry takes its place.
  */
+import type { AttachmentRef } from '../../core/attachments/attachments';
+import { attachmentChip } from '../../ui/components/attachment-chip';
 import { h } from '../../ui/dom';
-import { formatBytes, formatCount, formatMs, formatUsd } from '../../ui/format';
+import { formatCount, formatMs, formatUsd } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { fillReply } from './markdown-view';
-import {
-  siblingInfo,
-  type AttachmentKind,
-  type AttachmentRef,
-  type ChatNode,
-  type Thread,
-} from './thread';
+import { siblingInfo, type ChatNode, type Thread } from './thread';
 
 export interface MessageActions {
   copy(node: ChatNode): void;
@@ -62,13 +58,6 @@ export interface MessageView {
   /** The reasoning text element, when shown. */
   reasoning: HTMLElement | null;
 }
-
-export const KIND_ICONS: Readonly<Record<AttachmentKind, string>> = {
-  image: 'file-earmark-image',
-  pdf: 'file-earmark-pdf',
-  audio: 'file-earmark-music',
-  text: 'file-earmark-text',
-};
 
 /** Token, cost and latency line of a reply. */
 export function usageLine(node: ChatNode, free: boolean): string {
@@ -176,30 +165,14 @@ export function attachmentList(
     { class: 'list-unstyled d-flex flex-wrap gap-2 mb-0 mt-2', 'aria-label': 'Attachments' },
     refs.map((ref) => {
       const url = data(ref.id);
-      const missing = isMissing(ref, data);
-      return h(
-        'li',
-        {
-          class: ['or-chat-attachment', missing && 'is-missing'],
-          'data-testid': 'message-attachment',
-        },
-        ref.kind === 'image' && url
-          ? h('img', { class: 'or-chat-thumb', src: url, alt: '' })
-          : icon(KIND_ICONS[ref.kind]),
-        h(
-          'span',
-          { class: 'min-w-0' },
-          h('span', { class: 'd-block text-truncate' }, ref.name),
-          h(
-            'span',
-            {
-              class: ['d-block small', missing ? 'text-warning-emphasis' : 'text-body-secondary'],
-              'data-testid': missing ? 'attachment-missing' : null,
-            },
-            missing ? 'Attachment not kept after reload' : formatBytes(ref.size),
-          ),
-        ),
-      );
+      return attachmentChip({
+        ref,
+        ...(url ? { data: url } : {}),
+        ...(isMissing(ref, data)
+          ? { missing: { note: 'Attachment not kept after reload', testId: 'attachment-missing' } }
+          : {}),
+        testId: 'message-attachment',
+      });
     }),
   );
 }

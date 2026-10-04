@@ -163,6 +163,50 @@
   border-radius: 50%;
 }
 
+// Attachment chips (attachment-chip.ts: Chat's composer and messages, Model arena's prompt).
+.or-attachment {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  max-width: 16rem;
+  padding: 0.25rem 0.5rem;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius);
+
+  > .bi {
+    font-size: 1.25rem;
+    color: var(--bs-secondary-color);
+  }
+
+  &.is-missing {
+    border-style: dashed;
+  }
+}
+
+.or-attachment-thumb {
+  flex-shrink: 0;
+  width: 2.5rem;
+  height: 2.5rem;
+  object-fit: cover;
+  border-radius: calc(var(--bs-border-radius) - 2px);
+}
+
+// At least 24 × 24 px (WCAG 2.2 target size).
+.or-attachment-remove {
+  flex-shrink: 0;
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0.25rem;
+  color: var(--bs-secondary-color);
+  text-decoration: none;
+
+  &:hover,
+  &:focus-visible {
+    color: var(--bs-emphasis-color);
+  }
+}
+
 .or-drop-overlay {
   position: fixed;
   inset: 0;

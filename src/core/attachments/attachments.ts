@@ -1,6 +1,6 @@
 /**
- * Files attached to a chat message: what kind each is, the size limits, reading them, and the content part each
- * becomes in the request (docs/openrouter-api.md §2.4, §2.5).
+ * Files attached to a chat request (Chat's messages, Model arena's prompt): what kind each is, the size limits,
+ * reading them, and the content part each becomes in the request (docs/openrouter-api.md §2.4, §2.5).
  *
  * - Images (PNG, JPEG, WebP, GIF) go as `image_url` data URLs; the model needs image input.
  * - PDFs go as a `file` part with a data URL; the request adds the `file-parser` plugin (engine chosen in
@@ -8,15 +8,33 @@
  * - Audio goes as base64 `input_audio`; only models with audio input take it.
  * - Text, Markdown and code files are inlined as text.
  *
- * Only the text of text files is kept with the thread. Image, PDF and audio bytes stay in memory (the session
- * map, keyed by attachment id) and are gone after a reload: such attachments then go to the model as a short note.
+ * An `AttachmentRef` is JSON-safe: name, type, size, a text file's text and a PDF's parser text. Image, PDF and
+ * audio bytes are never in it: tools keep their data URLs in memory, by attachment id (rule 3).
  */
-import type { ContentPart } from '../../core/api/types';
-import { InvalidInputError } from '../../core/errors';
-import { readAsDataUrl, readAsText } from '../../core/files';
-import { isPlainObject, isString } from '../../core/util';
-import { formatBytes } from '../../ui/format';
-import { type AttachmentKind, type AttachmentRef, newId } from './thread';
+import type { ContentPart } from '../api/types';
+import { InvalidInputError } from '../errors';
+import { formatBytes, readAsDataUrl, readAsText } from '../files';
+import { isPlainObject, isString } from '../util';
+
+export type AttachmentKind = 'image' | 'pdf' | 'audio' | 'text';
+
+export interface AttachmentRef {
+  id: string;
+  name: string;
+  /** MIME type. */
+  type: string;
+  size: number;
+  kind: AttachmentKind;
+  /** Text files only: the content, inlined into the message. Binaries are never kept. */
+  text?: string;
+  /**
+   * PDFs only: the parser's text of the file, from the `annotations` of the reply that first read it
+   * (docs/openrouter-api.md §2.5). Later requests send this text instead of uploading and parsing the file again.
+   */
+  parsed?: string;
+  /** PDFs only, this session: pages counted when attached (prices the paid PDF parser). Not read back. */
+  pages?: number;
+}
 
 const MB = 1024 * 1024;
 
@@ -96,7 +114,7 @@ const TEXT_TYPES = new Set([
   'application/x-subrip',
 ]);
 
-/** What `accept` on the composer's file input lists: every type and extension we read. */
+/** What `accept` on a file input lists: every type and extension we read. */
 export const ACCEPT_ATTRIBUTE = [
   ...IMAGE_TYPES,
   'application/pdf',
@@ -109,7 +127,7 @@ export const ACCEPT_ATTRIBUTE = [
 const extensionOf = (name: string): string =>
   /\.([^.]+)$/.exec(name)?.[1]?.toLowerCase() ?? name.toLowerCase();
 
-/** The kind of a file, from its type and its extension; null when chat cannot use it. */
+/** The kind of a file, from its type and its extension; null when a chat request cannot carry it. */
 export function classifyFile(file: { name: string; type: string }): AttachmentKind | null {
   const type = file.type.toLowerCase();
   const extension = extensionOf(file.name);
@@ -151,14 +169,14 @@ export interface ReadAttachment {
 }
 
 /**
- * Reads a file for attaching. Throws InvalidInputError (a message the user can act on) for files chat cannot
- * use and files over the size limit.
+ * Reads a file for attaching. Throws InvalidInputError (a message the user can act on) for files a chat request
+ * cannot carry and files over the size limit.
  */
 export async function readAttachment(file: File): Promise<ReadAttachment> {
   const kind = classifyFile(file);
   if (!kind) {
     throw new InvalidInputError(
-      `${file.name} can't be attached: chat takes images, PDFs, audio, and text or code files.`,
+      `${file.name} can't be attached: only images, PDFs, audio, and text or code files can.`,
     );
   }
   const limit = SIZE_LIMITS[kind];
@@ -168,7 +186,7 @@ export async function readAttachment(file: File): Promise<ReadAttachment> {
     );
   }
   const ref: AttachmentRef = {
-    id: newId(),
+    id: crypto.randomUUID(),
     name: file.name || 'attachment',
     type: mimeFor(file, kind),
     size: file.size,
@@ -205,7 +223,7 @@ export function pdfPages(ref: Pick<AttachmentRef, 'pages' | 'size'>): number {
 
 /** A text item from "Send to…" as a text attachment. */
 export function textAttachment(name: string, text: string, type = 'text/plain'): AttachmentRef {
-  return { id: newId(), name, type, size: new Blob([text]).size, kind: 'text', text };
+  return { id: crypto.randomUUID(), name, type, size: new Blob([text]).size, kind: 'text', text };
 }
 
 /**
@@ -248,22 +266,31 @@ export function parsedFiles(annotations: unknown): { name: string; text: string 
   return files;
 }
 
-/** A note in place of an attachment whose bytes are gone (the thread was reloaded). */
-export function missingNote(ref: AttachmentRef): string {
-  return `[Attachment "${ref.name}" (${ref.kind === 'pdf' ? 'PDF' : ref.kind}) is no longer available.]`;
+/**
+ * Stores the parser's text (from a reply's `annotations`) on the PDFs that request sent for parsing, matched by
+ * name in order; their bytes are then no longer needed for later requests.
+ */
+export function keepParsed(refs: readonly AttachmentRef[], annotations: unknown): void {
+  const files = parsedFiles(annotations);
+  for (const ref of refs) {
+    const index = files.findIndex((file) => file.name === ref.name);
+    if (index < 0) continue;
+    ref.parsed = files[index]!.text;
+    files.splice(index, 1);
+  }
 }
 
 /**
- * The content part an attachment becomes. `data` is its data URL from the session (absent after a reload, then
- * the part is a short note so the model knows something was there).
+ * The content part an attachment becomes. `data` is its data URL from memory; null when the part needs the bytes
+ * and they are gone (the caller decides what to send instead: Chat sends a note after a reload).
  */
-export function toContentPart(ref: AttachmentRef, data: string | undefined): ContentPart {
+export function toContentPart(ref: AttachmentRef, data: string | undefined): ContentPart | null {
   if (ref.kind === 'text') {
     return { type: 'text', text: `<file name="${ref.name}">\n${ref.text ?? ''}\n</file>` };
   }
   // A PDF the parser read before: its text, without uploading or parsing it again.
   if (ref.kind === 'pdf' && ref.parsed !== undefined) return { type: 'text', text: ref.parsed };
-  if (!data) return { type: 'text', text: missingNote(ref) };
+  if (!data) return null;
   switch (ref.kind) {
     case 'image':
       return { type: 'image_url', image_url: { url: data } };
