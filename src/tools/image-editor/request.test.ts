@@ -26,7 +26,11 @@ describe('references and instructions', () => {
     expect(text).toContain('Change only the marked area: a red boat.');
     expect(text).toContain('Keep everything outside the marked area exactly as it is');
     expect(text).toContain('without any magenta tint');
-    expect(editInstruction('inpaint', 'x', ['marked'])).not.toContain('second reference');
+    const single = editInstruction('inpaint', 'x', ['marked']);
+    expect(single).not.toContain('second reference');
+    // Only what was sent is named: no unmarked picture for a one-reference model.
+    expect(single).not.toMatch(/unmarked|without any marks/);
+    expect(single).toContain('Keep everything outside the marked area exactly as it is.');
   });
 
   it('describes the empty area for outpaint, and needs no instruction', () => {

@@ -1,10 +1,11 @@
 /**
- * Outpainting geometry: a larger canvas around the picture (by margins, or out to an aspect ratio), the
- * picture placed on it, and the new area as the mask.
+ * Canvas geometry for edits: the larger outpaint canvas around the picture (by margins, or out to an aspect
+ * ratio), the picture placed on it, the new area as the mask and its compositing alpha, the plan at the size
+ * the model sees, and how a result of another shape is fitted onto the canvas.
  */
 import { aspectValue } from '../../core/models/image-params';
-import type { Mask, RasterImage, Rgb } from '../../core/media/image';
-import { createMask } from './mask';
+import type { Box, Mask, RasterImage, Rgb } from '../../core/media/image';
+import { createMask, featherOutside } from './mask';
 
 /** Extra space on each side, in percent of the picture's width (left, right) or height (top, bottom). */
 export interface Margins {
@@ -114,4 +115,75 @@ export function placeOnCanvas(
     );
   }
   return { width: plan.width, height: plan.height, data };
+}
+
+/**
+ * The alpha that lays an outpaint result over the picture's canvas: all result in the new area (there is only
+ * grey filler under it, never blended in), and a soft edge of `feather` pixels on the picture's side of the
+ * seam; beyond that the picture is kept exactly.
+ */
+export function outpaintAlpha(
+  plan: OutpaintPlan,
+  width: number,
+  height: number,
+  feather: number,
+): Mask {
+  return featherOutside(outpaintMask(plan, width, height), feather);
+}
+
+/** A plan at another size of the same canvas, with the picture's own box rounded once, consistently. */
+export interface ScaledPlan extends OutpaintPlan {
+  imageWidth: number;
+  imageHeight: number;
+}
+
+export function scaledPlan(
+  plan: OutpaintPlan,
+  width: number,
+  height: number,
+  size: { width: number; height: number },
+): ScaledPlan {
+  const sx = size.width / plan.width;
+  const sy = size.height / plan.height;
+  const offsetX = Math.round(plan.offsetX * sx);
+  const offsetY = Math.round(plan.offsetY * sy);
+  return {
+    width: size.width,
+    height: size.height,
+    offsetX,
+    offsetY,
+    imageWidth: Math.max(1, Math.round((plan.offsetX + width) * sx) - offsetX),
+    imageHeight: Math.max(1, Math.round((plan.offsetY + height) * sy) - offsetY),
+  };
+}
+
+/** Shapes closer than this (in log ratio, about 2%) count as the same: the result is scaled to fill. */
+const SAME_SHAPE = 0.02;
+
+/**
+ * Where a result goes on the canvas: filling it when the shapes agree, else fitted inside and centred (never
+ * stretched); `fill: false` means the edges of the canvas are not covered and the user should be told.
+ */
+export function fitResult(
+  resultWidth: number,
+  resultHeight: number,
+  canvasWidth: number,
+  canvasHeight: number,
+): { fill: boolean; box: Box } {
+  const same =
+    Math.abs(Math.log(resultWidth / resultHeight) - Math.log(canvasWidth / canvasHeight)) <=
+    SAME_SHAPE;
+  if (same) return { fill: true, box: { x: 0, y: 0, width: canvasWidth, height: canvasHeight } };
+  const scale = Math.min(canvasWidth / resultWidth, canvasHeight / resultHeight);
+  const width = Math.max(1, Math.round(resultWidth * scale));
+  const height = Math.max(1, Math.round(resultHeight * scale));
+  return {
+    fill: false,
+    box: {
+      x: Math.round((canvasWidth - width) / 2),
+      y: Math.round((canvasHeight - height) / 2),
+      width,
+      height,
+    },
+  };
 }

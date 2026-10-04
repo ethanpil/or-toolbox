@@ -177,6 +177,19 @@ function boxBlur(
  * 255 (the result is taken exactly); the band between blends.
  */
 export function featherInside(mask: Mask, radius: number): Mask {
+  return feather(mask, radius, Math.min);
+}
+
+/**
+ * The mask with a soft outer edge: a box blur of `radius` pixels, never less than the mask itself. Inside the
+ * mask it stays 255; the band of `radius` pixels outside it blends. For outpaint, where the mask is the new
+ * area and only the picture's side of the seam has anything to blend with.
+ */
+export function featherOutside(mask: Mask, radius: number): Mask {
+  return feather(mask, radius, Math.max);
+}
+
+function feather(mask: Mask, radius: number, clamp: (a: number, b: number) => number): Mask {
   const r = Math.max(0, Math.round(radius));
   const out = createMask(mask.width, mask.height);
   if (r === 0) {
@@ -189,7 +202,37 @@ export function featherInside(mask: Mask, radius: number): Mask {
   boxBlur(a, b, width, height, r, true);
   boxBlur(b, a, width, height, r, false);
   for (let i = 0; i < out.data.length; i++) {
-    out.data[i] = Math.min(mask.data[i] ?? 0, Math.round(a[i] ?? 0));
+    out.data[i] = clamp(mask.data[i] ?? 0, Math.round(a[i] ?? 0));
+  }
+  return out;
+}
+
+/** The mask with everything outside `box` set to 0 (where a fitted result does not reach). */
+export function clipMask(mask: Mask, box: Box): Mask {
+  const out = createMask(mask.width, mask.height);
+  const x0 = Math.max(0, box.x);
+  const x1 = Math.min(mask.width, box.x + box.width);
+  for (let y = Math.max(0, box.y); y < Math.min(mask.height, box.y + box.height); y++) {
+    const row = y * mask.width;
+    out.data.set(mask.data.subarray(row + x0, row + x1), row + x0);
+  }
+  return out;
+}
+
+/** The mask at another size, nearest pixel (the editor paints at the size the model sees). */
+export function scaleMask(mask: Mask, width: number, height: number): Mask {
+  if (width === mask.width && height === mask.height) {
+    return { width, height, data: new Uint8Array(mask.data) };
+  }
+  const out = createMask(width, height);
+  for (let y = 0; y < height; y++) {
+    const row =
+      Math.min(mask.height - 1, Math.floor(((y + 0.5) * mask.height) / height)) * mask.width;
+    for (let x = 0; x < width; x++) {
+      out.data[y * width + x] =
+        mask.data[row + Math.min(mask.width - 1, Math.floor(((x + 0.5) * mask.width) / width))] ??
+        0;
+    }
   }
   return out;
 }

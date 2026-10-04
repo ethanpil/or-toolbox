@@ -124,14 +124,18 @@ export function effective(form: GenerationForm, controls: ModelControls): Effect
   if (form.transparent) {
     if (controls.backgrounds?.includes('transparent')) {
       background = 'transparent';
-      // Transparency needs PNG or WebP (§3.2).
-      const current = outputFormat ?? controls.outputFormats?.[0] ?? null;
-      if (current === 'jpeg') {
+      // Transparency needs PNG or WebP (§3.2): one is always sent when the model lists it, never left to the
+      // model's default (the order of the list says nothing about the default).
+      if (outputFormat !== 'png' && outputFormat !== 'webp') {
         const lossless = ['png', 'webp'].find((format) => controls.outputFormats?.includes(format));
         if (lossless) outputFormat = lossless;
-        else {
+        else if (controls.outputFormats) {
           background = null;
           notes.push('This model makes JPEG only, which cannot be transparent.');
+        } else {
+          notes.push(
+            'This model does not say which file format it makes; transparency needs PNG or WebP.',
+          );
         }
       }
     } else notes.push('This model cannot make transparent backgrounds.');
@@ -241,6 +245,10 @@ export function parseForm(prompt: string, settings: Record<string, unknown>): Ge
   };
   const seed = settings['seed'];
   const count = settings['count'];
+  const validSeed =
+    typeof seed === 'number' && Number.isInteger(seed) && seed >= 0 && seed <= MAX_SEED
+      ? seed
+      : null;
   return {
     prompt,
     style: text('style'),
@@ -251,11 +259,9 @@ export function parseForm(prompt: string, settings: Record<string, unknown>): Ge
     quality: text('quality'),
     outputFormat: text('outputFormat'),
     transparent: settings['transparent'] === true,
-    seed:
-      typeof seed === 'number' && Number.isInteger(seed) && seed >= 0 && seed <= MAX_SEED
-        ? seed
-        : null,
-    seedLocked: settings['seedLocked'] === true,
+    seed: validSeed,
+    // A lock always has a seed: a locked run sends exactly that seed.
+    seedLocked: settings['seedLocked'] === true && validSeed !== null,
     count:
       typeof count === 'number' && Number.isInteger(count) && count >= 1 && count <= MAX_IMAGES
         ? count
@@ -278,4 +284,12 @@ export function formSettings(form: GenerationForm): Record<string, unknown> {
     seedLocked: form.seedLocked,
     count: form.count,
   };
+}
+
+/**
+ * The settings a run records (History, Recent prompts): the form with the seed the run used, locked, so
+ * reopening the run reproduces its pictures. Without a seed (the model takes none) the form as asked.
+ */
+export function runSettings(form: GenerationForm, seed: number | null): Record<string, unknown> {
+  return seed === null ? formSettings(form) : formSettings({ ...form, seed, seedLocked: true });
 }

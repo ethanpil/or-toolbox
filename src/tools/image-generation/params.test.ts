@@ -12,6 +12,7 @@ import {
   parseForm,
   planRequests,
   referenceProblem,
+  runSettings,
 } from './params';
 
 /** Shapes from tests/fixtures/openrouter/images-models.json. */
@@ -216,6 +217,34 @@ describe('transparency', () => {
       'This model cannot make transparent backgrounds.',
     ]);
   });
+
+  it('always sends PNG or WebP with transparency when the model lists one, whatever the list order', () => {
+    const withFormats = (values: string[]) =>
+      modelControls({
+        ...RIVERFLOW,
+        supported_parameters: {
+          ...RIVERFLOW.supported_parameters,
+          output_format: { type: 'enum', values },
+        },
+      });
+    // "Model default" must not be trusted to be lossless: the format is sent explicitly.
+    expect(effective(form({ transparent: true }), withFormats(['png', 'jpeg'])).outputFormat).toBe(
+      'png',
+    );
+    expect(effective(form({ transparent: true }), withFormats(['jpeg', 'webp'])).outputFormat).toBe(
+      'webp',
+    );
+    expect(
+      effective(form({ transparent: true, outputFormat: 'webp' }), withFormats(['png', 'webp']))
+        .outputFormat,
+    ).toBe('webp');
+    // A model that lists no formats gets the background alone, with a note that the format is its choice.
+    const unlisted = effective(form({ transparent: true }), modelControls(GPT_IMAGE_1));
+    expect(unlisted).toMatchObject({ background: 'transparent', outputFormat: null });
+    expect(unlisted.notes).toEqual([
+      'This model does not say which file format it makes; transparency needs PNG or WebP.',
+    ]);
+  });
 });
 
 describe('planRequests, sizes and references', () => {
@@ -277,5 +306,23 @@ describe('the stored form', () => {
       ...DEFAULT_FORM,
       prompt: 'x',
     });
+  });
+
+  it('never keeps a lock without a seed', () => {
+    expect(parseForm('x', { seedLocked: true, seed: null })).toMatchObject({
+      seed: null,
+      seedLocked: false,
+    });
+  });
+
+  it('records the seed a run used as locked, so reopening it reproduces the picture', () => {
+    const asked = form({ seed: null, seedLocked: false, count: 2 });
+    expect(runSettings(asked, 4242)).toEqual({
+      ...formSettings(asked),
+      seed: 4242,
+      seedLocked: true,
+    });
+    // A model without seeds: nothing to lock, the form as asked.
+    expect(runSettings(asked, null)).toEqual(formSettings(asked));
   });
 });

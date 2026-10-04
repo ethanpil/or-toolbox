@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Mask, RasterImage } from '../../core/media/image';
 import {
   applyOp,
+  clipMask,
   compositeMasked,
   createMask,
   featherInside,
@@ -11,6 +12,7 @@ import {
   type MaskOp,
   paintSegment,
   replayOps,
+  scaleMask,
   stampDisc,
 } from './mask';
 
@@ -127,5 +129,25 @@ describe('feather and composite', () => {
     expect(() => compositeMasked(original, raster(20, 20, [0, 0, 0, 255]), square())).toThrow(
       RangeError,
     );
+  });
+});
+
+describe('scaleMask', () => {
+  it('scales a mask to another size by nearest pixel', () => {
+    const mask = createMask(2, 2);
+    mask.data.set([255, 0, 0, 255]);
+    expect([...scaleMask(mask, 4, 4).data]).toEqual([
+      255, 255, 0, 0, 255, 255, 0, 0, 0, 0, 255, 255, 0, 0, 255, 255,
+    ]);
+    expect(scaleMask(mask, 2, 2).data).toEqual(mask.data);
+  });
+});
+describe('clipMask', () => {
+  it('keeps the mask inside a box only', () => {
+    const mask = createMask(4, 3);
+    mask.data.fill(255);
+    expect([...clipMask(mask, { x: 1, y: 1, width: 2, height: 5 }).data]).toEqual([
+      0, 0, 0, 0, 0, 255, 255, 0, 0, 255, 255, 0,
+    ]);
   });
 });

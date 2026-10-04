@@ -77,7 +77,9 @@ export function editInstruction(
   } else {
     lines.push(
       `Change only the marked area: ${text}.`,
-      'Keep everything outside the marked area exactly as it is in the unmarked picture.',
+      roles.includes('plain')
+        ? 'Keep everything outside the marked area exactly as it is in the unmarked picture.'
+        : 'Keep everything outside the marked area exactly as it is.',
     );
   }
   lines.push(
