@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Tool framework for the audio stages: `ui.holdWork()` (leave guard for unsaved in-memory work), `ui.progress()` (quiet counters), `retryGate()`, `progressBar()`, `audioResultCard()` and a shared `transcode()`; estimates are computed afresh at run start (20ea0ec, bca3f9f, ed3a51f).
 - Vite multi-page build of 22 pages under `/or-toolbox/`, with strict TypeScript, ESLint, Prettier, Vitest and Playwright (a76487c).
 - Shared page head with CSP meta tag, pre-paint theme script, PWA manifest and generated icons (a76487c).
 - Manifests, registry and placeholder pages for all 14 tools (a76487c).
@@ -71,6 +72,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Audio player seeks in recordings whose duration reads as Infinity; a single segment already in the target format is not re-encoded (ed3a51f). E2E: shared abort filtering in `watchForProblems`, chat reloads wait for stored replies, two load-sensitive unit tests made steady (53646cf).
 - Stats: the ledger counts a multi-model run as one run and one error, and tracks the estimated part of spend (shown as ≈ on the page); relative ranges roll over at UTC midnight; a series hidden in a chart comes back when its legend goes away; the tooltip names the hovered day when nothing happened on it; one ledger read per load.
 - History: runs in progress are never deleted (and Undo cannot bring one back); the model filter comes from the runs (routed ids included); JSON output keeps big numbers and every value as stored; "Show more" appends rows.
 - Models: one price model (`src/ui/model-price.ts`) for the picker, tool chip, Settings and the page, in each model's real billing unit; sorting and the price limit compare like with like; usage from one ledger read.
