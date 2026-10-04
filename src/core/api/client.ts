@@ -17,6 +17,8 @@
  *   (connection lost, aborted, stream without a usage chunk), the usage is reported with `costUnknown`, so the
  *   run books its reservation: unknown is never recorded as free. Video cost arrives only on the completed
  *   status read, which has no run: `VideoJobStatus.costUsd` is returned for the tool to add.
+ * - A paid or chat POST (not all-free) that fails where a provider may have run it (lost after sending, 408, a
+ *   5xx other than 503) throws with `outcomeUnknown` set (`markOutcome`), so the UI never offers a plain Retry.
  * - JSON success bodies are shape-checked; an `error` inside a 2xx body or a missing result field is an
  *   ApiError, never a TypeError from deep inside a tool.
  *
@@ -109,6 +111,22 @@ export const TOOL_CATEGORIES: Partial<Record<ToolId, string>> = {
  * - `never`: the single-use auth-code exchange.
  */
 export type RetryRule = 'read' | 'paid' | 'chat' | 'never';
+
+/**
+ * Marks `failure` as `outcomeUnknown` when it ends a non-idempotent POST (`paid`, `chat`) that is not all-free and
+ * that a provider may have run without an answer saying so: lost after it was `sent`, or answered 408 or a 5xx
+ * other than 503 (no provider was routed to). An error event inside a stream is an answer, so it is not marked.
+ */
+function markOutcome(spec: Spec, failure: unknown, sent: boolean): void {
+  if ((spec.rule !== 'paid' && spec.rule !== 'chat') || !spec.bill || spec.bill.allFree) return;
+  if (!(failure instanceof OrError)) return;
+  const unknown =
+    failure instanceof ApiError
+      ? !failure.detail.midStream &&
+        (failure.status === 408 || (failure.status >= 500 && failure.status !== 503))
+      : failure instanceof NetworkError && sent;
+  if (unknown) failure.outcomeUnknown = true;
+}
 
 export function mayRetry(error: unknown, rule: RetryRule): boolean {
   if (rule === 'never') return false;
@@ -369,6 +387,7 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
           : null;
       if (delay === null) {
         if (reached && failure instanceof NetworkError) bookUnknown(spec, startedAt);
+        markOutcome(spec, failure, reached);
         throw failure;
       }
       await sleep(delay, spec.signal);
@@ -631,6 +650,7 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
           spec.signal,
           'The connection dropped while the answer streamed.',
         );
+        markOutcome(spec, failure, true);
       }
       const result = assembler.result();
       // Once the response started the provider may bill, so usage is reported in every outcome.
@@ -702,6 +722,7 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
         }
       } catch (error) {
         failure = asFailure(error, spec.signal, 'The connection dropped while the image streamed.');
+        markOutcome(spec, failure, true);
       }
 
       const usage = mergeUsage(usages);

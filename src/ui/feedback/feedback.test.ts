@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ApiError,
   BudgetBlockedError,
   FreeOnlyError,
   NetworkError,
@@ -282,5 +283,61 @@ describe('presentError', () => {
     // Engine messages are never shown.
     expect($('error-toast')?.textContent).toContain('Something went wrong');
     expect($('toast-retry')).toBeNull();
+  });
+
+  /** What the API client throws when a paid request may have gone through. */
+  const unknownOutcome = <E extends NetworkError | ApiError>(error: E): E => {
+    error.outcomeUnknown = true;
+    return error;
+  };
+
+  it('never offers Retry when a paid request may have gone through, and says to check first', async () => {
+    const retry = vi.fn();
+    await presentError(unknownOutcome(new NetworkError()), { retry });
+    const toastEl = $('error-toast')!;
+    expect(toastEl.textContent).toContain('may have gone through');
+    expect(toastEl.textContent).toContain('billed');
+    expect($('toast-retry')).toBeNull();
+    // Without a tool's own way to check, the toast links to OpenRouter's activity log.
+    const activity = $<HTMLAnchorElement>('toast-activity')!;
+    expect(activity.getAttribute('href')).toBe('https://openrouter.ai/activity');
+    expect(activity.target).toBe('_blank');
+    document.body.replaceChildren();
+
+    await presentError(unknownOutcome(new ApiError('The provider timed out. Try again.', 524)), {
+      retry,
+    });
+    expect($('error-toast')?.textContent).toContain('524');
+    expect($('error-toast')?.textContent).not.toContain('Try again');
+    expect($('toast-retry')).toBeNull();
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it('offers the tool’s safe action instead, and Retry only when the caller says a resend is safe', async () => {
+    const retry = vi.fn();
+    const check = vi.fn();
+    await presentError(unknownOutcome(new ApiError('x', 502)), {
+      retry,
+      safeAction: { label: 'Check status', onClick: check },
+    });
+    expect($('toast-retry')).toBeNull();
+    expect($('toast-activity')).toBeNull();
+    const safe = $('toast-safe-action')!;
+    expect(safe.textContent).toBe('Check status');
+    safe.click();
+    expect(check).toHaveBeenCalledOnce();
+    document.body.replaceChildren();
+
+    await presentError(unknownOutcome(new NetworkError()), { retry, retryUnknownOutcome: true });
+    expect($('error-toast')?.textContent).toContain('may have gone through');
+    expect($('toast-activity')).not.toBeNull();
+    $('toast-retry')!.click();
+    expect(retry).toHaveBeenCalledOnce();
+    document.body.replaceChildren();
+
+    // The same errors without the flag (not from a paid call) keep their plain Retry.
+    await presentError(new ApiError('Mocked refusal', 500), { retry });
+    expect($('toast-retry')).not.toBeNull();
+    expect($('error-toast')?.textContent).not.toContain('may have gone through');
   });
 });

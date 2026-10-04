@@ -35,7 +35,7 @@ import videoPending from '../../../tests/fixtures/openrouter/videos-poll-pending
 import videoCompleted from '../../../tests/fixtures/openrouter/videos-poll-completed.recorded.json';
 import videoFailed from '../../../tests/fixtures/openrouter/videos-poll-failed.documented.json';
 import videosModels from '../../../tests/fixtures/openrouter/videos-models.json';
-import { ApiError, NetworkError, RateLimitError, isAbortError } from '../errors';
+import { ApiError, NetworkError, RateLimitError, isAbortError, isOutcomeUnknown } from '../errors';
 import type { KeyInfo, KeysService, ModelsService } from '../types';
 import {
   API_BASE,
@@ -1174,5 +1174,118 @@ describe('unknown cost', () => {
     s.models.estimate.mockResolvedValueOnce(null);
     await s.client.decide(jevRequest as Parameters<typeof s.client.decide>[0], { run: s.run });
     expect(s.run.usages[0]).toMatchObject({ promptTokens: 10, costUsd: 0, costUnknown: true });
+  });
+});
+
+describe('outcome unknown', () => {
+  const failure = (promise: Promise<unknown>): Promise<unknown> =>
+    promise.then(
+      () => {
+        throw new Error('expected a failure');
+      },
+      (e: unknown) => e,
+    );
+  const video = { model: 'x-ai/grok-imagine-video', prompt: 'p' };
+
+  it('marks a paid POST that may have reached a provider: lost after sending, 408, or a 5xx but 503', async () => {
+    const lost = setup([new TypeError('fetch failed')]);
+    const error = await failure(lost.client.videos.submit(video, { run: lost.run }));
+    expect(error).toBeInstanceOf(NetworkError);
+    expect(isOutcomeUnknown(error)).toBe(true);
+
+    for (const status of [500, 502, 408, 524, 529]) {
+      const s = setup([json(error502, status)]);
+      const answered = await failure(s.client.videos.submit(video, { run: s.run }));
+      expect(answered, String(status)).toMatchObject({ status, outcomeUnknown: true });
+    }
+
+    const cutBody = setup([brokenBody('audio/mpeg')]);
+    expect(
+      isOutcomeUnknown(
+        await failure(
+          cutBody.client.speech({ model: 'hexgrad/kokoro-82m', input: 'hi' }, { run: cutBody.run }),
+        ),
+      ),
+    ).toBe(true);
+
+    // Chat is a non-idempotent paid POST too, streamed or not.
+    const chat = setup([new TypeError('fetch failed')]);
+    expect(isOutcomeUnknown(await failure(chat.client.chat(chatBody, { run: chat.run })))).toBe(
+      true,
+    );
+    const cut = 'data: {"id":"g","model":"m","choices":[{"delta":{"content":"Hal"}}]}\n\n';
+    const stream = setup([sse(cut)]);
+    const dropped = await failure(
+      stream.client.chatStream(chatBody, { run: stream.run, onEvent: () => undefined }),
+    );
+    expect(dropped).toBeInstanceOf(NetworkError);
+    expect(isOutcomeUnknown(dropped)).toBe(true);
+
+    const partial = `data: {"type":"image_generation.partial_image","b64_json":"${PNG_B64}"}\n\n`;
+    const images = setup([sse(partial)]);
+    expect(
+      isOutcomeUnknown(
+        await failure(
+          images.client.images(
+            { model: 'openai/gpt-image-2', prompt: 'x', stream: true },
+            { run: images.run },
+          ),
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('leaves known outcomes unmarked: refusals, 503, error events, free requests and reads', async () => {
+    const outcomes: unknown[] = [];
+    const refused = setup([json(error400Model, 400), json(error402Balance, 402)]);
+    outcomes.push(await failure(refused.client.videos.submit(video, { run: refused.run })));
+    outcomes.push(await failure(refused.client.videos.submit(video, { run: refused.run })));
+
+    const limited = setup([json(error429Plain, 429)]);
+    outcomes.push(
+      await failure(
+        limited.client.images({ model: 'm', prompt: 'x' }, { run: limited.run, retry: false }),
+      ),
+    );
+
+    // 503: no provider was routed to (retried, then given up).
+    const busy = setup([noProvider(), noProvider(), noProvider()]);
+    outcomes.push(
+      await failure(busy.client.images({ model: 'm', prompt: 'x' }, { run: busy.run })),
+    );
+    expect(busy.fetch).toHaveBeenCalledTimes(3);
+
+    // A failed generation is an answer (docs §3.4).
+    const event = setup([sse(imagesStreamError.lines.join('\n'))]);
+    outcomes.push(
+      await failure(
+        event.client.images(
+          { model: 'openai/gpt-image-2', prompt: 'x', stream: true },
+          { run: event.run },
+        ),
+      ),
+    );
+
+    // Nothing can be billed for a request whose every model is free.
+    const free = setup([new TypeError('fetch failed')]);
+    outcomes.push(
+      await failure(
+        free.client.chat({ ...chatBody, model: 'liquid/lfm-2.5-2.6b:free' }, { run: free.run }),
+      ),
+    );
+
+    // Reads are idempotent: retried, never marked.
+    const read = setup([
+      new TypeError('fetch failed'),
+      new TypeError('fetch failed'),
+      json(error502, 502),
+    ]);
+    outcomes.push(await failure(read.client.videos.status('job', { keyId: 'key-1' })));
+
+    expect(outcomes).toHaveLength(7);
+    for (const outcome of outcomes) {
+      expect(outcome).toBeInstanceOf(Error);
+      expect(isOutcomeUnknown(outcome), String(outcome)).toBe(false);
+    }
   });
 });

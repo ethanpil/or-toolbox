@@ -16,6 +16,7 @@ import type {
   ToolManifest,
   ToolStateStore,
 } from '../../core/types';
+import type { ToastAction } from '../feedback/toast';
 
 /** What the Prompts panel saves and restores, and what History reopens. Must round-trip exactly. */
 export interface ToolSnapshot {
@@ -81,7 +82,8 @@ export interface RunnerOptions<A = unknown> {
   icon?: string;
   /**
    * The work. `signal` aborts when the user presses Stop (pass it to `ctx.beginRun`, which links it to the run).
-   * Throw to report failure; errors go through `presentError` with a Retry.
+   * Throw to report failure; errors go through `presentError` with a Retry (see `safeAction` for a paid request that
+   * may have gone through).
    */
   run: (signal: AbortSignal, arg?: A) => Promise<void>;
   /**
@@ -90,6 +92,17 @@ export interface RunnerOptions<A = unknown> {
    * items again. Return null when nothing is left: Retry then does nothing and says so. Default: the same argument.
    */
   replayArg?: (arg: A | undefined) => A | undefined | null;
+  /**
+   * Offered in the error toast instead of Retry when a paid request may have gone through (`isOutcomeUnknown`):
+   * a way to check without paying again, e.g. `{ label: 'Check status', onClick: refreshJobs }`. Default: a link
+   * to OpenRouter's activity page. Retry is never offered then, unless `retryUnknownOutcome`.
+   */
+  safeAction?: ToastAction;
+  /**
+   * Keep the toast's Retry (still through `replayArg`) after an unknown outcome. Set it only when sending again
+   * cannot pay twice, e.g. `run` first looks for the earlier request's result.
+   */
+  retryUnknownOutcome?: boolean;
   /** Text after the button (e.g. a reason it is disabled); also its description. */
   hint?: string;
   /** Where the bar goes; default the end of `ui.input`. */
