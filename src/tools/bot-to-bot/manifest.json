@@ -13,6 +13,7 @@
     "turnLimit": 20,
     "timeLimitMinutes": 5,
     "costCapUsd": 0.25,
-    "stopPhrase": "[END]"
+    "stopPhrase": "[END]",
+    "maxTokens": 1000
   }
 }

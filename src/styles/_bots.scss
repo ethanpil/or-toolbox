@@ -1,0 +1,244 @@
+// Bot-to-bot chat (src/tools/bot-to-bot): the bot setup, the totals, the transcript's bubbles and the moderator.
+// Bot A uses Bootstrap's info colours and Bot B its warning colours: the *-text-emphasis on *-bg-subtle pairs
+// are the alert pairs, AA in both themes. Bubbles sit on --or-inset, where link colours are checked too.
+
+$bot-colours: (
+  a: info,
+  b: warning,
+);
+
+// --- setup -------------------------------------------------------------------------------------------------
+.or-bot-setup {
+  padding: 0.75rem;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color-translucent);
+  border-radius: var(--bs-border-radius-lg);
+}
+
+@each $speaker, $colour in $bot-colours {
+  .or-bot-setup-#{$speaker} {
+    border-inline-start: 3px solid var(--bs-#{$colour}-border-subtle);
+  }
+}
+
+.or-bot-first-group {
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+.or-bot-first {
+  min-width: 5.5rem;
+  max-width: 12rem;
+}
+
+.or-bot-framing {
+  padding: 0.5rem 0.75rem;
+  background-color: var(--or-inset);
+  border-radius: var(--bs-border-radius);
+}
+
+// --- avatars -----------------------------------------------------------------------------------------------
+.or-bot-avatar {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  border-radius: 50%;
+}
+
+.or-bot-avatar-sm {
+  width: 1.5rem;
+  height: 1.5rem;
+  font-size: 0.6875rem;
+}
+
+@each $speaker, $colour in $bot-colours {
+  .or-bot-avatar-#{$speaker} {
+    color: var(--bs-#{$colour}-text-emphasis);
+    background-color: var(--bs-#{$colour}-bg-subtle);
+    border-color: var(--bs-#{$colour}-border-subtle);
+  }
+}
+
+// --- totals ------------------------------------------------------------------------------------------------
+.or-bot-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.or-bot-stat {
+  flex: 1 1 7.5rem;
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color-translucent);
+  border-radius: var(--bs-border-radius);
+}
+
+.or-bot-stat-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--bs-secondary-color);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.or-bot-stat-value {
+  margin: 0.125rem 0 0.375rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.or-bot-meter {
+  height: 0.375rem;
+}
+
+// --- transcript --------------------------------------------------------------------------------------------
+.or-bot-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  min-height: 16rem;
+  max-height: 70vh;
+  padding: 0.25rem;
+  margin: -0.25rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+
+  &:focus-visible {
+    border-radius: var(--bs-border-radius);
+    outline: 2px solid var(--or-focus-color);
+    outline-offset: 2px;
+  }
+}
+
+.or-bot-turn {
+  display: flex;
+  gap: 0.625rem;
+  align-items: flex-start;
+  max-width: 92%;
+
+  // Phones: the avatar and the side already tell the bots apart; the text gets the room.
+  @media (max-width: 575.98px) {
+    max-width: 100%;
+  }
+}
+
+.or-bot-turn-b {
+  flex-direction: row-reverse;
+  align-self: flex-end;
+}
+
+.or-bot-bubble {
+  min-width: 0;
+  padding: 0.625rem 0.875rem 0.375rem;
+  overflow-wrap: anywhere;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color-translucent);
+  border-radius: var(--bs-border-radius-lg);
+}
+
+@each $speaker, $colour in $bot-colours {
+  .or-bot-turn-#{$speaker} .or-bot-bubble {
+    border-inline-start: 3px solid var(--bs-#{$colour}-border-subtle);
+  }
+}
+
+.or-bot-turn-b .or-bot-bubble {
+  border-inline-start: 1px solid var(--bs-border-color-translucent);
+  border-inline-end: 3px solid var(--bs-warning-border-subtle);
+}
+
+.or-bot-name {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.or-bot-body {
+  margin-top: 0.25rem;
+
+  // Headings in a turn structure the turn; they should not outshout the page.
+  :is(h1, h2, h3, h4, h5, h6) {
+    margin-top: 0.75rem;
+    font-size: 1rem;
+    font-weight: 600;
+
+    &:first-child {
+      margin-top: 0;
+    }
+  }
+}
+
+.or-bot-foot {
+  min-height: 2rem;
+  margin-top: 0.25rem;
+}
+
+// Icon buttons in turns and the setup: at least 24 × 24 px (WCAG 2.2 target size).
+.or-bot-action {
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0.25rem;
+  color: var(--bs-secondary-color);
+  text-decoration: none;
+
+  &:hover,
+  &:focus-visible {
+    color: var(--bs-emphasis-color);
+  }
+}
+
+// The opening prompt and moderator messages: centred, set apart from both bots.
+.or-bot-mod {
+  display: flex;
+  justify-content: center;
+}
+
+.or-bot-mod-bubble {
+  width: min(100%, 34rem);
+  padding: 0.625rem 0.875rem 0.375rem;
+  overflow-wrap: anywhere;
+  background-color: var(--or-surface);
+  border: 1px dashed var(--bs-border-color);
+  border-radius: var(--bs-border-radius-lg);
+}
+
+.or-bot-mod-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--bs-secondary-color);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+// Where a stop condition ended the conversation: a centred divider.
+.or-bot-end {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  text-align: center;
+
+  &::before,
+  &::after {
+    flex: 1 1 1rem;
+    content: '';
+    border-top: 1px solid var(--bs-border-color);
+  }
+
+  > p {
+    max-width: 28rem;
+  }
+}
+
+.or-bot-moderator textarea {
+  min-height: 2.5rem;
+}
