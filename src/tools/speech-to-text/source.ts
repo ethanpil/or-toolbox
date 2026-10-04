@@ -115,8 +115,9 @@ export function passthroughFormat(
 }
 
 /** True when the source goes out as one request without decoding. */
-export function sentAsIs(source: AudioSource, partSeconds: number): boolean {
+export function sentAsIs(source: AudioSource, partSeconds: number, pcmWavOnly = false): boolean {
   return (
+    !pcmWavOnly &&
     passthroughFormat(source) !== null &&
     source.duration !== null &&
     source.duration <= partSeconds &&
@@ -125,14 +126,20 @@ export function sentAsIs(source: AudioSource, partSeconds: number): boolean {
 }
 
 /** How many parts a source of `duration` seconds is expected to be cut into (cuts land at pauses, so roughly). */
-export function expectedParts(source: AudioSource, partSeconds: number): number {
-  if (sentAsIs(source, partSeconds)) return 1;
+export function expectedParts(
+  source: AudioSource,
+  partSeconds: number,
+  pcmWavOnly = false,
+): number {
+  if (sentAsIs(source, partSeconds, pcmWavOnly)) return 1;
   return Math.max(1, Math.ceil((source.duration ?? 0) / Math.max(1, partSeconds - 1)));
 }
 
 export interface PrepareOptions {
   /** Longest part in seconds. */
   partSeconds: number;
+  /** The model takes only mono 16-bit PCM WAV: never send the file as it is (model-support.ts). */
+  pcmWavOnly?: boolean;
   signal: AbortSignal;
   /** Short progress lines ("Decoding the audio…"). */
   onStatus: (text: string) => void;
@@ -174,7 +181,7 @@ export async function prepareParts(
   options: PrepareOptions,
 ): Promise<AudioPart[]> {
   const format = passthroughFormat(source);
-  if (format && sentAsIs(source, options.partSeconds)) {
+  if (format && sentAsIs(source, options.partSeconds, options.pcmWavOnly)) {
     return [{ index: 0, start: 0, duration: source.duration ?? 0, blob: source.blob, format }];
   }
   const audio = await decodeForSpeech(source, options);
