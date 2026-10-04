@@ -14,7 +14,8 @@
  * - Storage failures never block a run: if the record cannot be written, the run goes ahead unpersisted
  *   (logged once per page), and its spend still reaches the stats when they can be written.
  * - pagehide only aborts (the page may be gone before any IndexedDB work finishes). Handed-off runs
- *   (`handOff(jobId)`) ignore aborts; their job's completion handler finishes them via `reattach()`.
+ *   (`handOff(jobId)`) ignore aborts; their job's completion handler finishes them via `reattach()`, or ends
+ *   them with `cancel()` (aborted, booking max(actual, reservation): the job may still bill).
  */
 
 import type {
@@ -307,15 +308,24 @@ export function createRunsService(core: CoreServices): RunsService {
     let lastWriteAt = -Infinity;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let pending: { promise: Promise<void>; settle: (error?: Error) => void } | null = null;
+    /** Usage, output or meta changed since the last write started; else a checkpoint just waits for that write. */
+    let unsaved = false;
+    let lastWrite: Promise<void> = Promise.resolve();
 
     const flush = (): Promise<void> => {
       lastWriteAt = Date.now();
-      return persist(runningFields());
+      unsaved = false;
+      lastWrite = persist(runningFields()).catch((error: unknown) => {
+        unsaved = true; // the next checkpoint tries again
+        throw error;
+      });
+      return lastWrite;
     };
 
     const scheduleWrite = (): Promise<void> => {
       if (finalRecord || !persisted || !valid()) return Promise.resolve();
       if (pending) return pending.promise;
+      if (!unsaved) return lastWrite;
       const wait = lastWriteAt + CHECKPOINT_INTERVAL_MS - Date.now();
       if (wait <= 0) return flush();
       let settle!: (error?: Error) => void;
@@ -404,6 +414,7 @@ export function createRunsService(core: CoreServices): RunsService {
         addTo((totals.byModel[usage.model] ??= emptyModelTotals()), usage);
         totals.costEstimated ||= usage.costEstimated;
         totals.costUnknown ||= usage.costUnknown === true;
+        unsaved = true;
         const copy = structuredClone(totals);
         for (const fn of [...usageListeners]) {
           try {
@@ -429,9 +440,15 @@ export function createRunsService(core: CoreServices): RunsService {
       },
       checkpoint(partial: RunCheckpoint) {
         if (finalRecord) return Promise.resolve();
-        if (partial.output !== undefined) output = partial.output;
+        if (partial.output !== undefined) {
+          output = partial.output;
+          unsaved = true;
+        }
         const copied = partial.meta ? copyMeta(partial.meta) : null;
-        if (copied) meta = { ...meta, ...copied };
+        if (copied) {
+          meta = { ...meta, ...copied };
+          unsaved = true;
+        }
         return scheduleWrite();
       },
       finish(result) {
@@ -450,6 +467,17 @@ export function createRunsService(core: CoreServices): RunsService {
           return finalize('aborted', abortReason);
         }
         return finalize('error', userMessage(error));
+      },
+      cancel(reason) {
+        if (!finalRecord && !finalizing) {
+          if (reason !== undefined) abortReason = reason;
+          if (!controller.signal.aborted) {
+            controller.abort(abortError(reason ?? 'The run was stopped.'));
+          }
+          // Its job may still finish and bill: unknown cost books max(actual, reservation), as for orphans.
+          if (handedOff()) totals.costUnknown = true;
+        }
+        return finalize('aborted', abortReason);
       },
       handOff(newJobId) {
         if (finalRecord) return;

@@ -67,5 +67,6 @@ export function fakeRun(
     finish: () => Promise.reject(new Error('not used')),
     fail: () => Promise.reject(new Error('not used')),
     handOff: () => undefined,
+    cancel: () => Promise.reject(new Error('not used')),
   };
 }

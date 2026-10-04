@@ -82,18 +82,22 @@ describe('polling', () => {
     expect(handler.poll).toHaveBeenCalledTimes(1);
     await advance(1);
     await until(async () => (await job(added.id))?.state === 'succeeded');
-    expect(await job(added.id)).toMatchObject({ result: 'clip-url', error: null });
+    expect(await job(added.id)).toMatchObject({
+      result: 'clip-url',
+      error: null,
+      failureKind: null,
+    });
 
     await advance(120_000);
     expect(handler.poll).toHaveBeenCalledTimes(2);
     expect(locks.held.size).toBe(0);
   });
 
-  it('records a failure reported by the handler', async () => {
+  it('records a failure reported by the handler as remote', async () => {
     core.jobs.register('video', scripted([{ state: 'failed', error: 'Content policy' }]));
     const added = await core.jobs.add(input);
     await until(async () => (await job(added.id))?.state === 'failed');
-    expect((await job(added.id))?.error).toBe('Content policy');
+    expect(await job(added.id)).toMatchObject({ error: 'Content policy', failureKind: 'remote' });
   });
 
   it('uses the handler interval, fixed or per job', async () => {
@@ -156,6 +160,7 @@ describe('resume, cancel and changes', () => {
       progress: null,
       remoteStatus: null,
       error: null,
+      failureKind: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       attempts: 0,
@@ -164,6 +169,27 @@ describe('resume, cancel and changes', () => {
     await (await getDb()).put('jobs', record);
     return record;
   }
+
+  it('reads records stored before failureKind existed as null', async () => {
+    const old: Partial<JobRecord> = { ...(await seed({ state: 'failed', error: 'x' })) };
+    delete old.failureKind;
+    await (await getDb()).put('jobs', old as JobRecord);
+    expect((await core.jobs.get(old.id!))?.failureKind).toBeNull();
+    expect((await core.jobs.list()).map((j) => j.failureKind)).toEqual([null]);
+    const seen: JobRecord[] = [];
+    core.jobs.subscribe((j) => seen.push(j));
+    core.bus.emit({ type: 'jobs-changed', id: old.id! });
+    await until(() => seen.length === 1);
+    expect(seen[0]).toMatchObject({ state: 'failed', failureKind: null });
+  });
+
+  it('clears the failure kind when a job leaves the failed state', async () => {
+    const failed = await seed({ state: 'failed', error: 'x', failureKind: 'gave-up' });
+    expect((await core.jobs.update(failed.id, { payload: { delivered: true } })).failureKind).toBe(
+      'gave-up',
+    );
+    expect((await core.jobs.update(failed.id, { state: 'cancelled' })).failureKind).toBeNull();
+  });
 
   it('resumes only open jobs of registered types after a reload', async () => {
     const open = await seed({ state: 'running' });
@@ -303,34 +329,197 @@ describe('completion notification', () => {
   }
   afterEach(() => setVisibility('visible'));
 
-  async function complete(): Promise<void> {
+  async function complete(notify?: boolean): Promise<void> {
     core.jobs.register('video', scripted([{ state: 'succeeded', result: 'ok' }]));
-    const added = await core.jobs.add(input);
+    const added = await core.jobs.add({ ...input, notify });
     await until(async () => (await job(added.id))?.state === 'succeeded');
+    await settle();
   }
 
-  it('notifies when the page is hidden and permission is granted', async () => {
+  it('notifies a job that opted in when the page is hidden and permission is granted', async () => {
     stubNotification('granted');
     setVisibility('hidden');
-    await complete();
+    await complete(true);
     expect(NotificationSpy).toHaveBeenCalledExactlyOnceWith(
       'Video studio: finished',
       expect.objectContaining({ body: 'Your result is ready.' }),
     );
   });
 
+  it('never notifies a job that did not opt in', async () => {
+    stubNotification('granted');
+    setVisibility('hidden');
+    await complete();
+    expect(NotificationSpy).not.toHaveBeenCalled();
+  });
+
   it('stays quiet when the page is visible', async () => {
     stubNotification('granted');
-    await complete();
+    await complete(true);
     expect(NotificationSpy).not.toHaveBeenCalled();
   });
 
   it('never asks for permission', async () => {
     stubNotification('default');
     setVisibility('hidden');
-    await complete();
+    await complete(true);
     expect(NotificationSpy).not.toHaveBeenCalled();
     expect(requestPermission).not.toHaveBeenCalled();
+  });
+
+  it('says when it gave up rather than that the job failed', async () => {
+    stubNotification('granted');
+    setVisibility('hidden');
+    core.jobs.register('video', scripted([new ApiError('Video not found', 404)]));
+    const added = await core.jobs.add({ ...input, notify: true });
+    await until(async () => (await job(added.id))?.state === 'failed');
+    await settle();
+    expect(NotificationSpy).toHaveBeenCalledExactlyOnceWith(
+      'Video studio: stopped checking',
+      expect.objectContaining({ body: 'Video not found' }),
+    );
+  });
+
+  it("shows one notification for a 'group' once none of its jobs is open, at most once", async () => {
+    stubNotification('granted');
+    setVisibility('hidden');
+    const answers: Record<string, JobPollResult<string>> = {};
+    core.jobs.register('video', {
+      poll: (j: JobRecord) => {
+        const n = (j.payload as { n: string }).n;
+        return Promise.resolve(answers[n] ?? { state: 'running' as const });
+      },
+    });
+    const add = (n: string) =>
+      core.jobs.add({ ...input, payload: { n }, groupId: 'seq', notify: 'group' });
+    const a = await add('a');
+    const b = await add('b');
+    await core.jobs.add({ ...input, payload: { n: 'other' }, groupId: 'other' }); // never notifies
+    await until(async () => (await job(b.id))?.state === 'running');
+    await settle();
+
+    answers['a'] = { state: 'succeeded', result: 'ok' };
+    answers['other'] = { state: 'succeeded', result: 'ok' };
+    await advance(DEFAULT_POLL_MS);
+    await until(async () => (await job(a.id))?.state === 'succeeded');
+    await settle();
+    expect(NotificationSpy).not.toHaveBeenCalled(); // b is still open
+
+    answers['b'] = { state: 'failed', error: 'Content policy' };
+    await advance(DEFAULT_POLL_MS);
+    await until(async () => (await job(b.id))?.state === 'failed');
+    await settle();
+    expect(NotificationSpy).toHaveBeenCalledExactlyOnceWith(
+      'Video studio: finished with failures',
+      expect.objectContaining({ body: '1 ready, 1 failed.', tag: 'ortoolbox-job-group-seq' }),
+    );
+
+    const c = await add('c'); // a re-run in the same group
+    answers['c'] = { state: 'succeeded', result: 'ok' };
+    await until(async () => (await job(c.id))?.state === 'succeeded');
+    await settle();
+    expect(NotificationSpy).toHaveBeenCalledOnce();
+  });
+});
+
+describe("booking a job's cost on its run", () => {
+  const begin = () =>
+    core.runs.begin({ tool: 'video-studio', model: 'v/video', prompt: 'a cat', estimateUsd: 0.5 });
+
+  async function startJob(steps: Step[]) {
+    const run = await begin();
+    core.jobs.register('video', scripted(steps));
+    const added = await core.jobs.add({ ...input, runId: run.id });
+    run.handOff(added.id);
+    return { run, added };
+  }
+
+  it('books the usage of a succeeded job before the job is final, so a failed download still counts', async () => {
+    // Another tab sees the job succeed, re-attaches the run and fails it (its download failed).
+    const other = createTestCore().core;
+    let claimed = false;
+    let costSeen = -1;
+    other.jobs.subscribe((j) => {
+      if (j.state !== 'succeeded' || claimed) return;
+      claimed = true;
+      void other.runs.reattach(j.runId!).then((handle) => {
+        costSeen = handle!.totals.costUsd;
+        return handle!.fail(new Error('The download failed.'));
+      });
+    });
+    const { run } = await startJob([
+      { state: 'succeeded', result: 'clip', usage: { costUsd: 0.2 } },
+    ]);
+    await until(async () => (await (await getDb()).get('runs', run.id))?.status === 'error');
+    expect(costSeen).toBeCloseTo(0.2);
+    expect(await (await getDb()).get('runs', run.id)).toMatchObject({
+      usage: { requests: 1, costUsd: 0.2, costUnknown: false },
+    });
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.2);
+  });
+
+  it('books the reservation when the provider reported no cost', async () => {
+    const { run, added } = await startJob([
+      { state: 'succeeded', result: 'clip', usage: { costUsd: null } },
+    ]);
+    await until(async () => (await job(added.id))?.state === 'succeeded');
+    await (await core.runs.reattach(run.id))!.finish();
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.5);
+  });
+
+  it('never books twice when the final write is retried', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- re-applied with the right `this` below
+    const original = IDBObjectStore.prototype.put;
+    let failed = false;
+    vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+      this: IDBObjectStore,
+      ...args: Parameters<IDBObjectStore['put']>
+    ) {
+      const record = args[0] as JobRecord;
+      if (this.name === 'jobs' && record.state === 'succeeded' && !failed) {
+        failed = true;
+        throw new DOMException('io', 'UnknownError');
+      }
+      return original.apply(this, args);
+    });
+    const succeeded = { state: 'succeeded', result: 'clip', usage: { costUsd: 0.2 } } as const;
+    const { run, added } = await startJob([succeeded, succeeded]);
+    await until(() => failed);
+    await settle();
+    await advance(MAX_POLL_MS);
+    await until(async () => (await job(added.id))?.state === 'succeeded');
+    await (await core.runs.reattach(run.id))!.finish();
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.2);
+  });
+
+  it('leaves the cost to the tool when the handler reports none', async () => {
+    const { run, added } = await startJob([{ state: 'succeeded', result: 'clip' }]);
+    await until(async () => (await job(added.id))?.state === 'succeeded');
+    const handle = (await core.runs.reattach(run.id))!;
+    expect(handle.totals.requests).toBe(0);
+    handle.addUsage({
+      model: handle.model,
+      promptTokens: 0,
+      completionTokens: 0,
+      costUsd: 0.3,
+      costEstimated: false,
+      latencyMs: 1,
+    });
+    await handle.finish();
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.3);
+  });
+
+  it('books the reservation when it gives up, and nothing for a remote failure', async () => {
+    const gaveUp = await startJob([new ApiError('Video not found', 404)]);
+    await until(async () => (await job(gaveUp.added.id))?.failureKind === 'gave-up');
+    await (await core.runs.reattach(gaveUp.run.id))!.fail(new Error('Video not found'));
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.5);
+
+    const remote = await startJob([{ state: 'failed', error: 'Content policy' }]);
+    await until(async () => (await job(remote.added.id))?.failureKind === 'remote');
+    await (await core.runs.reattach(remote.run.id))!.fail(new Error('Content policy'));
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.5);
   });
 });
 

@@ -257,7 +257,12 @@ function toRun(value: unknown): RunRecord | null {
 function toJob(value: unknown): JobRecord | null {
   if (!isPlainObject(value)) return null;
   const v = value;
+  // Both arrived after the first backups: a missing failure kind is null, a missing notify is left out (false).
+  const failureKind = v['failureKind'] ?? null;
+  const notify = v['notify'];
   if (
+    !(failureKind === null || failureKind === 'remote' || failureKind === 'gave-up') ||
+    !(notify === undefined || typeof notify === 'boolean' || notify === 'group') ||
     !isId(v['id']) ||
     !isToolId(v['tool']) ||
     !isString(v['type']) ||
@@ -290,6 +295,8 @@ function toJob(value: unknown): JobRecord | null {
     progress: v['progress'],
     remoteStatus: v['remoteStatus'],
     error: v['error'],
+    failureKind: v['state'] === 'failed' ? failureKind : null,
+    ...(notify === undefined ? {} : { notify }),
     createdAt: v['createdAt'],
     updatedAt: v['updatedAt'],
     attempts: v['attempts'],
