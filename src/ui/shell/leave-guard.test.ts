@@ -41,12 +41,15 @@ function fakeCore(
   pending: number,
   running: number,
   handedOff = 0,
+  holds: string[] = [],
 ): Pick<CoreServices, 'results' | 'runs'> {
   const results = Array.from({ length: pending }, (_, i) => ({ id: `r${i}` }) as SessionResult);
   return {
     results: {
       pending: () => [...results],
       summary: () => (pending === 0 ? null : `${pending} images not downloaded`),
+      holds: () => [...holds],
+      releaseHolds: vi.fn(),
       remove: vi.fn(),
       downloadAll: vi.fn(() => Promise.resolve()),
     } as unknown as CoreServices['results'],
@@ -68,6 +71,13 @@ describe('atStake', () => {
     // Runs handed off to a job finish without this page.
     expect(atStake(fakeCore(0, 0, 2))).toEqual([]);
     expect(atStake(fakeCore(0, 1, 1))).toEqual(['1 run in progress']);
+  });
+
+  it('lists unsaved work a tool holds', () => {
+    expect(atStake(fakeCore(1, 0, 0, ['A recording in progress']))).toEqual([
+      '1 images not downloaded',
+      'A recording in progress',
+    ]);
   });
 });
 

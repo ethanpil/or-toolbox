@@ -37,6 +37,7 @@ import { mountPage } from '../shell/index';
 import { historyUrl, settingsUrl } from '../shell/links';
 import { createToolContext, resolveFor } from './context';
 import { badgeValue, createEstimateTracker } from './estimate';
+import { createStatusLine } from './status-line';
 import { installFileDrop } from './file-drop';
 import { resultHandle } from './results';
 import { createRunner, type RunnerInternals } from './runner';
@@ -97,11 +98,7 @@ async function buildTool(
   const outputId = uid('tool-output');
   const input = h('div', { class: 'card-body vstack gap-3', 'data-testid': 'tool-input' });
   const output = h('div', { class: 'card-body', 'data-testid': 'tool-output' });
-  const statusLine = h('span', {
-    class: 'small text-body-secondary ms-auto text-truncate',
-    role: 'status',
-    'data-testid': 'tool-status',
-  });
+  const statusLine = createStatusLine();
   const notices = h('div', {
     class: 'vstack gap-2 mb-3 empty-hidden',
     'data-testid': 'tool-notices',
@@ -243,7 +240,7 @@ async function buildTool(
       'div',
       { class: 'row g-4 or-tool-zones' },
       zone(inputId, 'Input', input, null, 'col-lg-5'),
-      zone(outputId, 'Output', output, statusLine, 'col-lg-7'),
+      zone(outputId, 'Output', output, statusLine.element, 'col-lg-7'),
     ),
   );
 
@@ -451,9 +448,9 @@ async function buildTool(
     setEstimate(usd, note) {
       estimates.set(usd, note);
     },
-    status(text) {
-      statusLine.textContent = text;
-    },
+    status: (text) => statusLine.status(text),
+    progress: (text) => statusLine.progress(text),
+    holdWork: (description) => core.results.hold(description),
     addResult(resultInput) {
       return resultHandle(core, core.results.add({ tool: manifest.id, ...resultInput }));
     },

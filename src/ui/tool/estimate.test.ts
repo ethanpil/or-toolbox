@@ -28,16 +28,19 @@ describe('createEstimateTracker', () => {
     expect(show.mock.calls).toEqual([[0.02]]);
   });
 
-  it('reuses the latest estimate while nothing changed, and recomputes for another model', async () => {
+  it('computes afresh for the run, so input changed since the last refresh is what gets booked', async () => {
+    let chars = 100;
     let model = 'a';
-    const compute = vi.fn((m: string) => Promise.resolve(m === 'a' ? 0.1 : 0.2));
-    const tracker = createEstimateTracker({ compute, model: () => model, show: vi.fn() });
-    expect(await tracker.refresh()).toBe(0.1);
-    expect(await tracker.current()).toBe(0.1);
-    expect(compute).toHaveBeenCalledTimes(1);
+    const compute = vi.fn((m: string) => Promise.resolve((m === 'a' ? 1 : 2) * chars * 0.001));
+    const show = vi.fn();
+    const tracker = createEstimateTracker({ compute, model: () => model, show });
+    expect(await tracker.refresh()).toBeCloseTo(0.1);
+    chars = 5000; // pasted, and Run pressed before the tool's debounced refresh
+    expect(await tracker.current()).toBeCloseTo(5);
+    expect(show).toHaveBeenLastCalledWith(5); // the badge shows what was booked
     model = 'b';
-    expect(await tracker.current()).toBe(0.2);
-    expect(compute).toHaveBeenCalledTimes(2);
+    expect(await tracker.current()).toBeCloseTo(10);
+    expect(compute).toHaveBeenCalledTimes(3);
   });
 
   it('treats a missing model, a failing or a nonsense estimate as unknown', async () => {

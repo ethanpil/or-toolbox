@@ -98,6 +98,19 @@ describe('createToolTestContext', () => {
     expect(tool.getState()).toBeDefined();
   });
 
+  it('books an estimate of the input as it is when the run starts, even without a refresh', async () => {
+    t = createToolTestContext(getTool('chat'));
+    const tool = await t.mount(tinyTool);
+    tool.applyState({ prompt: 'x'.repeat(20), settings: {} });
+    await t.ctx.ui.refreshEstimate();
+    tool.applyState({ prompt: 'x'.repeat(400), settings: {} }); // pasted; no refresh before Run
+    const run = await t.ctx.beginRun({});
+    const record = await (await getDb()).get('runs', run.id);
+    expect(record?.reservedUsd).toBeCloseTo(0.4);
+    expect(t.estimate()).toBeCloseTo(0.4);
+    await run.finish();
+  });
+
   it('applies the header model only to the primary capability', () => {
     t = createToolTestContext(getTool('chat'), { modelOverride: 'x/override' });
     t.core.settings.update((draft) => {

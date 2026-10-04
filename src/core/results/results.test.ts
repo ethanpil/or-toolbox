@@ -180,3 +180,30 @@ describe('leave-page guard', () => {
     expect(fn).not.toHaveBeenCalled();
   });
 });
+
+describe('hold', () => {
+  it('guards leaving while unsaved work is held, and lists it', () => {
+    expect(results.holds()).toEqual([]);
+    const release = results.hold('A recording in progress');
+    const other = results.hold('3 paid parts not joined');
+    expect(results.holds()).toEqual(['A recording in progress', '3 paid parts not joined']);
+    expect(leaveIsGuarded()).toBe(true);
+    expect(results.summary()).toBeNull(); // holds are not results
+    const seen = vi.fn();
+    results.subscribe(seen);
+    release();
+    release(); // idempotent
+    expect(results.holds()).toEqual(['3 paid parts not joined']);
+    expect(seen).toHaveBeenCalledOnce();
+    expect(leaveIsGuarded()).toBe(true);
+    other();
+    expect(leaveIsGuarded()).toBe(false);
+  });
+
+  it('releaseHolds drops every hold (after "Leave anyway")', () => {
+    results.hold('A recording in progress');
+    results.releaseHolds();
+    expect(results.holds()).toEqual([]);
+    expect(leaveIsGuarded()).toBe(false);
+  });
+});
