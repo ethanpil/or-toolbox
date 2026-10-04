@@ -79,6 +79,9 @@ function seedDefaults(mock: OpenRouterMock): void {
       is_free_tier: false,
     },
   });
+
+  // Per-provider prices (keyless, like the catalog), read for TTS estimates: none listed by default.
+  mock.json('GET', /^\/api\/v1\/models\/.+\/endpoints$/, { data: { endpoints: [] } });
 }
 
 /**

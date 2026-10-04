@@ -267,6 +267,19 @@ describe('trimMedia', () => {
     expect(out.type).toBe('audio/mpeg');
   });
 
+  it('fades the end of an audio cut out, at the chosen MP3 bit rate', async () => {
+    fake.state.instance.probeLog = AUDIO_ONLY_LOG;
+    await trimMedia(mp3(), 0, 20, { fadeOut: 2, bitrate: 192 });
+    const args = trimArgs();
+    expect(args[args.indexOf('-af') + 1]).toBe('afade=t=out:st=18.000:d=2.000');
+    expect(args[args.indexOf('-b:a') + 1]).toBe('192k');
+    // No end, no length to fade against; video never fades.
+    await trimMedia(mp3(), 5, undefined, { fadeOut: 2 });
+    expect(trimArgs()).not.toContain('-af');
+    await trimMedia(mp4(), 0, 1, { kind: 'video', fadeOut: 2 });
+    expect(trimArgs()).not.toContain('-af');
+  });
+
   it('makes real video H.264 with even dimensions', async () => {
     fake.state.instance.probeLog = VIDEO_LOG;
     const out = await trimMedia(mp4(), 0, 1);

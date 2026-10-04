@@ -8,7 +8,7 @@
   "accepts": ["text/plain", "text/markdown"],
   "produces": ["audio/mpeg", "audio/wav"],
   "usesJobs": false,
-  "lazyLibs": [],
+  "lazyLibs": ["@ffmpeg/ffmpeg", "marked"],
   "defaults": {
     "format": "mp3"
   }
