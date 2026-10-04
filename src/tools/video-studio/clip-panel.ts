@@ -49,6 +49,8 @@ export interface ClipPanel {
   readonly formatSlot: HTMLElement;
   /** Where the Run bar goes (the end of this panel). */
   readonly runnerSlot: HTMLElement;
+  /** Moves focus to the source clip choice. */
+  focusSource(): void;
   render(view: ClipPanelView): void;
 }
 
@@ -220,6 +222,7 @@ export function clipPanel(host: ClipPanelHost): ClipPanel {
     references,
     formatSlot,
     runnerSlot,
+    focusSource: () => source.focus(),
     render(view) {
       if (mode.value !== view.mode) mode.value = view.mode;
       if (prompt.value !== view.prompt) prompt.value = view.prompt;

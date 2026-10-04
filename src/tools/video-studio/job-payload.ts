@@ -19,6 +19,8 @@ export interface VideoJobPayload {
   continues: boolean;
   sequenceId: string | null;
   slotKey: string | null;
+  /** The slot's attempt that sent it (each Re-run is a new attempt; 1 outside sequences). */
+  attempt: number;
   /** Set once its clip is on the timeline (or its failure was recorded): never handled twice. */
   delivered: boolean;
 }
@@ -42,6 +44,7 @@ export function parsePayload(raw: unknown): VideoJobPayload | null {
     continues: raw['continues'] === true,
     sequenceId: nullable(raw['sequenceId']),
     slotKey: nullable(raw['slotKey']),
+    attempt: isFiniteNumber(raw['attempt']) && raw['attempt'] >= 1 ? Math.floor(raw['attempt']) : 1,
     delivered: raw['delivered'] === true,
   };
 }

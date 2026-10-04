@@ -3,19 +3,23 @@
  * transitions on a JSON-safe `SequenceRun`, which the tool stores in `ctx.state`, so a reload resumes it.
  *
  * - **Slots:** Start expands the steps into slots, `repeat` rounds of every step, in order. A slot is
- *   `pending` â†’ `starting` (claimed: its frame is captured and its run begins) â†’ `running` (a job polls it) â†’
- *   `done` | `failed`.
- * - **Chained** slots start one at a time, each from the previous finished clip's last frame (the source clip for
- *   the first one, if any); **independent** slots run up to `MAX_PARALLEL` at once from their own prompt and images.
- * - **Spend cap:** a slot starts only if what the sequence has spent (actual costs as they arrive, an unknown one
- *   counted at its estimate) plus the estimates of the slots in flight plus its own estimate stays within the cap;
- *   otherwise the sequence stops with a message, and nothing more is sent. With a cap, a step whose cost cannot be
- *   estimated stops it too (the cap could not be kept).
- * - **Failures:** `stop` ends the sequence at a failed step, `skip` goes on (a chained step after it continues from
- *   the last clip that was made).
+ *   `pending` -> `starting` (claimed by one tab: its frame is captured and its run begins) -> `running` (a job
+ *   polls it) -> `done` | `failed`. Each Re-run is a new `attempt`; a job belongs to the attempt that sent it.
+ * - **Chained** slots start one at a time, each from the last frame of the clip of the nearest earlier step that
+ *   was made (the source clip for the first one, if any); **independent** slots run up to `MAX_PARALLEL` at once
+ *   from their own prompt and images. A chained step whose clip to continue is gone is never sent from its prompt
+ *   alone: the sequence pauses with a `blocker`, and the user picks another clip, no first frame, or a re-run of
+ *   the step before.
+ * - **Spend cap:** a slot starts only if what the sequence has spent, plus the estimates of the slots in flight,
+ *   plus its own estimate stays within the cap; otherwise the sequence stops with a message and nothing more is
+ *   sent. Spent means billed or maybe billed: a known cost, or the reservation (the estimate) of a step whose cost
+ *   is unknown, that failed after it was sent, that was abandoned mid-send or that the user stopped waiting for
+ *   (`spentEstimated` marks those). With a cap, a step whose cost cannot be estimated stops the sequence too.
+ * - **Failures:** `stop` ends the sequence at a failed step (a failed start included), `skip` goes on.
  * - **Pause** starts nothing new (jobs already sent finish and land on the timeline); **Resume** goes on, past
  *   failed steps. **Re-run** puts one finished or failed slot back as `forced`: it starts even while the sequence is
- *   paused or stopped, without redoing the others.
+ *   paused or stopped, without redoing the others; the chained step after it is then marked `stale` (it continued
+ *   the old take).
  */
 import { isFiniteNumber, isRecord, isString, isUnsafeKey } from '../../core/util';
 import { formatUsd } from '../../ui/format';
@@ -71,14 +75,32 @@ export interface Slot {
   attempt: number;
   /** Re-run: starts even while the sequence is paused or stopped. */
   forced: boolean;
+  /** The current attempt's job and run (null until it is queued). */
   jobId: string | null;
   runId: string | null;
   clipId: string | null;
   /** The estimate of the attempt in flight (or the last one). */
   estimateUsd: number | null;
-  /** What finished attempts cost (an unknown cost counts at its estimate). */
+  /** What finished attempts cost or may have cost (see `spentEstimated`). */
   spentUsd: number;
+  /** Part of `spentUsd` is a reservation, not a known cost. */
+  spentEstimated: boolean;
   error: string | null;
+  /** The user's choice of what this chained slot continues: another clip, or (with `noFrame`) nothing. */
+  chainFrom: string | null;
+  noFrame: boolean;
+  /** Its clip continued an older take of the step before, which a Re-run replaced. */
+  stale: boolean;
+  /** The tab that claimed it for starting, and when. */
+  claimedBy: string | null;
+  claimedAt: number | null;
+}
+
+/** Why a paused sequence waits for the user, and which slot it is about. */
+export interface Blocker {
+  slotKey: string;
+  kind: 'source-missing' | 'images-lost';
+  message: string;
 }
 
 export interface SequenceRun {
@@ -94,10 +116,11 @@ export interface SequenceRun {
   /** The clip the first chained step continues from, or null. */
   sourceClipId: string | null;
   /**
-   * How many images each step had at Start (by step id). Pictures stay in memory only, so after a reload a step
-   * that had some and now has none must not be sent without them.
+   * How many images each step has (by step id), kept up to date as the user changes them. Pictures stay in memory
+   * only, so after a reload a step that has fewer than this must not be sent without them.
    */
   stepImages: Record<string, number>;
+  blocker: Blocker | null;
   slots: Slot[];
   createdAt: number;
   updatedAt: number;
@@ -125,9 +148,30 @@ export function stepPrompt(spec: SequenceSpec, prompt: string): string {
 }
 
 /** 1-based position of a slot in the whole sequence ("step 7 of 10"). */
-export function slotNumber(run: SequenceRun, key: string): number {
+export function slotNumber(run: Pick<SequenceRun, 'slots'>, key: string): number {
   return run.slots.findIndex((slot) => slot.key === key) + 1;
 }
+
+const newSlot = (round: number, stepId: string): Slot => ({
+  key: slotKey(round, stepId),
+  stepId,
+  round,
+  status: 'pending',
+  attempt: 1,
+  forced: false,
+  jobId: null,
+  runId: null,
+  clipId: null,
+  estimateUsd: null,
+  spentUsd: 0,
+  spentEstimated: false,
+  error: null,
+  chainFrom: null,
+  noFrame: false,
+  stale: false,
+  claimedBy: null,
+  claimedAt: null,
+});
 
 export function createRun(input: {
   id: string;
@@ -140,22 +184,7 @@ export function createRun(input: {
 }): SequenceRun {
   const slots: Slot[] = [];
   for (let round = 0; round < input.spec.repeat; round++) {
-    for (const step of input.spec.steps) {
-      slots.push({
-        key: slotKey(round, step.id),
-        stepId: step.id,
-        round,
-        status: 'pending',
-        attempt: 1,
-        forced: false,
-        jobId: null,
-        runId: null,
-        clipId: null,
-        estimateUsd: null,
-        spentUsd: 0,
-        error: null,
-      });
-    }
+    for (const step of input.spec.steps) slots.push(newSlot(round, step.id));
   }
   return {
     v: 1,
@@ -167,18 +196,22 @@ export function createRun(input: {
     format: { ...input.format },
     sourceClipId: input.sourceClipId,
     stepImages: { ...input.stepImages },
+    blocker: null,
     slots,
     createdAt: input.now,
     updatedAt: input.now,
   };
 }
 
+const findSlot = (run: SequenceRun, key: string): Slot | undefined =>
+  run.slots.find((slot) => slot.key === key);
+
 const withSlot = (run: SequenceRun, key: string, patch: Partial<Slot>): SequenceRun => ({
   ...run,
   slots: run.slots.map((slot) => (slot.key === key ? { ...slot, ...patch } : slot)),
 });
 
-/** Spent so far plus the estimates of the slots in flight. */
+/** Spent (billed or maybe billed) plus the estimates of the slots in flight. */
 export function committedUsd(run: SequenceRun): number {
   return run.slots.reduce(
     (sum, slot) => sum + slot.spentUsd + (isInFlight(slot) ? (slot.estimateUsd ?? 0) : 0),
@@ -186,18 +219,19 @@ export function committedUsd(run: SequenceRun): number {
   );
 }
 
-/** Actual spend of the finished attempts. */
+/** Billed or maybe billed so far. */
 export function spentUsd(run: SequenceRun): number {
   return run.slots.reduce((sum, slot) => sum + slot.spentUsd, 0);
 }
 
-/** Total estimate before starting: every slot at the per-step estimate (null when unknown). */
-export function totalEstimate(spec: SequenceSpec, perStep: number | null): number | null {
-  if (perStep === null) return null;
-  return perStep * spec.steps.length * spec.repeat;
+/** Some of the spend is a reservation rather than a known cost (show it as "≈"). */
+export function spentIsEstimate(run: SequenceRun): boolean {
+  return run.slots.some((slot) => slot.spentEstimated);
 }
 
-const formatMoney = (usd: number): string => formatUsd(usd);
+/** Money as the panel shows it: `≈ $0.10` when part of it is a reservation. */
+export const moneyText = (usd: number, estimated: boolean): string =>
+  `${estimated ? '≈ ' : ''}${formatUsd(usd)}`;
 
 export interface Plan {
   /** Slot keys to claim and start now, in order. */
@@ -205,6 +239,23 @@ export interface Plan {
   /** A status change (stopped by the cap, done). */
   status?: SequenceStatus;
   message?: string | null;
+}
+
+/** Why the cap stops a slot about to start, or null when it may start. */
+export function capProblem(
+  run: SequenceRun,
+  key: string,
+  committed: number,
+  estimate: number | null,
+): string | null {
+  const cap = run.spec.capUsd;
+  if (cap === null) return null;
+  const number = slotNumber(run, key);
+  if (estimate === null) {
+    return `Stopped before step ${number}: its cost cannot be estimated, so the ${formatUsd(cap)} spend cap could not be kept.`;
+  }
+  if (committed + estimate <= cap + 1e-9) return null;
+  return `Stopped before step ${number}: it would bring this sequence to about ${formatUsd(committed + estimate)}, over its ${formatUsd(cap)} spend cap (${moneyText(spentUsd(run), spentIsEstimate(run))} spent so far).`;
 }
 
 /**
@@ -230,24 +281,8 @@ export function plan(run: SequenceRun, estimateOf: (slot: Slot) => number | null
   let committed = committedUsd(run);
   for (const slot of startable.slice(0, room)) {
     const estimate = estimateOf(slot);
-    const cap = run.spec.capUsd;
-    if (cap !== null) {
-      const number = slotNumber(run, slot.key);
-      if (estimate === null) {
-        return {
-          start,
-          status: 'stopped',
-          message: `Stopped before step ${number}: its cost cannot be estimated, so the ${formatMoney(cap)} spend cap could not be kept.`,
-        };
-      }
-      if (committed + estimate > cap + 1e-9) {
-        return {
-          start,
-          status: 'stopped',
-          message: `Stopped before step ${number}: it would bring this sequence to about ${formatMoney(committed + estimate)}, over its ${formatMoney(cap)} spend cap (${formatMoney(spentUsd(run))} spent so far).`,
-        };
-      }
-    }
+    const problem = capProblem(run, slot.key, committed, estimate);
+    if (problem) return { start, status: 'stopped', message: problem };
     committed += estimate ?? 0;
     start.push(slot.key);
   }
@@ -269,47 +304,76 @@ export function applyStatus(run: SequenceRun, next: Plan, now: number): Sequence
   return { ...run, status: next.status, message: next.message ?? null, updatedAt: now };
 }
 
-/** Claims a pending slot for starting, with the estimate it starts at. Null when it is not pending any more. */
+/**
+ * Claims a pending slot for starting by tab `claimer`, with the estimate it starts at; the previous attempt's job
+ * no longer belongs to it. Null when it is not pending any more.
+ */
 export function claim(
   run: SequenceRun,
   key: string,
   estimateUsd: number | null,
   now: number,
+  claimer = 'this-tab',
 ): SequenceRun | null {
-  const slot = run.slots.find((candidate) => candidate.key === key);
+  const slot = findSlot(run, key);
   if (!slot || slot.status !== 'pending') return null;
   return {
-    ...withSlot(run, key, { status: 'starting', estimateUsd, error: null }),
+    ...withSlot(run, key, {
+      status: 'starting',
+      estimateUsd,
+      error: null,
+      jobId: null,
+      runId: null,
+      claimedBy: claimer,
+      claimedAt: now,
+    }),
     updatedAt: now,
   };
 }
 
-/** The job is queued: the slot runs (unless its job already finished and settled it). */
+/** The job of attempt `attempt` is queued: the slot runs (unless that job already finished and settled it). */
 export function markRunning(
   run: SequenceRun,
   key: string,
-  ids: { jobId: string; runId: string },
+  ids: { jobId: string; runId: string; attempt: number },
   now: number,
 ): SequenceRun {
-  const slot = run.slots.find((candidate) => candidate.key === key);
-  if (!slot || slot.status !== 'starting') return run;
-  return { ...withSlot(run, key, { status: 'running', ...ids }), updatedAt: now };
+  const slot = findSlot(run, key);
+  if (!slot || slot.status !== 'starting' || slot.attempt !== ids.attempt) return run;
+  return {
+    ...withSlot(run, key, { status: 'running', jobId: ids.jobId, runId: ids.runId }),
+    updatedAt: now,
+  };
 }
 
 /**
- * Whether a finished job belongs to the slot's current attempt: its job id, or (the job finished before the
- * starting page recorded the id) a slot still starting.
+ * Whether a finished job is the slot's current attempt: its recorded job, or (the job finished before the starting
+ * page recorded it) a slot still starting that attempt.
  */
-function ownsJob(slot: Slot, jobId: string): boolean {
-  return (
-    (slot.status === 'running' && slot.jobId === jobId) ||
-    (slot.status === 'starting' && slot.jobId === null)
-  );
+export function ownsJob(slot: Slot, jobId: string, attempt: number): boolean {
+  if (slot.status === 'running') return slot.jobId === jobId;
+  return slot.status === 'starting' && slot.jobId === null && slot.attempt === attempt;
+}
+
+/** A pending slot again, nothing sent; the sequence's status stays (Pause, Stop or the cap stopped the start). */
+export function returnClaim(run: SequenceRun, key: string, now: number): SequenceRun {
+  const slot = findSlot(run, key);
+  if (!slot || slot.status !== 'starting') return run;
+  return {
+    ...withSlot(run, key, {
+      status: 'pending',
+      estimateUsd: null,
+      claimedBy: null,
+      claimedAt: null,
+    }),
+    updatedAt: now,
+  };
 }
 
 /**
- * Starting failed before anything was sent (no key, budget declined, the frame could not be read): the slot goes
- * back to pending and the sequence pauses with the reason, so nothing else starts behind the user's back.
+ * Starting failed before anything was sent (no key, the frame could not be read): the slot goes back to pending
+ * and a running sequence pauses with the reason, so nothing else starts behind the user's back. A stopped one
+ * stays stopped.
  */
 export function releaseClaim(
   run: SequenceRun,
@@ -317,19 +381,63 @@ export function releaseClaim(
   reason: string,
   now: number,
 ): SequenceRun {
-  const next = withSlot(run, key, { status: 'pending', estimateUsd: null });
-  return { ...next, status: 'paused', message: reason, updatedAt: now };
+  const next = returnClaim(run, key, now);
+  if (next === run) return run;
+  return {
+    ...next,
+    status: run.status === 'running' ? 'paused' : run.status,
+    message: reason,
+  };
+}
+
+/** A chained slot cannot start without the user's decision: back to pending, paused (stopped stays stopped). */
+export function block(
+  run: SequenceRun,
+  key: string,
+  blocker: Omit<Blocker, 'slotKey'>,
+  now: number,
+): SequenceRun {
+  const next = returnClaim(run, key, now);
+  if (next === run) return run;
+  return {
+    ...next,
+    status: run.status === 'running' ? 'paused' : run.status,
+    message: blocker.message,
+    blocker: { slotKey: key, ...blocker },
+  };
+}
+
+/**
+ * The user's answer to a `source-missing` blocker: continue `clipId` instead, or (null) send the step without a
+ * first frame. The sequence goes on.
+ */
+export function chooseSource(
+  run: SequenceRun,
+  key: string,
+  clipId: string | null,
+  now: number,
+): SequenceRun {
+  const next = withSlot(run, key, { chainFrom: clipId, noFrame: clipId === null });
+  return { ...next, blocker: null, status: 'running', message: null, updatedAt: now };
+}
+
+/** The user's answer to an `images-lost` blocker: send the step without the images it had. */
+export function dropStepImages(run: SequenceRun, stepId: string, now: number): SequenceRun {
+  const stepImages = { ...run.stepImages };
+  delete stepImages[stepId];
+  return { ...run, stepImages, blocker: null, status: 'running', message: null, updatedAt: now };
 }
 
 /** The slot's job made a clip. `costUsd` null (unknown) counts at the slot's estimate. */
 export function markDone(
   run: SequenceRun,
   key: string,
-  outcome: { jobId: string; clipId: string; costUsd: number | null },
+  outcome: { jobId: string; attempt: number; clipId: string; costUsd: number | null },
   now: number,
 ): SequenceRun {
-  const slot = run.slots.find((candidate) => candidate.key === key);
-  if (!slot || !ownsJob(slot, outcome.jobId)) return run;
+  const slot = findSlot(run, key);
+  if (!slot || !ownsJob(slot, outcome.jobId, outcome.attempt)) return run;
+  const unknown = outcome.costUsd === null;
   return {
     ...withSlot(run, key, {
       status: 'done',
@@ -337,34 +445,52 @@ export function markDone(
       jobId: outcome.jobId,
       clipId: outcome.clipId,
       spentUsd: slot.spentUsd + (outcome.costUsd ?? slot.estimateUsd ?? 0),
+      spentEstimated: slot.spentEstimated || unknown,
       error: null,
+      stale: false,
+      claimedBy: null,
+      claimedAt: null,
     }),
     updatedAt: now,
   };
 }
 
+/** What a failure cost: nothing (refused before work), a known amount, or maybe its reservation. */
+export type Billed = 'no' | 'maybe' | number;
+
 /**
- * The slot failed (its submit or its job). `jobId` null: the submit itself failed (only then is `key` matched
- * without a job). `costUsd`: what the failure is known to have cost (usually nothing). Applies the failure
- * policy: `stop` stops the sequence with the reason.
+ * The slot failed: its start (`jobId` null: matched while still starting) or its job. `billed` says whether it
+ * may have cost money; a maybe counts at the slot's estimate. Applies the failure policy: `stop` stops the
+ * sequence with the reason.
  */
 export function markFailed(
   run: SequenceRun,
   key: string,
-  failure: { jobId: string | null; error: string; costUsd?: number },
+  failure: { jobId: string | null; attempt: number; error: string; billed: Billed },
   now: number,
 ): SequenceRun {
-  const slot = run.slots.find((candidate) => candidate.key === key);
+  const slot = findSlot(run, key);
   if (!slot || !isInFlight(slot)) return run;
-  if (failure.jobId === null ? slot.status !== 'starting' : !ownsJob(slot, failure.jobId)) {
-    return run;
-  }
+  const owns =
+    failure.jobId === null
+      ? slot.status === 'starting' && slot.attempt === failure.attempt
+      : ownsJob(slot, failure.jobId, failure.attempt);
+  if (!owns) return run;
+  const cost =
+    failure.billed === 'no'
+      ? 0
+      : failure.billed === 'maybe'
+        ? (slot.estimateUsd ?? 0)
+        : failure.billed;
   let next: SequenceRun = {
     ...withSlot(run, key, {
       status: 'failed',
       forced: false,
       error: failure.error,
-      spentUsd: slot.spentUsd + (failure.costUsd ?? 0),
+      spentUsd: slot.spentUsd + cost,
+      spentEstimated: slot.spentEstimated || failure.billed === 'maybe',
+      claimedBy: null,
+      claimedAt: null,
     }),
     updatedAt: now,
   };
@@ -403,12 +529,12 @@ export function stop(run: SequenceRun, now: number): SequenceRun {
 /** Resume a paused or stopped sequence: failed steps are passed over (Re-run tries one again). */
 export function resume(run: SequenceRun, now: number): SequenceRun {
   if (run.status !== 'paused' && run.status !== 'stopped') return run;
-  return { ...run, status: 'running', message: null, updatedAt: now };
+  return { ...run, status: 'running', message: null, blocker: null, updatedAt: now };
 }
 
 /** Re-run one slot that finished or failed, without redoing the others. */
 export function rerun(run: SequenceRun, key: string, now: number): SequenceRun | null {
-  const slot = run.slots.find((candidate) => candidate.key === key);
+  const slot = findSlot(run, key);
   if (!slot || !isFinalSlot(slot)) return null;
   return {
     ...withSlot(run, key, {
@@ -416,24 +542,45 @@ export function rerun(run: SequenceRun, key: string, now: number): SequenceRun |
       forced: true,
       attempt: slot.attempt + 1,
       error: null,
+      chainFrom: null,
+      noFrame: false,
     }),
     status: run.status === 'done' ? 'running' : run.status,
     message: run.status === 'done' ? null : run.message,
+    blocker: run.blocker?.slotKey === key ? null : run.blocker,
     updatedAt: now,
   };
 }
 
+/** The chained slot after `key`, if any (the one that continued its clip). */
+export function nextChained(run: SequenceRun, key: string): Slot | null {
+  if (run.spec.mode !== 'chained') return null;
+  const index = run.slots.findIndex((slot) => slot.key === key);
+  return index >= 0 ? (run.slots[index + 1] ?? null) : null;
+}
+
+/** Marks the slot whose clip continued an old take (it should be made again from the new one). */
+export function markStale(run: SequenceRun, key: string, now: number): SequenceRun {
+  const slot = findSlot(run, key);
+  if (!slot || slot.status !== 'done' || slot.stale) return run;
+  return { ...withSlot(run, key, { stale: true }), updatedAt: now };
+}
+
 /**
  * After a reload: a slot left `starting` belongs to a page that closed mid-start (its frame or its submit). It
- * may or may not have reached OpenRouter, so it is never sent again by itself: it fails with that reason and the
- * sequence pauses for the user to decide (Re-run, or Resume past it).
+ * may or may not have reached OpenRouter, so it is never sent again by itself: it fails, its reservation counts as
+ * maybe billed, and the sequence pauses for the user to decide (Re-run, or Resume past it).
  */
 export function abandonStart(run: SequenceRun, key: string, now: number): SequenceRun {
-  const slot = run.slots.find((candidate) => candidate.key === key);
+  const slot = findSlot(run, key);
   if (!slot || slot.status !== 'starting') return run;
   const next = withSlot(run, key, {
     status: 'failed',
     forced: false,
+    spentUsd: slot.spentUsd + (slot.estimateUsd ?? 0),
+    spentEstimated: true,
+    claimedBy: null,
+    claimedAt: null,
     error:
       'The page closed while this step was being sent; it may have been billed. Re-run it if no clip arrives.',
   });
@@ -446,29 +593,77 @@ export function abandonStart(run: SequenceRun, key: string, now: number): Sequen
 }
 
 /**
- * The clip a chained slot continues from: the clip of the nearest earlier slot that has one (passing failed or
- * skipped steps), else the sequence's source clip, else null (the first step starts from its prompt).
- * `hasClip` says whether a clip id is still on the timeline.
+ * What a slot starts from. `expected`: it should start from a clip's last frame (chained, with a step or a source
+ * clip before it, unless the user chose no frame); `clipId`: that clip (the user's choice, else the clip of the
+ * nearest earlier step that was made, else the source clip), or null when there is none to continue.
  */
-export function chainSource(
-  run: SequenceRun,
+export function chainSourceOf(
+  run: Pick<SequenceRun, 'spec' | 'slots' | 'sourceClipId'>,
   key: string,
-  hasClip: (clipId: string) => boolean,
-): string | null {
+): { expected: boolean; clipId: string | null } {
   const index = run.slots.findIndex((slot) => slot.key === key);
+  const slot = run.slots[index];
+  if (run.spec.mode !== 'chained' || !slot || slot.noFrame)
+    return { expected: false, clipId: null };
+  if (slot.chainFrom) return { expected: true, clipId: slot.chainFrom };
   for (let i = index - 1; i >= 0; i--) {
-    const clipId = run.slots[i]?.clipId;
-    if (run.slots[i]?.status === 'done' && clipId && hasClip(clipId)) return clipId;
+    const earlier = run.slots[i];
+    if (earlier?.status === 'done' && earlier.clipId)
+      return { expected: true, clipId: earlier.clipId };
   }
-  return run.sourceClipId && hasClip(run.sourceClipId) ? run.sourceClipId : null;
+  if (run.sourceClipId) return { expected: true, clipId: run.sourceClipId };
+  return { expected: index > 0, clipId: null };
 }
 
-/** Whether a slot will start from a first frame (chained, with a clip before it). */
-export function startsFromFrame(
-  run: Pick<SequenceRun, 'spec' | 'sourceClipId'>,
-  index: number,
-): boolean {
-  return run.spec.mode === 'chained' && (index > 0 || run.sourceClipId !== null);
+/**
+ * What a step's images do in a run: reference images cannot go with a first frame (frames win), so a step that
+ * starts from a frame takes only a last frame (null: none, when the model cannot end on a chosen frame).
+ */
+export function effectiveRole(
+  role: ImageRole,
+  fromFrame: boolean,
+  lastFrame: boolean,
+): ImageRole | null {
+  if (fromFrame) return lastFrame ? 'last-frame' : null;
+  if (role === 'last-frame' && !lastFrame) return 'references';
+  return role;
+}
+
+/** An edit of a stored run's editable fields; only the fields present are written. */
+export interface SpecEdit {
+  style?: string;
+  capUsd?: number | null;
+  onFailure?: FailurePolicy;
+  steps?: readonly { id: string; prompt?: string; imageRole?: ImageRole }[];
+  /** Image counts per step, as the user set them now. */
+  stepImages?: Readonly<Record<string, number>>;
+}
+
+/** Applies `edit` field by field to the run as stored now (steps the run does not have are ignored). */
+export function applySpecEdit(run: SequenceRun, edit: SpecEdit, now: number): SequenceRun {
+  const spec: SequenceSpec = {
+    ...run.spec,
+    ...(edit.style !== undefined ? { style: edit.style } : {}),
+    ...(edit.capUsd !== undefined ? { capUsd: edit.capUsd } : {}),
+    ...(edit.onFailure !== undefined ? { onFailure: edit.onFailure } : {}),
+    steps: run.spec.steps.map((step) => {
+      const changed = edit.steps?.find((candidate) => candidate.id === step.id);
+      return changed
+        ? {
+            ...step,
+            ...(changed.prompt !== undefined ? { prompt: changed.prompt } : {}),
+            ...(changed.imageRole !== undefined ? { imageRole: changed.imageRole } : {}),
+          }
+        : step;
+    }),
+  };
+  const stepImages = { ...run.stepImages };
+  for (const [id, count] of Object.entries(edit.stepImages ?? {})) {
+    if (!run.spec.steps.some((step) => step.id === id)) continue;
+    if (count > 0) stepImages[id] = count;
+    else delete stepImages[id];
+  }
+  return { ...run, spec, stepImages, updatedAt: now };
 }
 
 // --- parsing ----------------------------------------------------------------------------------------------
@@ -522,6 +717,7 @@ function parseSlot(raw: unknown): Slot | null {
   const attempt = raw['attempt'];
   const estimate = raw['estimateUsd'];
   const spent = raw['spentUsd'];
+  const claimedAt = raw['claimedAt'];
   return {
     key: raw['key'],
     stepId: raw['stepId'],
@@ -534,7 +730,13 @@ function parseSlot(raw: unknown): Slot | null {
     clipId: nullableString(raw['clipId']),
     estimateUsd: isFiniteNumber(estimate) ? estimate : null,
     spentUsd: isFiniteNumber(spent) && spent >= 0 ? spent : 0,
+    spentEstimated: raw['spentEstimated'] === true,
     error: nullableString(raw['error']),
+    chainFrom: nullableString(raw['chainFrom']),
+    noFrame: raw['noFrame'] === true,
+    stale: raw['stale'] === true,
+    claimedBy: nullableString(raw['claimedBy']),
+    claimedAt: isFiniteNumber(claimedAt) ? claimedAt : null,
   };
 }
 
@@ -545,6 +747,13 @@ function parseCounts(raw: unknown): Record<string, number> {
     if (!isUnsafeKey(key) && isFiniteNumber(value) && value > 0) counts[key] = Math.floor(value);
   }
   return counts;
+}
+
+function parseBlocker(raw: unknown): Blocker | null {
+  if (!isRecord(raw) || !isString(raw['slotKey']) || !isString(raw['message'])) return null;
+  const kind = raw['kind'];
+  if (kind !== 'source-missing' && kind !== 'images-lost') return null;
+  return { slotKey: raw['slotKey'], kind, message: raw['message'] };
 }
 
 /** A stored run, validated; null when it is missing or unusable. */
@@ -568,6 +777,7 @@ export function parseRun(raw: unknown): SequenceRun | null {
     format: parseFormat(raw['format']),
     sourceClipId: isString(raw['sourceClipId']) ? raw['sourceClipId'] : null,
     stepImages: parseCounts(raw['stepImages']),
+    blocker: parseBlocker(raw['blocker']),
     slots,
     createdAt: isFiniteNumber(created) ? created : 0,
     updatedAt: isFiniteNumber(updated) ? updated : 0,

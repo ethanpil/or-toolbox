@@ -28,6 +28,11 @@ export const VIDEO_REFERENCE_MAX = 4;
  * FLUX.3 Video, the likely one, was never probed. Add a model here once a request proves it.
  */
 export const PREVIOUS_JOB_MODELS: ReadonlySet<string> = new Set<string>();
+/**
+ * Models known to make a clip from a last frame alone (no first frame). None is confirmed; the one-clip form has
+ * no such mode either, so a sequence step that would send only a last frame is refused until a probe proves one.
+ */
+export const LAST_FRAME_ONLY_MODELS: ReadonlySet<string> = new Set<string>();
 /** What Continue sends when the prompt is left empty. */
 export const CONTINUE_PROMPT =
   'Continue the shot smoothly from this frame, keeping the same scene, subject, style and motion.';

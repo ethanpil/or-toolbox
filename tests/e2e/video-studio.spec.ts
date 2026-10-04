@@ -228,13 +228,24 @@ test.describe('Video studio', () => {
     await page.getByTestId('video-clip-frames').click();
     await expect(page.getByTestId('video-frame-grabber')).toBeVisible();
     await expect(page.getByTestId('video-frames-slider')).toBeFocused();
-    // Keyboard: the slider moves frame by frame.
+    // Keyboard: the slider moves frame by frame, at the clip's own 24 fps (read from the file).
+    await expect(page.getByTestId('video-frames-time')).toHaveText('Frame 1 of 25 · 0.02 s');
     for (let i = 0; i < 6; i++) await page.keyboard.press('ArrowRight');
     await page.getByTestId('video-frames-next').click();
-    await expect(page.getByTestId('video-frames-time')).toHaveText('0.29 s of 1.04 s');
+    await expect(page.getByTestId('video-frames-time')).toHaveText('Frame 8 of 25 · 0.31 s');
+    // The last position is the true final frame.
+    await page.getByTestId('video-frames-slider').focus();
+    await page.keyboard.press('End');
+    await expect(page.getByTestId('video-frames-time')).toHaveText('Frame 25 of 25 · 1.02 s');
+    for (let i = 0; i < 17; i++) await page.keyboard.press('ArrowLeft');
+    await expect(page.getByTestId('video-frames-time')).toHaveText('Frame 8 of 25 · 0.31 s');
     await page.getByTestId('video-frames-save').click();
     await expect(page.getByTestId('video-frame-result')).toHaveCount(1);
-    await expect(page.getByTestId('video-frame-result')).toContainText('Frame at 0.29 s');
+    await expect(page.getByTestId('video-frame-result')).toContainText('Frame 8 (0.31 s)');
+    // Close gives focus back to the Frames button that opened it.
+    await page.getByTestId('video-frames-close').click();
+    await expect(page.getByTestId('video-frame-grabber')).toBeHidden();
+    await expect(page.getByTestId('video-clip-frames')).toBeFocused();
 
     await page.getByTestId('video-frame-first').click();
     await expect(page.getByTestId('video-mode')).toHaveValue('first');
@@ -326,7 +337,12 @@ test.describe('Video studio', () => {
     await page.getByTestId('video-clip').first().getByTestId('video-clip-down').focus();
     await page.keyboard.press('Enter');
     await expect.poll(ids).toEqual([second, first]);
-    await expect(page.locator(`[data-clip-id="${first}"]`).locator(':focus')).toHaveCount(1);
+    // Focus stays on the same button, now at the end of the list: still focusable, aria-disabled.
+    const movedDown = page.locator(`[data-clip-id="${first}"]`).getByTestId('video-clip-down');
+    await expect(movedDown).toBeFocused();
+    await expect(movedDown).toHaveAttribute('aria-disabled', 'true');
+    await page.keyboard.press('Enter');
+    await expect.poll(ids).toEqual([second, first]);
     // Alt+Arrow Up anywhere in a clip moves it back.
     await page.keyboard.press('Alt+ArrowUp');
     await expect.poll(ids).toEqual([first, second]);
@@ -336,11 +352,106 @@ test.describe('Video studio', () => {
     await page.getByTestId('video-trim-end').first().fill('0.2');
     await page.getByTestId('video-trim-end').first().blur();
     await page.getByTestId('video-join').click();
-    await expect(page.getByTestId('video-join-stop')).toBeVisible();
-    await page.getByTestId('video-join-stop').click();
+    // Focus goes to Stop while it joins, and back to Join after.
+    await expect(page.getByTestId('video-join-stop')).toBeFocused();
+    await page.keyboard.press('Enter');
     await expect(page.getByTestId('tool-status')).toHaveText('Join stopped.');
     await expect(page.getByTestId('video-join')).toBeVisible();
+    await expect(page.getByTestId('video-join')).toBeFocused();
     await expect(page.getByTestId('video-export')).toHaveCount(0);
+    expect(problems).toEqual([]);
+  });
+
+  test('a sequence asks one budget question at Start; its steps then run without dialogs of their own', async ({
+    page,
+    context,
+    mock,
+  }) => {
+    // Default budgets: Warn, $0.10 per run. Each 3 s step ($0.15) is over it; the sequence asks once.
+    await seedApp(context, { key: true });
+    const jobs = mockVideoJobs(mock, { cost: 0.15 });
+    mockVideoCatalog(mock);
+    const problems = await watchForProblems(page);
+    await page.goto('tools/video-studio/');
+    const id = await page.getByTestId('video-tab-sequence').getAttribute('id');
+    await page.locator(`label[for="${id}"]`).click();
+    for (let i = 1; i < 3; i++) await page.getByTestId('seq-add-step').click();
+    for (const [index, prompt] of ['One', 'Two', 'Three'].entries()) {
+      await page.getByTestId('seq-step-prompt').nth(index).fill(prompt);
+    }
+    await page.getByTestId('video-duration').selectOption('3');
+    await page.getByTestId('seq-cap').fill('2');
+    await page.getByTestId('seq-cap').blur();
+
+    // Declined: nothing is stored or sent.
+    await page.getByTestId('seq-start').click();
+    const dialog = page.getByTestId('seq-budget-confirm');
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByTestId('seq-budget-total')).toHaveText(
+      'About $0.45 for 3 clips, asked once for the whole sequence.',
+    );
+    await expect(dialog).toContainText('Spend cap $2.00');
+    await dialog.getByTestId('dialog-cancel').click();
+    await expect(page.getByTestId('tool-status')).toHaveText('Not started: nothing was sent.');
+    await expect(page.getByTestId('seq-progress')).toBeHidden();
+    expect(jobs.submits()).toEqual([]);
+
+    // Accepted: three steps, no per-step dialog.
+    await page.getByTestId('seq-start').click();
+    await page.getByTestId('seq-budget-confirm').getByTestId('dialog-confirm').click();
+    await expect(page.locator('[data-testid="seq-slot"][data-status="done"]')).toHaveCount(3, {
+      timeout: 120_000,
+    });
+    await expect(page.getByTestId('budget-dialog')).toHaveCount(0);
+    expect(jobs.submits().map((body) => body.prompt)).toEqual(['One', 'Two', 'Three']);
+    expect(problems).toEqual([]);
+  });
+
+  test('a chained step whose clip is gone pauses with choices instead of sending its prompt alone', async ({
+    page,
+    context,
+    mock,
+  }) => {
+    await seedApp(context, { key: true, settings: NO_BUDGETS });
+    const jobs = mockVideoJobs(mock, { held: [1] });
+    mockVideoCatalog(mock);
+    const problems = await watchForProblems(page);
+    await page.goto('tools/video-studio/');
+    const id = await page.getByTestId('video-tab-sequence').getAttribute('id');
+    await page.locator(`label[for="${id}"]`).click();
+    await page.getByTestId('seq-add-step').click();
+    await page.getByTestId('seq-step-prompt').nth(0).fill('First');
+    await page.getByTestId('seq-step-prompt').nth(1).fill('Second');
+    await page.getByTestId('video-duration').selectOption('1');
+    await page.getByTestId('seq-start').click();
+    await expect.poll(() => jobs.submits().length).toBe(1);
+
+    // Paused while step 1 is generating; its clip arrives, then is removed from the timeline.
+    await page.getByTestId('seq-pause').click();
+    await expect(page.getByTestId('seq-resume')).toBeVisible();
+    // Steps are editable again while paused.
+    await expect(page.getByTestId('seq-step-prompt').nth(1)).toBeEditable();
+    jobs.release(1);
+    await expect(page.getByTestId('video-clip-player')).toHaveCount(1, { timeout: 60_000 });
+    await page.getByTestId('video-clip-remove').click();
+    await page.getByTestId('video-remove-confirm').getByTestId('dialog-confirm').click();
+    await expect(page.getByTestId('video-clip')).toHaveCount(0);
+
+    await page.getByTestId('seq-resume').click();
+    const blocker = page.getByTestId('seq-blocker');
+    await expect(blocker).toContainText(
+      'Paused before step 2: there is no clip for it to continue.',
+      { timeout: 30_000 },
+    );
+    expect(jobs.submits()).toHaveLength(1);
+    await expect(blocker.getByTestId('seq-blocker-rerun-previous')).toBeVisible();
+    await blocker.getByTestId('seq-blocker-no-frame').click();
+    await expect.poll(() => jobs.submits().length, { timeout: 30_000 }).toBe(2);
+    expect(jobs.submits()[1]).toMatchObject({ prompt: 'Second' });
+    expect(jobs.submits()[1]!.frame_images).toBeUndefined();
+    await expect(page.locator('[data-testid="seq-slot"][data-status="done"]')).toHaveCount(2, {
+      timeout: 60_000,
+    });
     expect(problems).toEqual([]);
   });
 
