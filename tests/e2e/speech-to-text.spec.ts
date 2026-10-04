@@ -301,10 +301,28 @@ async function recordedSeconds(page: Page): Promise<number> {
 }
 
 /**
- * Waits until at least `seconds` are recorded. Never waits for one exact timer text: under load the timer can
- * move past it between two looks (the Stage 4 gate failure).
+ * Waits until sound reaches the recorder: its level meter moves. On a busy machine the stubbed microphone's first
+ * audio arrives well after Record, and a recording stopped before it holds nothing ("Nothing was recorded").
+ */
+async function waitForSound(page: Page): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        page
+          .getByTestId('stt-record-level')
+          .locator('.or-level-bar')
+          .evaluate((bar: HTMLElement) => bar.style.transform),
+      { timeout: 30_000 },
+    )
+    .not.toMatch(/^(scaleX\(0(\.0+)?\))?$/);
+}
+
+/**
+ * Waits until sound is coming in and at least `seconds` are recorded. Never waits for one exact timer text: under
+ * load the timer can move past it between two looks.
  */
 async function recordUntil(page: Page, seconds: number): Promise<void> {
+  await waitForSound(page);
   await expect
     .poll(() => recordedSeconds(page), { timeout: 30_000 })
     .toBeGreaterThanOrEqual(seconds);
@@ -551,23 +569,26 @@ test('a time in the transcript of a recording plays from there', async ({
   await page.getByTestId('run-button').click();
   await expect(page.getByTestId('stt-segment')).toHaveCount(3);
 
-  // MediaRecorder's WebM has no duration in its header (the browser reports Infinity) and no seek index. Where
-  // the seek lands is read when it lands, so playback that merely started from 0 and ran on cannot pass.
+  // MediaRecorder's WebM has no duration in its header (the browser reports Infinity) and no seek index: the
+  // player finds the length by seeking to the end and back, and a seek made meanwhile must not be undone by that
+  // rewind. Where each seek lands is read when it lands (playback that merely started from 0 and ran on cannot
+  // pass), and the last one must be the segment's start.
   const audio = page.getByTestId('stt-player').locator('audio');
   await audio.evaluate((element: HTMLAudioElement) => {
-    element.addEventListener(
-      'seeked',
-      () => {
-        element.dataset['seekedAt'] = String(element.currentTime);
-      },
-      { once: true },
-    );
+    element.addEventListener('seeked', () => {
+      element.dataset['seekedAt'] = String(element.currentTime);
+    });
   });
   await page.getByTestId('stt-seek').nth(1).click();
-  await expect(audio).toHaveAttribute('data-seeked-at', /^\d/);
-  const landed = Number(await audio.getAttribute('data-seeked-at'));
-  expect(landed).toBeGreaterThan(1.4);
-  expect(landed).toBeLessThan(1.6);
+  const landed = async (): Promise<number> =>
+    Number((await audio.getAttribute('data-seeked-at')) ?? Number.NaN);
+  await expect.poll(async () => Math.abs((await landed()) - 1.5) < 0.1).toBe(true);
+  // Nothing rewinds it afterwards: a second later it plays on from there.
+  await page.waitForTimeout(1000);
+  expect(Math.abs((await landed()) - 1.5)).toBeLessThan(0.1);
+  expect(
+    await audio.evaluate((element: HTMLAudioElement) => element.currentTime),
+  ).toBeGreaterThanOrEqual(1.4);
   await expect(page.getByTestId('stt-segment').nth(1)).toHaveAttribute('aria-current', 'true');
   expect(problems).toEqual([]);
 });

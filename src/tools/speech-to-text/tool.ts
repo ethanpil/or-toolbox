@@ -337,8 +337,12 @@ export function setup(ctx: ToolContext): ToolInstance {
         announce('This transcript belongs to a recording that is no longer loaded.');
         return;
       }
-      player.audio.currentTime = seconds;
-      void player.audio.play().catch(() => undefined);
+      // Through the player: a recording's length probe would otherwise rewind a seek made while it runs.
+      const { audio } = player;
+      void player
+        .seek(seconds)
+        .then(() => audio.play())
+        .catch(() => undefined);
     },
     onChange: () => updateActions(),
   });

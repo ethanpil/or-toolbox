@@ -67,6 +67,7 @@ describe('audioPlayer seeking', () => {
   function recording(): { audio: HTMLAudioElement; canvas: HTMLCanvasElement; seeks: number[] } {
     const player = audioPlayer({ blob: clip(), label: 'Recording', peaks: new Float32Array(240) });
     const { audio } = player;
+    players.set(audio, player);
     const canvas = player.element.querySelector('canvas')!;
     canvas.getBoundingClientRect = () => ({ left: 0, width: 200 }) as DOMRect;
     const seeks: number[] = [];
@@ -101,4 +102,27 @@ describe('audioPlayer seeking', () => {
     canvas.dispatchEvent(new MouseEvent('click', { clientX: 50 }));
     await vi.waitFor(() => expect(seeks).toEqual([1e101, 0, 10]));
   });
+
+  it('seek() waits for the metadata and the probe, so the probe’s rewind cannot undo it', async () => {
+    const { audio, seeks } = recording();
+    let ready = 0;
+    Object.defineProperty(audio, 'readyState', { configurable: true, get: () => ready });
+    // Asked before the metadata is in: nothing happens yet.
+    const seeking = player(audio).seek(12);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(seeks).toEqual([]);
+    ready = HTMLMediaElement.HAVE_METADATA;
+    audio.dispatchEvent(new Event('loadedmetadata'));
+    await seeking;
+    expect(seeks).toEqual([1e101, 0, 12]);
+    expect(audio.currentTime).toBe(12);
+  });
 });
+
+/** The player that owns `audio` (the tests build them through `recording()`). */
+const players = new WeakMap<HTMLAudioElement, ReturnType<typeof audioPlayer>>();
+function player(audio: HTMLAudioElement): ReturnType<typeof audioPlayer> {
+  const found = players.get(audio);
+  if (!found) throw new Error('No player for this element');
+  return found;
+}
