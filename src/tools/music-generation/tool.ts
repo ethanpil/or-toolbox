@@ -376,7 +376,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       ctx.modelOverride !== null
         ? 'This visit uses the model from the link you opened; change it with the model button above.'
         : known || !model
-          ? 'Lyria always makes this length; set a target length below to cut it shorter.'
+          ? 'Lyria always makes this length; a target length in Settings cuts it shorter.'
           : `The model above (${model}) is not one of these; its length is up to the model.`;
     formChanged();
   };
