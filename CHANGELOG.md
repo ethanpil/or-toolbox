@@ -64,6 +64,9 @@ All notable changes to this project are documented here. The format follows
 - Decision: text or key-value situation, question builder for Yes/No, Choice and Score (slug ids, criteria, options and a scale reordered by drag or Move buttons, thresholds), answer cards with meter, bars and scale, Clear / Needs review that re-labels without a new run, starter templates, saved deciders with Undo, JSON download and copy, free-only on Mercury Decide (099f5dd, eefc703).
 - Model picker help text per capability (`CAPABILITY_INFO.help`), used to say which decision models are verified (95ee388).
 - Stage 7 e2e gate for Decision: each question type with Jev, Mercury and thin responses, key-value state as the tutorial request, saved deciders, 429 and Stop, History reopen, 320 px by keyboard (44e6570).
+- Bot-to-bot chat: two bots with names, models and personas, framing shown read-only; streamed turns as alternating bubbles with avatars and per-turn tokens, cost and latency; turn, time, cost-cap and stop-phrase limits plus Stop; Pause, Step, Resume, moderator messages, edit and resume with Undo; one run per press with History replay; survives a reload; Markdown and JSON export (ae264ed, 484b833).
+- Stage 7 e2e for Bot-to-bot chat: every stop condition, moderation, a failed turn, exports and the prompts round trip (7d15e9f).
+- Shared `approxTokens()` in `src/core/tokens.ts` (0575155).
 
 ### Changed
 
