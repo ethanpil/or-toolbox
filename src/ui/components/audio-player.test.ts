@@ -39,4 +39,66 @@ describe('audioPlayer waveform', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(media.decodeAudio).not.toHaveBeenCalled();
   });
+
+  it('takes a known length instead of measuring the file', async () => {
+    audioPlayer({ blob: clip(), label: 'Known', seconds: 90 });
+    await vi.waitFor(() => expect(media.peaks).toHaveBeenCalled());
+    expect(media.getAudioDuration).not.toHaveBeenCalled();
+
+    audioPlayer({ blob: clip(), label: 'Known and long', seconds: 31 * 60 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(media.getAudioDuration).not.toHaveBeenCalled();
+    expect(media.decodeAudio).toHaveBeenCalledTimes(1);
+  });
+
+  it('decodes nothing when peaks are given', async () => {
+    audioPlayer({ blob: clip(), label: 'Drawn', peaks: new Float32Array(240) });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(media.getAudioDuration).not.toHaveBeenCalled();
+    expect(media.decodeAudio).not.toHaveBeenCalled();
+  });
+});
+
+describe('audioPlayer seeking', () => {
+  /**
+   * The player's <audio> as a MediaRecorder WebM: `duration` is Infinity until something seeks past the end,
+   * which is when the browser finds the real length (40 s here) and fires `durationchange`.
+   */
+  function recording(): { audio: HTMLAudioElement; canvas: HTMLCanvasElement; seeks: number[] } {
+    const player = audioPlayer({ blob: clip(), label: 'Recording', peaks: new Float32Array(240) });
+    const { audio } = player;
+    const canvas = player.element.querySelector('canvas')!;
+    canvas.getBoundingClientRect = () => ({ left: 0, width: 200 }) as DOMRect;
+    const seeks: number[] = [];
+    let duration = Infinity;
+    let time = 0;
+    Object.defineProperty(audio, 'duration', { configurable: true, get: () => duration });
+    Object.defineProperty(audio, 'currentTime', {
+      configurable: true,
+      get: () => time,
+      set: (value: number) => {
+        seeks.push(value);
+        time = value;
+        if (value > 1e100) {
+          duration = 40;
+          time = 40;
+          audio.dispatchEvent(new Event('durationchange'));
+        }
+      },
+    });
+    return { audio, canvas, seeks };
+  }
+
+  it('finds the length of a stream with none in its header once its metadata loads', async () => {
+    const { audio, seeks } = recording();
+    audio.dispatchEvent(new Event('loadedmetadata'));
+    await vi.waitFor(() => expect(seeks).toEqual([1e101, 0]));
+    expect(audio.duration).toBe(40);
+  });
+
+  it('finds the length before a waveform click seeks, then seeks within it', async () => {
+    const { canvas, seeks } = recording();
+    canvas.dispatchEvent(new MouseEvent('click', { clientX: 50 }));
+    await vi.waitFor(() => expect(seeks).toEqual([1e101, 0, 10]));
+  });
 });

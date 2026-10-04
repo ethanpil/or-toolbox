@@ -112,9 +112,35 @@ describe('stitchAudio', () => {
     expect((await samplesOf(call?.blob as Blob)).pcm).toEqual([0, 32767, 32767, 0]);
   });
 
-  it('passes a single segment through the same path', async () => {
+  it('returns a single segment already in the target format as it is: no decode, no ffmpeg', async () => {
+    const wav = segment(24000, [0.5]);
+    const progress: number[] = [];
+    expect(await stitchAudio([wav], 'wav', { onProgress: (ratio) => progress.push(ratio) })).toBe(
+      wav,
+    );
+    // An MPEG audio frame header (MPEG-1 Layer III), typed as MP3...
+    const mp3 = new Blob([new Uint8Array([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0])], {
+      type: 'audio/mpeg',
+    });
+    expect(await stitchAudio([mp3], 'mp3')).toBe(mp3);
+    // ...and one with no type: same bytes, typed for the target.
+    const untyped = new Blob([new Uint8Array([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0])]);
+    const typed = await stitchAudio([untyped], 'mp3');
+    expect(typed.type).toBe('audio/mpeg');
+    expect(new Uint8Array(await typed.arrayBuffer())).toEqual(
+      new Uint8Array(await untyped.arrayBuffer()),
+    );
+    expect(decoded.calls).toHaveLength(0);
+    expect(transcode.calls).toHaveLength(0);
+    expect(progress).toEqual([1]);
+  });
+
+  it('converts a single segment of another format the usual way', async () => {
     const only = segment(24000, [0.5]);
-    expect((await samplesOf(await stitchAudio([only], 'wav'))).pcm).toEqual([16384]);
+    await stitchAudio([only], 'mp3');
+    expect(decoded.calls).toHaveLength(1);
+    expect(transcode.calls).toHaveLength(1);
+    expect((await samplesOf(transcode.calls[0]?.blob as Blob)).pcm).toEqual([16384]);
   });
 
   it('rejects an empty list as input error', async () => {

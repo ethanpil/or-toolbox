@@ -71,6 +71,10 @@ function toChannelCount(channels: Float32Array[], count: number): Float32Array[]
  * (WAV and MP3 do), and is stereo if any segment is (mono segments are
  * repeated in both channels), else mono. Wrap raw PCM from a PCM-only TTS
  * model with `pcmToWav` first.
+ *
+ * A single segment that already is a `format` file (by its bytes) is
+ * returned as it is, typed for `format`: nothing is decoded and ffmpeg is not
+ * loaded (so `bitrate` does not apply to it).
  */
 export async function stitchAudio(
   segments: readonly Blob[],
@@ -80,6 +84,13 @@ export async function stitchAudio(
   if (segments.length === 0) throw new InvalidInputError('There is no audio to join.');
   const { signal } = options;
   throwIfAborted(signal);
+
+  const only = segments.length === 1 ? segments[0] : undefined;
+  const type = format === 'mp3' ? 'audio/mpeg' : 'audio/wav';
+  if (only && (await sniffBlobMime(only).catch(() => null)) === type) {
+    options.onProgress?.(1);
+    return only.type === type ? only : only.slice(0, only.size, type);
+  }
 
   const headers = await Promise.all(segments.map(headerFormat));
   const sampleRate = headers.find((header) => header !== null)?.sampleRate ?? DEFAULT_SAMPLE_RATE;

@@ -1,16 +1,23 @@
 /**
  * `audioPlayer()`: the browser's own audio controls (fully keyboard and screen-reader accessible) with a
  * waveform drawn above them from `peaks` (src/core/media/audio.ts `peaks()`). Without `peaks`, a Blob under
- * 64 MB and 30 minutes is decoded lazily (8 kHz, mono) to draw one. Clicking the waveform seeks; the played
- * part is drawn in the accent colour.
+ * 64 MB and 30 minutes (`seconds`, else measured) is decoded lazily (8 kHz, mono) to draw one. Clicking the
+ * waveform seeks; the played part is drawn in the accent colour.
+ *
+ * A stream with no length in its header (a MediaRecorder WebM: `duration` is Infinity) cannot be seeked until
+ * the browser has found its end, so the player probes it once (`resolveDuration`) when its metadata loads, and
+ * a waveform click waits for that before seeking.
  */
+import { resolveDuration } from '../../core/media/media-element';
 import { h } from '../dom';
 
 export interface AudioPlayerOptions {
   src?: string;
   blob?: Blob;
-  /** Loudest absolute sample (0–1) per bucket. */
+  /** Loudest absolute sample (0–1) per bucket; given, nothing is decoded for the waveform. */
   peaks?: Float32Array;
+  /** Known length in seconds (from the recorder, the decoder, the model): given, the file is not measured. */
+  seconds?: number;
   /** Accessible name, e.g. the file name. */
   label: string;
   testId?: string;
@@ -33,6 +40,7 @@ const BUCKETS = 240;
 export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
   const ownUrl = options.blob ? URL.createObjectURL(options.blob) : null;
   let peaks: Float32Array | null = options.peaks ?? null;
+  const known = options.seconds !== undefined && options.seconds > 0 ? options.seconds : null;
 
   const audio = h('audio', {
     controls: true,
@@ -48,6 +56,17 @@ export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
     canvas,
     audio,
   );
+
+  /** The length to draw and seek against: the element's once it knows it, else the caller's. */
+  const length = (): number =>
+    Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : (known ?? 0);
+
+  let probe: Promise<void> | null = null;
+  /** Settles once the element knows its length: an Infinity one is probed (once). */
+  const measured = (): Promise<void> => {
+    if (audio.duration === Infinity) probe ??= resolveDuration(audio);
+    return probe ?? Promise.resolve();
+  };
 
   const draw = (): void => {
     const context = canvas.getContext('2d');
@@ -66,7 +85,8 @@ export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
     const styles = getComputedStyle(document.documentElement);
     const played = styles.getPropertyValue('--bs-primary').trim() || '#4f46e5';
     const rest = styles.getPropertyValue('--bs-secondary-color').trim() || '#6c757d';
-    const progress = audio.duration > 0 ? audio.currentTime / audio.duration : 0;
+    const total = length();
+    const progress = total > 0 ? audio.currentTime / total : 0;
     const bar = width / peaks.length;
     for (let i = 0; i < peaks.length; i++) {
       const value = Math.max(0.03, peaks[i] ?? 0);
@@ -77,12 +97,18 @@ export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
   };
 
   canvas.addEventListener('click', (event) => {
-    if (!(audio.duration > 0)) return;
     const box = canvas.getBoundingClientRect();
-    audio.currentTime = ((event.clientX - box.left) / box.width) * audio.duration;
+    const ratio = (event.clientX - box.left) / box.width;
+    void measured().then(() => {
+      const total = length();
+      if (total > 0 && Number.isFinite(ratio)) audio.currentTime = ratio * total;
+    });
   });
   audio.addEventListener('timeupdate', draw);
-  audio.addEventListener('loadedmetadata', draw);
+  audio.addEventListener('loadedmetadata', () => {
+    draw();
+    void measured();
+  });
   const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(draw) : null;
   observer?.observe(canvas);
 
@@ -92,7 +118,7 @@ export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
     // decode of an hour of audio would hold hundreds of megabytes of samples).
     void import('../../core/media/audio')
       .then(async (media) => {
-        const seconds = await media.getAudioDuration(blob).catch(() => Number.NaN);
+        const seconds = known ?? (await media.getAudioDuration(blob).catch(() => Number.NaN));
         if (!(seconds > 0) || seconds > MAX_WAVEFORM_SECONDS) return null;
         const decoded = await media.decodeAudio(blob, {
           sampleRate: WAVEFORM_SAMPLE_RATE,
