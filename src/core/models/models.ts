@@ -22,6 +22,7 @@ import {
   estimateVideo,
 } from './estimate';
 import { isFreeModelId } from './free';
+import { bareImageControls, imageModelControls } from './image-params';
 import { normalizeModel } from './normalize';
 import { getTool } from '../../tools/registry';
 
@@ -31,6 +32,8 @@ export const REFRESH_FAILURE_BACKOFF_MS = 5 * 60 * 1000;
 export const KV_CATALOG = 'models:catalog';
 export const KV_IMAGE_MODELS = 'models:images';
 export const KV_VIDEO_MODELS = 'models:videos';
+/** After a failed (or empty) image model read, `imageControls` asks the network again once this has passed. */
+export const IMAGE_CONTROLS_RETRY_MS = 30_000;
 export const kvEndpoints = (modelId: string): string => `models:endpoints:${modelId}`;
 
 interface CacheOptions<T> {
@@ -182,6 +185,8 @@ export function createModelsService(
   const maxAgeMs = options.maxAgeMs ?? CATALOG_MAX_AGE_MS;
   let emitting = false;
   let listening = false;
+  /** When `imageControls` last found the image list unreadable or empty; null when it was fine. */
+  let imageListFailedAt: number | null = null;
 
   function announce(): void {
     emitting = true;
@@ -208,9 +213,13 @@ export function createModelsService(
     if (listening) return;
     listening = true;
     core.bus.on('models-refreshed', () => {
+      imageListFailedAt = null;
       if (!emitting) dropMemory();
     });
-    core.bus.on('data-reset', dropMemory);
+    core.bus.on('data-reset', () => {
+      imageListFailedAt = null;
+      dropMemory();
+    });
   }
 
   const catalog = new ListCache<RawModel>({
@@ -381,6 +390,28 @@ export function createModelsService(
     imageModels(opts) {
       listen();
       return images.get(opts?.refresh === true);
+    },
+
+    async imageControls(modelId) {
+      listen();
+      const unknown = { status: 'unknown', controls: bareImageControls(modelId) } as const;
+      // Never latched: after a failure, the next call past the cool-off asks the network again.
+      const failedBefore = imageListFailedAt !== null;
+      if (failedBefore && now() - imageListFailedAt! < IMAGE_CONTROLS_RETRY_MS) return unknown;
+      let list: RawImageModel[];
+      try {
+        list = await images.get(failedBefore);
+      } catch {
+        imageListFailedAt = now();
+        return unknown;
+      }
+      if (list.length === 0) {
+        imageListFailedAt = now();
+        return unknown;
+      }
+      imageListFailedAt = null;
+      const raw = list.find((model) => model.id === modelId);
+      return raw ? { status: 'ready', controls: imageModelControls(raw) } : { status: 'missing' };
     },
 
     videoModels(opts) {
