@@ -4,8 +4,8 @@
  * the model sees, and how a result of another shape is fitted onto the canvas.
  */
 import { aspectValue } from '../../core/models/image-params';
-import type { Box, Mask, RasterImage, Rgb } from '../../core/media/image';
-import { createMask, featherOutside } from './mask';
+import type { Box, Mask, Rgb } from '../../core/media/image';
+import { createMask } from './mask';
 
 /** Extra space on each side, in percent of the picture's width (left, right) or height (top, bottom). */
 export interface Margins {
@@ -95,42 +95,34 @@ export function outpaintMask(plan: OutpaintPlan, width: number, height: number):
   return mask;
 }
 
-/** The picture on the new canvas, the new area filled with `fill`. */
-export function placeOnCanvas(
-  image: RasterImage,
-  plan: OutpaintPlan,
-  fill: Rgb = OUTPAINT_FILL,
-): RasterImage {
-  const data = new Uint8ClampedArray(plan.width * plan.height * 4);
-  for (let i = 0; i < data.length; i += 4) {
-    data[i] = fill[0];
-    data[i + 1] = fill[1];
-    data[i + 2] = fill[2];
-    data[i + 3] = 255;
-  }
-  for (let y = 0; y < image.height; y++) {
-    data.set(
-      image.data.subarray(y * image.width * 4, (y + 1) * image.width * 4),
-      ((plan.offsetY + y) * plan.width + plan.offsetX) * 4,
-    );
-  }
-  return { width: plan.width, height: plan.height, data };
-}
-
 /**
- * The alpha that lays an outpaint result over the picture's canvas: all result in the new area (there is only
- * grey filler under it, never blended in), and a soft edge of `feather` pixels on the picture's side of the
- * seam; beyond that the picture is kept exactly.
+ * What an outpaint composite keeps of the picture's canvas: 255 where the picture sits, and where a fitted result
+ * does not reach (`reach`, its box on the canvas; null when it fills the canvas). The composite runs with the
+ * result as the "original" and the canvas as the "result" (`compositeMaskedAsync(result, canvas, mask, {
+ * feather })`): the new area is all result, the picture is kept exactly beyond the soft edge, and that edge lies
+ * on the picture's side of the seam, so the grey filler never blends into generated pixels.
  */
-export function outpaintAlpha(
+export function pictureMask(
   plan: OutpaintPlan,
   width: number,
   height: number,
-  feather: number,
+  reach: Box | null = null,
 ): Mask {
-  return featherOutside(outpaintMask(plan, width, height), feather);
+  const mask = createMask(plan.width, plan.height);
+  if (reach) {
+    mask.data.fill(255);
+    const x0 = Math.max(0, reach.x);
+    const x1 = Math.min(plan.width, reach.x + reach.width);
+    for (let y = Math.max(0, reach.y); y < Math.min(plan.height, reach.y + reach.height); y++) {
+      mask.data.fill(0, y * plan.width + x0, y * plan.width + x1);
+    }
+  }
+  for (let y = 0; y < height; y++) {
+    const row = (plan.offsetY + y) * plan.width + plan.offsetX;
+    mask.data.fill(255, row, row + width);
+  }
+  return mask;
 }
-
 /** A plan at another size of the same canvas, with the picture's own box rounded once, consistently. */
 export interface ScaledPlan extends OutpaintPlan {
   imageWidth: number;
