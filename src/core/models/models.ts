@@ -316,11 +316,15 @@ export function createModelsService(
       case 'video': {
         const model = (await videos.get()).find((m) => m.id === input.model);
         if (!model) return null;
-        const videoInput: { seconds: number; resolution?: string; withAudio?: boolean } = {
-          seconds: input.seconds,
-        };
+        const videoInput: {
+          seconds: number;
+          resolution?: string;
+          withAudio?: boolean;
+          images?: number;
+        } = { seconds: input.seconds };
         if (input.resolution) videoInput.resolution = input.resolution;
         if (input.withAudio !== undefined) videoInput.withAudio = input.withAudio;
+        if (input.images) videoInput.images = input.images;
         return estimateVideo(model, videoInput);
       }
       case 'music': {

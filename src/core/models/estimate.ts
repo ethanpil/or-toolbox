@@ -213,19 +213,33 @@ function shortSide(resolution: string): number | null {
  */
 export function estimateVideo(
   model: RawVideoModel,
-  input: { seconds: number; resolution?: string; withAudio?: boolean },
+  input: { seconds: number; resolution?: string; withAudio?: boolean; images?: number },
 ): number | null {
   const skus = Object.entries(model.pricing_skus ?? {})
     .map(([key, value]) => parseSku(key, value))
     .filter((sku): sku is VideoSku => sku !== null);
   const wantRes = input.resolution?.toLowerCase();
+  let cost: number | null;
   if (input.withAudio !== undefined) {
-    return videoCost(model, skus, input.seconds, wantRes, input.withAudio ? 'with' : 'without');
+    cost = videoCost(model, skus, input.seconds, wantRes, input.withAudio ? 'with' : 'without');
+  } else {
+    const costs = (['with', 'without'] as const)
+      .map((audio) => videoCost(model, skus, input.seconds, wantRes, audio))
+      .filter((value): value is number => value !== null);
+    cost = costs.length > 0 ? Math.max(...costs) : null;
   }
-  const costs = (['with', 'without'] as const)
-    .map((audio) => videoCost(model, skus, input.seconds, wantRes, audio))
-    .filter((cost): cost is number => cost !== null);
-  return costs.length > 0 ? Math.max(...costs) : null;
+  return cost === null ? null : cost + imageInputCost(model, input.images ?? 0);
+}
+
+/**
+ * Per-image input charge (`cents_per_image_input`, Grok: the recorded $0.052 is $0.05 for 1 s plus $0.002 for its
+ * first frame). Other image surcharges (`reference_images`) have no documented unit and stay out.
+ */
+function imageInputCost(model: RawVideoModel, images: number): number {
+  if (!(images > 0)) return 0;
+  const raw = model.pricing_skus?.['cents_per_image_input'];
+  const cents = raw === undefined ? null : priceNumber(raw);
+  return cents === null ? 0 : (cents / 100) * images;
 }
 
 function videoCost(

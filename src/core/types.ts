@@ -346,6 +346,8 @@ export type EstimateInput =
       resolution?: string;
       aspectRatio?: string;
       withAudio?: boolean;
+      /** Images sent with the request (frames and references), for per-image input charges. */
+      images?: number;
     }
   | { kind: 'music'; model: string }
   | { kind: 'decision'; model: string; inputTokens: number };
