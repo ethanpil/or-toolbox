@@ -58,6 +58,9 @@ All notable changes to this project are documented here. The format follows
 - Stage 5 e2e gate for Isolated image: 20 synthetic photos with imperfect mocked isolations, all passing QA, the ZIP of 20 JPGs checked pixel by pixel (ccc8999).
 - Video studio: model-aware form from `/videos/models`; text, first frame, first + last frame and reference modes; Continue from a clip's true last frame (uploads included) and native extend with a public HTTPS link (else Continue); persisted jobs with hand-off and cost booking; auto-extend sequences (chained or 3 at once, repeat, style, spend cap, stop/skip, pause/resume, re-run) that resume after a reload; frame grabber; timeline with reorder, trims, dropped repeated first frames and an ffmpeg join with Stop (cfb9c20).
 - Stage 6 e2e gate: a 5-step chained sequence survives a reload, joins into an MP4 that plays; a spend cap stops a sequence (0ec6971).
+- Bot-to-bot chat: two bots with names, models and personas, framing shown read-only; streamed turns as alternating bubbles with avatars and per-turn tokens, cost and latency; turn, time, cost-cap and stop-phrase limits plus Stop; Pause, Step, Resume, moderator messages, edit and resume with Undo; one run per press with History replay; survives a reload; Markdown and JSON export (ae264ed, 484b833).
+- Stage 7 e2e for Bot-to-bot chat: every stop condition, moderation, a failed turn, exports and the prompts round trip (7d15e9f).
+- Shared `approxTokens()` in `src/core/tokens.ts` (0575155).
 
 ### Changed
 
