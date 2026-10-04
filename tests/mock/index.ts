@@ -82,6 +82,9 @@ function seedDefaults(mock: OpenRouterMock): void {
 
   // Per-provider prices (keyless, like the catalog), read for TTS estimates: none listed by default.
   mock.json('GET', /^\/api\/v1\/models\/.+\/endpoints$/, { data: { endpoints: [] } });
+
+  // The image models' parameters (keyless), read by the image tools: none listed by default.
+  mock.json('GET', '/api/v1/images/models', { data: [] });
 }
 
 /**

@@ -127,7 +127,8 @@ export function estimateTranscription(
 
 /**
  * Images: `image_output` is USD per output image token. Per-megapixel models bill width x height / 256 tokens,
- * per-image models a flat 4175 (so 1 MP is the floor). References add the input-image price.
+ * per-image models a flat 4175 (so 1 MP is the floor). References add the input-image price. A zero price is
+ * unknown, not free (free models are `:free` ids, answered before this; some paid models list "0").
  */
 export function estimateImage(
   model: ModelInfo,
@@ -135,7 +136,7 @@ export function estimateImage(
 ): number | null {
   const raw = model.pricing.raw;
   const perToken = priceNumber(raw['image_output']) ?? priceNumber(raw['image_token']);
-  if (perToken === null) return null;
+  if (perToken === null || perToken === 0) return null;
   const pixels = input.width && input.height ? input.width * input.height : 0;
   const tokens = Math.max(MIN_IMAGE_TOKENS, Math.ceil(pixels / PIXELS_PER_IMAGE_TOKEN));
   let total = input.images * tokens * perToken;

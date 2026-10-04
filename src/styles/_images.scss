@@ -1,0 +1,147 @@
+// Image tools (Image generation, Image editor): aspect chips, reference thumbnails, the editor canvas and the
+// version strip.
+
+// Aspect ratio chips: a small box drawn in the chip's shape.
+.or-aspect-box {
+  display: inline-block;
+  width: calc(1.1rem * var(--or-aspect-w, 1));
+  height: calc(1.1rem * var(--or-aspect-h, 1));
+  border: 2px solid currentcolor;
+  border-radius: 2px;
+
+  &.is-auto {
+    width: 1rem;
+    height: 1rem;
+    border-style: dashed;
+  }
+}
+
+.or-aspect-chip {
+  min-height: 2.25rem;
+}
+
+// Reference thumbnails with a remove button on the corner (24 x 24 px at least).
+.or-reference {
+  position: relative;
+
+  img {
+    display: block;
+  }
+}
+
+.or-reference-remove {
+  position: absolute;
+  top: -0.5rem;
+  right: -0.5rem;
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border-radius: 50%;
+}
+
+// A waiting card's placeholder.
+.or-image-placeholder {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  background-color: var(--or-inset);
+}
+
+// The editor canvas: the stage is scaled and moved with a transform; the brush outline follows the pointer.
+.or-editor-viewport {
+  position: relative;
+  height: min(65vh, 36rem);
+  overflow: hidden;
+  touch-action: none;
+  cursor: crosshair;
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius-lg);
+
+  &.is-panning {
+    cursor: grab;
+  }
+
+  &:focus-visible {
+    outline: 3px solid var(--or-focus-color);
+    outline-offset: 2px;
+  }
+}
+
+.or-editor-stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+
+  canvas {
+    display: block;
+  }
+}
+
+.or-editor-mask {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+
+.or-editor-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px #000;
+
+  &.is-eraser {
+    border-style: dashed;
+  }
+}
+
+.or-editor-size {
+  width: 8rem;
+}
+
+.or-editor-zoom {
+  min-width: 3rem;
+  text-align: end;
+}
+
+// Outpaint: the new canvas as a small diagram, the picture inside it.
+.or-outpaint-schematic {
+  position: relative;
+  flex-shrink: 0;
+  width: 6rem;
+  max-height: 6rem;
+  background-color: var(--bs-secondary-bg);
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0 4px,
+    rgba(var(--bs-emphasis-color-rgb), 0.15) 4px 6px
+  );
+  border: 1px dashed var(--bs-border-color);
+}
+
+.or-outpaint-inner {
+  position: absolute;
+  background-color: var(--bs-primary-bg-subtle);
+  border: 2px solid var(--bs-primary);
+}
+
+// Version strip: a row of thumbnails that scrolls sideways.
+.or-version-strip {
+  padding-bottom: 0.25rem;
+  overflow-x: auto;
+}
+
+.or-version-thumb {
+  padding: 0.25rem;
+
+  img {
+    display: block;
+    object-fit: cover;
+  }
+}
