@@ -58,6 +58,9 @@ All notable changes to this project are documented here. The format follows
 - Stage 5 e2e gate for Isolated image: 20 synthetic photos with imperfect mocked isolations, all passing QA, the ZIP of 20 JPGs checked pixel by pixel (ccc8999).
 - Video studio: model-aware form from `/videos/models`; text, first frame, first + last frame and reference modes; Continue from a clip's true last frame (uploads included) and native extend with a public HTTPS link (else Continue); persisted jobs with hand-off and cost booking; auto-extend sequences (chained or 3 at once, repeat, style, spend cap, stop/skip, pause/resume, re-run) that resume after a reload; frame grabber; timeline with reorder, trims, dropped repeated first frames and an ffmpeg join with Stop (cfb9c20).
 - Stage 6 e2e gate: a 5-step chained sequence survives a reload, joins into an MP4 that plays; a spend cap stops a sequence (0ec6971).
+- Decision: text or key-value situation, question builder for Yes/No, Choice and Score (slug ids, criteria, options and a scale reordered by drag or Move buttons, thresholds), answer cards with meter, bars and scale, Clear / Needs review that re-labels without a new run, starter templates, saved deciders with Undo, JSON download and copy, free-only on Mercury Decide (099f5dd, eefc703).
+- Model picker help text per capability (`CAPABILITY_INFO.help`), used to say which decision models are verified (95ee388).
+- Stage 7 e2e gate for Decision: each question type with Jev, Mercury and thin responses, key-value state as the tutorial request, saved deciders, 429 and Stop, History reopen, 320 px by keyboard (44e6570).
 
 ### Changed
 

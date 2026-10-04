@@ -341,7 +341,9 @@ export function resultsView(): ResultsView {
             : `Cost ${formatUsd(result.costUsd)}`;
       replace(
         meta,
-        result.model ? h('span', null, 'Answered by ', h('code', null, result.model)) : null,
+        result.model
+          ? h('span', null, 'Answered by ', h('code', { class: 'text-body' }, result.model))
+          : null,
         result.model ? ' · ' : null,
         h('span', { 'data-testid': 'dec-cost' }, cost),
       );
