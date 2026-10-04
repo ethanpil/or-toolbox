@@ -9,7 +9,13 @@ import {
   type RasterImage,
   unsharpMask,
 } from './image';
-import { isolateRaster, resizeAuto } from './image-pipeline';
+import {
+  adaptiveThreshold,
+  fillAndDespeckle,
+  isolateRaster,
+  MIN_ADAPTIVE_THRESHOLD,
+  resizeAuto,
+} from './image-pipeline';
 
 function fillRect(
   img: RasterImage,
@@ -31,7 +37,8 @@ function photo(): RasterImage {
   return img;
 }
 
-describe('isolateRaster', () => {
+// Deep `toEqual` over whole images is slow on a loaded machine; the default 5 s is not enough there.
+describe('isolateRaster', { timeout: 30_000 }, () => {
   it('is the pipeline step by step: box, square, white fill, sharpen, QA', () => {
     const source = photo();
     const result = isolateRaster(source, { size: 200 });
@@ -94,6 +101,176 @@ describe('isolateRaster', () => {
     expect(result.box).toEqual({ x: 0, y: 0, width: 40, height: 30 });
     expect(result.check.borderPureWhite).toBe(true);
     expect(new Set(result.image.data)).toEqual(new Set([255]));
+  });
+});
+
+/** A deterministic pseudo-random sequence in [0, 1) (mulberry32). */
+function random(seed: number): () => number {
+  let a = seed;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** A 160 x 120 edit-model answer: a navy product with a white label, on `level` plus or minus `noise`. */
+function offWhitePhoto(level: number, noise: number, seed = 1): RasterImage {
+  const next = random(seed);
+  const img = createRaster(160, 120, '#ffffff');
+  for (let i = 0; i < img.data.length; i += 4) {
+    const value = level + Math.round((next() * 2 - 1) * noise);
+    img.data[i] = value;
+    img.data[i + 1] = value;
+    img.data[i + 2] = value;
+  }
+  fillRect(img, 50, 30, 60, 50, [20, 30, 90]);
+  fillRect(img, 60, 40, 40, 30, [250, 250, 250]);
+  return img;
+}
+
+describe('adaptiveThreshold', () => {
+  it('keeps the threshold when the background is clean and light enough', () => {
+    expect(adaptiveThreshold(createRaster(40, 30, '#fbfbfb'), 245)).toBe(245);
+    expect(adaptiveThreshold(createRaster(40, 30, '#ffffff'), 245)).toBe(245);
+  });
+
+  it('stays clear of the noise of a light background, so a shadow’s faint tail does not cross it', () => {
+    const light = adaptiveThreshold(offWhitePhoto(252, 3), 245);
+    expect(light).toBeLessThan(245);
+    expect(light).toBeGreaterThan(230);
+  });
+
+  it('goes below an even off-white background and its noise, never above the threshold', () => {
+    expect(adaptiveThreshold(createRaster(40, 30, '#f0f0f0'), 245)).toBe(237);
+    const noisy = adaptiveThreshold(offWhitePhoto(240, 3), 245);
+    expect(noisy).toBeLessThan(237);
+    expect(noisy).toBeGreaterThanOrEqual(MIN_ADAPTIVE_THRESHOLD);
+    expect(adaptiveThreshold(createRaster(40, 30, '#f0f0f0'), 230)).toBe(230);
+  });
+
+  it('reads the background past a product that reaches part of the border', () => {
+    const cut = offWhitePhoto(240, 3);
+    fillRect(cut, 0, 30, 60, 50, [20, 30, 90]);
+    const adapted = adaptiveThreshold(cut, 245);
+    expect(adapted).toBeLessThan(237);
+    const { box } = isolateRaster(cut, { size: 100, adaptThreshold: true });
+    expect(box).toEqual({ x: 0, y: 30, width: 110, height: 50 });
+  });
+
+  it('leaves a grey or busy border alone, so the photo still fails the QA', () => {
+    expect(adaptiveThreshold(createRaster(40, 30, '#808080'), 245)).toBe(245);
+    expect(adaptiveThreshold(offWhitePhoto(225, 12), 245)).toBe(245);
+  });
+
+  it('reads light over white for transparent pixels', () => {
+    const clear = createRaster(20, 20, '#000000');
+    for (let i = 3; i < clear.data.length; i += 4) clear.data[i] = 0;
+    expect(adaptiveThreshold(clear, 245)).toBe(245);
+  });
+});
+
+describe('isolateRaster with adaptThreshold', () => {
+  it('finds the product on a noisy off-white background and fills all of that background', () => {
+    const source = offWhitePhoto(242, 3, 7);
+    const plain = isolateRaster(source, { size: 200, sharpen: false });
+    const adapted = isolateRaster(source, { size: 200, sharpen: false, adaptThreshold: true });
+
+    // At 245 the noise below it counts as content: the box is nearly the whole photo.
+    expect(plain.threshold).toBe(245);
+    expect(plain.box.width).toBeGreaterThan(150);
+    // Adapted, the box is the product and every background pixel is pure white.
+    expect(adapted.threshold).toBeLessThan(239);
+    expect(adapted.box).toEqual({ x: 50, y: 30, width: 60, height: 50 });
+    expect(adapted.check).toEqual({
+      borderPureWhite: true,
+      touchesEdge: false,
+      nonWhiteBorderPixels: 0,
+    });
+    const { data, width } = adapted.image;
+    const pixel = (x: number, y: number): number[] => [
+      ...data.slice((y * width + x) * 4, (y * width + x) * 4 + 3),
+    ];
+    expect(pixel(5, 5)).toEqual([255, 255, 255]);
+    // The label inside the product is near-white too, but enclosed: it keeps its colour.
+    expect(pixel(100, 100)).toEqual([250, 250, 250]);
+  });
+
+  it('is the plain pipeline when the background needs nothing', () => {
+    const source = photo();
+    const adapted = isolateRaster(source, { size: 120, adaptThreshold: true });
+    const plain = isolateRaster(source, { size: 120 });
+    expect(adapted.threshold).toBe(245);
+    // Compared as bytes: a deep `toEqual` over 57,600 values takes seconds on a busy machine.
+    expect(Buffer.from(adapted.image.data).equals(Buffer.from(plain.image.data))).toBe(true);
+  });
+});
+
+const at = (img: RasterImage, x: number, y: number): number[] => [
+  ...img.data.slice((y * img.width + x) * 4, (y * img.width + x) * 4 + 3),
+];
+
+/** A shadow's fringe where it fades through the threshold: single pixels and a pair just below 245. */
+const SPECKS: [number, number][] = [
+  [25, 85],
+  [135, 83],
+  [30, 95],
+  [128, 92],
+  [80, 100],
+  [20, 82],
+  [21, 82],
+];
+
+/** 160 x 120 at 250, a navy product, the core of its shadow (230) and the specks around it. */
+function shadowPhoto(): RasterImage {
+  const img = createRaster(160, 120, '#fafafa');
+  for (let y = 77; y <= 87; y++) {
+    for (let x = 40; x <= 120; x++) {
+      if (((x - 80) / 40) ** 2 + ((y - 82) / 5) ** 2 <= 1)
+        img.data.set([230, 230, 230, 255], (y * 160 + x) * 4);
+    }
+  }
+  fillRect(img, 50, 30, 60, 50, [20, 30, 90]);
+  for (const [x, y] of SPECKS) img.data.set([243, 243, 243, 255], (y * 160 + x) * 4);
+  return img;
+}
+
+describe('fillAndDespeckle', () => {
+  it('whitens the background and light specks; keeps the product with all inside it, and darker or larger groups', () => {
+    const img = createRaster(100, 80, '#f8f8f8');
+    fillRect(img, 30, 20, 40, 40, [20, 30, 90]); // the product
+    fillRect(img, 38, 28, 24, 24, [250, 250, 250]); // its white label
+    fillRect(img, 45, 35, 4, 2, [230, 230, 230]); // light print on the label
+    fillRect(img, 10, 10, 2, 2, [238, 238, 238]); // a light speck
+    fillRect(img, 85, 60, 2, 2, [60, 60, 60]); // a small dark part
+    fillRect(img, 0, 70, 3, 3, [238, 238, 238]); // light, but on the edge
+    fillRect(img, 80, 10, 10, 10, [240, 240, 240]); // light, but larger than a speck
+    const out = fillAndDespeckle(img, 245, 8);
+    expect(at(out, 5, 5)).toEqual([255, 255, 255]);
+    expect(at(out, 10, 10)).toEqual([255, 255, 255]);
+    expect(at(out, 40, 30)).toEqual([250, 250, 250]);
+    expect(at(out, 46, 36)).toEqual([230, 230, 230]);
+    expect(at(out, 31, 21)).toEqual([20, 30, 90]);
+    expect(at(out, 85, 60)).toEqual([60, 60, 60]);
+    expect(at(out, 0, 70)).toEqual([238, 238, 238]);
+    expect(at(out, 85, 15)).toEqual([240, 240, 240]);
+    expect(img.data[(10 * 100 + 10) * 4]).toBe(238); // the input is not changed
+  });
+
+  it('leaves no grey dots where a soft shadow fades through the threshold, and keeps the box to it', () => {
+    const source = shadowPhoto();
+    const plain = isolateRaster(source, { size: 200, sharpen: false });
+    const clean = isolateRaster(source, { size: 200, sharpen: false, despeckle: true });
+    // Without despeckling the specks widen the box (and stay, as grey dots)…
+    expect(plain.box).toEqual({ x: 20, y: 30, width: 116, height: 71 });
+    // …with it they are white, and the box is the product and its shadow.
+    expect(clean.box).toEqual({ x: 40, y: 30, width: 81, height: 58 });
+    const cleaned = fillAndDespeckle(source, 245, 19);
+    for (const [x, y] of SPECKS) expect(at(cleaned, x, y)).toEqual([255, 255, 255]);
+    expect(at(cleaned, 80, 85)).toEqual([230, 230, 230]);
+    expect(at(cleaned, 5, 5)).toEqual([255, 255, 255]);
+    expect(clean.check.borderPureWhite).toBe(true);
   });
 });
 
