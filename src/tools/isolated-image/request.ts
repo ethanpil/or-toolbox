@@ -1,14 +1,14 @@
 /**
- * The edit request: the fixed instruction, and which `/images` parameters a model takes (its
- * `supported_parameters` from `GET /images/models`: an absent key is unsupported, and sending one makes routing
- * refuse the request; docs/openrouter-api.md §3.2).
+ * The edit request: the fixed instruction, and which `/images` fields a model takes, from
+ * `ctx.models.imageControls(model)` (the one policy every image tool follows; docs/tool-authoring.md, "Image
+ * models").
  */
-import type { ImageRequest, RawImageModel } from '../../core/api/types';
-import { isFiniteNumber, isRecord } from '../../core/util';
+import type { ImageRequest } from '../../core/api/types';
+import type { ImageControlsResult } from '../../core/types';
 
-/** The instruction every photo is sent with. `notes` is the user's optional line about this batch. */
-export function buildInstruction(options: { shadow: boolean; notes: string }): string {
-  const parts = [
+/** The instruction every photo is sent with. It is fixed: the tool takes no notes that could weaken it. */
+export function buildInstruction(options: { shadow: boolean }): string {
+  return [
     'Edit this product photo into a clean e-commerce packshot.',
     'Keep the product exactly as it is: the same shape, proportions, colours, materials, logos, labels and text.',
     'Do not redraw, restyle, crop or add anything to the product.',
@@ -18,55 +18,41 @@ export function buildInstruction(options: { shadow: boolean; notes: string }): s
     options.shadow
       ? 'Keep a soft, natural shadow directly under the product.'
       : 'No shadow, reflection or gradient: the background is flat pure white everywhere.',
-  ];
-  const notes = options.notes.trim();
-  return notes ? `${parts.join(' ')}\n\nAbout these photos: ${notes}` : parts.join(' ');
+  ].join(' ');
 }
 
 /** Extra request fields a model takes, or why it cannot edit a photo at all. */
 export type EditSupport =
   { ok: true; params: Pick<ImageRequest, 'n' | 'output_format'> } | { ok: false; reason: string };
 
-function range(descriptor: unknown): { min: number; max: number } | null {
-  if (!isRecord(descriptor) || descriptor['type'] !== 'range') return null;
-  const { min, max } = descriptor;
-  return isFiniteNumber(min) && isFiniteNumber(max) ? { min, max } : null;
-}
-
-function enumValues(descriptor: unknown): unknown[] {
-  if (!isRecord(descriptor) || descriptor['type'] !== 'enum') return [];
-  return Array.isArray(descriptor['values']) ? descriptor['values'] : [];
-}
-
 /**
- * Whether `model` can edit one photo, from the `/images` model list (`models`; undefined or empty when it
- * could not be read, and then the request is tried as it is). PNG is asked for where offered: a lossless
- * answer keeps JPEG noise out of the background the browser fills.
+ * Whether `model` can edit one photo. `missing` (the image list was read and lacks it) and a model that takes no
+ * single reference image are refused before the run. `unknown` (the list could not be read) tries the request
+ * with the photo and the instruction only, nothing else. PNG is asked for where offered: a lossless answer keeps
+ * JPEG noise out of the background the browser fills.
  */
-export function editSupport(
-  model: string,
-  models: readonly RawImageModel[] | undefined,
-): EditSupport {
-  if (!models || models.length === 0) return { ok: true, params: {} };
-  const entry = models.find((candidate) => candidate.id === model);
-  if (!entry) {
+export function editSupport(model: string, found: ImageControlsResult): EditSupport {
+  if (found.status === 'missing') {
     return {
       ok: false,
       reason: `${model} does not edit images through OpenRouter's image endpoint. Choose another model.`,
     };
   }
-  const parameters = isRecord(entry.supported_parameters) ? entry.supported_parameters : {};
-  const references = range(parameters['input_references']);
-  if (!references || references.max < 1 || references.min > 1) {
+  if (found.status === 'unknown') return { ok: true, params: {} };
+  const { controls } = found;
+  if (!controls.references || controls.references.max < 1 || controls.references.min > 1) {
     return {
       ok: false,
-      reason: `${entry.name || model} cannot edit a photo (it takes no single reference image). Choose another model.`,
+      reason: `${controls.name} cannot edit a photo (it takes no single reference image). Choose another model.`,
     };
   }
-  const params: Pick<ImageRequest, 'n' | 'output_format'> = {};
-  if ('n' in parameters) params.n = 1;
-  if (enumValues(parameters['output_format']).includes('png')) params.output_format = 'png';
-  return { ok: true, params };
+  return {
+    ok: true,
+    params: {
+      ...(controls.n ? { n: 1 } : {}),
+      ...(controls.outputFormats?.includes('png') ? { output_format: 'png' as const } : {}),
+    },
+  };
 }
 
 export function buildRequest(

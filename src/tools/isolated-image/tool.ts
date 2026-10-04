@@ -4,22 +4,24 @@
  * Isolate press; the answer is then post-processed in the image worker (`isolateImage`: product box, square
  * with margin, near-white flood-filled to #FFFFFF from the edges, light sharpening, QA). The review shows a
  * before/after wipe and a side-by-side view per photo, with its own margin and threshold: changing those, or the
- * output settings, only re-runs the post-processing (no request). Results are registered with the leave guard
- * and download one by one or as a ZIP.
+ * output settings, only re-runs the post-processing (no request). Results are `imageResultCard`s (leave guard,
+ * Send to…, Remove) and download one by one or as a ZIP. The tool is promptless: the instruction is fixed, and
+ * Prompts saves settings presets.
  */
-import type { RawImageModel } from '../../core/api/types';
 import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
 import { zipFiles } from '../../core/export/zip';
 import { downloadBlob } from '../../core/files';
-import type { Box } from '../../core/media/image';
+import { type Box, fitWithin, readImageSize } from '../../core/media/image';
 import { isolateImage } from '../../core/media/image-async';
 import type { RunHandle } from '../../core/types';
 import { abortError, debounce, utcDay } from '../../core/util';
 import { compareSlider, type CompareSlider } from '../../ui/components/compare-slider';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
+import { type ImageResultCard, imageResultCard } from '../../ui/components/image-result-card';
 import { modelPicker } from '../../ui/components/model-picker';
 import { progressBar } from '../../ui/components/progress-bar';
+import { imageThumbnail } from '../../ui/components/reference-picker';
 import { switchField } from '../../ui/components/switch-field';
 import { focusedKey, focusKey, h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
@@ -31,6 +33,7 @@ import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
 import type { ResultHandle, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
 import { retryGate } from '../../ui/tool/retry-gate';
+import { pendingOnly } from '../../ui/tool/runner';
 import {
   appliedMargin,
   CONCURRENCY,
@@ -66,8 +69,14 @@ interface Processed {
   /** The `processingKey` it was made with. */
   key: string;
   blob: Blob;
+  /** Its result card (leave guard, downloads, Send to…, Remove); a new name needs a new card. */
+  card: ImageResultCard;
+  /** `card.handle`, and the full image's object URL (the review); the grid shows `thumbUrl`. */
   handle: ResultHandle;
   url: string;
+  thumbUrl: string;
+  /** The card's own part: thumbnail, badges, reasons, redrawn in place. */
+  extra: HTMLElement;
   qa: QaReport;
   /** The threshold and margin used (the margin raised for JPG; see `appliedMargin`). */
   threshold: number;
@@ -83,13 +92,19 @@ interface Photo {
   readonly key: string;
   readonly file: File;
   readonly name: string;
-  /** Object URL of the original (thumbnails, the "before" side). */
+  /** Object URL of the original (the review's "before" side). */
   readonly url: string;
+  /** Object URL of a small copy for the photo list and the grid, once made. */
+  thumbUrl: string | null;
+  /** Pixel size from the file's header (no decoding), once read: the estimate's answer size. */
+  dims: { width: number; height: number } | null;
   phase: Phase;
   error: string | null;
   /** The model's answer (paid for), kept so the post-processing can run again without a request. */
   edited: Blob | null;
   model: string | null;
+  /** The run that made `edited`: a replayed Retry skips photos the failed run already made. */
+  editRun: string | null;
   /** Review choices for this photo; null follows the settings (the threshold: automatic). */
   margin: number | null;
   threshold: number | null;
@@ -110,6 +125,9 @@ const MAX_PHOTOS = 100;
 /** Post-processing jobs in flight at once (decode, worker, encode); the worker itself does one at a time. */
 const PROCESS_SLOTS = 2;
 const RECONCILE_DELAY_MS = 350;
+/** Thumbnail sides: the photo list shows 48 px, a grid card about 250 px (so twice its 144 for sharpness). */
+const LIST_THUMB = 144;
+const GRID_THUMB = 288;
 
 const PHASE_TEXT: Partial<Record<Phase, string>> = {
   queued: 'Waiting',
@@ -181,7 +199,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     patternHelp: uid('iso-pattern-help'),
     sendSize: uid('iso-send-size'),
     concurrency: uid('iso-concurrency'),
-    notes: uid('iso-notes'),
   };
 
   /** Applies a change from a control: validated, saved as the tool's options, and acted on. */
@@ -405,13 +422,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     'aria-label': 'Photos',
     'data-testid': 'iso-photos',
   });
-  const notes = h('textarea', {
-    id: ids.notes,
-    class: 'form-control',
-    rows: 2,
-    placeholder: 'For example: the product is the left shoe; remove the price sticker',
-    'data-testid': 'tool-prompt',
-  });
   const drop = dropZone({
     accept: ctx.manifest.accepts,
     multiple: true,
@@ -428,19 +438,9 @@ export function setup(ctx: ToolContext): ToolInstance {
       photoList,
     ),
     h(
-      'div',
-      null,
-      h(
-        'label',
-        { class: 'form-label fw-semibold', htmlFor: ids.notes },
-        'Notes for the model (optional)',
-      ),
-      notes,
-      h(
-        'div',
-        { class: 'form-text' },
-        'Added to the fixed instruction: keep the product unchanged, remove everything else, pure white background.',
-      ),
+      'p',
+      { class: 'form-text mb-0' },
+      'Each photo goes to the model with one fixed instruction: keep the product exactly as it is, remove everything else, pure white background. A soft shadow is in Settings.',
     ),
   );
 
@@ -457,6 +457,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     removeAllButton.disabled = running;
   };
 
+  const rows = new Map<string, HTMLElement>();
   const photoRow = (photo: Photo): HTMLElement =>
     h(
       'li',
@@ -465,7 +466,9 @@ export function setup(ctx: ToolContext): ToolInstance {
         'data-testid': 'iso-photo',
         dataset: { key: photo.key },
       },
-      h('img', { class: 'or-iso-photo-thumb', src: photo.url, alt: '', decoding: 'async' }),
+      photo.thumbUrl
+        ? h('img', { class: 'or-iso-photo-thumb', src: photo.thumbUrl, alt: '', decoding: 'async' })
+        : h('span', { class: 'or-iso-photo-thumb', 'aria-hidden': 'true' }),
       h(
         'div',
         { class: 'min-w-0 flex-grow-1' },
@@ -495,7 +498,27 @@ export function setup(ctx: ToolContext): ToolInstance {
     );
 
   const renderPhotos = (): void => {
-    replace(photoList, photos.map(photoRow));
+    rows.clear();
+    replace(
+      photoList,
+      photos.map((photo) => {
+        const row = photoRow(photo);
+        rows.set(photo.key, row);
+        return row;
+      }),
+    );
+    renderCount();
+  };
+
+  /** Redraws one photo's row (its status, thumbnail), keeping focus in it. */
+  const updatePhotoRow = (photo: Photo): void => {
+    const old = rows.get(photo.key);
+    if (!old?.isConnected) return renderPhotos();
+    const key = focusedKey(old);
+    const fresh = photoRow(photo);
+    rows.set(photo.key, fresh);
+    old.replaceWith(fresh);
+    if (key) focusKey(fresh, key);
     renderCount();
   };
 
@@ -512,36 +535,61 @@ export function setup(ctx: ToolContext): ToolInstance {
       );
     }
     if (taken.length === 0) return;
-    photos = [
-      ...photos,
-      ...taken.map((file): Photo => ({
-        key: uid('photo'),
-        file,
-        name: file.name || 'photo',
-        url: URL.createObjectURL(file),
-        phase: 'idle',
-        error: null,
-        edited: null,
-        model: null,
-        margin: null,
-        threshold: null,
-        result: null,
-        job: null,
-        failedKey: null,
-      })),
-    ];
+    const added = taken.map((file): Photo => ({
+      key: uid('photo'),
+      file,
+      name: file.name || 'photo',
+      url: URL.createObjectURL(file),
+      thumbUrl: null,
+      dims: null,
+      phase: 'idle',
+      error: null,
+      edited: null,
+      model: null,
+      editRun: null,
+      margin: null,
+      threshold: null,
+      result: null,
+      job: null,
+      failedKey: null,
+    }));
+    photos = [...photos, ...added];
     syncControls();
     renderPhotos();
     void ui.refreshEstimate();
+    for (const photo of added) {
+      // Small copies for the list (a full-size <img> per photo decodes megapixels each).
+      void imageThumbnail(photo.file, LIST_THUMB)
+        .then((thumb) => {
+          if (!photos.includes(photo)) return;
+          photo.thumbUrl = URL.createObjectURL(thumb);
+          updatePhotoRow(photo);
+          if (!photo.result && cards.has(photo.key)) updateCard(photo);
+        })
+        .catch(() => undefined); // not an image the browser reads: the request will say so
+      void readImageSize(photo.file)
+        .then((dims) => {
+          photo.dims = dims;
+          void ui.refreshEstimate();
+        })
+        .catch(() => undefined);
+    }
+  };
+
+  /** Lets go of a result: its card (and leave-guard entry) and its thumbnail. */
+  const retire = (result: Processed): void => {
+    result.card.remove();
+    URL.revokeObjectURL(result.thumbUrl);
   };
 
   /** Drops a photo and everything made from it. */
   const discard = (photo: Photo): void => {
     photo.job?.controller.abort();
     photo.job = null;
-    photo.result?.handle.remove();
+    if (photo.result) retire(photo.result);
     photo.result = null;
     URL.revokeObjectURL(photo.url);
+    if (photo.thumbUrl) URL.revokeObjectURL(photo.thumbUrl);
     photos = photos.filter((candidate) => candidate !== photo);
     if (detail?.key === photo.key) closeDetail(false);
   };
@@ -550,17 +598,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     list.filter((photo) => photo.result && !photo.result.handle.result.downloaded);
 
   const removePhoto = async (photo: Photo): Promise<void> => {
-    if (inRun(photo)) return;
-    if (notDownloaded([photo]).length > 0) {
-      const ok = await confirmDialog({
-        title: 'Remove this photo?',
-        message: `The result for ${photo.name} has not been downloaded.`,
-        confirmLabel: 'Remove',
-        tone: 'danger',
-        testId: 'iso-remove-dialog',
-      });
-      if (!ok || !photos.includes(photo)) return;
-    }
+    if (!(await confirmRemoval(photo))) return;
     discard(photo);
     afterRemoval();
     announce(`${photo.name} removed.`);
@@ -624,7 +662,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   );
   const progress = progressBar({ label: 'Photos isolated', hidden: true, testId: 'iso-progress' });
   const grid = h('ul', {
-    class: 'row row-cols-1 row-cols-sm-2 row-cols-xxl-3 g-3 list-unstyled mb-0',
+    class: 'row row-cols-1 row-cols-sm-2 row-cols-xxl-3 g-3 list-unstyled mb-0 or-iso-grid',
     'aria-label': 'Results',
     'data-testid': 'iso-results',
   });
@@ -701,111 +739,211 @@ export function setup(ctx: ToolContext): ToolInstance {
       ),
     );
 
-  const card = (photo: Photo): HTMLElement => {
-    const busy = busyText(photo);
-    const result = photo.result;
-    const showActions = !inRun(photo);
-    return h(
-      'li',
-      {
-        class: 'col',
-        'data-testid': 'iso-card',
-        dataset: {
-          key: photo.key,
-          phase: photo.phase,
-          qa: result ? (result.qa.pass ? 'pass' : 'fail') : '',
-          busy: busy ? 'true' : 'false',
-        },
-      },
-      h(
-        'div',
-        { class: 'card h-100' },
-        h(
-          'div',
-          { class: 'or-iso-result-frame' },
-          h('img', {
-            class: ['or-iso-result-img', !result && 'is-source'],
-            src: result?.url ?? photo.url,
-            alt: result ? `${photo.name} on white` : `${photo.name}, not isolated yet`,
+  /** The image in a card: a small copy (never the 2000 px result), with a spinner while work goes on. */
+  const cardImage = (
+    src: string | null,
+    alt: string,
+    busy: boolean,
+    source: boolean,
+  ): HTMLElement =>
+    h(
+      'div',
+      { class: 'or-iso-result-frame' },
+      src
+        ? h('img', {
+            class: ['or-iso-result-img', source && 'is-source'],
+            src,
+            alt,
             decoding: 'async',
             'data-testid': 'iso-card-image',
-          }),
-          busy
-            ? h(
-                'div',
-                { class: 'or-iso-busy' },
-                h('div', { class: 'spinner-border', 'aria-hidden': 'true' }),
-              )
-            : null,
-        ),
+          })
+        : null,
+      busy
+        ? h(
+            'div',
+            { class: 'or-iso-busy' },
+            h('div', { class: 'spinner-border', 'aria-hidden': 'true' }),
+          )
+        : null,
+    );
+
+  const statusBadge = (photo: Photo, busy: string | null): HTMLElement | null =>
+    busy || photo.phase === 'failed' || (photo.phase === 'stopped' && !photo.result)
+      ? h(
+          'span',
+          {
+            class: ['badge', photo.phase === 'failed' ? 'text-bg-danger' : 'text-bg-secondary'],
+            'data-testid': 'iso-status',
+          },
+          busy ?? PHASE_TEXT[photo.phase] ?? '',
+        )
+      : null;
+
+  const errorNote = (photo: Photo): HTMLElement | null =>
+    photo.error
+      ? h(
+          'div',
+          { class: 'small text-danger-emphasis', role: 'note', 'data-testid': 'iso-error' },
+          photo.error,
+        )
+      : null;
+
+  /** A result card's own part (thumbnail, badges, QA reasons), redrawn in place so focus stays put. */
+  const paintExtra = (photo: Photo, result: Processed): void => {
+    const busy = busyText(photo);
+    replace(
+      result.extra,
+      cardImage(result.thumbUrl, `${photo.name} on white`, busy !== null, false),
+      h(
+        'div',
+        { class: 'd-flex flex-wrap align-items-center gap-1' },
+        statusBadge(photo, busy),
+        qaBadge(result.qa),
+      ),
+      errorNote(photo),
+      result.qa.pass
+        ? null
+        : h(
+            'div',
+            { class: 'small text-warning-emphasis', 'data-testid': 'iso-qa-reasons' },
+            result.qa.reasons.join(' '),
+          ),
+    );
+  };
+
+  /** A photo still without a result: its original, its status, Retry and Another model. */
+  const pendingCard = (photo: Photo): HTMLElement => {
+    const busy = busyText(photo);
+    return h(
+      'div',
+      { class: 'card h-100' },
+      h(
+        'div',
+        { class: 'card-body p-2 vstack gap-2' },
         h(
           'div',
-          { class: 'card-body p-2 vstack gap-2' },
-          h(
-            'div',
-            { class: 'd-flex flex-wrap align-items-center gap-1' },
-            h('span', { class: 'fw-semibold text-truncate me-auto min-w-0' }, photo.name),
-            busy || photo.phase === 'failed' || (photo.phase === 'stopped' && !result)
-              ? h(
-                  'span',
-                  {
-                    class: [
-                      'badge',
-                      photo.phase === 'failed' ? 'text-bg-danger' : 'text-bg-secondary',
-                    ],
-                    'data-testid': 'iso-status',
-                  },
-                  busy ?? PHASE_TEXT[photo.phase] ?? '',
-                )
-              : null,
-            result ? qaBadge(result.qa) : null,
-          ),
-          photo.error
-            ? h(
-                'div',
-                { class: 'small text-danger-emphasis', role: 'note', 'data-testid': 'iso-error' },
-                photo.error,
-              )
-            : null,
-          result && !result.qa.pass
-            ? h(
-                'div',
-                { class: 'small text-warning-emphasis', 'data-testid': 'iso-qa-reasons' },
-                result.qa.reasons.join(' '),
-              )
-            : null,
-          showActions
-            ? h(
-                'div',
-                { class: 'd-flex flex-wrap gap-1 mt-auto' },
-                result
-                  ? h(
-                      'button',
-                      {
-                        type: 'button',
-                        class:
-                          'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
-                        'aria-label': `Review ${photo.name}`,
-                        'data-focus-key': `review:${photo.key}`,
-                        'data-testid': 'iso-review',
-                        onclick: () => openDetail(photo),
-                      },
-                      icon('layout-split'),
-                      'Review',
-                    )
-                  : null,
-                result ? result.handle.button() : null,
-                !result && photo.phase !== 'idle' ? retryButton(photo) : null,
-                photo.phase !== 'idle' ? otherModelButton(photo) : null,
-              )
-            : null,
+          { class: 'd-flex flex-wrap align-items-center gap-1' },
+          h('h3', { class: 'h6 mb-0 text-truncate me-auto min-w-0' }, photo.name),
+          statusBadge(photo, busy),
         ),
+        cardImage(photo.thumbUrl, `${photo.name}, not isolated yet`, busy !== null, true),
+        errorNote(photo),
+        inRun(photo) || photo.phase === 'idle'
+          ? null
+          : h(
+              'div',
+              { class: 'd-flex flex-wrap gap-1 mt-auto' },
+              retryButton(photo),
+              otherModelButton(photo),
+            ),
       ),
     );
   };
 
+  const confirmRemoval = async (photo: Photo): Promise<boolean> => {
+    if (inRun(photo)) {
+      announce(`${photo.name} is being isolated: wait until it is done.`);
+      return false;
+    }
+    if (notDownloaded([photo]).length === 0) return true;
+    const ok = await confirmDialog({
+      title: 'Remove this photo?',
+      message: `The result for ${photo.name} has not been downloaded.`,
+      confirmLabel: 'Remove',
+      tone: 'danger',
+      testId: 'iso-remove-dialog',
+    });
+    return ok && photos.includes(photo);
+  };
+
+  /**
+   * A result's card: the framework's image result card (leave guard, the download as it is, Send to…, Remove with
+   * focus handling) with this tool's actions and its thumbnail, badges and reasons (`extra`). Only the file as it
+   * is is offered: its JPG border was checked after encoding, a conversion's would not be. Remove drops the photo.
+   */
+  const makeCard = (
+    photo: Photo,
+    blob: Blob,
+    name: string,
+    extra: HTMLElement,
+    output: { size: number },
+  ): ImageResultCard => {
+    const made = imageResultCard({
+      ui,
+      blob,
+      name,
+      title: photo.name,
+      meta: [`${output.size} × ${output.size}`, formatBytes(blob.size)],
+      formats: [],
+      viewer: false,
+      extra,
+      actions: [
+        {
+          label: 'Review',
+          icon: 'layout-split',
+          ariaLabel: `Review ${photo.name}`,
+          onClick: () => openDetail(photo),
+          testId: 'iso-review',
+        },
+        {
+          label: 'Edit again',
+          icon: 'arrow-clockwise',
+          ariaLabel: `Edit ${photo.name} again`,
+          onClick: () => retry([photo]),
+          testId: 'iso-retry',
+        },
+        {
+          label: 'Another model…',
+          icon: 'cpu',
+          ariaLabel: `Retry ${photo.name} with another model`,
+          onClick: () => void retryWithModel(photo),
+          testId: 'iso-retry-model',
+        },
+      ],
+      beforeRemove: () => confirmRemoval(photo),
+      onRemove: () => {
+        discard(photo);
+        afterRemoval();
+      },
+      focusFallback: () => (zipButton.disabled ? drop.querySelector('button') : zipButton),
+      testId: 'iso',
+    });
+    // Edit again and Another model follow Run (busy or disabled), like every per-item Retry.
+    for (const button of made.element.querySelectorAll<HTMLButtonElement>(
+      '[data-focus-key^="image-action:"]',
+    )) {
+      if (!button.dataset['focusKey']?.endsWith(':Review')) gate.bind(button);
+    }
+    return made;
+  };
+
   const cards = new Map<string, HTMLElement>();
   const shown = (): Photo[] => photos.filter((photo) => photo.phase !== 'idle' || photo.result);
+
+  /** Fills a photo's grid cell: its result card (moved in once, then updated in place) or its status card. */
+  const fillCard = (cell: HTMLElement, photo: Photo): void => {
+    const result = photo.result;
+    Object.assign(cell.dataset, {
+      key: photo.key,
+      phase: photo.phase,
+      qa: result ? (result.qa.pass ? 'pass' : 'fail') : '',
+      busy: busyText(photo) ? 'true' : 'false',
+    });
+    if (!result) {
+      replace(cell, pendingCard(photo));
+      return;
+    }
+    paintExtra(photo, result);
+    if (cell.childElementCount !== 1 || cell.firstElementChild !== result.card.element) {
+      cell.replaceChildren(result.card.element);
+    }
+  };
+
+  const card = (photo: Photo): HTMLElement => {
+    const cell = h('li', { class: 'col', 'data-testid': 'iso-card' });
+    fillCard(cell, photo);
+    return cell;
+  };
 
   const renderGrid = (): void => {
     cards.clear();
@@ -823,18 +961,16 @@ export function setup(ctx: ToolContext): ToolInstance {
     renderSummary();
   };
 
-  /** Redraws one card (and keeps focus inside it), or the grid when the card is not there yet. */
+  /** Redraws one card (focus stays where it was), or the grid when the card is not there yet. */
   const updateCard = (photo: Photo): void => {
-    const old = cards.get(photo.key);
-    if (!old?.isConnected) {
+    const cell = cards.get(photo.key);
+    if (!cell?.isConnected) {
       renderGrid();
       return;
     }
-    const key = focusedKey(old);
-    const fresh = card(photo);
-    cards.set(photo.key, fresh);
-    old.replaceWith(fresh);
-    if (key) focusKey(fresh, key);
+    const key = focusedKey(cell);
+    fillCard(cell, photo);
+    if (key && !cell.contains(document.activeElement)) focusKey(cell, key);
     renderSummary();
   };
 
@@ -1163,7 +1299,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     detailView.hidden = true;
     gridView.hidden = false;
     renderGrid();
-    if (restoreFocus && key && !focusKey(grid, `review:${key}`)) zipButton.focus();
+    if (!restoreFocus || !key) return;
+    // Back on the Review button of the photo that was open (an action of its result card).
+    const review = (
+      key ? photoOf(key) : undefined
+    )?.result?.card.element.querySelector<HTMLElement>('[data-focus-key$=":Review"]');
+    (review ?? zipButton).focus();
   };
 
   /** The review's labels follow the photo's choices at once; the images follow when the result is made. */
@@ -1273,6 +1414,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       const flaws = s.format === 'jpg' ? await encodedBorderFlaws(blob) : 0;
       return {
         blob,
+        thumb: await imageThumbnail(blob, GRID_THUMB),
         source,
         box: result.box,
         check: result.check,
@@ -1285,19 +1427,19 @@ export function setup(ctx: ToolContext): ToolInstance {
     // Removed, or edited again, while this was made: it is not this photo's result any more.
     if (!photos.includes(photo) || photo.edited !== edited) throw abortError();
     const output = { format: s.format, size: s.size };
-    // Named under the pattern as it is now, which may have changed while this was being made.
-    const handle = ui.addResult({
-      kind: 'image',
-      name: resultName(photo, output),
-      blob: made.blob,
-    });
     const previous = photo.result;
     const qa = qaReport(made, made.source, wanted);
+    const extra = h('div', { class: 'vstack gap-2' });
+    // Named under the pattern as it is now, which may have changed while this was being made.
+    const resultCard = makeCard(photo, made.blob, resultName(photo, output), extra, output);
     photo.result = {
       key,
       blob: made.blob,
-      handle,
-      url: ctx.results.objectUrl(handle.result.id),
+      card: resultCard,
+      handle: resultCard.handle,
+      url: ctx.results.objectUrl(resultCard.handle.result.id),
+      thumbUrl: URL.createObjectURL(made.thumb),
+      extra,
       qa,
       threshold: made.threshold,
       margin,
@@ -1318,7 +1460,26 @@ export function setup(ctx: ToolContext): ToolInstance {
         );
       }
     }
-    previous?.handle.remove();
+    if (previous) swapCard(photo, previous);
+  };
+
+  /**
+   * Puts a photo's new result card where its old one was and lets the old one go; a control focused in the old
+   * card hands focus to the one with the same label in the new card.
+   */
+  const swapCard = (photo: Photo, previous: Processed): void => {
+    const focused = document.activeElement;
+    const label =
+      focused instanceof HTMLElement && previous.card.element.contains(focused)
+        ? focused.textContent
+        : null;
+    if (cards.has(photo.key)) updateCard(photo);
+    retire(previous);
+    if (label === null || !photo.result) return;
+    const match = [...photo.result.card.element.querySelectorAll('button')].find(
+      (button) => button.textContent === label,
+    );
+    match?.focus();
   };
 
   /** A result's file name under the current pattern, for the format and size it was made in. */
@@ -1345,7 +1506,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         if (!photos.includes(photo)) return;
         updateCard(photo);
         if (detail?.key === photo.key) updateDetail();
-        renderPhotos();
+        updatePhotoRow(photo);
       };
       refresh();
       void process(photo, job.controller.signal).then(
@@ -1373,17 +1534,20 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   /** Gives every result its name under the current pattern (positions change when photos are removed). */
   const renameAll = (): void => {
-    photos.forEach((photo) => {
+    for (const photo of photos) {
       const result = photo.result;
-      if (!result) return;
+      if (!result) continue;
       const name = resultName(photo, result);
-      if (name === result.handle.result.name) return;
-      const handle = ui.addResult({ kind: 'image', name, blob: result.blob });
-      if (result.handle.result.downloaded) ctx.results.markDownloaded(handle.result.id);
-      result.handle.remove();
-      result.handle = handle;
-      result.url = ctx.results.objectUrl(handle.result.id);
-    });
+      if (name === result.handle.result.name) continue;
+      // A card's name is fixed: a renamed result gets a new card (same Blob, same thumbnail and extra part).
+      const renamed = makeCard(photo, result.blob, name, result.extra, result);
+      if (result.handle.result.downloaded) ctx.results.markDownloaded(renamed.handle.result.id);
+      const old = result.card;
+      result.card = renamed;
+      result.handle = renamed.handle;
+      result.url = ctx.results.objectUrl(renamed.handle.result.id);
+      old.remove();
+    }
     renderGrid();
     updateDetail();
   };
@@ -1410,20 +1574,30 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- running --------------------------------------------------------------------------------------------
-  const estimateFor = (model: string, count: number): Promise<number | null> =>
-    count === 0
-      ? Promise.resolve(null)
-      : ctx.models.estimate({
-          kind: 'image',
-          model,
-          images: count,
-          references: count,
-          width: settings.sendSize,
-          height: settings.sendSize,
-        });
-
-  const imageModels = (): Promise<RawImageModel[] | undefined> =>
-    ctx.models.imageModels().catch(() => undefined);
+  /**
+   * One edit per photo, each uploading its photo once. The answer is assumed as large as the largest photo
+   * sent (sizes read from the files' headers, at most the send size; the send size itself before they are read).
+   */
+  const estimateFor = (model: string, list: readonly Photo[]): Promise<number | null> => {
+    if (list.length === 0) return Promise.resolve(null);
+    let width = 0;
+    let height = 0;
+    for (const photo of list) {
+      const sent = photo.dims
+        ? fitWithin(photo.dims.width, photo.dims.height, settings.sendSize)
+        : { width: settings.sendSize, height: settings.sendSize };
+      if (sent.width * sent.height > width * height) ({ width, height } = sent);
+    }
+    return ctx.models.estimate({
+      kind: 'image',
+      model,
+      images: list.length,
+      references: 1,
+      requests: list.length,
+      width,
+      height,
+    });
+  };
 
   /** One photo: the edit request, then its post-processing. */
   const isolate = async (
@@ -1442,6 +1616,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     if (!image) throw new InvalidInputError('The model returned no image.');
     photo.edited = image.blob;
     photo.model = run.model;
+    photo.editRun = run.id;
     photo.margin = null;
     photo.threshold = null;
     photo.failedKey = null;
@@ -1456,11 +1631,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       .map((photo) => qaLine(photo.name, photo.result?.qa ?? null, photo.error))
       .join('\n');
 
-  /**
-   * Photos each retry argument has already made. The error toast's Retry replays the same argument after a
-   * fatal error (a 402 mid-batch): it must not pay again for photos that got their result the first time.
-   */
-  const madeBy = new WeakMap<RunArg, Set<string>>();
+  /** The latest run, so a replayed Retry can tell which photos that run already made. */
+  let lastRun: string | null = null;
 
   /** One line naming what went wrong in a run: a request's error, else the first QA reason (two at most). */
   const problemsOf = (list: readonly Photo[]): string[] => {
@@ -1477,12 +1649,8 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   const run = async (signal: AbortSignal, arg?: RunArg): Promise<void> => {
-    const made = arg ? (madeBy.get(arg) ?? new Set<string>()) : null;
-    if (arg && made) madeBy.set(arg, made);
     let targets = arg
-      ? photos.filter(
-          (photo) => arg.keys.includes(photo.key) && !made?.has(photo.key) && !inRun(photo),
-        )
+      ? photos.filter((photo) => arg.keys.includes(photo.key) && !inRun(photo))
       : pending();
     if (targets.length === 0) {
       if (!arg) {
@@ -1496,10 +1664,10 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     const model = arg?.model ?? ctx.model().model;
     if (!model) return;
-    const support = editSupport(model, await imageModels());
+    const support = editSupport(model, await ctx.models.imageControls(model));
     if (!support.ok) throw new InvalidInputError(support.reason);
     const request = {
-      instruction: buildInstruction({ shadow: settings.shadow, notes: notes.value }),
+      instruction: buildInstruction({ shadow: settings.shadow }),
       params: support.params,
       sendSize: settings.sendSize,
     };
@@ -1511,10 +1679,11 @@ export function setup(ctx: ToolContext): ToolInstance {
           { retry: arg !== undefined, noun: 'photo' },
         ),
         // A retry books only its photos (and its own model); a plain run uses the header's estimate.
-        ...(arg ? { model, estimateUsd: await estimateFor(model, targets.length) } : {}),
+        ...(arg ? { model, estimateUsd: await estimateFor(model, targets) } : {}),
       },
       signal,
     );
+    lastRun = handle.id;
 
     // Photos removed while the run was being approved are not sent.
     targets = targets.filter((photo) => photos.includes(photo));
@@ -1545,15 +1714,14 @@ export function setup(ctx: ToolContext): ToolInstance {
         work: (photo, itemSignal) => isolate(handle, photo, request, itemSignal),
         onItem: ({ item: photo, status, error }) => {
           if (status === 'running') photo.phase = 'editing';
-          else if (status === 'done') {
-            photo.phase = 'done';
-            made?.add(photo.key);
-          } else if (status === 'failed') {
+          else if (status === 'done') photo.phase = 'done';
+          else if (status === 'failed') {
             photo.phase = 'failed';
             photo.error = userMessage(error);
           } else photo.phase = status;
           if (status !== 'running' && status !== 'queued') finished += 1;
           updateCard(photo);
+          updatePhotoRow(photo);
           if (detail?.key === photo.key) updateDetail();
           updateProgress();
         },
@@ -1581,7 +1749,26 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner = ui.runner<RunArg>({ label: 'Isolate', icon: 'bounding-box', run });
+  /**
+   * A photo the failed run already made: the error toast's Retry (a 402 part-way) must not pay for it again. A
+   * photo that had a result from an earlier run and failed now ("Edit again") is still to do; a removed one is not.
+   */
+  const madeByLastRun = (key: string): boolean => {
+    const photo = photoOf(key);
+    return !photo || (photo.result !== null && photo.editRun === lastRun);
+  };
+  const remaining = pendingOnly(madeByLastRun);
+
+  const runner = ui.runner<RunArg>({
+    label: 'Isolate',
+    icon: 'bounding-box',
+    run,
+    replayArg: (arg) => {
+      if (!arg) return undefined;
+      const keys = remaining(arg.keys);
+      return keys ? { ...arg, keys } : null;
+    },
+  });
   const gate = retryGate(runner);
   gate.bind(retryFailedButton);
 
@@ -1634,9 +1821,11 @@ export function setup(ctx: ToolContext): ToolInstance {
   renderGrid();
 
   return {
-    getState: (): ToolSnapshot => ({ prompt: notes.value, settings: { ...settings } }),
-    applyState: ({ prompt, settings: saved }) => {
-      notes.value = prompt;
+    // Promptless: the instruction is fixed (no notes that could weaken "keep the product unchanged"), so the
+    // form is its settings, and Prompts saves them as presets.
+    promptless: true,
+    getState: (): ToolSnapshot => ({ prompt: '', settings: { ...settings } }),
+    applyState: ({ settings: saved }) => {
       const before = settings;
       settings = readSettings(saved, settings);
       syncControls();
@@ -1645,7 +1834,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     },
     estimate: async (model) => {
       const version = ++estimateVersion;
-      const usd = await estimateFor(model, pending().length);
+      const usd = await estimateFor(model, pending());
       if (version === estimateVersion) {
         lastEstimate = usd;
         renderCount();
@@ -1660,7 +1849,6 @@ export function setup(ctx: ToolContext): ToolInstance {
         ),
       ),
     sample: async () => {
-      notes.value = 'The product is the teal mug; remove the plant and the book.';
       addPhotos([await samplePhoto()]);
     },
   };
