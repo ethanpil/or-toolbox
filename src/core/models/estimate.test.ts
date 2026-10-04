@@ -178,6 +178,22 @@ describe('video', () => {
     expect(
       estimateVideo(video('x-ai/grok-imagine-video'), { seconds: 5, resolution: '720p' }),
     ).toBeCloseTo(0.35, 6);
+    // The first frame as an image input: 0.2 cents each, the recorded $0.052 exactly.
+    expect(
+      estimateVideo(video('x-ai/grok-imagine-video'), {
+        seconds: 1,
+        resolution: '480p',
+        images: 1,
+      }),
+    ).toBeCloseTo(0.052, 6);
+    // Models without a per-image price add nothing.
+    expect(
+      estimateVideo(video('bytedance/seedance-2.0-mini'), {
+        seconds: 4.04,
+        resolution: '480p',
+        images: 2,
+      }),
+    ).toBeCloseTo(0.1358, 3);
   });
 
   it('prices token-billed Seedance from frame size (recorded $0.1358 for 4.04 s at 480p)', () => {

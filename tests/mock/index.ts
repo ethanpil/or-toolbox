@@ -85,6 +85,9 @@ function seedDefaults(mock: OpenRouterMock): void {
 
   // The image models' parameters (keyless), read by the image tools: none listed by default.
   mock.json('GET', '/api/v1/images/models', { data: [] });
+
+  // The video models' options and prices (keyless), read by Video studio: none listed by default.
+  mock.json('GET', '/api/v1/videos/models', { data: [] });
 }
 
 /**

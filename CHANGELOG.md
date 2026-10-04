@@ -55,11 +55,14 @@ All notable changes to this project are documented here. The format follows
 - Image editor: painted masks (brush, eraser, undo/redo, invert, zoom/pan, keyboard), Inpaint, Outpaint and Whole image through marked-up references, "Keep outside the mask" compositing, version history; Stage 5 mask round-trip gate (5d90742).
 - Isolated image: product photos edited on `/images` (data-URL reference, fixed instruction, soft shadow on request), post-processed in the worker onto a pure white square with a QA verdict and reason per photo; review with a before/after slider, side by side, per-photo margin and threshold without a new request; retry, retry with another model; JPG/PNG downloads and a ZIP with a file name pattern (aa282c3).
 - Stage 5 e2e gate for Isolated image: 20 synthetic photos with imperfect mocked isolations, all passing QA, the ZIP of 20 JPGs checked pixel by pixel (ccc8999).
+- Video studio: model-aware form from `/videos/models`; text, first frame, first + last frame and reference modes; Continue from a clip's true last frame (uploads included) and native extend with a public HTTPS link (else Continue); persisted jobs with hand-off and cost booking; auto-extend sequences (chained or 3 at once, repeat, style, spend cap, stop/skip, pause/resume, re-run) that resume after a reload; frame grabber; timeline with reorder, trims, dropped repeated first frames and an ffmpeg join with Stop (cfb9c20).
+- Stage 6 e2e gate: a 5-step chained sequence survives a reload, joins into an MP4 that plays; a spend cap stops a sequence (0ec6971).
 
 ### Changed
 
 - `trimMedia` takes `fadeOut` and `bitrate` for audio cuts (da8b7b9).
 - Image estimates treat a zero catalog price as unknown, not free (f6af99d).
+- Video estimates take an `images` count and add per-image input prices (`cents_per_image_input`) (e7aaee5).
 - Image pipeline: opt-in `adaptThreshold` (threshold kept below the picture's own background and noise) and `despeckle` (background filled on the picture and small light specks removed before the product box); `IsolateResult.threshold` (fdb6368).
 
 - Stage 0 review fixes: COEP `require-corp` only, isolation reload limited to pages that need threads, manifest-based offline shell, hardened `h()` and Markdown sanitising, dev-server CSP and isolation, TypeScript 6, single gated CI pipeline (cb1cc69).
