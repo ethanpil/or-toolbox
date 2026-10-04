@@ -1,9 +1,11 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ImageRequest, ImageResult, RawImageModel, RawModel } from '../../core/api/types';
-import { ApiError } from '../../core/errors';
+import { ApiError, KeyLockedError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient } from '../../core/types';
+import type * as Errors from '../../ui/feedback/errors';
+import { presentError, wasPresented } from '../../ui/feedback/errors';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
 import { stemFrom, setup } from './tool';
@@ -18,7 +20,14 @@ vi.mock('../../core/media/image', () => ({
   toBlob: () => Promise.resolve(new Blob(['x'], { type: 'image/png' })),
 }));
 
+// The shell's error presenter opens dialogs; here it only records what reached it.
+vi.mock('../../ui/feedback/errors', async (importOriginal) => ({
+  ...(await importOriginal<typeof Errors>()),
+  presentError: vi.fn(() => Promise.resolve()),
+}));
+
 const KLEIN = 'black-forest-labs/flux.2-klein-4b';
+const MULTI = 'openai/gpt-image-1';
 const PER_TOKEN = 0.014 / 4096;
 
 const catalog: RawModel[] = [
@@ -29,6 +38,14 @@ const catalog: RawModel[] = [
     context_length: null,
     architecture: { input_modalities: ['text', 'image'], output_modalities: ['image'] },
     pricing: { prompt: '0', completion: '0', image_output: String(PER_TOKEN) },
+  },
+  {
+    id: MULTI,
+    name: 'GPT Image 1',
+    created: 1,
+    context_length: null,
+    architecture: { input_modalities: ['text', 'image'], output_modalities: ['image'] },
+    pricing: { prompt: '0', completion: '0', image_output: '0.00003' },
   },
 ];
 const imageModels: RawImageModel[] = [
@@ -43,6 +60,15 @@ const imageModels: RawImageModel[] = [
       seed: { type: 'boolean' },
     },
   },
+  {
+    id: MULTI,
+    name: 'GPT Image 1',
+    supported_parameters: {
+      aspect_ratio: { type: 'enum', values: ['1:1', '3:2'] },
+      n: { type: 'range', min: 1, max: 4 },
+      input_references: { type: 'range', min: 0, max: 16 },
+    },
+  },
 ];
 
 const png = (): Blob => new Blob([new Uint8Array([0x89, 0x50])], { type: 'image/png' });
@@ -50,10 +76,11 @@ const png = (): Blob => new Blob([new Uint8Array([0x89, 0x50])], { type: 'image/
 let t: ToolTestContext;
 let calls: ImageRequest[];
 
-async function mount(api: Partial<ApiClient> = {}) {
+async function mount(api: Partial<ApiClient> = {}, modelOverride: string | null = null) {
   calls = [];
   t = createToolTestContext(getTool('image-generation'), {
     catalog,
+    modelOverride,
     api: {
       images: (body) => {
         calls.push(body);
@@ -75,7 +102,7 @@ async function mount(api: Partial<ApiClient> = {}) {
   });
   const tool = await t.mount(setup);
   await vi.waitFor(() =>
-    expect(t.zones.input.querySelector('[data-testid="imagegen-aspect-16-9"]')).not.toBeNull(),
+    expect(t.zones.input.querySelector('[data-testid="imagegen-aspect-1-1"]')).not.toBeNull(),
   );
   return tool;
 }
@@ -259,6 +286,130 @@ describe('Image generation', () => {
     t.core.bus.emit({ type: 'models-refreshed' });
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(reads).toBe(1);
+  });
+
+  it('a locked seed is always the seed sent; clearing the field unlocks it', async () => {
+    const tool = await mount();
+    tool.applyState({ prompt: 'A cat', settings: { seed: 77, seedLocked: true } });
+    await t.runners[0]!.trigger();
+    await t.runners[0]!.trigger();
+    expect(calls.map((call) => call.seed)).toEqual([77, 77]);
+
+    const field = $<HTMLInputElement>('imagegen-seed');
+    field.value = '';
+    field.dispatchEvent(new Event('input'));
+    expect(tool.getState().settings).toMatchObject({ seed: null, seedLocked: false });
+    expect($('imagegen-seed-lock').getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('records the seed a run used as locked, so History and Recent prompts reproduce it', async () => {
+    const tool = await mount();
+    tool.applyState({ prompt: 'A cat', settings: { count: 2 } });
+    await t.runners[0]!.trigger();
+    const [run] = await t.core.history.query({ tool: 'image-generation' });
+    expect(run?.settings).toMatchObject({ seed: calls[0]!.seed, seedLocked: true, count: 2 });
+    // The form itself stays unlocked: the next run draws a new seed.
+    expect(tool.getState().settings['seedLocked']).toBe(false);
+    tool.applyState({ prompt: run!.prompt ?? '', settings: run!.settings ?? {} });
+    await t.runners[0]!.trigger();
+    expect(calls.slice(2).map((call) => call.seed)).toEqual(
+      calls.slice(0, 2).map((call) => call.seed),
+    );
+
+    // A variation is recorded with its own seed, locked.
+    document.querySelector<HTMLButtonElement>('[data-testid="imagegen-vary"]')!.click();
+    await vi.waitFor(() => expect(calls).toHaveLength(5));
+    await vi.waitFor(() => expect(t.runners[0]!.busy).toBe(false));
+    const [variation] = await t.core.history.query({ tool: 'image-generation' });
+    expect(variation?.settings).toMatchObject({ seed: calls[4]!.seed, seedLocked: true, count: 1 });
+  });
+
+  it('marks images a request did not deliver as failed, with a Retry for just those', async () => {
+    let answer: ImageResult = {
+      created: 0,
+      images: [{ blob: png(), mediaType: 'image/png' }],
+      usage: { cost: 0.01 },
+      generationId: null,
+      error: new ApiError('Provider returned an error', 502),
+    };
+    const images: ApiClient['images'] = (body) => {
+      calls.push(body);
+      return Promise.resolve(answer);
+    };
+    const tool = await mount({ images }, MULTI);
+    tool.applyState({ prompt: 'A fox', settings: { count: 3 } });
+    await t.runners[0]!.trigger();
+    expect(calls[0]?.n).toBe(3);
+    expect(t.zones.output.querySelectorAll('[data-testid="imagegen-result"]')).toHaveLength(1);
+    const failed = t.zones.output.querySelector('[data-testid="imagegen-failed"]')!;
+    expect(failed.querySelector('h4')?.textContent).toBe('Image 2');
+    expect(failed.textContent).toContain('Provider returned an error');
+    expect(t.status()).toBe('1 of 3 images ready; 2 failed');
+
+    answer = {
+      created: 0,
+      images: [png(), png()].map((blob) => ({ blob, mediaType: 'image/png' })),
+      usage: { cost: 0.02 },
+      generationId: null,
+    };
+    $<HTMLButtonElement>('imagegen-retry').click();
+    await vi.waitFor(() =>
+      expect(t.zones.output.querySelectorAll('[data-testid="imagegen-result"]')).toHaveLength(3),
+    );
+    expect(calls[1]).toMatchObject({ prompt: 'A fox', n: 2 });
+    expect(t.zones.output.querySelector('[data-testid="imagegen-failed"]')).toBeNull();
+    const titles = [...t.zones.output.querySelectorAll('[data-testid="imagegen-result"] h4')].map(
+      (heading) => heading.textContent,
+    );
+    expect(titles).toEqual(['Image 1', 'Image 2', 'Image 3']);
+  });
+
+  it('a retry that needs an action (locked keys) reaches the shell instead of being swallowed', async () => {
+    const locked = new KeyLockedError();
+    let attempt = 0;
+    const images: ApiClient['images'] = (body) => {
+      calls.push(body);
+      attempt++;
+      return Promise.reject(
+        attempt === 1 ? new ApiError('Provider returned an error', 502) : locked,
+      );
+    };
+    await mount({ images });
+    vi.mocked(presentError).mockClear();
+    $<HTMLTextAreaElement>('tool-prompt').value = 'A fox';
+    $<HTMLTextAreaElement>('tool-prompt').dispatchEvent(new Event('input'));
+    await t.runners[0]!.trigger();
+    $<HTMLButtonElement>('imagegen-retry').click();
+    await vi.waitFor(() => expect(attempt).toBe(2));
+    await vi.waitFor(() => expect(t.runners[0]!.busy).toBe(false));
+    expect(vi.mocked(presentError).mock.calls.map(([error]) => error)).toContain(locked);
+    // Not marked as shown by the card: presentError opens the unlock dialog for it.
+    expect(wasPresented(locked)).toBe(false);
+  });
+
+  it('offers an SVG result as it is: no conversions, no Edit, no Use as reference', async () => {
+    const images: ApiClient['images'] = (body) => {
+      calls.push(body);
+      return Promise.resolve({
+        created: 0,
+        images: [
+          { blob: new Blob(['<svg/>'], { type: 'image/svg+xml' }), mediaType: 'image/svg+xml' },
+        ],
+        usage: { cost: 0.01 },
+        generationId: null,
+      });
+    };
+    await mount({ images });
+    $<HTMLTextAreaElement>('tool-prompt').value = 'A logo';
+    $<HTMLTextAreaElement>('tool-prompt').dispatchEvent(new Event('input'));
+    await t.runners[0]!.trigger();
+    const card = t.zones.output.querySelector('[data-testid="imagegen-result"]')!;
+    expect(card.querySelector('[data-testid="imagegen-download"]')?.textContent).toBe(
+      'Download .svg',
+    );
+    expect(card.querySelector('[data-testid="imagegen-vary"]')).not.toBeNull();
+    expect(card.querySelector('[data-testid="imagegen-edit"]')).toBeNull();
+    expect(card.querySelector('[data-testid="imagegen-use-reference"]')).toBeNull();
   });
 
   it('names files after the prompt', () => {

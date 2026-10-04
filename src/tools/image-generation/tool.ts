@@ -16,12 +16,13 @@ import { imageSize, loadImage, toDataUrl } from '../../core/media/image';
 import type { RunHandle } from '../../core/types';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
+import { describeAccept, mimeMatches, partitionFiles } from '../../ui/components/file-types';
 import { imageResultCard } from '../../ui/components/image-result-card';
 import { progressBar } from '../../ui/components/progress-bar';
 import { switchField } from '../../ui/components/switch-field';
 import { h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, markPresented, presentError } from '../../ui/feedback/errors';
+import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
 import { formatBytes, formatDateTime, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
@@ -48,6 +49,7 @@ import {
   ratioOf,
   referenceProblem,
   type RequestPlan,
+  runSettings,
 } from './params';
 
 /** References are scaled to this before upload: plenty to guide a model, and well under body limits. */
@@ -158,8 +160,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   let imageModels: RawImageModel[] | null = null;
   let imageModelsFailed = false;
   let loading: Promise<void> | null = null;
-  /** Reads the list (the cache when it has one); 
-eread after a refresh elsewhere, never forcing the network. */
+  /** Reads the list (the cache when it has one); `reread` after a refresh elsewhere, never forcing the network. */
   const loadImageModels = (reread = false): Promise<void> => {
     if (loading && !reread) return loading;
     loading = ctx.models
@@ -412,7 +413,13 @@ eread after a refresh elsewhere, never forcing the network. */
     referenceSection.hidden = (!limits || limits.max === 0) && references.length === 0;
   };
 
-  const addReferences = (files: readonly File[]): void => {
+  const addReferences = (offered: readonly File[]): void => {
+    // Only the picture types references are sent as (PNG, JPEG, WebP): never an SVG or anything else.
+    const { accepted: files, rejected } = partitionFiles([...offered], ctx.manifest.accepts);
+    if (rejected.length > 0 && files.length === 0) {
+      ui.status(`Reference images must be ${describeAccept(ctx.manifest.accepts)}.`);
+      return;
+    }
     const room = Math.max(0, referenceMax() - references.length);
     const taken = files.slice(0, room);
     for (const file of taken) {
@@ -635,6 +642,12 @@ eread after a refresh elsewhere, never forcing the network. */
       seed.value.trim() !== '' && Number.isInteger(value) && value >= 0 && value <= MAX_SEED
         ? value
         : null;
+    // A lock is a promise that exactly this seed is sent: without a seed there is nothing to lock.
+    if (form.seed === null && form.seedLocked) {
+      form.seedLocked = false;
+      renderSeed({ keepValue: true });
+      announce('Seed unlocked: each run picks a new seed.');
+    }
     formChanged();
   });
   const seedLock = h('button', {
@@ -670,9 +683,10 @@ eread after a refresh elsewhere, never forcing the network. */
     icon('shuffle'),
   );
   const seedHelp = h('div', { id: ids.seedHelp, class: 'form-text' });
-  const renderSeed = (): void => {
+  /** `keepValue`: the user is typing in the field; leave what they typed. */
+  const renderSeed = ({ keepValue = false }: { keepValue?: boolean } = {}): void => {
     const supported = current.controls?.seed ?? false;
-    seed.value = form.seed === null ? '' : String(form.seed);
+    if (!keepValue) seed.value = form.seed === null ? '' : String(form.seed);
     seed.disabled = !supported;
     seedLock.disabled = !supported;
     seedRandom.disabled = !supported;
@@ -868,6 +882,10 @@ eread after a refresh elsewhere, never forcing the network. */
   };
 
   const useAsReference = (generation: Generation): void => {
+    if (!isReferenceType(generation.blob.type)) {
+      ui.status(`Reference images must be ${describeAccept(ctx.manifest.accepts)}.`);
+      return;
+    }
     const max = referenceMax();
     if (references.length >= max) {
       ui.status(
@@ -889,8 +907,15 @@ eread after a refresh elsewhere, never forcing the network. */
       .catch((error: unknown) => void presentError(error));
   };
 
-  /** The cards of a finished request, in place of its waiting card. */
-  const showImages = async (item: Item, images: GeneratedImage[]): Promise<void> => {
+  /** Raster pictures the image tools take as input (PNG, JPEG, WebP); an SVG result is not one. */
+  const isReferenceType = (type: string): boolean => mimeMatches(type, ctx.manifest.accepts);
+
+  /** The cards of a finished request, in place of its waiting card (then `after`, a card for missing images). */
+  const showImages = async (
+    item: Item,
+    images: GeneratedImage[],
+    after: HTMLElement | null,
+  ): Promise<void> => {
     const group = item.group;
     const body = item.plan.body;
     const columns = await Promise.all(
@@ -900,6 +925,8 @@ eread after a refresh elsewhere, never forcing the network. */
         const title = titleOf(item, offset);
         const column = h('div', { class: 'col', 'data-testid': 'imagegen-image' });
         const generation: Generation = { group, body, blob: image.blob, name };
+        // An SVG is offered as it is: it cannot be converted here, used as a reference or edited.
+        const raster = isReferenceType(image.mediaType);
         const card = imageResultCard({
           ui,
           blob: image.blob,
@@ -912,7 +939,7 @@ eread after a refresh elsewhere, never forcing the network. */
             body.seed !== undefined ? `seed ${body.seed}` : null,
             formatBytes(image.blob.size),
           ],
-          formats: ['png', 'jpg', 'webp'],
+          formats: raster ? ['png', 'jpg', 'webp'] : [],
           actions: [
             {
               label: 'Variations',
@@ -922,20 +949,24 @@ eread after a refresh elsewhere, never forcing the network. */
               onClick: () =>
                 void gate.retry({ variation: generation }, 'Generate cannot start now.'),
             },
-            {
-              label: 'Use as reference',
-              icon: 'images',
-              ariaLabel: `Use ${title.toLowerCase()} as a reference image`,
-              testId: 'imagegen-use-reference',
-              onClick: () => useAsReference(generation),
-            },
-            {
-              label: 'Edit',
-              icon: 'brush',
-              ariaLabel: `Edit ${title.toLowerCase()} in Image editor`,
-              testId: 'imagegen-edit',
-              onClick: () => sendToEditor(generation),
-            },
+            ...(raster
+              ? [
+                  {
+                    label: 'Use as reference',
+                    icon: 'images',
+                    ariaLabel: `Use ${title.toLowerCase()} as a reference image`,
+                    testId: 'imagegen-use-reference',
+                    onClick: () => useAsReference(generation),
+                  },
+                  {
+                    label: 'Edit',
+                    icon: 'brush',
+                    ariaLabel: `Edit ${title.toLowerCase()} in Image editor`,
+                    testId: 'imagegen-edit',
+                    onClick: () => sendToEditor(generation),
+                  },
+                ]
+              : []),
           ],
           onRemove: () => {
             column.remove();
@@ -950,7 +981,7 @@ eread after a refresh elsewhere, never forcing the network. */
     );
     if (item.partialUrl) URL.revokeObjectURL(item.partialUrl);
     item.partialUrl = null;
-    item.slot.replaceWith(...columns);
+    item.slot.replaceWith(...columns, ...(after ? [after] : []));
   };
 
   const settle = (item: Item, status: ItemStatus, error?: unknown): void => {
@@ -978,8 +1009,15 @@ eread after a refresh elsewhere, never forcing the network. */
     group.bar.update(done, items.length, requestProgress(items));
   };
 
-  /** One request: streamed partials go to the waiting card; the images replace it. */
-  const generate = async (run: RunHandle, item: Item, signal: AbortSignal): Promise<number> => {
+  /**
+   * One request: streamed partials go to the waiting card; the images replace it. Images asked for and not
+   * delivered (fewer than `n`, or an error after some) get a failed card of their own, with Retry for just them.
+   */
+  const generate = async (
+    run: RunHandle,
+    item: Item,
+    signal: AbortSignal,
+  ): Promise<{ made: number; missing: number }> => {
     const result = await ctx.api.images(item.plan.body, {
       run,
       signal,
@@ -990,11 +1028,31 @@ eread after a refresh elsewhere, never forcing the network. */
         drawWaiting(item);
       },
     });
-    await showImages(item, result.images);
-    if (result.error) {
-      announce(`Some images arrived before an error: ${userMessage(result.error)}`);
+    const made = result.images.length;
+    const missing = Math.max(0, item.plan.images - made);
+    let remainder: Item | null = null;
+    if (missing > 0) {
+      const body: ImageRequest = { ...item.plan.body };
+      if (body.n !== undefined && missing > 1) body.n = missing;
+      else delete body.n;
+      remainder = {
+        group: item.group,
+        plan: { body, images: missing },
+        first: item.first + made,
+        status: 'failed',
+        error: result.error
+          ? userMessage(result.error)
+          : `The model returned ${made} of the ${plural(item.plan.images, 'image')} asked for.`,
+        slot: h('div', { class: 'col' }),
+        partialUrl: null,
+      };
     }
-    return result.images.length;
+    await showImages(item, result.images, remainder?.slot ?? null);
+    if (remainder) drawFailed(remainder);
+    else if (result.error) {
+      announce(`The images arrived, then an error: ${userMessage(result.error)}`);
+    }
+    return { made, missing };
   };
 
   /** A new group at the top of the gallery, its requests waiting. */
@@ -1085,10 +1143,12 @@ eread after a refresh elsewhere, never forcing the network. */
           updateBar(group, items);
         },
       });
-      const made = outcome.outcomes.reduce((sum, entry) => sum + (entry.value ?? 0), 0);
+      const made = outcome.outcomes.reduce((sum, entry) => sum + (entry.value?.made ?? 0), 0);
+      const asked = outcome.outcomes.reduce((sum, entry) => sum + entry.item.plan.images, 0);
+      const failed = asked - made;
       const summary =
-        outcome.failed > 0
-          ? `${plural(made, 'image')} ready; ${plural(outcome.failed, 'request')} failed`
+        failed > 0
+          ? `${made} of ${plural(asked, 'image')} ready; ${failed} failed`
           : `${plural(made, 'image')} ready`;
       // The ticker stops first, or a tick during the History write would overwrite the summary.
       stopTicker();
@@ -1098,7 +1158,7 @@ eread after a refresh elsewhere, never forcing the network. */
         .filter((value): value is number => value !== undefined);
       await handle.finish({
         output: `${summary}.\nPrompt sent: ${items[0]?.plan.body.prompt ?? ''}`,
-        meta: { images: made, failed: outcome.failed, ...(seeds.length ? { seeds } : {}) },
+        meta: { images: made, failed, ...(seeds.length ? { seeds } : {}) },
       });
     } catch (error) {
       stopTicker();
@@ -1149,7 +1209,7 @@ eread after a refresh elsewhere, never forcing the network. */
         model: group.model,
         title: `Retry: ${shorten(group.form.prompt.trim(), 60)}`,
         prompt: '',
-        settings: formSettings(group.form),
+        settings: runSettings(group.form, group.items[0]?.plan.body.seed ?? null),
         estimateUsd,
       },
       signal,
@@ -1158,8 +1218,9 @@ eread after a refresh elsewhere, never forcing the network. */
     try {
       await runGroup(handle, group, [item]);
     } catch (error) {
-      // The card shows what happened, with Retry; no second message for it.
-      if (!isStop(error)) markPresented(error);
+      // The card shows what happened, with Retry; no second message for it. Errors that need an action (no key,
+      // locked keys, budget, storage) still reach the shell, which opens the dialog that fixes them.
+      if (!isStop(error) && !needsAction(error)) markPresented(error);
       throw error;
     }
   };
@@ -1182,7 +1243,7 @@ eread after a refresh elsewhere, never forcing the network. */
         model: source.model,
         title: `Variation: ${shorten(source.form.prompt.trim(), 60)}`,
         prompt: source.form.prompt,
-        settings: formSettings(variationForm),
+        settings: runSettings(variationForm, body.seed ?? null),
         estimateUsd,
       },
       signal,
@@ -1255,7 +1316,7 @@ eread after a refresh elsewhere, never forcing the network. */
 
     // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
     const handle = await ctx.beginRun(
-      { title: shorten(asked.prompt.trim(), 80), settings: formSettings(sentForm) },
+      { title: shorten(asked.prompt.trim(), 80), settings: runSettings(sentForm, runSeed) },
       signal,
     );
     if (runSeed !== null && !asked.seedLocked) {
