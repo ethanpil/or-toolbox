@@ -152,6 +152,10 @@ export async function runFfmpegSmokeTest(
 
 /** Runs axe (WCAG 2.2 A/AA) and fails on serious or critical violations. */
 export async function expectNoSeriousA11yViolations(page: Page): Promise<void> {
+  // A toast fading in is half transparent, and axe would measure its text at that contrast.
+  await page.waitForFunction(
+    () => document.querySelector('.toast.showing, .toast.hiding') === null,
+  );
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
     .analyze();
