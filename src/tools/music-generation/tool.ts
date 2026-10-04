@@ -16,10 +16,10 @@ import type { ChatStreamResult } from '../../core/api/types';
 import { ApiError, InvalidInputError, isAbortError, userMessage } from '../../core/errors';
 import { getAudioDuration } from '../../core/media/audio';
 import type { RunHandle } from '../../core/types';
-import { audioPlayer, type AudioPlayer } from '../../ui/components/audio-player';
+import type { AudioPlayer } from '../../ui/components/audio-player';
+import { type AudioResultCard, audioResultCard } from '../../ui/components/audio-result-card';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
-import { exportMenu } from '../../ui/components/export-menu';
 import { h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { isStop, markPresented } from '../../ui/feedback/errors';
@@ -29,7 +29,8 @@ import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { setToolBinding } from '../../ui/settings-actions';
 import { type ItemStatus, runItems } from '../../ui/tool/batch';
-import type { ResultHandle, RunnerState, ToolContext, ToolInstance } from '../../ui/tool/index';
+import type { ToolContext, ToolInstance } from '../../ui/tool/index';
+import { retryGate } from '../../ui/tool/retry-gate';
 import {
   activeLine,
   insertTag,
@@ -112,12 +113,10 @@ interface Variation {
   /** The failure was Lyria declining: a retry would only be charged for the same answer. */
   refused: boolean;
   card: HTMLElement;
-  handle: ResultHandle | null;
-  player: AudioPlayer | null;
-  /** The card's Remove button, where focus goes when a neighbouring card is removed. */
+  /** The song as a result card (player, downloads, Send to…, Remove), once it is made. */
+  result: AudioResultCard | null;
+  /** A card without a song: its Remove button, where focus goes when a neighbouring card is removed. */
   removeButton: HTMLButtonElement | null;
-  /** A failed card's Retry button, kept in step with the runner (busy, no key…) in place. */
-  retryButton: HTMLButtonElement | null;
 }
 
 /** The runner's argument: retry one variation. */
@@ -648,9 +647,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     });
   };
 
-  const transcode = async (blob: Blob, to: 'mp3' | 'wav'): Promise<Blob> =>
-    (await import('../../core/media/ffmpeg-ops')).transcodeAudio(blob, to);
-
   /** The lyrics under a player, the line being sung highlighted as it plays. */
   const lyricsPanel = (
     lyricsData: TimedLyrics,
@@ -723,90 +719,103 @@ export function setup(ctx: ToolContext): ToolInstance {
     return list;
   };
 
-  let runnerState: RunnerState = { busy: false, disabledReason: null };
-  const blockedReason = (): string | null =>
-    runnerState.busy ? 'Wait until the current run ends.' : runnerState.disabledReason;
-  /** Updates a Retry button in place, so focus on it (or anywhere in its card) is never lost. */
-  const syncRetry = (button: HTMLButtonElement): void => {
-    const blocked = blockedReason();
-    button.classList.toggle('disabled', blocked !== null);
-    button.setAttribute('aria-disabled', String(blocked !== null));
-    button.title = blocked ?? '';
+  const titleOf = (variation: Variation): string =>
+    variation.group.count > 1 ? `Variation ${variation.index + 1}` : 'Result';
+
+  /** Where focus can land in a card: its Remove button. */
+  const removeButtonOf = (variation: Variation): HTMLElement | null =>
+    variation.result
+      ? variation.result.element.querySelector<HTMLElement>('button[aria-label^="Remove "]')
+      : variation.removeButton;
+
+  /** Takes a variation off the page's books (its card, its group when it was the last). Safe to call twice. */
+  const forget = (variation: Variation): void => {
+    const group = variation.group;
+    const at = group.variations.indexOf(variation);
+    if (at < 0) return;
+    if (variation.result) players.delete(variation.result.player);
+    variation.card.remove();
+    group.variations.splice(at, 1);
+    if (group.variations.length === 0) {
+      group.section.remove();
+      groups.splice(groups.indexOf(group), 1);
+    }
+    showEmpty();
   };
 
-  const removeButtonFor = (variation: Variation, name: string): HTMLButtonElement =>
-    h(
-      'button',
-      {
-        type: 'button',
-        class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
-        'aria-label': `Remove ${name}`,
-        'data-testid': 'music-remove',
-        onclick: () => removeVariation(variation),
-      },
-      icon('trash'),
-      'Remove',
+  /** The card that takes a removed one's place: the next in its group, the one before, another group's. */
+  const neighbourOf = (variation: Variation): Variation | undefined => {
+    const list = variation.group.variations;
+    const at = list.indexOf(variation);
+    return (
+      list[at + 1] ??
+      list[at - 1] ??
+      groups.flatMap((group) => group.variations).find((other) => other !== variation)
     );
+  };
+
+  /** Where focus goes when `variation` is removed and no other song card took it. */
+  const focusAfter = (variation: Variation): HTMLElement | null => {
+    const next = neighbourOf(variation);
+    forget(variation);
+    return (next && removeButtonOf(next)) ?? (empty.hidden ? null : empty);
+  };
+
+  /** Removes a card that has no song (failed or stopped). Song cards remove themselves (audioResultCard). */
+  const removeVariation = (variation: Variation): void => {
+    focusAfter(variation)?.focus();
+    announce(`Removed ${titleOf(variation).toLowerCase()}.`);
+  };
+
+  /** A finished song as a result card: player, downloads, Send to…, Remove; notes and lyrics in between. */
+  const songCard = (variation: Variation, song: Song): AudioResultCard => {
+    const group = variation.group;
+    const title = titleOf(variation);
+    const name = `${group.stem}${group.count > 1 ? `-${variation.index + 1}` : ''}.mp3`;
+    const extra = h('div', { class: 'vstack gap-2' });
+    const card = audioResultCard({
+      ui,
+      blob: song.blob,
+      name,
+      ...(song.seconds === null ? {} : { seconds: song.seconds }),
+      title: group.count > 1 ? title : name,
+      headingLevel: 4,
+      metaParts: [
+        song.seconds === null ? 'Length unknown' : formatDuration(song.seconds),
+        song.fullSeconds !== null ? `cut from ${formatDuration(song.fullSeconds)}` : null,
+        formatBytes(song.blob.size),
+      ],
+      formats: ['mp3', 'wav'],
+      extra,
+      onRemove: () => forget(variation),
+      focusFallback: () => focusAfter(variation),
+      testId: 'music',
+    });
+    extra.append(
+      ...song.notes.map((note) =>
+        h(
+          'div',
+          { class: 'small text-warning-emphasis', role: 'note', 'data-testid': 'music-note' },
+          note,
+        ),
+      ),
+    );
+    const lyricsElement = lyricsPanel(song.lyrics, card.player, `Lyrics of ${title.toLowerCase()}`);
+    if (lyricsElement) extra.append(lyricsElement);
+    addPlayer(card.player);
+    return card;
+  };
 
   const drawVariation = (variation: Variation): void => {
-    const title = variation.group.count > 1 ? `Variation ${variation.index + 1}` : 'Result';
-    const song = variation.song;
-    let body: (HTMLElement | null)[];
+    const title = titleOf(variation);
     variation.removeButton = null;
-    variation.retryButton = null;
-    if (song && variation.player && variation.handle) {
-      const handle = variation.handle;
-      const name = handle.result.name;
-      const fileStem = name.replace(/\.mp3$/, '');
-      const blob = song.blob;
-      variation.removeButton = removeButtonFor(variation, name);
-      body = [
-        h(
-          'div',
-          { class: 'small text-body-secondary', 'data-testid': 'music-meta' },
-          [
-            song.seconds === null ? 'Length unknown' : formatDuration(song.seconds),
-            song.fullSeconds !== null ? `cut from ${formatDuration(song.fullSeconds)}` : null,
-            formatBytes(blob.size),
-          ]
-            .filter(Boolean)
-            .join(' · '),
-        ),
-        ...song.notes.map((note) =>
-          h(
-            'div',
-            { class: 'small text-warning-emphasis', role: 'note', 'data-testid': 'music-note' },
-            note,
-          ),
-        ),
-        variation.player.element,
-        lyricsPanel(song.lyrics, variation.player, `Lyrics of ${title.toLowerCase()}`),
-        h(
-          'div',
-          { class: 'd-flex flex-wrap gap-2 mt-auto' },
-          exportMenu({
-            filename: fileStem,
-            resultIds: () => [handle.result.id],
-            testId: 'music-download',
-            formats: [
-              {
-                label: 'MP3',
-                extension: 'mp3',
-                icon: 'file-earmark-music',
-                build: () => blob,
-              },
-              {
-                label: 'WAV',
-                extension: 'wav',
-                icon: 'file-earmark-music',
-                build: () => transcode(blob, 'wav'),
-              },
-            ],
-          }),
-          variation.removeButton,
-        ),
-      ];
-    } else if (variation.status === 'queued' || variation.status === 'running') {
+    variation.card.dataset['status'] = variation.status;
+    if (variation.result) {
+      replace(variation.card, variation.result.element);
+      return;
+    }
+    let body: (HTMLElement | null)[];
+    if (variation.status === 'queued' || variation.status === 'running') {
       body = [
         h(
           'div',
@@ -821,27 +830,18 @@ export function setup(ctx: ToolContext): ToolInstance {
         h('div', { class: 'small text-body-secondary' }, variation.phase),
       ];
     } else {
-      variation.removeButton = removeButtonFor(variation, title);
-      // Lyria declining is not retried: the same request would be charged for the same answer.
-      if (!variation.refused) {
-        variation.retryButton = h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
-            'aria-label': `Retry ${title.toLowerCase()}`,
-            'data-testid': 'music-retry',
-            onclick: () => {
-              if (!runner.trigger({ retry: variation }).started) {
-                announce(blockedReason() ?? 'Cannot start now.');
-              }
-            },
-          },
-          icon('arrow-clockwise'),
-          'Retry',
-        );
-        syncRetry(variation.retryButton);
-      }
+      variation.removeButton = h(
+        'button',
+        {
+          type: 'button',
+          class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
+          'aria-label': `Remove ${title.toLowerCase()}`,
+          'data-testid': 'music-remove',
+          onclick: () => removeVariation(variation),
+        },
+        icon('trash'),
+        'Remove',
+      );
       body = [
         h(
           'div',
@@ -853,7 +853,23 @@ export function setup(ctx: ToolContext): ToolInstance {
         h(
           'div',
           { class: 'd-flex flex-wrap gap-2 mt-auto' },
-          variation.retryButton,
+          // Lyria declining is not retried: the same request would be charged for the same answer.
+          variation.refused
+            ? null
+            : gate.bind(
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
+                    'aria-label': `Retry ${title.toLowerCase()}`,
+                    'data-testid': 'music-retry',
+                    onclick: () => gate.retry({ retry: variation }, 'Compose cannot start now.'),
+                  },
+                  icon('arrow-clockwise'),
+                  'Retry',
+                ),
+              ),
           variation.removeButton,
         ),
       ];
@@ -866,32 +882,6 @@ export function setup(ctx: ToolContext): ToolInstance {
         h('div', { class: 'card-body vstack gap-2' }, h('h4', { class: 'h6 mb-0' }, title), body),
       ),
     );
-    variation.card.dataset['status'] = variation.status;
-  };
-
-  /** Removes a card, and moves focus to the card that takes its place (or the empty state). */
-  const removeVariation = (variation: Variation): void => {
-    const group = variation.group;
-    const at = group.variations.indexOf(variation);
-    variation.handle?.remove();
-    if (variation.player) {
-      players.delete(variation.player);
-      variation.player.dispose();
-    }
-    variation.card.remove();
-    group.variations.splice(at, 1);
-    if (group.variations.length === 0) {
-      group.section.remove();
-      groups.splice(groups.indexOf(group), 1);
-    }
-    showEmpty();
-    const next =
-      group.variations[at] ??
-      group.variations[at - 1] ??
-      groups.flatMap((other) => other.variations)[0];
-    const focusTarget = next?.removeButton ?? (empty.hidden ? null : empty);
-    focusTarget?.focus();
-    announce('Removed.');
   };
 
   // --- running --------------------------------------------------------------------------------------------
@@ -1011,18 +1001,9 @@ export function setup(ctx: ToolContext): ToolInstance {
       variation.refused = outcome.error instanceof NoMusicError;
     }
     if (outcome.status === 'done' && outcome.value) {
-      const song = outcome.value;
-      const group = variation.group;
-      const name = `${group.stem}${group.count > 1 ? `-${variation.index + 1}` : ''}.mp3`;
-      variation.song = song;
+      variation.song = outcome.value;
       variation.error = null;
-      variation.handle = ui.addResult({ kind: 'audio', name, blob: song.blob });
-      variation.player = audioPlayer({
-        blob: song.blob,
-        label: song.seconds === null ? name : `${name}, ${formatDuration(song.seconds)}`,
-        testId: 'music-player',
-      });
-      addPlayer(variation.player);
+      variation.result = songCard(variation, outcome.value);
     }
     drawVariation(variation);
   };
@@ -1043,9 +1024,9 @@ export function setup(ctx: ToolContext): ToolInstance {
     stopTicker();
     const tick = (): void => {
       const seconds = Math.round((Date.now() - started) / 1000);
-      ui.status(`Composing… ${seconds} s`);
+      ui.progress(`Composing… ${seconds} s`);
     };
-    tick();
+    ui.status('Composing…');
     elapsedTimer = setInterval(tick, 1000);
   };
 
@@ -1090,7 +1071,6 @@ export function setup(ctx: ToolContext): ToolInstance {
       settle(variation, { status: 'done', value: song });
       const summary = `Variation ${variation.index + 1} ready`;
       ui.status(summary);
-      announce('The music is ready.');
       await handle.finish({
         output: historyOutput(summary, [variation], true),
         meta: {
@@ -1164,10 +1144,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       error: null,
       refused: false,
       card: h('div', { class: 'col', 'data-testid': 'music-variation' }),
-      handle: null,
-      player: null,
+      result: null,
       removeButton: null,
-      retryButton: null,
     }));
     // Side by side, two at most: the output zone is about half the page.
     replace(
@@ -1205,7 +1183,6 @@ export function setup(ctx: ToolContext): ToolInstance {
       // The ticker stops first, or a tick during the History write would overwrite the summary.
       stopTicker();
       ui.status(summary);
-      announce(made.length > 0 ? 'The music is ready.' : 'No music was made.');
       await handle.finish({
         output: historyOutput(summary, made, count > 1),
         meta: {
@@ -1232,13 +1209,9 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   const runner = ui.runner<RetryArg>({ label: 'Compose', icon: 'music-note-beamed', run });
-  runner.subscribe((state) => {
-    runnerState = state;
-    for (const group of groups) {
-      for (const variation of group.variations) {
-        if (variation.retryButton) syncRetry(variation.retryButton);
-      }
-    }
+  // A Retry button disappears when its card starts again: focus goes to Stop (or back to Compose).
+  const gate = retryGate(runner, {
+    fallback: () => (runner.busy ? runner.stopButton : runner.button),
   });
 
   // --- state ----------------------------------------------------------------------------------------------

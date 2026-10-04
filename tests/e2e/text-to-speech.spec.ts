@@ -330,7 +330,7 @@ test.describe('Text-to-speech', () => {
     expect(calls[3]?.input).toMatch(/^Part 2,/);
     const { result, segment } = await decodedLengths(page, SPEECH_MP3.toString('base64'));
     expect(result).toBe(segment * 3);
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('Stop keeps the parts already made; Read aloud makes only the rest and joins them', async ({
@@ -356,7 +356,7 @@ test.describe('Text-to-speech', () => {
     await page.getByTestId('tool-prompt').fill(paragraphs(8));
     await expect(page.getByTestId('tts-counts')).toContainText('8 requests');
     await page.getByTestId('run-button').click();
-    await expect(page.getByTestId('tts-progress-text')).toHaveText('2 of 8 parts made');
+    await expect(page.getByTestId('tool-status')).toHaveText('Reading aloud: 2 of 8 parts');
     await page.getByTestId('stop-button').click();
 
     await expect(page.getByTestId('tool-status')).toHaveText('Stopped · 2 of 8 parts made');

@@ -185,7 +185,7 @@ test.describe('Music generation', () => {
         }),
     );
     expect(duration).toBeGreaterThan(12);
-    await expect(page.getByTestId('music-meta')).toHaveText(/^0:1[23] · /);
+    await expect(page.getByTestId('music-result-meta')).toHaveText(/^0:1[23] · /);
 
     // The line being sung is highlighted as the song plays.
     const lines = page.getByTestId('music-lyric-line');
@@ -213,9 +213,12 @@ test.describe('Music generation', () => {
     await closeDrawer(page);
     await page.getByTestId('run-button').click();
     await expect(page.getByTestId('music-group')).toHaveCount(2);
-    await expect(page.getByTestId('music-meta').first()).toHaveText(/^0:08 · cut from 0:1[23] · /, {
-      timeout: 180_000,
-    });
+    await expect(page.getByTestId('music-result-meta').first()).toHaveText(
+      /^0:08 · cut from 0:1[23] · /,
+      {
+        timeout: 180_000,
+      },
+    );
     const cut = await decodedSeconds(page, 0);
     console.info(
       `Music gate: streamed song ${full.toFixed(3)} s; cut to 8 s → ${cut.toFixed(3)} s`,
@@ -294,7 +297,7 @@ test.describe('Music generation', () => {
     mock.json('GET', '/api/v1/models', { data: CATALOG });
     const answers = [brokenStream, failingStream, lyriaStream, refusalStream];
     mock.respond('POST', '/api/v1/chat/completions', () => (answers.shift() ?? lyriaStream)());
-    const problems = await watchForProblems(page);
+    const problems = await watchForProblems(page, STREAM_CANCELS);
     await page.goto('tools/music-generation/');
     await openDrawer(page);
     await page.getByTestId('music-variations').selectOption('2');
@@ -341,7 +344,7 @@ test.describe('Music generation', () => {
     await expect(page.locator('.or-drawer')).toBeVisible();
     await expect(page.getByTestId('music-target')).toBeFocused();
     expect(mock.calls('/api/v1/chat/completions')).toHaveLength(4);
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('free-only mode shows the notice: no music model is free', async ({

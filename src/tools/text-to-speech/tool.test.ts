@@ -317,6 +317,8 @@ describe('Text-to-speech tool', { timeout: 30_000 }, () => {
     await t.runners[0]!.trigger();
     expect(speech).toHaveBeenCalledTimes(3);
     expect($(t.zones.output, 'tts-notice')?.textContent).toContain('2 of 3 parts made');
+    // The paid parts live only in this page: leaving asks first.
+    expect(t.core.results.holds()).toEqual(['2 paid speech parts not joined yet']);
 
     fail = false;
     // Only the format changed: the parts are kept, joined into the new format.
@@ -329,9 +331,10 @@ describe('Text-to-speech tool', { timeout: 30_000 }, () => {
     expect(speech.mock.calls[3]?.[0].input).toMatch(/^Part 2,/);
     expect(stitched.calls).toHaveLength(1);
     expect(stitched.calls[0]).toMatchObject({ format: 'wav' });
-    expect(announced).toContain('Continuing: 2 parts made earlier are kept.');
     const [record] = await t.core.history.query({ tool: 'text-to-speech' });
     expect(record).toMatchObject({ title: 'Continue: 1 part of speech-part-1-sentence-1' });
+    // Joined: nothing is held any more (the take is a result of its own).
+    expect(t.core.results.holds()).toEqual([]);
 
     // Complete: the next Read aloud is a new take, and changed text always starts again.
     tool.applyState({ ...tool.getState(), prompt: longText(2) });

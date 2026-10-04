@@ -214,7 +214,7 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
       'HELLO WORLD',
       'HELLO DAY',
     ]);
-    expect($(cards[0]!, 'music-meta')?.textContent).toMatch(/^0:03 · /);
+    expect($(cards[0]!, 'music-result-meta')?.textContent).toMatch(/^0:03 · /);
     expect(t.core.results.pending().map((result) => result.name)).toEqual([
       expect.stringMatching(/^music-.*-1\.mp3$/),
       expect.stringMatching(/^music-.*-2\.mp3$/),
@@ -241,7 +241,9 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
       5,
       expect.objectContaining({ kind: 'audio', fadeOut: 2, bitrate: 192 }),
     ]);
-    expect($(t.zones.output, 'music-meta')?.textContent).toMatch(/^0:03 · cut from 0:1[23] · /);
+    expect($(t.zones.output, 'music-result-meta')?.textContent).toMatch(
+      /^0:03 · cut from 0:1[23] · /,
+    );
   });
 
   it('keeps the variation that worked when another fails', async () => {
@@ -500,7 +502,7 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
     await t.runners[0]!.trigger();
     const newest = $(t.zones.output, 'music-variation')!;
     expect(trims.calls).toHaveLength(1);
-    expect($(newest, 'music-meta')?.textContent).not.toContain('cut from');
+    expect($(newest, 'music-result-meta')?.textContent).not.toContain('cut from');
     expect($(newest, 'music-note')?.textContent).toBe('Shorter than the 0:10 target: kept whole.');
   });
 
@@ -513,7 +515,7 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
     tool.applyState({ prompt: 'Odd', settings: { targetSeconds: 10 } });
     await t.runners[0]!.trigger();
     const card = $(t.zones.output, 'music-variation')!;
-    expect($(card, 'music-meta')?.textContent).toMatch(/^Length unknown · /);
+    expect($(card, 'music-result-meta')?.textContent).toMatch(/^Length unknown · /);
     expect(card.textContent).not.toContain('0:00');
     expect($(card, 'music-note')?.textContent).toBe(
       'Its length could not be read, so it was not cut.',

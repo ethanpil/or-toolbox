@@ -20,10 +20,10 @@ import { decodeAudio, getAudioDuration } from '../../core/media/audio';
 import { pcmToWav } from '../../core/media/wav';
 import type { ModelInfo, RunHandle } from '../../core/types';
 import { debounce } from '../../core/util';
-import { audioPlayer, type AudioPlayer } from '../../ui/components/audio-player';
+import { audioResultCard } from '../../ui/components/audio-result-card';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
-import { exportMenu } from '../../ui/components/export-menu';
+import { progressBar } from '../../ui/components/progress-bar';
 import { h, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { isStop, presentError } from '../../ui/feedback/errors';
@@ -31,13 +31,8 @@ import { formatBytes, formatDuration, formatInt, formatUsd, plural } from '../..
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { type ItemStatus, runItems } from '../../ui/tool/batch';
-import type {
-  ResultHandle,
-  RunnerState,
-  SendItem,
-  ToolContext,
-  ToolInstance,
-} from '../../ui/tool/index';
+import type { ToolContext, ToolInstance } from '../../ui/tool/index';
+import { retryGate } from '../../ui/tool/retry-gate';
 import { countWords, fileStem, normalizeText, splitText, stripMarkdown } from './text';
 import { chunkLimit, previewText, speedSupported, voiceLabel } from './voices';
 
@@ -88,12 +83,6 @@ interface Plan {
 
 /** The runner's argument: retry these parts, or join the parts already made. */
 type RunArg = { parts: string[] } | { join: true };
-
-interface Take {
-  handle: ResultHandle;
-  player: AudioPlayer;
-  element: HTMLElement;
-}
 
 /** What a take's card shows: plain values, so nothing in it keeps a plan (and its part audio) alive. */
 interface TakeInfo {
@@ -526,25 +515,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- output zone ----------------------------------------------------------------------------------------
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress',
-      role: 'progressbar',
-      'aria-label': 'Progress',
-      'aria-valuemin': '0',
-      'aria-valuemax': '100',
-      'aria-valuenow': '0',
-      'data-testid': 'tts-progress',
-    },
-    progressBar,
-  );
-  const progressText = h('div', {
-    class: 'small text-body-secondary',
-    'data-testid': 'tts-progress-text',
-  });
-  const progressSection = h('div', { class: 'vstack gap-2', hidden: true }, progress, progressText);
+  const bar = progressBar({ label: 'Parts made', hidden: true, testId: 'tts-progress' });
   const notice = h('div', { hidden: true, 'data-testid': 'tts-notice' });
   const empty = emptyState({
     icon: 'volume-up',
@@ -552,111 +523,45 @@ export function setup(ctx: ToolContext): ToolInstance {
     text: 'Add text, choose a voice and press Read aloud.',
     testId: 'tts-empty',
   });
+  // Focus lands here when the last take is removed.
+  empty.tabIndex = -1;
   const takesList = h('div', { class: 'vstack gap-3', 'data-testid': 'tts-results' });
-  ui.output.append(h('div', { class: 'vstack gap-3' }, progressSection, notice, empty, takesList));
+  ui.output.append(h('div', { class: 'vstack gap-3' }, bar.element, notice, empty, takesList));
 
-  const takes: Take[] = [];
-  const setProgress = (ratio: number, label: string): void => {
-    const percent = Math.round(Math.min(1, Math.max(0, ratio)) * 100);
-    progressBar.style.width = `${percent}%`;
-    progress.setAttribute('aria-valuenow', String(percent));
-    progressText.textContent = label;
-  };
+  let takes = 0;
   const showEmpty = (): void => {
-    empty.hidden = takes.length > 0 || !progressSection.hidden;
+    empty.hidden = takes > 0 || !bar.element.hidden;
   };
 
-  const transcode = async (blob: Blob, to: Format): Promise<Blob> =>
-    (await import('../../core/media/ffmpeg-ops')).transcodeAudio(blob, to);
-
+  /** A joined take as a card. Built from plain values, so nothing in it keeps a plan (and its parts) alive. */
   const addTake = (blob: Blob, info: TakeInfo): void => {
     const { stem, format: madeAs, seconds } = info;
-    const name = `${stem}.${madeAs}`;
-    const handle = ui.addResult({ kind: 'audio', name, blob });
-    const player = audioPlayer({
+    const card = audioResultCard({
+      ui,
       blob,
-      label: seconds === null ? name : `${name}, ${formatDuration(seconds)}`,
-      testId: 'tts-player',
+      name: `${stem}.${madeAs}`,
+      ...(seconds === null ? {} : { seconds }),
+      metaParts: [
+        seconds === null ? null : formatDuration(seconds),
+        info.voice ? voiceLabel(info.voice) : "The model's own voice",
+        formatBytes(blob.size),
+      ],
+      formats: ['mp3', 'wav'],
+      onRemove: () => {
+        takes -= 1;
+        showEmpty();
+      },
+      focusFallback: () => empty,
+      testId: 'tts',
     });
-    const menu = exportMenu({
-      filename: stem,
-      resultIds: () => [handle.result.id],
-      testId: 'tts-download',
-      formats: (['mp3', 'wav'] as const).map((id) => ({
-        label: id === 'mp3' ? 'MP3' : 'WAV',
-        extension: id,
-        icon: 'file-earmark-music',
-        build: () => (id === madeAs ? blob : transcode(blob, id)),
-      })),
-    });
-    const item: Take = { handle, player, element: h('div') };
-    const remove = (): void => {
-      handle.remove();
-      player.dispose();
-      item.element.remove();
-      takes.splice(takes.indexOf(item), 1);
-      showEmpty();
-      announce(`Removed ${name}.`);
-    };
-    const send: SendItem[] = [{ kind: 'file', blob, name }];
-    item.element = h(
-      'article',
-      { class: 'border rounded p-3 vstack gap-2', 'data-testid': 'tts-result' },
-      h(
-        'div',
-        { class: 'd-flex flex-wrap align-items-baseline gap-2' },
-        h('h3', { class: 'h6 mb-0 text-break me-auto' }, name),
-        h(
-          'span',
-          { class: 'small text-body-secondary', 'data-testid': 'tts-result-meta' },
-          [
-            seconds === null ? null : formatDuration(seconds),
-            info.voice ? voiceLabel(info.voice) : "The model's own voice",
-            formatBytes(blob.size),
-          ]
-            .filter(Boolean)
-            .join(' · '),
-        ),
-      ),
-      player.element,
-      h(
-        'div',
-        { class: 'd-flex flex-wrap gap-2' },
-        menu,
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
-            'data-testid': 'tts-send',
-            onclick: () => ui.sendTo(send),
-          },
-          icon('send'),
-          'Send to…',
-        ),
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
-            'aria-label': `Remove ${name}`,
-            'data-testid': 'tts-remove',
-            onclick: remove,
-          },
-          icon('trash'),
-          'Remove',
-        ),
-      ),
-    );
-    takes.unshift(item);
-    takesList.prepend(item.element);
+    takes += 1;
+    takesList.prepend(card.element);
     showEmpty();
   };
 
   // --- running --------------------------------------------------------------------------------------------
   let plan: Plan | null = null;
   let running = false;
-  let runnerState: RunnerState = { busy: false, disabledReason: null };
 
   const missing = (current: Plan): Chunk[] =>
     current.chunks.filter((chunk) => chunk.status !== 'done');
@@ -667,33 +572,46 @@ export function setup(ctx: ToolContext): ToolInstance {
     speed: current.speed ?? 1,
     format: current.format,
   });
+  /** The bar and the status line's counter (announced now and then, not on every tick). */
+  const setProgress = (ratio: number, label: string): void => {
+    bar.update(Math.round(Math.min(1, Math.max(0, ratio)) * 100), 100, label);
+    ui.progress(label);
+  };
   /** Lets go of a plan's part audio (after the join, or when a new plan replaces it). */
   const releasePlan = (current: Plan | null): void => {
     for (const chunk of current?.chunks ?? []) chunk.blob = null;
   };
 
-  const actionButton = (label: string, testId: string, arg: () => RunArg): HTMLElement => {
-    const blocked = runnerState.busy
-      ? 'Wait until the current run ends.'
-      : runnerState.disabledReason;
-    return h(
-      'button',
-      {
-        type: 'button',
-        class: ['btn btn-sm btn-warning', blocked && 'disabled'],
-        'aria-disabled': String(blocked !== null),
-        title: blocked ?? '',
-        'data-focus-key': 'tts-retry',
-        'data-testid': testId,
-        onclick: () => {
-          if (!runner.trigger(arg()).started) announce(blocked ?? 'Cannot start now.');
-        },
-      },
-      label,
-    );
+  /**
+   * Paid parts that are not joined yet live only in this page: leaving asks first. The hold follows the plan
+   * (its description says how many parts) and ends when the audio is joined or the plan is replaced.
+   */
+  let held: { description: string; release: () => void } | null = null;
+  const syncHold = (): void => {
+    const made = plan ? madeCount(plan) : 0;
+    const description = made > 0 ? `${plural(made, 'paid speech part')} not joined yet` : null;
+    if (description === (held?.description ?? null)) return;
+    held?.release();
+    held = description ? { description, release: ui.holdWork(description) } : null;
   };
 
+  /** A notice button that follows Run (unavailable while it is busy or disabled, but focusable). */
+  const actionButton = (label: string, testId: string, arg: () => RunArg): HTMLElement =>
+    gate.bind(
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'btn btn-sm btn-warning',
+          'data-testid': testId,
+          onclick: () => gate.retry(arg(), 'Reading aloud cannot start now.'),
+        },
+        label,
+      ),
+    );
+
   const renderNotice = (): void => {
+    syncHold();
     const current = plan;
     const left = current && !running ? missing(current) : [];
     const joinPending = current !== null && !running && left.length === 0 && current.joinNote;
@@ -817,7 +735,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     current.joinNote = null;
     let blob: Blob;
     try {
-      setProgress(0, 'Joining the parts…');
+      bar.update(0, 100, 'Joining the parts…');
       ui.status('Joining the parts…');
       const { stitchAudio } = await import('../../core/media/stitch');
       blob = await stitchAudio(
@@ -866,7 +784,6 @@ export function setup(ctx: ToolContext): ToolInstance {
         ? `Generated the audio, ${plural(total, 'part')}`
         : `Generated ${formatDuration(seconds)} of audio, ${plural(total, 'part')}`;
     ui.status(summary);
-    announce('The audio is ready.');
     // Complete: the parts are no longer needed (the take keeps only the joined audio).
     releasePlan(current);
     if (plan === current) plan = null;
@@ -908,14 +825,14 @@ export function setup(ctx: ToolContext): ToolInstance {
   /** Joins the current plan without making anything (Join again, or a continued plan with every part made). */
   const joinOnly = async (current: Plan, signal: AbortSignal): Promise<void> => {
     running = true;
-    progressSection.hidden = false;
+    bar.element.hidden = false;
     showEmpty();
     renderNotice();
     try {
       await joinPlan(current, signal, null, {});
     } finally {
       running = false;
-      progressSection.hidden = true;
+      bar.element.hidden = true;
       showEmpty();
       renderNotice();
     }
@@ -1003,17 +920,21 @@ export function setup(ctx: ToolContext): ToolInstance {
     running = true;
     target.joinNote = null;
     for (const chunk of todo) Object.assign(chunk, { status: 'queued', blob: null, error: null });
-    const showMade = (): void => {
+    const showMade = (first = false): void => {
       const made = madeCount(target);
-      setProgress(made / total, `${made} of ${plural(total, 'part')} made`);
-      ui.status(`Reading aloud: ${made} of ${plural(total, 'part')}`);
+      bar.update(made, total, `${made} of ${plural(total, 'part')} made`);
+      const text = `Reading aloud: ${made} of ${plural(total, 'part')}`;
+      if (first) ui.status(text);
+      else ui.progress(text);
+      syncHold();
     };
-    progressSection.hidden = false;
+    bar.element.hidden = false;
     showEmpty();
     renderNotice();
-    if (continued)
-      announce(`Continuing: ${plural(total - todo.length, 'part')} made earlier are kept.`);
-    showMade();
+    if (continued) {
+      ui.status(`Continuing: ${plural(total - todo.length, 'part')} made earlier are kept`);
+    }
+    showMade(!continued);
     try {
       try {
         await runItems({
@@ -1059,16 +980,16 @@ export function setup(ctx: ToolContext): ToolInstance {
       });
     } finally {
       running = false;
-      progressSection.hidden = true;
+      bar.element.hidden = true;
       showEmpty();
       renderNotice();
     }
   };
 
   const runner = ui.runner<RunArg>({ label: 'Read aloud', icon: 'volume-up', run });
-  runner.subscribe((state) => {
-    runnerState = state;
-    renderNotice();
+  // A notice button that starts a run disappears with the notice: focus goes to Stop (or back to Run).
+  const gate = retryGate(runner, {
+    fallback: () => (runner.busy ? runner.stopButton : runner.button),
   });
 
   // --- files and text in ----------------------------------------------------------------------------------
