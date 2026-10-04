@@ -4,6 +4,7 @@
  * substitutions are explained by the notes under the form); a choice goes back to the tool through `onChange`.
  */
 import { h, replace } from '../../ui/dom';
+import { setFieldError } from '../../ui/feedback/field-error';
 import { uid } from '../../ui/id';
 import { type ClipFormat, MAX_SEED } from './format';
 import { effectiveFormat, resolutionRank, type VideoControls } from './params';
@@ -63,14 +64,20 @@ export function formatFields(options: {
     'aria-describedby': ids.seedHelp,
     'data-testid': 'video-seed',
   });
+  const seedError = h('div', { class: 'invalid-feedback', 'data-testid': 'video-seed-error' });
   seed.addEventListener('change', () => {
-    const value = Number(seed.value);
-    options.onChange({
-      seed:
-        seed.value.trim() !== '' && Number.isInteger(value) && value >= 0 && value <= MAX_SEED
-          ? value
-          : null,
-    });
+    const text = seed.value.trim();
+    const value = Number(text);
+    const valid = text === '' || (Number.isInteger(value) && value >= 0 && value <= MAX_SEED);
+    // An entry that is not a seed is said, and nothing is sent until it is fixed (a new seed each time).
+    setFieldError(
+      seed,
+      seedError,
+      valid
+        ? null
+        : `Enter a whole number from 0 to ${MAX_SEED.toLocaleString('en-US')}, or leave it empty. Until then a new seed is used each time.`,
+    );
+    options.onChange({ seed: valid && text !== '' ? value : null });
   });
   const seedHelp = h('div', { id: ids.seedHelp, class: 'form-text' });
 
@@ -103,7 +110,14 @@ export function formatFields(options: {
     'div',
     { class: 'vstack gap-3' },
     sizeField,
-    h('div', null, h('label', { class: 'form-label', htmlFor: ids.seed }, 'Seed'), seed, seedHelp),
+    h(
+      'div',
+      null,
+      h('label', { class: 'form-label', htmlFor: ids.seed }, 'Seed'),
+      seed,
+      seedError,
+      seedHelp,
+    ),
   );
 
   const options$ = (values: readonly string[], label: (value: string) => string) =>
@@ -161,13 +175,18 @@ export function formatFields(options: {
       );
       size.value = value.size ?? '';
 
+      // The field shows what will be sent: nothing for a model without a seed. An entry being fixed is left alone.
       const seeded = controls?.seed === true;
-      if (document.activeElement !== seed)
-        seed.value = format.seed === null ? '' : String(format.seed);
+      const fixing = seed.getAttribute('aria-invalid') === 'true';
+      if (document.activeElement !== seed && !fixing) {
+        seed.value = seeded && value.seed !== null ? String(value.seed) : '';
+      }
       seed.disabled = !seeded;
+      seed.placeholder = seeded ? 'Random' : 'Not sent';
+      if (!seeded) setFieldError(seed, seedError, null);
       seedHelp.textContent = seeded
         ? 'Empty: a new seed each time. A number repeats a result with the same settings (not guaranteed).'
-        : 'This model does not take a seed.';
+        : 'This model does not take a seed, so none is sent.';
     },
   };
 }

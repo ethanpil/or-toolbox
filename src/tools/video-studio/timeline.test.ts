@@ -31,6 +31,9 @@ const clip = (id: string, patch: Partial<TimelineClip> = {}): TimelineClip => ({
   included: true,
   sequenceId: null,
   slotKey: null,
+  attempt: 1,
+  expired: false,
+  staleSource: false,
   createdAt: 1,
   ...patch,
 });
@@ -78,6 +81,8 @@ describe('timeline', () => {
       clip('b', { continues: true, dropFirstFrame: true }),
       clip('c', { included: false }),
       clip('d', { continues: true, dropFirstFrame: false, trimStart: 0.1 }),
+      // OpenRouter no longer has it: it cannot be joined.
+      clip('e', { expired: true }),
     ];
     expect(joinPlan(clips)).toEqual([
       { id: 'a', trimEnd: 0.25 },

@@ -32,6 +32,12 @@ export interface TimelineClip {
   included: boolean;
   sequenceId: string | null;
   slotKey: string | null;
+  /** The sequence step's attempt that made it (1 outside sequences). */
+  attempt: number;
+  /** OpenRouter no longer has it (a download answered 404): it cannot be played, joined or continued here. */
+  expired: boolean;
+  /** It continued a take of the step before that a Re-run has since replaced. */
+  staleSource: boolean;
   createdAt: number;
 }
 
@@ -117,7 +123,7 @@ export function playLength(clip: TimelineClip, fps = ASSUMED_FPS): number | null
 
 /** The clips that go into the join, in order. */
 export function joinable(clips: readonly TimelineClip[]): TimelineClip[] {
-  return clips.filter((clip) => clip.included);
+  return clips.filter((clip) => clip.included && !clip.expired);
 }
 
 /** Total length of the join, or null while a clip's length is unknown. */
@@ -203,6 +209,9 @@ function parseClip(raw: unknown): TimelineClip | null {
     included: raw['included'] !== false,
     sequenceId: nullable(raw['sequenceId']),
     slotKey: nullable(raw['slotKey']),
+    attempt: isFiniteNumber(raw['attempt']) && raw['attempt'] >= 1 ? Math.floor(raw['attempt']) : 1,
+    expired: raw['expired'] === true,
+    staleSource: raw['staleSource'] === true,
     createdAt: isFiniteNumber(created) ? created : 0,
   };
 }

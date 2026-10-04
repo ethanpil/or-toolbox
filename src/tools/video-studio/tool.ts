@@ -4,29 +4,34 @@
  * timeline joined into one MP4 in the browser.
  *
  * - **Jobs:** every clip is one run and one persisted job. The run is handed off (`run.handOff`) as soon as the
- *   job is queued, so Generate is free again at once and leaving the page is safe; the job polls
- *   `GET /videos/{id}` (quick at first, then every 30 s), downloads the clip when it is done, and the tab that
- *   sees it finish re-attaches the run and books the cost from the completed status. `POST /videos` is never
- *   retried once it may have reached OpenRouter (core client rules).
+ *   job is queued, so Generate is free again at once and leaving the page is safe. The job polls
+ *   `GET /videos/{id}` (quick at first, then every 30 s) and succeeds with the completed status's cost; the tab
+ *   that sees it finish re-attaches the run, books the cost, places the clip and settles its sequence step in one
+ *   locked update (delivery.ts), then downloads the video. A clip OpenRouter no longer has (404) is marked expired
+ *   (its cost stays booked). `POST /videos` is never sent again by itself once it may have reached OpenRouter.
  * - **Persisted state** (`ctx.state`, JSON only): the timeline and the sequence run, written under one Web Lock
- *   (store.ts), so a reload resumes polling and the sequence where it was, and two tabs never send one step twice.
- *   Videos stay in memory: after a reload, generated clips are downloaded again while OpenRouter keeps them;
- *   uploads must be added again.
- * - **Continue** captures a clip's true last frame (`captureFrame('last')`) as a PNG first frame; the new clip
- *   joins the timeline right after its source, with its repeated first frame left out of the join by default.
- *   **Extend** sends a public HTTPS link as a video reference on models that take one (uploads cannot be sent as
- *   video), else falls back to Continue.
- * - **Sequences** (sequence.ts): chained steps one at a time, each from the previous clip's last frame;
- *   independent steps up to three at once; a spend cap checked against actual costs before every step.
+ *   (store.ts). Form edits reach a stored run field by field (only what this tab's user changed), and every change
+ *   of the stored run, here or in another tab, is read back into the form.
+ * - **Sequences:** sequence.ts holds the rules, sequence-runner.ts runs them. Start asks ONE budget question for
+ *   the whole sequence (its total estimate, with the cap); its steps then begin their runs without a dialog of
+ *   their own (each still reserves its estimate). A Re-run asks for itself.
  * - **Leave guard:** generated clips and joined videos are session results; running jobs and a running sequence
  *   are held work.
  */
 import type { RawVideoModel, VideoRequest } from '../../core/api/types';
-import { InvalidInputError, userMessage } from '../../core/errors';
+import {
+  BudgetBlockedError,
+  FreeOnlyError,
+  InvalidInputError,
+  KeyLockedError,
+  NoKeyError,
+  OrError,
+} from '../../core/errors';
 import { isFinalState, webLocks } from '../../core/jobs';
 import { toDataUrl } from '../../core/media/image';
 import { captureFrame, getVideoMetadata } from '../../core/media/video';
-import type { JobRecord, RunHandle, Usage } from '../../core/types';
+import type { BudgetCheck, JobRecord, RunHandle, Usage } from '../../core/types';
+import { abortError } from '../../core/util';
 import { bindJobList, jobList } from '../../ui/components/job-list';
 import type { ReferenceInput } from '../../ui/components/reference-picker';
 import { switchField } from '../../ui/components/switch-field';
@@ -36,13 +41,16 @@ import { mimeMatches } from '../../ui/components/file-types';
 import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
-import { isStop, presentError } from '../../ui/feedback/errors';
-import { formatBytes, formatDuration, plural } from '../../ui/format';
+import { isStop, markPresented, presentError } from '../../ui/feedback/errors';
+import { toast } from '../../ui/feedback/toast';
+import { formatBytes, formatDuration, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
+import { budgetConfirm } from '../../ui/shell/budget-confirm';
 import type { SendItem, ToolContext, ToolInstance } from '../../ui/tool/types';
 import { clipPanel, VIDEO_TYPES } from './clip-panel';
 import { type ClipMedia, createClipMedia } from './clip-media';
+import { placeDelivery, repairSlots } from './delivery';
 import type { ClipFormat } from './format';
 import { formatFields } from './format-fields';
 import { frameGrabber } from './frame-grabber';
@@ -63,6 +71,7 @@ import {
   effectiveFormat,
   extendNote,
   extendPlan,
+  LAST_FRAME_ONLY_MODELS,
   modeProblem,
   parseSettings,
   resolutionRank,
@@ -72,47 +81,45 @@ import {
   type VideoControls,
 } from './params';
 import {
-  abandonStart,
-  applyStatus,
-  chainSource,
-  claim,
+  applySpecEdit,
+  chooseSource,
   createRun,
+  dropStepImages,
+  effectiveRole,
   isActive,
-  markDone,
   markFailed,
-  markRunning,
   pause,
-  plan,
-  releaseClaim,
   rerun,
   resume,
   type SequenceRun,
   type SequenceSpec,
-  type Slot,
   slotNumber,
-  startsFromFrame,
-  stepPrompt,
+  type SpecEdit,
   type StepSpec,
   stop,
 } from './sequence';
-import { effectiveRole, sequencePanel } from './sequence-panel';
+import { sequencePanel } from './sequence-panel';
+import { billedBy, createSequenceRunner, imagesForSlot, markSent } from './sequence-runner';
 import { createStore, SEQUENCE_KEY, TIMELINE_KEY } from './store';
 import {
   clampTrim,
   insertClip,
   joinPlan,
   moveClip,
-  type Placement,
   removeClip,
-  slotPlacement,
   type TimelineClip,
   updateClip,
 } from './timeline';
 import { timelinePanel } from './timeline-panel';
+import { frameRateOf } from './video-fps';
 
 /** Frames and references are scaled to this before upload (data URLs; PNG kept when it fits). */
 const IMAGE_ENCODING = { maxSide: 2048, maxBytes: 4 * 1024 * 1024 };
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+/** Typing in a step prompt or the style reaches the stored run after this pause. */
+const EDIT_DELAY_MS = 300;
+/** Without Web Locks, a claim older than this belongs to a page that is gone. */
+const CLAIM_STALE_MS = 2 * 60_000;
 
 /** A short file stem from a prompt: `fishing-boat-leaves-a-quiet`. */
 export function stemFrom(prompt: string): string {
@@ -171,11 +178,23 @@ async function lockIsFree(name: string): Promise<boolean> {
 
 const startLockName = (runId: string, key: string): string =>
   `ortoolbox:video-studio:start:${runId}:${key}`;
+const tabLockName = (tabId: string): string => `ortoolbox:video-studio:tab:${tabId}`;
+
+/** A failed job's reason as a user-safe error (never a bare Error: History would show "Something went wrong"). */
+const jobFailure = (message: string): OrError => new OrError('api', message);
 
 export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
   const tool = ctx.manifest.id;
   const store = createStore(ctx.state);
+  /** This page, for sequence claims; its life lock tells other tabs it is open. */
+  const tabId = uid('video-tab');
+  const locks = webLocks();
+  if (locks) {
+    void locks
+      .request(tabLockName(tabId), () => new Promise<void>(() => undefined))
+      .catch(() => undefined);
+  }
 
   // --- state --------------------------------------------------------------------------------------------------
   let settings: StudioSettings = structuredClone(DEFAULT_SETTINGS);
@@ -187,8 +206,6 @@ export function setup(ctx: ToolContext): ToolInstance {
   /** Mirrors of the persisted timeline and sequence run. */
   let clips: TimelineClip[] = [];
   let run: SequenceRun | null = null;
-  /** Videos a poll downloaded, until the job is delivered to the timeline. */
-  const jobBlobs = new Map<string, Blob>();
   let runningJobs = 0;
 
   // --- models ---------------------------------------------------------------------------------------------
@@ -209,6 +226,17 @@ export function setup(ctx: ToolContext): ToolInstance {
     return result?.status === 'ready' ? result.controls : null;
   };
   const currentModel = (): string | null => ctx.model().model;
+  /** Why `model` cannot run now (missing from the video models, free-only), or null. */
+  const modelBlocked = (model: string | null): string | null => {
+    if (model === null) return 'No model is available in free-only mode.';
+    if (statusFor(model)?.status === 'missing') {
+      return `${model} is not a video generator. Choose another model.`;
+    }
+    if (ctx.settings.get().freeOnly && !ctx.models.isFree(model)) {
+      return `Free-only mode is on, and ${model} is not free.`;
+    }
+    return null;
+  };
 
   // --- estimates ------------------------------------------------------------------------------------------
   /** One clip on `model` with `format`, sending `images` images; null when unknown. */
@@ -234,23 +262,19 @@ export function setup(ctx: ToolContext): ToolInstance {
       ...(images > 0 ? { images } : {}),
     });
   };
-  /** Estimates by number of images (0 to references + 2), for the sequence planner (which is synchronous). */
-  const estimatesByImages = async (model: string, format: ClipFormat): Promise<(number | null)[]> =>
-    Promise.all(
-      Array.from({ length: VIDEO_REFERENCE_MAX + 3 }, (_, images) =>
-        estimateClip(model, format, images),
-      ),
-    );
 
   // --- media ----------------------------------------------------------------------------------------------
   const media: ClipMedia = createClipMedia({
-    download: (clip) => ctx.api.videos.content(clip.remoteId!, { keyId: clip.keyId! }),
+    download: (clip, signal) =>
+      ctx.api.videos.content(clip.remoteId!, { keyId: clip.keyId!, signal }),
     addResult: (clip, blob) => ui.addResult({ kind: 'video', name: clip.name, blob }),
     lastFrame: lastFrameDataUrl,
     onChange: (clipId) => {
       void measure(clipId);
       scheduleRender();
     },
+    // Expired on OpenRouter: recorded, so no tab offers it, joins it or downloads it again.
+    onExpired: (clip) => void saveTimeline((list) => updateClip(list, clip.id, { expired: true })),
   });
   /** Reads a clip's length once its video is here, and stores it. */
   const measuring = new Set<string>();
@@ -270,10 +294,10 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
   const clipById = (id: string | null): TimelineClip | undefined =>
     id ? clips.find((clip) => clip.id === id) : undefined;
-  /** This page has the clip's video or can download it. */
-  const obtainable = (clip: TimelineClip | undefined): boolean =>
-    !!clip &&
-    (media.blob(clip.id) !== undefined || (clip.source === 'generated' && !!clip.remoteId));
+  /** A clip on the timeline whose video this page has or can download. */
+  const usable = (clip: TimelineClip | undefined): clip is TimelineClip =>
+    !!clip && clips.some((candidate) => candidate.id === clip.id) && media.usable(clip);
+  const usableClips = (): TimelineClip[] => clips.filter((clip) => media.usable(clip));
 
   // --- persisted state ------------------------------------------------------------------------------------
   const saveTimeline = async (
@@ -282,21 +306,21 @@ export function setup(ctx: ToolContext): ToolInstance {
     clips = await store.updateTimeline(fn);
     scheduleRender();
   };
+  /** The stored run changed (here or elsewhere): mirror it, bring it into the form, say how it ended. */
+  const runChanged = (next: SequenceRun | null): void => {
+    const previous = run;
+    run = next;
+    syncFormFromRun(next);
+    if (next) noteFinish(previous, next);
+    if (next && next.status !== 'running') sequenceRunner.abortStarts();
+    scheduleRender();
+  };
   const saveSequence = async (
     fn: (current: SequenceRun | null) => SequenceRun | null,
   ): Promise<SequenceRun | null> => {
-    run = await store.updateSequence(fn);
-    scheduleRender();
-    return run;
-  };
-  /** A clip whose job this tab polled already has its video: use it instead of downloading it again. */
-  const adoptJobBlobs = (): void => {
-    for (const clip of clips) {
-      const blob = clip.jobId ? jobBlobs.get(clip.jobId) : undefined;
-      if (!blob || !clip.jobId) continue;
-      jobBlobs.delete(clip.jobId);
-      media.put(clip, blob);
-    }
+    const next = await store.updateSequence(fn);
+    runChanged(next);
+    return next;
   };
   const reloadTimeline = async (): Promise<void> => {
     const next = await store.timeline();
@@ -307,40 +331,126 @@ export function setup(ctx: ToolContext): ToolInstance {
       }
     }
     clips = next;
-    adoptJobBlobs();
     media.prefetch(clips);
     for (const clip of clips) void measure(clip.id);
     scheduleRender();
   };
   const reloadSequence = async (): Promise<void> => {
-    const previous = run;
-    run = await store.sequence();
-    if (run && run !== previous) noteFinish(previous, run);
-    scheduleRender();
+    runChanged(await store.sequence());
+  };
+  const recoverStarts = async (): Promise<void> => {
+    const all = await ctx.jobs.list({ tool }).catch(() => [] as JobRecord[]);
+    await sequenceRunner.recover(all);
   };
   ctx.bus.on('tool-state-changed', (event) => {
     if (event.tool !== tool) return;
     if (event.key === TIMELINE_KEY) void reloadTimeline();
-    if (event.key === SEQUENCE_KEY) void reloadSequence();
+    if (event.key === SEQUENCE_KEY) {
+      void reloadSequence().then(() => recoverStarts());
+    }
   });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible')
+      void recoverStarts().then(() => sequenceRunner.advance());
+  });
+
+  // --- form edits reach the stored run, field by field --------------------------------------------------------
+  /** Edits not written yet (typing), merged; written after a pause, on blur-like moments and before actions. */
+  let pending: SpecEdit = {};
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  const mergeEdit = (into: SpecEdit, edit: SpecEdit): SpecEdit => {
+    const steps = [...(into.steps ?? [])];
+    for (const step of edit.steps ?? []) {
+      const at = steps.findIndex((candidate) => candidate.id === step.id);
+      if (at >= 0) steps[at] = { ...steps[at]!, ...step };
+      else steps.push(step);
+    }
+    return {
+      ...into,
+      ...edit,
+      ...(steps.length ? { steps } : {}),
+      ...(into.stepImages || edit.stepImages
+        ? { stepImages: { ...into.stepImages, ...edit.stepImages } }
+        : {}),
+    };
+  };
+  const flushEdits = async (): Promise<void> => {
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = null;
+    const edit = pending;
+    pending = {};
+    if (Object.keys(edit).length === 0 || !run) return;
+    await saveSequence((current) => (current ? applyEditNow(current, edit) : current));
+  };
+  const applyEditNow = (current: SequenceRun, edit: SpecEdit): SequenceRun => {
+    // The steps' prompts and images are read while a step is sent: never changed under a running sequence.
+    const safe: SpecEdit =
+      current.status === 'running'
+        ? {
+            ...(edit.capUsd !== undefined ? { capUsd: edit.capUsd } : {}),
+            ...(edit.onFailure !== undefined ? { onFailure: edit.onFailure } : {}),
+            ...(edit.stepImages ? { stepImages: edit.stepImages } : {}),
+          }
+        : edit;
+    return applySpecEditTo(current, safe);
+  };
+  const applySpecEditTo = (current: SequenceRun, edit: SpecEdit): SequenceRun =>
+    Object.keys(edit).length === 0 ? current : applySpecEdit(current, edit, Date.now());
+  const queueEdit = (edit: SpecEdit, now = false): void => {
+    if (!run) return;
+    pending = mergeEdit(pending, edit);
+    if (pendingTimer) clearTimeout(pendingTimer);
+    if (now) {
+      void flushEdits().then(() => sequenceRunner.advance());
+      return;
+    }
+    pendingTimer = setTimeout(() => void flushEdits(), EDIT_DELAY_MS);
+  };
+  /**
+   * The stored run into the form: the run's values, with this tab's edits not written yet on top. An active run
+   * fixes the list's shape too; a finished one only its steps' values (the form may grow for the next Start).
+   */
+  const syncFormFromRun = (stored: SequenceRun | null): void => {
+    if (!stored) return;
+    const mine = new Map((pending.steps ?? []).map((step) => [step.id, step]));
+    const fromRun = new Map(stored.spec.steps.map((step) => [step.id, step]));
+    const own = (step: StepSpec): StepSpec => {
+      const edited = mine.get(step.id);
+      return edited ? { ...step, ...edited } : step;
+    };
+    const steps = isActive(stored)
+      ? stored.spec.steps.map(own)
+      : settings.sequence.steps.map((step) => own(fromRun.get(step.id) ?? step));
+    settings.sequence = {
+      ...(isActive(stored) ? stored.spec : settings.sequence),
+      style: pending.style ?? stored.spec.style,
+      capUsd: pending.capUsd !== undefined ? pending.capUsd : stored.spec.capUsd,
+      onFailure: pending.onFailure ?? stored.spec.onFailure,
+      steps,
+    };
+  };
 
   // --- notifications --------------------------------------------------------------------------------------
   const notifyAllowed = (): boolean =>
     ctx.options.get()['notify'] === true &&
     typeof Notification !== 'undefined' &&
     Notification.permission === 'granted';
+  /** The last sequence job delivered per run: its notification is replaced by the sequence's (never two). */
+  const lastJobOf = new Map<string, string>();
   /** A browser notification when a sequence ends while the tab is in the background. */
   const noteFinish = (before: SequenceRun | null, after: SequenceRun): void => {
     const ended = after.status === 'done' || after.status === 'stopped';
     if (!ended || before?.id !== after.id || before.status === after.status) return;
     announce(after.message ?? 'The sequence ended.');
     if (!notifyAllowed() || document.visibilityState !== 'hidden') return;
+    const job = lastJobOf.get(after.id);
     try {
       new Notification(
         `${ctx.manifest.name}: sequence ${after.status === 'done' ? 'finished' : 'stopped'}`,
         {
           body: after.message ?? '',
-          tag: `ortoolbox-sequence-${after.id}`,
+          // The same tag as the job notification of its last clip, which this one replaces.
+          tag: job ? `ortoolbox-job-${job}` : `ortoolbox-sequence-${after.id}`,
         },
       );
     } catch {
@@ -364,6 +474,51 @@ export function setup(ctx: ToolContext): ToolInstance {
     runningJobs = open.length;
     syncHold();
   };
+
+  // --- budgets: one question for a whole sequence ------------------------------------------------------------
+  /** Sequences whose steps are beginning their runs now under the Start confirmation (by run id). */
+  const preApproved = new Map<string, number>();
+  ctx.runs.setConfirmHandler((check, spec) =>
+    spec.groupId && (preApproved.get(spec.groupId) ?? 0) > 0
+      ? Promise.resolve(true)
+      : budgetConfirm(check, spec),
+  );
+  /** The Start confirmation: every rule the total crosses, the total, the cap. */
+  const confirmSequence = (
+    check: BudgetCheck,
+    total: number | null,
+    count: number,
+    cap: number | null,
+  ): Promise<boolean> =>
+    confirmDialog({
+      title: 'Start this sequence?',
+      tone: 'warning',
+      icon: 'piggy-bank',
+      confirmLabel: 'Start sequence',
+      testId: 'seq-budget-confirm',
+      message: [
+        h('p', null, 'This sequence goes over a limit you set:'),
+        h(
+          'ul',
+          { class: 'mb-3' },
+          check.reasons.map((reason) => h('li', null, reason.message)),
+        ),
+        h(
+          'p',
+          { class: 'mb-1', 'data-testid': 'seq-budget-total' },
+          total === null
+            ? `${plural(count, 'clip')}; the cost cannot be estimated.`
+            : `About ${formatUsd(total)} for ${plural(count, 'clip')}, asked once for the whole sequence.`,
+        ),
+        h(
+          'p',
+          { class: 'mb-0 small text-body-secondary' },
+          cap === null
+            ? 'No spend cap: it runs every step.'
+            : `Spend cap ${formatUsd(cap)}: it stops before a step would pass it.`,
+        ),
+      ],
+    });
 
   // --- input zone -----------------------------------------------------------------------------------------
   const tabName = uid('video-tab');
@@ -435,53 +590,38 @@ export function setup(ctx: ToolContext): ToolInstance {
     },
   });
 
-  // Edits of an active run's prompts, style, cap and failure rule reach the stored run (debounced for typing).
-  let specWrite: ReturnType<typeof setTimeout> | null = null;
-  const forwardSpec = (): void => {
-    if (!isActive(run)) return;
-    if (specWrite) clearTimeout(specWrite);
-    specWrite = setTimeout(() => {
-      specWrite = null;
-      const edited = settings.sequence;
-      void saveSequence((current) => {
-        if (!isActive(current)) return current;
-        const steps = current.spec.steps.map((step) => {
-          const live = edited.steps.find((candidate) => candidate.id === step.id);
-          return live ? { ...step, prompt: live.prompt, imageRole: live.imageRole } : step;
-        });
-        return {
-          ...current,
-          spec: {
-            ...current.spec,
-            style: edited.style,
-            capUsd: edited.capUsd,
-            onFailure: edited.onFailure,
-            steps,
-          },
-          updatedAt: Date.now(),
-        };
-      }).then(() => advance());
-    }, 400);
-  };
-
   let stepCounter = 0;
+  const stepEdit = (stepId: string): SpecEdit['steps'] => {
+    const step = settings.sequence.steps.find((candidate) => candidate.id === stepId);
+    return step ? [{ id: step.id, prompt: step.prompt, imageRole: step.imageRole }] : [];
+  };
   const sequenceForm = sequencePanel({
     ui,
     onSpec: (patch) => {
       settings.sequence = { ...settings.sequence, ...patch };
-      forwardSpec();
+      if (patch.capUsd !== undefined) queueEdit({ capUsd: patch.capUsd }, true);
+      if (patch.onFailure !== undefined) queueEdit({ onFailure: patch.onFailure }, true);
+      if (patch.style !== undefined) queueEdit({ style: patch.style });
       formChanged();
     },
     onSteps: (steps: StepSpec[]) => {
       settings.sequence = { ...settings.sequence, steps };
-      forwardSpec();
       formChanged();
     },
+    onStepEdit: (stepId) => queueEdit({ steps: stepEdit(stepId) }),
     onSource: (clipId) => {
       sequenceSourceId = clipId;
       formChanged();
     },
-    onImages: () => formChanged(),
+    onImages: (stepId) => {
+      // The stored count follows what the user set (removing images on purpose is allowed).
+      const count = sequenceForm.images(stepId)?.references().length ?? 0;
+      queueEdit({ stepImages: { [stepId]: count } }, true);
+      if (run && count === 0 && (run.stepImages[stepId] ?? 0) > 0) {
+        ui.status('That step will be sent without images.');
+      }
+      formChanged();
+    },
     newStepId: () => {
       const taken = new Set(settings.sequence.steps.map((step) => step.id));
       let id: string;
@@ -495,6 +635,19 @@ export function setup(ctx: ToolContext): ToolInstance {
     stop: () => void saveSequence((current) => (current ? stop(current, Date.now()) : current)),
     clear: () => void clearSequence(),
     rerun: (key) => void rerunSlot(key),
+    chooseSource: (key, clipId) =>
+      void answerBlocker((current) => chooseSource(current, key, clipId, Date.now())),
+    dropImages: (stepId) =>
+      void answerBlocker((current) => dropStepImages(current, stepId, Date.now())),
+    rerunPrevious: (key) => {
+      const index = run?.slots.findIndex((slot) => slot.key === key) ?? -1;
+      const previous = index > 0 ? run?.slots[index - 1] : undefined;
+      if (!previous) return;
+      void answerBlocker((current) => {
+        const again = rerun(current, previous.key, Date.now());
+        return again ? { ...again, blocker: null, status: 'running', message: null } : current;
+      });
+    },
   });
 
   const clipPane = h('div', { 'data-testid': 'video-pane-clip' }, clipForm.element);
@@ -577,11 +730,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     move: (clipId, delta) => void moveTimelineClip(clipId, delta),
     trim: (clipId, trimStart, trimEnd) => {
       const clip = clipById(clipId);
-      if (!clip) return;
-      const value = clampTrim(clip.duration, trimStart, trimEnd);
+      const value = clampTrim(clip?.duration ?? null, trimStart, trimEnd);
+      if (!clip) return value;
       clips = updateClip(clips, clipId, value);
       scheduleRender();
       void saveTimeline((list) => updateClip(list, clipId, value));
+      return value;
     },
     setIncluded: (clipId, included) => {
       clips = updateClip(clips, clipId, { included });
@@ -598,16 +752,16 @@ export function setup(ctx: ToolContext): ToolInstance {
     frames: (clipId) => {
       const clip = clipById(clipId);
       const blob = clip && media.blob(clip.id);
-      if (clip && blob) grabber.open(clip, blob);
+      if (clip && blob) {
+        void grabber.open(clip, blob, () => void timeline.focusClip(clipId, 'video-clip-frames'));
+      }
     },
     remove: (clipId) => void removeTimelineClip(clipId),
     retry: (clipId) => {
       const clip = clipById(clipId);
       if (!clip) return;
       media.retry(clipId);
-      void media.ensure(clip).catch((error: unknown) => {
-        void presentError(error, { retry: () => timeline.focusList() });
-      });
+      void media.ensure(clip).catch(() => undefined); // shown on the clip, with Try again
     },
     join: () => void joinClips(),
     stopJoin: () => joining?.abort(),
@@ -615,7 +769,8 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   const grabber = frameGrabber({
     ui,
-    capture: (blob, time) => captureFrame(blob, time),
+    frameRate: (blob) => frameRateOf(blob),
+    capture: (blob, time, fps) => captureFrame(blob, time, { fps }),
     useAsFirst: (blob, name) => useImage('first', blob, name),
     useAsLast: (blob, name) => useImage('last', blob, name),
     useAsReference: (blob, name) => useImage('references', blob, name),
@@ -647,9 +802,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     if (clip.source === 'upload') parts.push('Uploaded');
     if (clip.slotKey && run && clip.sequenceId === run.id) {
       const number = slotNumber(run, clip.slotKey);
-      if (number > 0) parts.push(`Sequence step ${number}`);
+      if (number > 0)
+        parts.push(`Sequence step ${number}${clip.attempt > 1 ? `, take ${clip.attempt}` : ''}`);
     } else if (clip.slotKey) parts.push('Sequence');
-    if (clip.continues) parts.push('Continues the clip before');
+    if (clip.staleSource) parts.push('Continued an earlier take of the clip before');
+    else if (clip.continues) parts.push('Continues the clip before');
+    if (clip.expired) parts.push('Expired on OpenRouter');
     if (!clip.included) parts.push('Left out of the join');
     return parts;
   };
@@ -673,7 +831,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       firstFrame: clipForm.first.references().length > 0,
       lastFrame: clipForm.last.references().length > 0,
       references: clipForm.references.references().length,
-      source: obtainable(source),
+      source: usable(source),
       sourceJob: source ? { remoteId: source.remoteId, model: source.model } : null,
       extendUrl: settings.extendUrl,
     };
@@ -747,32 +905,30 @@ export function setup(ctx: ToolContext): ToolInstance {
       references: 1,
       source: true,
     });
+    const sources = usableClips();
     clipForm.render({
       mode: settings.mode,
       prompt,
       extendUrl: settings.extendUrl,
       sourceId: clipSourceId,
-      clips,
+      clips: sources,
       notes,
       problem,
     });
 
-    // The sequence form.
-    const runModelControls = isActive(run) ? controlsOf(run.model) : controls;
+    // The sequence form: the run's own model decides what its steps take and whether it can resume.
+    const runModel = isActive(run) ? run.model : model;
+    const runControls = runModel ? controlsOf(runModel) : null;
     sequenceForm.render({
       spec: settings.sequence,
       run,
-      clips,
+      clips: sources,
       sourceId: sequenceSourceId,
-      lastFrame: runModelControls ? runModelControls.lastFrame : true,
+      lastFrame: runControls ? runControls.lastFrame : true,
       perStep: sequenceEstimate.perStep,
       total: sequenceEstimate.total,
-      blocked:
-        model === null
-          ? 'No model is available in free-only mode.'
-          : status?.status === 'missing'
-            ? `${model} is not a video generator. Choose another model.`
-            : null,
+      blocked: modelBlocked(model),
+      resumeBlocked: run ? modelBlocked(run.model) : null,
     });
 
     // The timeline is rebuilt only when it changed (a rebuild moves the players, which pauses them).
@@ -811,48 +967,34 @@ export function setup(ctx: ToolContext): ToolInstance {
   const refreshSequenceEstimate = async (): Promise<void> => {
     const mine = ++estimateGeneration;
     const model = currentModel();
-    const total = model ? await sequenceTotal(model) : null;
+    const total = model ? await sequenceTotal(model, settings.sequence) : null;
     if (mine !== estimateGeneration) return;
     const count = settings.sequence.steps.length * settings.sequence.repeat;
     sequenceEstimate = { total, perStep: total === null ? null : total / Math.max(1, count) };
     scheduleRender();
   };
 
-  /** Images a slot's request carries (its first frame and its step's images). */
-  const slotImages = (
-    sequence: Pick<SequenceRun, 'spec' | 'sourceClipId' | 'slots'>,
-    slot: Slot,
-    lastFrame: boolean,
-  ): number => {
-    const index = sequence.slots.findIndex((candidate) => candidate.key === slot.key);
-    const fromFrame = startsFromFrame(sequence, index);
-    const step = sequence.spec.steps.find((candidate) => candidate.id === slot.stepId);
-    const role = step ? effectiveRole(step.imageRole, fromFrame, lastFrame) : null;
-    const pictures = (step && sequenceForm.images(step.id)?.references().length) ?? 0;
-    const extra =
-      role === 'last-frame'
-        ? Math.min(1, pictures)
-        : role === 'references'
-          ? Math.min(VIDEO_REFERENCE_MAX, pictures)
-          : 0;
-    return (fromFrame ? 1 : 0) + extra;
-  };
-
-  /** The whole sequence as the form stands, on `model`. */
-  const sequenceTotal = async (model: string): Promise<number | null> => {
+  /** The whole sequence on `model`: every slot at its own estimate (null when one is unknown). */
+  const sequenceTotal = async (model: string, spec: SequenceSpec): Promise<number | null> => {
     const preview = createRun({
       id: 'preview',
-      spec: settings.sequence,
+      spec,
       model,
       format: settings.format,
-      sourceClipId: settings.sequence.mode === 'chained' ? sequenceSourceId : null,
+      sourceClipId: spec.mode === 'chained' ? sequenceSourceId : null,
       now: 0,
     });
-    const byImages = await estimatesByImages(model, settings.format);
+    const byImages = await Promise.all(
+      Array.from({ length: VIDEO_REFERENCE_MAX + 3 }, (_, images) =>
+        estimateClip(model, settings.format, images),
+      ),
+    );
     const lastFrame = controlsOf(model)?.lastFrame ?? true;
+    const pictures = (stepId: string): number =>
+      sequenceForm.images(stepId)?.references().length ?? 0;
     let total = 0;
     for (const slot of preview.slots) {
-      const estimate = byImages[slotImages(preview, slot, lastFrame)] ?? null;
+      const estimate = byImages[imagesForSlot(preview, slot, lastFrame, pictures)] ?? null;
       if (estimate === null) return null;
       total += estimate;
     }
@@ -900,6 +1042,9 @@ export function setup(ctx: ToolContext): ToolInstance {
         included: true,
         sequenceId: null,
         slotKey: null,
+        attempt: 1,
+        expired: false,
+        staleSource: false,
         createdAt: Date.now(),
       };
       media.put(clip, blob);
@@ -991,7 +1136,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     clips = [...moved];
     scheduleRender();
     const index = clips.findIndex((clip) => clip.id === clipId);
-    announce(`Moved to position ${index + 1} of ${clips.length}.`);
+    const name = clips[index]?.name ?? 'The clip';
+    announce(`Moved ${name} to position ${index + 1} of ${clips.length}.`);
     await saveTimeline((list) => moveClip(list, clipId, delta));
   };
 
@@ -1018,17 +1164,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     render();
     announce(`Removed ${clip.name}.`);
     const next = clips[index] ?? clips[index - 1];
-    const target = next
-      ? timeline.element.querySelector<HTMLElement>(
-          `[data-clip-id="${CSS.escape(next.id)}"] [data-testid="video-clip-remove"]`,
-        )
-      : null;
-    if (target) target.focus();
-    else timeline.focusList();
+    if (!next || !timeline.focusClip(next.id, 'clip-remove')) timeline.focusList();
     await saveTimeline((list) => removeClip(list, clipId));
   };
 
   // --- jobs -----------------------------------------------------------------------------------------------
+  // Polling only reads the status; the video is downloaded when the clip is delivered (and again after a reload).
   ctx.jobs.register<VideoJobPayload, VideoJobResult>(VIDEO_JOB, {
     intervalMs: (job) => pollInterval(Date.now() - job.createdAt),
     poll: async (job, signal) => {
@@ -1036,9 +1177,6 @@ export function setup(ctx: ToolContext): ToolInstance {
       const status = await ctx.api.videos.status(job.remoteId, { keyId: job.keyId, signal });
       if (!status.done) return { state: 'running', progress: null, remoteStatus: 'Generating' };
       if (status.status === 'completed') {
-        // The clip is fetched with the result, so a completed job always has its video in this tab.
-        const blob = await ctx.api.videos.content(job.remoteId, { keyId: job.keyId, signal });
-        jobBlobs.set(job.id, blob);
         return { state: 'succeeded', result: { costUsd: status.costUsd, outputs: status.outputs } };
       }
       return {
@@ -1067,14 +1205,15 @@ export function setup(ctx: ToolContext): ToolInstance {
       });
       return;
     }
-    if (job.state === 'cancelled') handle.addUsage(unknownUsage(handle.model, latencyMs));
-    await handle.fail(
-      new Error(
-        job.state === 'cancelled'
-          ? 'Stopped waiting for the video job (OpenRouter may still finish and bill it).'
-          : (job.error ?? 'The video job failed.'),
-      ),
-    );
+    if (job.state === 'cancelled') {
+      // "Stop waiting": not an error. The job may still be billed, so its reservation is booked; the run ends as
+      // aborted (a handed-off run ignores aborts here, so the next page-start sweep finalizes it).
+      handle.addUsage(unknownUsage(handle.model, latencyMs));
+      await handle.checkpoint({ meta: { stoppedWaiting: true } });
+      await handle.fail(abortError('Stopped waiting for the video job.'));
+      return;
+    }
+    await handle.fail(jobFailure(job.error ?? 'The video job failed.'));
   };
 
   /** Puts a finished job's clip on the timeline (or records its failure), once. */
@@ -1085,6 +1224,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     delivering.add(job.id);
     try {
       await settleRun(job, payload).catch((error: unknown) => console.error(error));
+      if (payload.sequenceId) lastJobOf.set(payload.sequenceId, job.id);
       if (job.state === 'succeeded') await placeClip(job, payload);
       else {
         const error =
@@ -1093,9 +1233,15 @@ export function setup(ctx: ToolContext): ToolInstance {
             : (job.error ?? 'The video job failed.');
         if (payload.sequenceId && payload.slotKey) {
           const key = payload.slotKey;
+          // A failed or abandoned job may still have been billed: its reservation counts against the cap.
           await saveSequence((current) =>
             current?.id === payload.sequenceId
-              ? markFailed(current, key, { jobId: job.id, error }, Date.now())
+              ? markFailed(
+                  current,
+                  key,
+                  { jobId: job.id, attempt: payload.attempt, error, billed: 'maybe' },
+                  Date.now(),
+                )
               : current,
           );
         } else if (job.state === 'failed') {
@@ -1110,16 +1256,15 @@ export function setup(ctx: ToolContext): ToolInstance {
         .catch(() => undefined);
     } finally {
       delivering.delete(job.id);
-      void advance();
+      void sequenceRunner.advance();
     }
   };
 
   const placeClip = async (job: JobRecord, payload: VideoJobPayload): Promise<void> => {
     const { costUsd } = parseResult(job.result);
-    const stem = stemFrom(payload.prompt);
     const draft: TimelineClip = {
       id: uid('clip'),
-      name: `${stem}-${(job.remoteId ?? job.id).slice(-6)}.mp4`,
+      name: `${stemFrom(payload.prompt)}-${(job.remoteId ?? job.id).slice(-6)}.mp4`,
       source: 'generated',
       jobId: job.id,
       remoteId: job.remoteId,
@@ -1134,56 +1279,29 @@ export function setup(ctx: ToolContext): ToolInstance {
       included: true,
       sequenceId: payload.sequenceId,
       slotKey: payload.slotKey,
+      attempt: payload.attempt,
+      expired: false,
+      staleSource: false,
       createdAt: Date.now(),
     };
+    // Clip and step in one locked step (idempotent: a repeat finds the clip and settles the step again).
     const placed = await store.transaction(async (tx) => {
-      let list = await tx.timeline();
-      const existing = list.find((clip) => clip.jobId === job.id);
-      if (existing) return existing;
-      const sequence = await tx.sequence();
-      let placement: Placement = 'end';
-      let replaced: string | null = null;
-      const inSequence =
-        sequence !== null && payload.sequenceId === sequence.id && payload.slotKey !== null;
-      if (inSequence && payload.slotKey) {
-        const slot = sequence.slots.find((candidate) => candidate.key === payload.slotKey);
-        if (slot?.clipId && list.some((clip) => clip.id === slot.clipId)) {
-          // A re-run: the new take goes where the old one was, which stays on the timeline left out.
-          placement = { before: slot.clipId };
-          replaced = slot.clipId;
-        } else {
-          placement = slotPlacement(
-            list,
-            sequence.slots.map((candidate) => candidate.key),
-            sequence.id,
-            payload.slotKey,
-          );
-        }
-      } else if (payload.after && list.some((clip) => clip.id === payload.after)) {
-        placement = { after: payload.after };
-      }
-      list = insertClip(list, draft, placement);
-      if (replaced) list = updateClip(list, replaced, { included: false });
-      await tx.setTimeline(list);
-      if (inSequence && payload.slotKey) {
-        const next = markDone(
-          sequence,
-          payload.slotKey,
-          { jobId: job.id, clipId: draft.id, costUsd },
-          Date.now(),
-        );
-        if (next !== sequence) await tx.setSequence(next);
-      }
-      return draft;
+      const stored = await tx.sequence();
+      const result = placeDelivery(
+        await tx.timeline(),
+        stored,
+        { jobId: job.id, costUsd, payload },
+        draft,
+        Date.now(),
+      );
+      await tx.setTimeline(result.clips);
+      if (result.run && result.run !== stored) await tx.setSequence(result.run);
+      return result;
     });
-    clips = await store.timeline();
-    const previous = run;
-    run = await store.sequence();
-    if (run && run !== previous) noteFinish(previous, run);
-    adoptJobBlobs();
-    const stored = clipById(placed.id) ?? placed;
-    if (!media.blob(stored.id)) void media.ensure(stored).catch(() => undefined); // shown on the clip, with Try again
-    if (!payload.sequenceId) ui.status(`Clip ready: ${placed.name}.`);
+    clips = placed.clips;
+    runChanged(placed.run ?? (await store.sequence()));
+    if (!media.blob(placed.clip.id)) void media.ensure(placed.clip).catch(() => undefined); // shown on the clip
+    if (!payload.sequenceId) ui.status(`Clip ready: ${placed.clip.name}.`);
     scheduleRender();
   };
 
@@ -1221,7 +1339,8 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   /**
    * Sends one request in `handle`'s run and queues its job; the run is handed off to the job. A request that may
-   * have reached OpenRouter is never sent again: if anything after it fails, the run books its reservation.
+   * have reached OpenRouter is never sent again: if anything after it fails, the run books its reservation and the
+   * error is marked as sent (sequence-runner.ts `billedBy`).
    */
   const submitJob = async (
     handle: RunHandle,
@@ -1246,7 +1365,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       handle.handOff(job.id);
       return job;
     } catch (error) {
-      if (submitted) handle.addUsage(unknownUsage(handle.model));
+      if (submitted) {
+        markSent(error);
+        handle.addUsage(unknownUsage(handle.model));
+      }
       await handle.fail(error);
       throw error;
     }
@@ -1262,11 +1384,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     } else if (/reference/i.test(problem)) {
       if (!clipForm.references.focus()) clipForm.prompt.focus();
     } else if (/clip to/i.test(problem)) {
-      clipForm.element.querySelector<HTMLElement>('[data-testid="video-source"]')?.focus();
+      clipForm.focusSource();
     } else clipForm.prompt.focus();
   };
 
   const generateClip = async (signal: AbortSignal): Promise<void> => {
+    // The form as it is now: what History records and what is sent, whatever changes during the awaits below.
+    const snapshot = { prompt, settings: settingsJson(settings) };
     const model = currentModel();
     if (!model) return;
     await modelsReady;
@@ -1276,8 +1400,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       return;
     }
     const controls = status?.status === 'ready' ? status.controls : null;
-    const mode = settings.mode;
-    const inputs = modeInputs();
+    const form = parseSettings(snapshot.settings);
+    const text0 = snapshot.prompt;
+    const mode = form.mode;
+    const inputs = { ...modeInputs(), prompt: text0, extendUrl: form.extendUrl };
     const problem = modeProblem(mode, controls, inputs);
     if (problem) return focusProblem(problem);
     const pickers =
@@ -1299,7 +1425,7 @@ export function setup(ctx: ToolContext): ToolInstance {
 
     const source = clipById(clipSourceId);
     const extend =
-      mode === 'extend' ? extendPlan(controls, settings.extendUrl, inputs.sourceJob) : null;
+      mode === 'extend' ? extendPlan(controls, form.extendUrl, inputs.sourceJob) : null;
     const continuing = mode === 'continue' || extend === 'continue';
     let firstFrame: string | null = null;
     let lastFrame: string | null = null;
@@ -1314,42 +1440,62 @@ export function setup(ctx: ToolContext): ToolInstance {
       ui.status('Reading the last frame of the clip…');
       firstFrame = await media.lastFrame(source);
     }
-    const text = prompt.trim() || (mode === 'continue' || mode === 'extend' ? CONTINUE_PROMPT : '');
+    const text = text0.trim() || (mode === 'continue' || mode === 'extend' ? CONTINUE_PROMPT : '');
     const built = buildVideoRequest({
       model,
       prompt: text,
-      format: settings.format,
+      format: form.format,
       controls,
       firstFrame,
       lastFrame,
       references,
-      videoUrl: extend === 'native' ? settings.extendUrl.trim() : null,
+      videoUrl: extend === 'native' ? form.extendUrl.trim() : null,
       previousJobId: extend === 'previous-job' ? (source?.remoteId ?? null) : null,
     });
-    const estimateUsd = await estimateClip(model, settings.format, built.images);
+    const estimateUsd = await estimateClip(model, form.format, built.images);
 
     // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
     const handle = await ctx.beginRun(
-      { title: shorten(text || 'Video clip', 80), estimateUsd },
+      {
+        model,
+        prompt: snapshot.prompt,
+        settings: snapshot.settings,
+        title: shorten(text || 'Video clip', 80),
+        estimateUsd,
+      },
       signal,
     );
     ui.status('Sending the request…');
     const sourceIndex = source ? clips.findIndex((clip) => clip.id === source.id) : -1;
     const label =
       mode === 'continue' || mode === 'extend'
-        ? `${mode === 'continue' ? 'Continue' : 'Extend'} clip ${sourceIndex + 1}${prompt.trim() ? `: ${shorten(prompt.trim(), 50)}` : ''}`
+        ? `${mode === 'continue' ? 'Continue' : 'Extend'} clip ${sourceIndex + 1}${text0.trim() ? `: ${shorten(text0.trim(), 50)}` : ''}`
         : shorten(text, 70);
-    await submitJob(handle, built.body, {
-      v: 1,
-      model,
-      prompt: text,
-      label,
-      after: (mode === 'continue' || mode === 'extend') && source ? source.id : null,
-      continues: continuing && firstFrame !== null,
-      sequenceId: null,
-      slotKey: null,
-      delivered: false,
-    });
+    try {
+      await submitJob(handle, built.body, {
+        v: 1,
+        model,
+        prompt: text,
+        label,
+        after: (mode === 'continue' || mode === 'extend') && source ? source.id : null,
+        continues: continuing && firstFrame !== null,
+        sequenceId: null,
+        slotKey: null,
+        attempt: 1,
+        delivered: false,
+      });
+    } catch (error) {
+      if (!isStop(error) && billedBy(error) === 'maybe') {
+        // It may have reached OpenRouter: a Retry would pay twice. Say so instead of offering one.
+        markPresented(error);
+        toast({
+          variant: 'warning',
+          message:
+            'The request may have reached OpenRouter before the connection failed, so it may be billed. It was not sent again: check the Jobs list and your OpenRouter activity before trying again.',
+        });
+      }
+      throw error;
+    }
     ui.status(
       extend === 'continue'
         ? 'Sent: continuing from the last frame. The clip joins the timeline when it is ready.'
@@ -1358,36 +1504,100 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- sequences ------------------------------------------------------------------------------------------
-  type RunArg = 'sequence';
+  const sequenceRunner = createSequenceRunner({
+    store,
+    tabId,
+    now: () => Date.now(),
+    clip: (clipId) => clipById(clipId),
+    usable: (clip) => usable(clip),
+    lastFrame: (clip) => media.lastFrame(clip),
+    controls: (model) => controlsOf(model),
+    estimate: estimateClip,
+    images: {
+      count: (stepId) => sequenceForm.images(stepId)?.references().length ?? 0,
+      problem: (stepId) => sequenceForm.images(stepId)?.problem() ?? null,
+      dataUrls: (stepId) =>
+        sequenceForm.images(stepId)?.dataUrls(IMAGE_ENCODING) ?? Promise.resolve([]),
+    },
+    beginRun: async (input, signal) => {
+      // A step under the Start confirmation begins without a dialog of its own; a Re-run asks for itself.
+      if (input.preApproved)
+        preApproved.set(input.run.id, (preApproved.get(input.run.id) ?? 0) + 1);
+      try {
+        return await ctx.beginRun(
+          {
+            model: input.run.model,
+            title: input.title,
+            prompt: '',
+            // History reopens the sequence as it was started.
+            settings: settingsJson({
+              ...DEFAULT_SETTINGS,
+              tab: 'sequence',
+              format: input.run.format,
+              sequence: input.run.spec,
+            }),
+            estimateUsd: input.estimateUsd,
+            groupId: input.run.id,
+          },
+          signal,
+        );
+      } finally {
+        if (input.preApproved) {
+          const left = (preApproved.get(input.run.id) ?? 1) - 1;
+          if (left > 0) preApproved.set(input.run.id, left);
+          else preApproved.delete(input.run.id);
+        }
+      }
+    },
+    submit: submitJob,
+    claimAlive: async (slot) => {
+      if (!slot.claimedBy) return false;
+      if (!locks) return Date.now() - (slot.claimedAt ?? 0) < CLAIM_STALE_MS;
+      return !(await lockIsFree(tabLockName(slot.claimedBy)));
+    },
+    starting: async (runId, key) => !(await lockIsFree(startLockName(runId, key))),
+    withStartLock: async (runId, key, work) => {
+      if (locks) await locks.request(startLockName(runId, key), work);
+      else await work();
+    },
+    report: (error) => void presentError(error, { retry: () => void resumeSequence() }),
+    changed: (next) => runChanged(next),
+  });
 
+  let starting = false;
   const startSequencePressed = async (): Promise<void> => {
-    const started = runner.trigger('sequence');
-    if (!started.started) {
-      ui.status(
-        runner.disabledReason ??
-          'Wait until the clip being sent is on its way, then start the sequence.',
-      );
+    if (starting) return;
+    starting = true;
+    try {
+      await startSequence();
+    } catch (error) {
+      if (!isStop(error)) void presentError(error, { retry: () => void startSequencePressed() });
+    } finally {
+      starting = false;
     }
-    await started;
   };
 
-  /** Checks the step list, stores a new run and starts its first steps. */
-  const startSequence = async (signal: AbortSignal): Promise<void> => {
+  /** Checks the step list, asks once for the whole sequence's budget, stores the run and starts its first steps. */
+  const startSequence = async (): Promise<void> => {
     const model = currentModel();
     if (!model) return;
     await modelsReady;
-    const status = statusFor(model);
-    if (status?.status === 'missing') {
-      ui.status(`${model} is not a video generator. Choose another model.`);
+    const blocked = modelBlocked(model);
+    if (blocked) {
+      ui.status(blocked);
       return;
     }
-    if (isActive(run) && run.status !== 'done') {
+    await flushEdits();
+    const stored = await store.sequence();
+    if (isActive(stored)) {
+      runChanged(stored);
       ui.status(
-        'A sequence is already under way: resume it, or start a new one with New sequence.',
+        'A sequence is under way (here or in another tab): resume it, or start over with New sequence.',
       );
       return;
     }
     const spec: SequenceSpec = structuredClone(settings.sequence);
+    const controls = controlsOf(model);
     for (const [index, step] of spec.steps.entries()) {
       const picker = sequenceForm.images(step.id);
       const issue = picker?.problem();
@@ -1396,262 +1606,120 @@ export function setup(ctx: ToolContext): ToolInstance {
         picker?.focus();
         return;
       }
-      const hasImages = (picker?.references().length ?? 0) > 0;
-      const continues = startsFromFrame({ spec, sourceClipId: sequenceSourceId }, index);
-      if (!step.prompt.trim() && !spec.style.trim() && !hasImages && !continues) {
+      const pictures = picker?.references().length ?? 0;
+      const continues = spec.mode === 'chained' && (index > 0 || sequenceSourceId !== null);
+      if (!step.prompt.trim() && !spec.style.trim() && pictures === 0 && !continues) {
         ui.status(`Step ${index + 1} needs a prompt.`);
-        sequenceForm.element
-          .querySelectorAll<HTMLElement>('[data-testid="seq-step-prompt"]')
-          [index]?.focus();
+        sequenceForm.focusStep(step.id);
+        return;
+      }
+      const role = effectiveRole(step.imageRole, continues, controls?.lastFrame ?? true);
+      if (
+        role === 'last-frame' &&
+        !continues &&
+        pictures > 0 &&
+        !LAST_FRAME_ONLY_MODELS.has(model)
+      ) {
+        ui.status(
+          `Step ${index + 1} would end on a chosen frame without starting from one, which this model is not known to take. Use reference images, or chain it from a clip.`,
+        );
+        sequenceForm.focusStep(step.id);
         return;
       }
     }
-    if (signal.aborted) return;
     const source = spec.mode === 'chained' ? clipById(sequenceSourceId) : undefined;
     const created = createRun({
       id: crypto.randomUUID(),
       spec,
       model,
       format: settings.format,
-      sourceClipId: source && obtainable(source) ? source.id : null,
+      sourceClipId: usable(source) ? source.id : null,
       stepImages: Object.fromEntries(
         spec.steps.map((step) => [step.id, sequenceForm.images(step.id)?.references().length ?? 0]),
       ),
       now: Date.now(),
     });
-    await saveSequence(() => created);
-    ui.status(`Sequence started: ${plural(created.slots.length, 'step')}.`);
-    await advance();
-  };
 
-  /**
-   * Starts whatever the plan allows (sequence.ts `plan`): claims the slots under the store's lock, then starts
-   * each. Called after every change that may let a step start (a step finished, Resume, Re-run, page load).
-   */
-  let advancing: Promise<void> | null = null;
-  let advanceAgain = false;
-  function advance(): Promise<void> {
-    if (advancing) {
-      advanceAgain = true;
-      return advancing;
+    // One budget question for the whole sequence; its steps then run without dialogs of their own.
+    const key = ctx.keys.resolve(tool);
+    if (!key) throw new NoKeyError();
+    if (!ctx.keys.lock.unlocked()) throw new KeyLockedError();
+    if (ctx.settings.get().freeOnly && !ctx.models.isFree(model)) throw new FreeOnlyError([model]);
+    const total = await sequenceTotal(model, spec);
+    const check = await ctx.budgets.check({ keyId: key.id, estimateUsd: total });
+    if (check.verdict === 'block') throw new BudgetBlockedError(check);
+    if (
+      check.verdict === 'confirm' &&
+      !(await confirmSequence(check, total, created.slots.length, spec.capUsd))
+    ) {
+      ui.status('Not started: nothing was sent.');
+      return;
     }
-    advancing = (async () => {
-      try {
-        do {
-          advanceAgain = false;
-          await advanceOnce();
-        } while (advanceAgain);
-      } catch (error) {
-        console.error(error);
-      } finally {
-        advancing = null;
-      }
-    })();
-    return advancing;
-  }
 
-  const advanceOnce = async (): Promise<void> => {
-    const stored = await store.sequence();
-    if (!stored || stored.status === 'done') return;
-    const byImages = await estimatesByImages(stored.model, stored.format);
-    await modelsReady;
-    const lastFrame = controlsOf(stored.model)?.lastFrame ?? true;
-    const before = run;
-    const claimed: string[] = [];
-    let after: SequenceRun | null = null;
-    await store.transaction(async (tx) => {
-      const current = await tx.sequence();
-      if (!current || current.id !== stored.id) return;
-      const estimateOf = (slot: Slot): number | null =>
-        byImages[slotImages(current, slot, lastFrame)] ?? null;
-      const next = plan(current, estimateOf);
-      let updated = applyStatus(current, next, Date.now());
-      for (const key of next.start) {
-        const slot = updated.slots.find((candidate) => candidate.key === key);
-        const claimedRun = slot ? claim(updated, key, estimateOf(slot), Date.now()) : null;
-        if (claimedRun) {
-          updated = claimedRun;
-          claimed.push(key);
-        }
-      }
-      if (updated !== current) await tx.setSequence(updated);
-      after = updated;
+    // Stored only if no other tab started one meanwhile.
+    const saved = await store.transaction(async (tx) => {
+      if (isActive(await tx.sequence())) return null;
+      await tx.setSequence(created);
+      return created;
     });
-    if (after) {
-      run = after;
-      noteFinish(before, after);
-      scheduleRender();
+    if (!saved) {
+      runChanged(await store.sequence());
+      ui.status('Another tab started a sequence meanwhile; nothing was started here.');
+      return;
     }
-    for (const key of claimed) void startSlot(stored.id, key);
+    pending = {};
+    runChanged(saved);
+    ui.status(`Sequence started: ${plural(saved.slots.length, 'step')}.`);
+    await sequenceRunner.advance();
   };
 
-  /** Starts one claimed slot: its first frame, its images, its run, its request and its job. */
-  const startSlot = async (runId: string, key: string): Promise<void> => {
-    const work = async (): Promise<void> => {
-      const current = await store.sequence();
-      const slot = current?.slots.find((candidate) => candidate.key === key);
-      if (!current || current.id !== runId || slot?.status !== 'starting') return;
-      const number = slotNumber(current, key);
-      const index = number - 1;
-      const step = current.spec.steps.find((candidate) => candidate.id === slot.stepId);
-      let handle: RunHandle;
-      let body: VideoRequest;
-      let continues: boolean;
-      try {
-        if (!step) throw new InvalidInputError(`Step ${number} is no longer in the list.`);
-        await modelsReady;
-        const controls = controlsOf(current.model);
-        const fromFrame = startsFromFrame(current, index);
-        const sourceId = fromFrame
-          ? chainSource(current, key, (id) => obtainable(clipById(id)))
-          : null;
-        const sourceClip = clipById(sourceId);
-        const firstFrame = sourceClip ? await media.lastFrame(sourceClip) : null;
-        continues = firstFrame !== null;
-        const role = effectiveRole(
-          step.imageRole,
-          firstFrame !== null,
-          controls?.lastFrame ?? true,
-        );
-        const picker = sequenceForm.images(step.id);
-        const issue = role ? picker?.problem() : null;
-        if (issue) throw new InvalidInputError(`Step ${number}: ${issue}`);
-        if (
-          role &&
-          (current.stepImages[step.id] ?? 0) > 0 &&
-          (picker?.references().length ?? 0) === 0
-        ) {
-          throw new InvalidInputError(
-            `Step ${number}'s images were not kept after the reload (pictures stay in memory only). Add them again, then Resume`,
-          );
-        }
-        const pictures = role && picker ? await picker.dataUrls(IMAGE_ENCODING) : [];
-        const text = stepPrompt(current.spec, step.prompt) || (firstFrame ? CONTINUE_PROMPT : '');
-        const built = buildVideoRequest({
-          model: current.model,
-          prompt: text,
-          format: current.format,
-          controls,
-          firstFrame,
-          lastFrame: role === 'last-frame' ? (pictures[0] ?? null) : null,
-          references: role === 'references' ? pictures : [],
-        });
-        if (!built.body.prompt && !built.body.frame_images && !built.body.input_references) {
-          throw new InvalidInputError(`Step ${number} needs a prompt.`);
-        }
-        body = built.body;
-        const estimateUsd = await estimateClip(current.model, current.format, built.images);
-        handle = await ctx.beginRun({
-          model: current.model,
-          title: `Sequence step ${number}: ${shorten(step.prompt.trim() || text, 60)}`,
-          prompt: '',
-          // History reopens the sequence as it was started.
-          settings: settingsJson({
-            ...DEFAULT_SETTINGS,
-            tab: 'sequence',
-            format: current.format,
-            sequence: current.spec,
-          }),
-          estimateUsd,
-          groupId: current.id,
-        });
-      } catch (error) {
-        // Nothing was sent: the step waits, and the sequence pauses with the reason.
-        const reason = isStop(error)
-          ? 'Paused: the budget confirmation was declined.'
-          : `Paused before step ${number}: ${userMessage(error).replace(/\.$/, '')}.`;
-        await saveSequence((latest) =>
-          latest?.id === runId ? releaseClaim(latest, key, reason, Date.now()) : latest,
-        );
-        if (!isStop(error)) void presentError(error, { retry: () => void resumeSequence() });
-        return;
-      }
-      try {
-        const job = await submitJob(handle, body, {
-          v: 1,
-          model: current.model,
-          prompt: body.prompt ?? '',
-          label: `Sequence step ${number}${step.prompt.trim() ? `: ${shorten(step.prompt.trim(), 50)}` : ''}`,
-          after: null,
-          continues,
-          sequenceId: runId,
-          slotKey: key,
-          delivered: false,
-        });
-        await saveSequence((latest) =>
-          latest?.id === runId
-            ? markRunning(latest, key, { jobId: job.id, runId: handle.id }, Date.now())
-            : latest,
-        );
-      } catch (error) {
-        await saveSequence((latest) =>
-          latest?.id === runId
-            ? markFailed(latest, key, { jobId: null, error: userMessage(error) }, Date.now())
-            : latest,
-        );
-        void presentError(error);
-      }
-    };
-    const locks = webLocks();
-    try {
-      if (locks) await locks.request(startLockName(runId, key), work);
-      else await work();
-    } catch (error) {
-      console.error(error);
-    }
-    void advance();
-  };
-
+  /** Writes this tab's edits first, so Resume and Re-run send what the user sees. */
   const resumeSequence = async (): Promise<void> => {
+    await flushEdits();
     await saveSequence((current) => (current ? resume(current, Date.now()) : current));
-    await advance();
+    await sequenceRunner.advance();
   };
 
   const rerunSlot = async (key: string): Promise<void> => {
+    await flushEdits();
     await saveSequence((current) =>
       current ? (rerun(current, key, Date.now()) ?? current) : current,
     );
-    await advance();
+    await sequenceRunner.advance();
+  };
+
+  const answerBlocker = async (fn: (current: SequenceRun) => SequenceRun): Promise<void> => {
+    await flushEdits();
+    await saveSequence((current) => (current?.blocker ? fn(current) : current));
+    await sequenceRunner.advance();
   };
 
   const clearSequence = async (): Promise<void> => {
-    if (run && run.slots.some((slot) => slot.status === 'pending')) {
+    const inFlight =
+      run?.slots.filter((slot) => slot.status === 'starting' || slot.status === 'running').length ??
+      0;
+    const waiting = run?.slots.filter((slot) => slot.status === 'pending').length ?? 0;
+    if (inFlight > 0 || waiting > 0) {
       const sure = await confirmDialog({
         title: 'Start a new sequence?',
-        message: 'The steps not sent yet are dropped. Clips already made stay on the timeline.',
+        message: [
+          inFlight > 0
+            ? `${plural(inFlight, 'step')} ${inFlight === 1 ? 'is' : 'are'} still being made: ${inFlight === 1 ? 'it finishes' : 'they finish'}, ${inFlight === 1 ? 'is' : 'are'} paid for and land${inFlight === 1 ? 's' : ''} on the timeline. `
+            : '',
+          waiting > 0
+            ? `${plural(waiting, 'step')} not sent yet ${waiting === 1 ? 'is' : 'are'} dropped. `
+            : '',
+          'Clips already made stay on the timeline.',
+        ].join(''),
         confirmLabel: 'New sequence',
         tone: 'warning',
         testId: 'seq-clear-confirm',
       });
       if (!sure) return;
     }
+    pending = {};
     await saveSequence(() => null);
     ui.status('Ready for a new sequence.');
-  };
-
-  /** After a reload: slots left `starting` by a closed page adopt their job, or fail and pause the sequence. */
-  const recoverStarts = async (all: readonly JobRecord[]): Promise<void> => {
-    const stored = await store.sequence();
-    if (!stored) return;
-    for (const slot of stored.slots) {
-      if (slot.status !== 'starting' || !(await lockIsFree(startLockName(stored.id, slot.key))))
-        continue;
-      const job = all.find((candidate) => {
-        const payload = parsePayload(candidate.payload);
-        return (
-          payload?.sequenceId === stored.id &&
-          payload.slotKey === slot.key &&
-          !payload.delivered &&
-          !isFinalState(candidate.state)
-        );
-      });
-      await saveSequence((current) => {
-        if (current?.id !== stored.id) return current;
-        return job?.runId
-          ? markRunning(current, slot.key, { jobId: job.id, runId: job.runId }, Date.now())
-          : abandonStart(current, slot.key, Date.now());
-      });
-    }
   };
 
   // --- joining --------------------------------------------------------------------------------------------
@@ -1672,6 +1740,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     const controller = new AbortController();
     joining = controller;
     render();
+    timeline.focusJoin('stop');
     ui.status(`Joining ${plural(parts.length, 'clip')}…`);
     const progress = (ratio: number, label: string): void => {
       // The core download goes on after a Stop (the next join uses it): it must not write over "Join stopped."
@@ -1708,8 +1777,12 @@ export function setup(ctx: ToolContext): ToolInstance {
       if (isStop(error) || controller.signal.aborted) ui.status('Join stopped.');
       else void presentError(error, { retry: () => void joinClips() });
     } finally {
+      const hadFocus =
+        document.activeElement === document.body ||
+        timeline.element.contains(document.activeElement);
       joining = null;
       render();
+      if (hadFocus) timeline.focusJoin('join');
     }
   };
 
@@ -1731,9 +1804,15 @@ export function setup(ctx: ToolContext): ToolInstance {
       resultIds: () => [handle.result.id, ...clipResults],
       testId: 'video-export-download',
     });
-    const card = h(
+    const meta = h(
+      'span',
+      { class: 'small text-body-secondary', 'data-testid': 'video-export-meta' },
+      `${plural(clipIds.length, 'clip')} · ${formatBytes(blob.size)}`,
+    );
+    const removeKey = `export-remove:${exportCount}`;
+    const card: HTMLElement = h(
       'article',
-      { class: 'card', 'data-testid': 'video-export' },
+      { class: 'card', 'data-testid': 'video-export', 'data-export-remove': removeKey },
       h(
         'div',
         { class: 'card-body d-flex flex-column gap-2' },
@@ -1741,11 +1820,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           'div',
           { class: 'd-flex flex-wrap align-items-baseline gap-2' },
           h('h4', { class: 'h6 mb-0 me-auto text-break' }, name),
-          h(
-            'span',
-            { class: 'small text-body-secondary', 'data-testid': 'video-export-meta' },
-            `${plural(clipIds.length, 'clip')} · ${formatBytes(blob.size)}`,
-          ),
+          meta,
         ),
         player.element,
         h(
@@ -1769,6 +1844,7 @@ export function setup(ctx: ToolContext): ToolInstance {
               type: 'button',
               class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
               'aria-label': `Remove ${name}`,
+              'data-focus-key': removeKey,
               'data-testid': 'video-export-remove',
               onclick: async () => {
                 if (!handle.result.downloaded) {
@@ -1780,11 +1856,22 @@ export function setup(ctx: ToolContext): ToolInstance {
                   });
                   if (!sure) return;
                 }
+                // The card focus contract: the next joined video's Remove, else the previous one's, else Join.
+                const cards = [...timeline.exports.children].filter(
+                  (candidate): candidate is HTMLElement => candidate instanceof HTMLElement,
+                );
+                const at = cards.indexOf(card);
+                const neighbour = cards[at + 1] ?? cards[at - 1];
                 player.dispose();
                 handle.remove();
                 card.remove();
                 announce(`Removed ${name}.`);
-                timeline.focusList();
+                const key = neighbour?.getAttribute('data-export-remove');
+                const target = key
+                  ? neighbour?.querySelector<HTMLElement>(`[data-focus-key="${CSS.escape(key)}"]`)
+                  : null;
+                if (target) target.focus();
+                else timeline.focusJoin('join');
               },
             },
             icon('trash'),
@@ -1796,8 +1883,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     timeline.exports.prepend(card);
     void getVideoMetadata(blob)
       .then(({ duration }) => {
-        const meta = card.querySelector('[data-testid="video-export-meta"]');
-        if (meta && duration > 0) {
+        if (duration > 0) {
           meta.textContent = `${plural(clipIds.length, 'clip')} · ${formatDuration(duration)} · ${formatBytes(blob.size)}`;
         }
       })
@@ -1805,14 +1891,21 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- runner ---------------------------------------------------------------------------------------------
+  // Generate makes one clip. Ctrl/Cmd+Enter on the Sequence tab starts the sequence instead; the error toast's
+  // Retry always repeats what failed (a clip), whatever tab is showing by then.
+  type RunArg = 'clip';
   const runner = ui.runner<RunArg>({
     label: 'Generate',
     icon: 'camera-reels',
     container: clipForm.runnerSlot,
-    run: (signal, arg) =>
-      arg === 'sequence' || settings.tab === 'sequence'
-        ? startSequence(signal)
-        : generateClip(signal),
+    replayArg: (arg) => arg ?? 'clip',
+    run: async (signal, arg) => {
+      if (arg === undefined && settings.tab === 'sequence') {
+        await startSequencePressed();
+        return;
+      }
+      await generateClip(signal);
+    },
   });
 
   // --- model changes ----------------------------------------------------------------------------------------
@@ -1837,18 +1930,25 @@ export function setup(ctx: ToolContext): ToolInstance {
   render();
   void (async () => {
     clips = await store.timeline();
-    run = await store.sequence();
-    if (isActive(run)) settings.sequence = structuredClone(run.spec);
+    const stored = await store.sequence();
+    if (stored && isActive(stored)) settings.sequence = structuredClone(stored.spec);
+    runChanged(stored);
     media.prefetch(clips);
     for (const clip of clips) void measure(clip.id);
     formChanged();
     const all = await ctx.jobs.list({ tool });
     void countJobs();
+    // Steps whose clip is already placed (the page closed between the two writes) are settled.
+    if (stored) {
+      const costOf = (jobId: string): number | null =>
+        parseResult(all.find((job) => job.id === jobId)?.result).costUsd;
+      await saveSequence((current) => (current ? repairSlots(current, clips, costOf) : current));
+    }
     for (const job of all) {
       if (job.type === VIDEO_JOB && isFinalState(job.state)) void deliver(job);
     }
-    await recoverStarts(all);
-    await advance();
+    await sequenceRunner.recover(all);
+    await sequenceRunner.advance();
   })().catch((error: unknown) => void presentError(error));
 
   // --- instance -------------------------------------------------------------------------------------------
@@ -1863,7 +1963,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     applyState: ({ prompt: text, settings: saved }) => applySettings(parseSettings(saved), text),
     estimate: async (model) => {
       await modelsReady;
-      if (settings.tab === 'sequence') return sequenceTotal(model);
+      if (settings.tab === 'sequence') return sequenceTotal(model, settings.sequence);
       return estimateClip(model, settings.format, clipImages(controlsOf(model)));
     },
     onFiles: (files) => takeFiles(files),

@@ -9,7 +9,8 @@
 import { emptyState } from '../../ui/components/empty-state';
 import { progressBar } from '../../ui/components/progress-bar';
 import { videoPlayer } from '../../ui/components/video-player';
-import { h, replace } from '../../ui/dom';
+import { focusKey, h, replace } from '../../ui/dom';
+import { announce } from '../../ui/feedback/announce';
 import { formatDuration, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
@@ -23,7 +24,8 @@ export interface TimelinePanelHost {
   /** "Step 3", "Uploaded", "Continues clip 2"… */
   describe(clip: TimelineClip): string[];
   move(clipId: string, delta: number): void;
-  trim(clipId: string, trimStart: number, trimEnd: number): void;
+  /** Stores the trims; returns what was stored (clamped to leave part of the clip). */
+  trim(clipId: string, trimStart: number, trimEnd: number): { trimStart: number; trimEnd: number };
   setIncluded(clipId: string, included: boolean): void;
   setDropFirstFrame(clipId: string, drop: boolean): void;
   continueFrom(clipId: string): void;
@@ -43,6 +45,10 @@ export interface TimelinePanel {
   /** The join's progress (0 to 1) and label. */
   progress(ratio: number, label: string): void;
   focusList(): void;
+  /** Focus on the join's Stop (while it runs) or its Join button. */
+  focusJoin(which: 'join' | 'stop'): void;
+  /** A clip's control by its focus key prefix (`video-clip-frames`, `clip-remove`…); false when it is gone. */
+  focusClip(clipId: string, control: string): boolean;
 }
 
 const seconds = (value: number): string => (Math.round(value * 100) / 100).toString();
@@ -127,9 +133,20 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
     exports,
   );
 
+  /**
+   * A trim field. It always shows the stored value: one the clip cannot take is clamped, and the field says so
+   * (`aria-invalid` and a note) until the next valid entry.
+   */
   const trimField = (clip: TimelineClip, which: 'start' | 'end', label: string): HTMLElement => {
     const id = uid(`trim-${which}`);
+    const noteId = uid(`trim-${which}-note`);
     const max = clip.duration ? Math.max(0, clip.duration - 0.1) : undefined;
+    const note = h('div', {
+      id: noteId,
+      class: 'form-text text-warning-emphasis mt-1',
+      hidden: true,
+      'data-testid': `video-trim-${which}-note`,
+    });
     const input = h('input', {
       id,
       type: 'number',
@@ -139,28 +156,47 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
       step: '0.05',
       inputMode: 'decimal',
       value: seconds(which === 'start' ? clip.trimStart : clip.trimEnd),
+      'aria-describedby': noteId,
       'data-focus-key': `trim-${which}:${clip.id}`,
       'data-testid': `video-trim-${which}`,
       onchange: () => {
         const value = Number(input.value);
-        const next = Number.isFinite(value) ? value : 0;
-        host.trim(
+        const asked = input.value.trim() === '' || !Number.isFinite(value) ? 0 : value;
+        const stored = host.trim(
           clip.id,
-          which === 'start' ? next : clip.trimStart,
-          which === 'end' ? next : clip.trimEnd,
+          which === 'start' ? asked : clip.trimStart,
+          which === 'end' ? asked : clip.trimEnd,
         );
+        const kept = which === 'start' ? stored.trimStart : stored.trimEnd;
+        input.value = seconds(kept);
+        const clamped = Math.abs(kept - asked) > 0.0005;
+        input.setAttribute('aria-invalid', String(clamped));
+        input.classList.toggle('is-invalid', clamped);
+        note.hidden = !clamped;
+        note.textContent = !clamped
+          ? ''
+          : asked < kept
+            ? 'A trim cannot be negative: 0 s is used.'
+            : `${seconds(kept)} s is the most this trim can be: at least 0.1 s of the clip stays.`;
+        if (clamped) announce(note.textContent);
       },
     });
     return h(
       'div',
       { class: 'col-6' },
-      h('label', { class: 'form-label small mb-1', htmlFor: id }, label),
+      h(
+        'label',
+        { class: 'form-label small mb-1', htmlFor: id },
+        label,
+        h('span', { class: 'visually-hidden' }, ` of ${clip.name}, in seconds`),
+      ),
       h(
         'div',
-        { class: 'input-group input-group-sm' },
+        { class: 'input-group input-group-sm has-validation' },
         input,
-        h('span', { class: 'input-group-text' }, 's'),
+        h('span', { class: 'input-group-text', 'aria-hidden': 'true' }, 's'),
       ),
+      note,
     );
   };
 
@@ -189,6 +225,10 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
     );
   };
 
+  /**
+   * A clip's button. `disabled` takes it out of the tab order; `unavailable` (the reorder buttons at the ends)
+   * keeps it focusable with `aria-disabled`, so focus stays on it after a move, and says why on a press.
+   */
   const action = (
     clip: TimelineClip,
     label: string,
@@ -196,18 +236,25 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
     testId: string,
     ariaLabel: string,
     onclick: () => void,
-    disabled = false,
+    options: { disabled?: boolean; unavailable?: string | null } = {},
   ): HTMLButtonElement =>
     h(
       'button',
       {
         type: 'button',
-        class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
+        class: [
+          'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
+          options.unavailable && 'disabled',
+        ],
         'aria-label': ariaLabel,
-        disabled,
+        'aria-disabled': options.unavailable ? 'true' : null,
+        disabled: options.disabled ?? false,
         'data-focus-key': `${testId}:${clip.id}`,
         'data-testid': testId,
-        onclick,
+        onclick: () => {
+          if (options.unavailable) announce(options.unavailable);
+          else onclick();
+        },
       },
       icon(glyph),
       label,
@@ -334,18 +381,18 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
             'Up',
             'arrow-up',
             'video-clip-up',
-            `Move ${title} up`,
+            `Move ${clip.name} up`,
             () => host.move(clip.id, -1),
-            index === 0,
+            { unavailable: index === 0 ? `${clip.name} is already first.` : null },
           ),
           action(
             clip,
             'Down',
             'arrow-down',
             'video-clip-down',
-            `Move ${title} down`,
+            `Move ${clip.name} down`,
             () => host.move(clip.id, 1),
-            index === count - 1,
+            { unavailable: index === count - 1 ? `${clip.name} is already last.` : null },
           ),
           action(
             clip,
@@ -354,7 +401,7 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
             'video-clip-continue',
             `Continue ${title} from its last frame`,
             () => host.continueFrom(clip.id),
-            !ready,
+            { disabled: !ready },
           ),
           action(
             clip,
@@ -371,7 +418,7 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
             'video-clip-frames',
             `Grab frames from ${title}`,
             () => host.frames(clip.id),
-            !ready,
+            { disabled: !ready },
           ),
           host.downloadButton(clip),
           h(
@@ -391,6 +438,11 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
       ),
     );
     return item;
+  };
+
+  const focusList = (): void => {
+    const target = list.querySelector<HTMLElement>('button:not(:disabled)') ?? empty;
+    target.focus();
   };
 
   return {
@@ -426,9 +478,14 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
     progress(ratio, label) {
       bar.update(Math.round(Math.min(1, Math.max(0, ratio)) * 100), 100, label);
     },
-    focusList() {
-      const target = list.querySelector<HTMLElement>('button:not(:disabled)') ?? empty;
-      target.focus();
+    focusList,
+    focusJoin(which) {
+      const target = which === 'stop' ? stopButton : joinButton;
+      if (!target.hidden && !target.disabled) target.focus();
+      else if (which === 'join') focusList();
+    },
+    focusClip(clipId, control) {
+      return focusKey(list, `${control}:${clipId}`);
     },
   };
 }

@@ -6,7 +6,12 @@
  *
  * Step rows keep their elements across renders (their image pickers hold the pictures), so typing, focus and
  * images survive every update. While a run is active the list's shape (steps, order, mode, repeats) is fixed;
- * prompts, style, cap and the failure rule stay editable and apply to the steps not sent yet.
+ * while it is running, prompts, image roles and the style are read-only too (a step being sent reads them), and
+ * the cap and the failure rule stay editable. A paused, stopped or finished run takes edits again; they reach the
+ * stored run before Resume or Re-run.
+ *
+ * When the run waits for a decision (`blocker`), the panel offers the ways on: continue another clip, send the
+ * step without a first frame or re-run the step before (a lost clip to continue), or send it without its images.
  */
 import { referencePicker, type ReferencePicker } from '../../ui/components/reference-picker';
 import { h, replace } from '../../ui/dom';
@@ -17,17 +22,19 @@ import type { ToolUi } from '../../ui/tool/types';
 import { fillClipOptions } from './clip-panel';
 import { VIDEO_REFERENCE_MAX } from './params';
 import {
+  effectiveRole,
   type FailurePolicy,
   type ImageRole,
   isActive,
   MAX_REPEAT,
   MAX_STEPS,
+  moneyText,
   type SequenceMode,
   type SequenceRun,
   type SequenceSpec,
   type Slot,
+  spentIsEstimate,
   spentUsd,
-  startsFromFrame,
   type StepSpec,
 } from './sequence';
 import type { TimelineClip } from './timeline';
@@ -38,6 +45,8 @@ export interface SequencePanelHost {
   ui: Pick<ToolUi, 'status'>;
   onSpec(patch: Partial<Omit<SequenceSpec, 'steps'>>): void;
   onSteps(steps: StepSpec[]): void;
+  /** A step prompt or image role was edited (to write to the stored run). */
+  onStepEdit(stepId: string): void;
   onSource(clipId: string | null): void;
   onImages(stepId: string): void;
   newStepId(): string;
@@ -47,11 +56,16 @@ export interface SequencePanelHost {
   stop(): void;
   clear(): void;
   rerun(slotKey: string): void;
+  /** Blocker answers: continue `clipId` (null: no first frame), drop a step's images, re-run the step before. */
+  chooseSource(slotKey: string, clipId: string | null): void;
+  dropImages(stepId: string): void;
+  rerunPrevious(slotKey: string): void;
 }
 
 export interface SequenceView {
   spec: SequenceSpec;
   run: SequenceRun | null;
+  /** Clips that can be continued (usable here), for the source and the blocker's choice. */
   clips: readonly TimelineClip[];
   sourceId: string | null;
   /** The model can end a clip on a chosen frame. */
@@ -60,6 +74,8 @@ export interface SequenceView {
   total: number | null;
   /** Start is unavailable (with the reason), e.g. no model. */
   blocked: string | null;
+  /** Resume is unavailable (with the reason): checked against the run's own model. */
+  resumeBlocked: string | null;
 }
 
 export interface SequencePanel {
@@ -68,6 +84,8 @@ export interface SequencePanel {
   readonly formatSlot: HTMLElement;
   /** The image picker of a step (its pictures are memory-only). */
   images(stepId: string): ReferencePicker | undefined;
+  /** Moves focus to a step's prompt. */
+  focusStep(stepId: string): void;
   render(view: SequenceView): void;
 }
 
@@ -100,17 +118,6 @@ const STATUS_BADGE: Record<Slot['status'], string> = {
   done: 'text-bg-success',
   failed: 'text-bg-danger',
 };
-
-/** What a step's images do in a run: references cannot go with a first frame (frames win). */
-export function effectiveRole(
-  role: ImageRole,
-  fromFrame: boolean,
-  lastFrame: boolean,
-): ImageRole | null {
-  if (fromFrame) return lastFrame ? 'last-frame' : null;
-  if (role === 'last-frame' && !lastFrame) return 'references';
-  return role;
-}
 
 export function sequencePanel(host: SequencePanelHost): SequencePanel {
   const ids = {
@@ -237,6 +244,7 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
       'data-testid': 'seq-step-prompt',
       oninput: () => {
         host.onSteps(steps().map((s) => (s.id === step.id ? { ...s, prompt: prompt.value } : s)));
+        host.onStepEdit(step.id);
       },
     });
     const role = h(
@@ -248,6 +256,7 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
         onchange: () => {
           const value: ImageRole = role.value === 'last-frame' ? 'last-frame' : 'references';
           host.onSteps(steps().map((s) => (s.id === step.id ? { ...s, imageRole: value } : s)));
+          host.onStepEdit(step.id);
         },
       },
       h('option', { value: 'references' }, 'Reference images (style or content)'),
@@ -438,6 +447,13 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
     'data-testid': 'seq-spent',
   });
   const formatSlot = h('div');
+  const blockerBox = h('div', {
+    class: 'alert alert-warning d-flex flex-column gap-2 mb-0',
+    role: 'group',
+    hidden: true,
+    'data-testid': 'seq-blocker',
+  });
+  const blockerSourceId = uid('seq-blocker-source');
 
   const element = h(
     'div',
@@ -489,9 +505,111 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
     estimate,
     controls,
     message,
+    blockerBox,
     spent,
     progress,
   );
+
+  const smallButton = (
+    label: string,
+    testId: string,
+    key: string,
+    onclick: () => void,
+    variant = 'btn-outline-secondary',
+  ) =>
+    h(
+      'button',
+      {
+        type: 'button',
+        class: `btn btn-sm ${variant}`,
+        'data-focus-key': key,
+        'data-testid': testId,
+        onclick,
+      },
+      label,
+    );
+
+  /** The ways on from a blocked step. */
+  const blockerChoices = (
+    run: SequenceRun,
+    clips: readonly TimelineClip[],
+  ): (HTMLElement | null)[] => {
+    const blocker = run.blocker;
+    if (!blocker) return [];
+    const index = run.slots.findIndex((slot) => slot.key === blocker.slotKey);
+    const slot = run.slots[index];
+    if (!slot) return [];
+    if (blocker.kind === 'images-lost') {
+      return [
+        h('div', null, blocker.message),
+        h(
+          'div',
+          { class: 'd-flex flex-wrap gap-2' },
+          smallButton(
+            'Send it without its images',
+            'seq-blocker-drop-images',
+            `blocker-drop:${slot.key}`,
+            () => host.dropImages(slot.stepId),
+          ),
+        ),
+      ];
+    }
+    const choose = h('select', {
+      id: blockerSourceId,
+      class: 'form-select form-select-sm w-auto',
+      'data-focus-key': `blocker-source:${slot.key}`,
+      'data-testid': 'seq-blocker-source',
+    });
+    fillClipOptions(choose, clips, 'Choose a clip…');
+    const previous = run.slots[index - 1];
+    const canRerunPrevious =
+      previous !== undefined && (previous.status === 'done' || previous.status === 'failed');
+    return [
+      h('div', null, blocker.message),
+      clips.length > 0
+        ? h(
+            'div',
+            { class: 'd-flex flex-wrap align-items-center gap-2' },
+            h(
+              'label',
+              { class: 'small', htmlFor: blockerSourceId },
+              'Continue from an earlier clip',
+            ),
+            choose,
+            smallButton(
+              'Continue from it',
+              'seq-blocker-continue',
+              `blocker-continue:${slot.key}`,
+              () => {
+                if (choose.value) host.chooseSource(slot.key, choose.value);
+                else {
+                  host.ui.status('Choose the clip to continue first.');
+                  choose.focus();
+                }
+              },
+            ),
+          )
+        : null,
+      h(
+        'div',
+        { class: 'd-flex flex-wrap gap-2' },
+        smallButton(
+          'Send without a first frame',
+          'seq-blocker-no-frame',
+          `blocker-no-frame:${slot.key}`,
+          () => host.chooseSource(slot.key, null),
+        ),
+        canRerunPrevious
+          ? smallButton(
+              'Re-run the previous step',
+              'seq-blocker-rerun-previous',
+              `blocker-rerun:${slot.key}`,
+              () => host.rerunPrevious(slot.key),
+            )
+          : null,
+      ),
+    ];
+  };
 
   const slotRow = (run: SequenceRun, slot: Slot): HTMLElement => {
     const step = run.spec.steps.findIndex((candidate) => candidate.id === slot.stepId);
@@ -515,10 +633,21 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
         ? h('span', { class: 'small text-body-secondary' }, `take ${slot.attempt}`)
         : null,
       slot.spentUsd > 0
-        ? h('span', { class: 'small text-body-secondary' }, formatUsd(slot.spentUsd))
+        ? h(
+            'span',
+            { class: 'small text-body-secondary' },
+            moneyText(slot.spentUsd, slot.spentEstimated),
+          )
         : slot.estimateUsd !== null && (slot.status === 'starting' || slot.status === 'running')
           ? h('span', { class: 'small text-body-secondary' }, formatEstimate(slot.estimateUsd))
           : null,
+      slot.stale
+        ? h(
+            'span',
+            { class: 'small text-warning-emphasis', 'data-testid': 'seq-slot-stale' },
+            'Made from the old take of the step before: re-run it to continue the new one',
+          )
+        : null,
       canRerun
         ? h(
             'button',
@@ -550,6 +679,8 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
     const { spec, run } = next;
     const active = isActive(run);
     const running = run?.status === 'running';
+    // A running sequence reads its steps as it sends them: they are read-only until it pauses or ends.
+    const locked = running;
     // Shape is fixed while a run is active.
     chained.input.checked = spec.mode === 'chained';
     independent.input.checked = spec.mode === 'independent';
@@ -583,16 +714,15 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
       if (document.activeElement !== row.prompt && row.prompt.value !== step.prompt)
         row.prompt.value = step.prompt;
       row.prompt.setAttribute('aria-label', `Step ${index + 1} prompt`);
-      const fromFrame = startsFromFrame(
-        { spec, sourceClipId: fromSource ? sourceId : null },
-        index,
-      );
+      row.prompt.readOnly = locked;
+      const fromFrame = spec.mode === 'chained' && (index > 0 || fromSource);
       const role = effectiveRole(step.imageRole, fromFrame, next.lastFrame);
       row.role.value = role ?? step.imageRole;
       const referencesOption = row.role.options[0]!;
       const lastOption = row.role.options[1]!;
       referencesOption.disabled = fromFrame;
       lastOption.disabled = !next.lastFrame;
+      row.role.disabled = locked;
       row.roleField.hidden = role === null;
       row.pickerSlot.hidden = role === null;
       row.picker.setLimits({
@@ -603,7 +733,9 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
           ? 'This step starts from the last frame of the clip before it, and this model cannot end on a chosen frame, so it takes no images.'
           : fromFrame
             ? 'Starts from the last frame of the clip before it. Reference images cannot go with a frame, so only a last frame can be added.'
-            : '';
+            : role === 'last-frame'
+              ? 'A last frame alone is not sent: this step starts from no frame. Use reference images, or chain it from a clip.'
+              : '';
       row.up.disabled = active || index === 0;
       row.down.disabled = active || index === spec.steps.length - 1;
       row.remove.disabled = active || spec.steps.length === 1;
@@ -614,6 +746,7 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
     addStep.disabled = active || spec.steps.length >= MAX_STEPS;
 
     if (document.activeElement !== style && style.value !== spec.style) style.value = spec.style;
+    style.readOnly = locked;
     if (document.activeElement !== repeat) repeat.value = String(spec.repeat);
     repeat.disabled = active;
     if (document.activeElement !== cap) cap.value = spec.capUsd === null ? '' : String(spec.capUsd);
@@ -633,8 +766,8 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
     stopButton.hidden = !(running || run?.status === 'paused');
     clearButton.hidden = !run || running;
     startButton.disabled = next.blocked !== null;
-    resumeButton.disabled = next.blocked !== null;
-    blockedNote.textContent = next.blocked ?? '';
+    resumeButton.disabled = next.resumeBlocked !== null;
+    blockedNote.textContent = (active ? next.resumeBlocked : next.blocked) ?? '';
     const focused = document.activeElement;
     if (
       hadFocus &&
@@ -645,21 +778,32 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
         ?.focus();
     }
 
-    message.textContent = run?.message ?? '';
+    // A blocked run shows its message with the ways on; any other message on its own.
+    message.textContent = run?.blocker ? '' : (run?.message ?? '');
     message.className = [
       'small empty-hidden',
       run?.status === 'stopped' ? 'text-danger-emphasis' : 'text-body-secondary',
     ].join(' ');
+    const blockerKey = run?.blocker
+      ? JSON.stringify([run.blocker, next.clips.map((clip) => clip.id)])
+      : '';
+    if (blockerKey !== renderedBlocker) {
+      renderedBlocker = blockerKey;
+      replace(blockerBox, run ? blockerChoices(run, next.clips) : null);
+    }
+    blockerBox.hidden = !run?.blocker;
     spent.textContent = run
-      ? `Spent so far: ${formatUsd(spentUsd(run))}${run.spec.capUsd !== null ? ` of a ${formatUsd(run.spec.capUsd)} cap` : ''}.`
+      ? `Spent so far: ${moneyText(spentUsd(run), spentIsEstimate(run))}${run.spec.capUsd !== null ? ` of a ${formatUsd(run.spec.capUsd)} cap` : ''}.`
       : '';
     replace(progress, run ? run.slots.map((slot) => slotRow(run, slot)) : null);
   };
+  let renderedBlocker = '';
 
   return {
     element,
     formatSlot,
     images: (stepId) => rows.get(stepId)?.picker,
+    focusStep: (stepId) => rows.get(stepId)?.prompt.focus(),
     render,
   };
 }

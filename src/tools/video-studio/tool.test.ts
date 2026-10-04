@@ -6,7 +6,9 @@ import type { RawVideoModel, VideoJobStatus, VideoRequest } from '../../core/api
 import type * as Media from '../../core/media/image';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient } from '../../core/types';
+import { NetworkError } from '../../core/errors';
 import type * as Errors from '../../ui/feedback/errors';
+import { presentError } from '../../ui/feedback/errors';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
 import { DEFAULT_SETTINGS, settingsJson } from './params';
@@ -243,5 +245,112 @@ describe('Video studio', () => {
     await t.runners[0]!.trigger();
     expect(t.status()).toBe('Choose or upload the clip to continue.');
     expect(submits).toEqual([]);
+  });
+
+  it('records the form as it was when Generate was pressed, whatever changes while it is sent', async () => {
+    let release!: () => void;
+    const tool = await mount({
+      videos: {
+        submit: async (body) => {
+          submits.push(body);
+          await new Promise<void>((resolve) => (release = resolve));
+          return { ...completed('gen-vid-1-00000000000000000001'), status: 'pending', done: false };
+        },
+        status: (id) => Promise.resolve(completed(id)),
+        content: () => Promise.resolve(new Blob(['mp4'], { type: 'video/mp4' })),
+      },
+    });
+    const pressed = {
+      prompt: 'A boat at dawn',
+      settings: settingsJson({
+        ...DEFAULT_SETTINGS,
+        format: { ...DEFAULT_SETTINGS.format, duration: 1 },
+      }),
+    };
+    tool.applyState(pressed);
+    const run = t.runners[0]!.trigger();
+    await vi.waitFor(() => expect(submits).toHaveLength(1));
+    // The user edits the form while the request is on its way.
+    tool.applyState({
+      prompt: 'Something else',
+      settings: settingsJson({ ...DEFAULT_SETTINGS, mode: 'references' }),
+    });
+    release();
+    await run;
+    const [record] = await t.core.history.query({ tool: 'video-studio' });
+    expect(record?.prompt).toBe('A boat at dawn');
+    expect(record?.settings).toEqual(pressed.settings);
+    expect(record?.model).toBe(GROK);
+  });
+
+  it('never resends a request that may have reached OpenRouter, and says so instead of offering Retry', async () => {
+    const failure = new NetworkError();
+    const tool = await mount({
+      videos: {
+        submit: (body) => {
+          submits.push(body);
+          return Promise.reject(failure);
+        },
+        status: (id) => Promise.resolve(completed(id)),
+        content: () => Promise.resolve(new Blob(['mp4'])),
+      },
+    });
+    tool.applyState({
+      prompt: 'A boat',
+      settings: settingsJson({
+        ...DEFAULT_SETTINGS,
+        format: { ...DEFAULT_SETTINGS.format, duration: 1 },
+      }),
+    });
+    vi.mocked(presentError).mockClear();
+    await t.runners[0]!.trigger();
+    expect(submits).toHaveLength(1);
+    // Explained once (a toast) instead of an error with a Retry that would send it again.
+    expect(document.body.textContent).toContain('may have reached OpenRouter');
+    expect(vi.mocked(presentError).mock.calls.map((call) => call[0])).toEqual([failure]);
+    // (The real API client reports a lost paid request as an unknown cost, so the run books its reservation.)
+    const [record] = await t.core.history.query({ tool: 'video-studio' });
+    expect(record?.status).toBe('error');
+  });
+
+  it("writes only this tab's edits over a stored run: a cap lowered elsewhere stays, and the form follows it", async () => {
+    const { createRun } = await import('./sequence');
+    const { SEQUENCE_KEY } = await import('./store');
+    const tool = await mount();
+    const stored = {
+      ...createRun({
+        id: 'seq',
+        spec: {
+          ...DEFAULT_SETTINGS.sequence,
+          capUsd: 0.5,
+          steps: [{ id: 'a', prompt: 'One', imageRole: 'references' as const }],
+        },
+        model: GROK,
+        format: DEFAULT_SETTINGS.format,
+        sourceClipId: null,
+        now: 1,
+      }),
+      status: 'paused' as const,
+    };
+    await t.ctx.state.set(SEQUENCE_KEY, stored);
+    await vi.waitFor(() =>
+      expect((tool.getState().settings['sequence'] as { capUsd: number }).capUsd).toBe(0.5),
+    );
+    // Another tab lowers the cap; this tab's form follows.
+    await t.ctx.state.set(SEQUENCE_KEY, { ...stored, spec: { ...stored.spec, capUsd: 0.1 } });
+    await vi.waitFor(() =>
+      expect((tool.getState().settings['sequence'] as { capUsd: number }).capUsd).toBe(0.1),
+    );
+    // This tab edits a prompt: only the prompt is written.
+    const prompt = $<HTMLTextAreaElement>('seq-step-prompt');
+    prompt.value = 'One, better';
+    prompt.dispatchEvent(new Event('input'));
+    await vi.waitFor(async () => {
+      const now = await t.ctx.state.get<{ spec: { capUsd: number; steps: { prompt: string }[] } }>(
+        SEQUENCE_KEY,
+      );
+      expect(now?.spec.steps[0]?.prompt).toBe('One, better');
+      expect(now?.spec.capUsd).toBe(0.1);
+    });
   });
 });
