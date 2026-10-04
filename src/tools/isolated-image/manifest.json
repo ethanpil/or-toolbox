@@ -13,7 +13,13 @@
     "size": 2000,
     "margin": 0.08,
     "whiteThreshold": 245,
+    "sharpen": true,
+    "sharpenAmount": 0.5,
+    "shadow": false,
     "format": "jpg",
-    "jpegQuality": 92
+    "jpegQuality": 92,
+    "filenamePattern": "{name}-white.{ext}",
+    "sendSize": 1024,
+    "concurrency": 2
   }
 }
