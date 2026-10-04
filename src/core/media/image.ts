@@ -6,10 +6,12 @@
  * - **Pixel algorithms** on a plain `RasterImage` (`{ width, height, data }`,
  *   RGBA, 4 bytes per pixel, row-major). They need no DOM, so they run and are
  *   unit-tested in Node: bounding box, padding to a square, the white
- *   flood fill, unsharp mask, the isolated-image QA check, mask overlays.
- * - **Canvas wrappers** (`loadImage`, `imageDataFrom`, `toBlob`, `resizeCanvas`,
- *   `cropCanvas`, `toDataUrl`) that move pixels between Blobs, bitmaps and
- *   `RasterImage`. They need a browser and are covered by tests/e2e/media/.
+ *   flood fill, unsharp mask, the isolated-image QA check, mask overlays, the
+ *   mask feather and composite.
+ * - **Canvas wrappers** (`loadImage`, `readImageSize`, `imageDataFrom`, `toBlob`,
+ *   `resizeCanvas`, `cropCanvas`, `toDataUrl`, `toDataUrls`) that move pixels
+ *   between Blobs, bitmaps and `RasterImage`. They need a browser and are
+ *   covered by tests/e2e/media/.
  *
  * Memory: a `RasterImage` costs width x height x 4 bytes (a 2000 x 2000 image
  * is 16 MB), and most algorithms here return a new one instead of editing in
@@ -17,6 +19,7 @@
  */
 import { InvalidInputError } from '../errors';
 import { readAsDataUrl } from '../files';
+import { readImageHeader } from './image-header';
 
 // --- types ------------------------------------------------------------------
 
@@ -621,6 +624,96 @@ export function maskToRaster(mask: Mask): RasterImage {
   return { width: mask.width, height: mask.height, data };
 }
 
+/** One box-blur pass of `radius` along rows (`horizontal`) or columns, edges clamped. */
+function boxBlur(
+  source: Float32Array,
+  target: Float32Array,
+  width: number,
+  height: number,
+  radius: number,
+  horizontal: boolean,
+): void {
+  const lines = horizontal ? height : width;
+  const length = horizontal ? width : height;
+  const at = (line: number, i: number): number =>
+    horizontal ? line * width + i : i * width + line;
+  const size = radius * 2 + 1;
+  for (let line = 0; line < lines; line++) {
+    let sum = 0;
+    for (let k = -radius; k <= radius; k++) {
+      sum += source[at(line, Math.min(length - 1, Math.max(0, k)))] ?? 0;
+    }
+    for (let i = 0; i < length; i++) {
+      target[at(line, i)] = sum / size;
+      const out = Math.max(0, i - radius);
+      const into = Math.min(length - 1, i + radius + 1);
+      sum += (source[at(line, into)] ?? 0) - (source[at(line, out)] ?? 0);
+    }
+  }
+}
+
+/**
+ * The mask with a soft inner edge, for compositing: a box blur of `radius` pixels, then never more than the
+ * mask itself. Outside the mask it stays 0 (the original is kept exactly); deeper than `radius` inside it is
+ * 255 (the result is taken exactly); the band between blends. Returns a new mask. In a worker:
+ * `featherInsideAsync` (image-async.ts).
+ */
+export function featherInside(mask: Mask, radius: number): Mask {
+  const r = Math.max(0, Math.round(radius));
+  const { width, height } = mask;
+  const out: Mask = { width, height, data: new Uint8Array(width * height) };
+  if (r === 0) {
+    out.data.set(mask.data);
+    return out;
+  }
+  const a = Float32Array.from(mask.data);
+  const b = new Float32Array(a.length);
+  boxBlur(a, b, width, height, r, true);
+  boxBlur(b, a, width, height, r, false);
+  for (let i = 0; i < out.data.length; i++) {
+    out.data[i] = Math.min(mask.data[i] ?? 0, Math.round(a[i] ?? 0));
+  }
+  return out;
+}
+
+/**
+ * The result inside the mask, the original outside: `alpha` 0 copies the original pixel exactly, 255 the
+ * result pixel exactly, values between blend. All three must be the same size. In a worker, with the feather
+ * done there too: `compositeMaskedAsync` (image-async.ts).
+ */
+export function compositeMasked(
+  original: RasterImage,
+  result: RasterImage,
+  alpha: Mask,
+): RasterImage {
+  if (
+    original.width !== result.width ||
+    original.height !== result.height ||
+    alpha.width !== original.width ||
+    alpha.height !== original.height
+  ) {
+    throw new RangeError('The image, the result and the mask must be the same size.');
+  }
+  const out = new Uint8ClampedArray(original.data);
+  for (let p = 0; p < alpha.data.length; p++) {
+    const a = alpha.data[p] ?? 0;
+    if (a === 0) continue;
+    const i = p * 4;
+    if (a === 255) {
+      out[i] = result.data[i] ?? 0;
+      out[i + 1] = result.data[i + 1] ?? 0;
+      out[i + 2] = result.data[i + 2] ?? 0;
+      out[i + 3] = result.data[i + 3] ?? 0;
+      continue;
+    }
+    const t = a / 255;
+    for (let c = 0; c < 4; c++) {
+      out[i + c] = (original.data[i + c] ?? 0) * (1 - t) + (result.data[i + c] ?? 0) * t;
+    }
+  }
+  return { width: original.width, height: original.height, data: out };
+}
+
 /** `maskToRaster` encoded as a PNG. Browser only. */
 export function maskToPng(mask: Mask): Promise<Blob> {
   return toBlob(maskToRaster(mask), { type: 'image/png' });
@@ -716,6 +809,29 @@ export async function loadImage(blob: Blob): Promise<ImageBitmap | HTMLImageElem
   return loadImageElement(blob);
 }
 
+/**
+ * The pixel size of an image file as `loadImage` shows it (EXIF rotation applied), for callers that need only
+ * the size. PNG, JPEG, WebP and GIF are read from their header, without decoding (and without checking that
+ * the rest of the file decodes); other formats, and the rare PNG or WebP with an EXIF rotation, are decoded.
+ * Browser only for those.
+ */
+export async function readImageSize(blob: Blob): Promise<{ width: number; height: number }> {
+  const header = await readImageHeader(blob);
+  if (header?.orientation === 1) return { width: header.width, height: header.height };
+  // Every browser applies a JPEG's orientation; for the other formats, ask the decoder.
+  if (header?.type === 'image/jpeg') {
+    return header.orientation >= 5
+      ? { width: header.height, height: header.width }
+      : { width: header.width, height: header.height };
+  }
+  const source = await loadImage(blob);
+  try {
+    return imageSize(source);
+  } finally {
+    if ('close' in source) source.close();
+  }
+}
+
 /** Reads pixels from anything drawable, optionally scaled to `size`. */
 export function imageDataFrom(
   source: CanvasImageSource,
@@ -802,53 +918,153 @@ export function cropCanvas(source: CanvasImageSource, box: Box): CanvasLike {
 }
 
 export interface DataUrlOptions {
-  /** Re-encode when the file is bigger than this. Default 4 MiB. */
+  /** Re-encode a file bigger than this; the most each result should weigh. Default 4 MiB. */
   maxBytes?: number;
   /** Shrink when the longer side is bigger than this. Default 2048. */
   maxDimension?: number;
-  /** Format used when the image has to be re-encoded. Default `image/jpeg`. */
+  /** Format used when an image has to be re-encoded. Default `image/jpeg`. */
   type?: string;
-  /** Starting quality for a re-encode. Default 0.9. */
+  /** Starting quality for a lossy re-encode. Default 0.9. */
   quality?: number;
 }
 
+/** One picture of a `toDataUrls` set, with its own format for a re-encode. */
+export interface DataUrlItem {
+  image: Blob | RasterImage;
+  /** Format if this one is re-encoded. Default: the `type` option. */
+  type?: string;
+}
+
+/** Formats whose size the quality changes. PNG ignores it (and Safari answers a WebP request with PNG). */
+const LOSSY_TYPES = new Set(['image/jpeg', 'image/webp']);
+/** A lossy result over the limit loses this much quality per try, while above `QUALITY_FLOOR`. */
+const QUALITY_STEP = 0.15;
+const QUALITY_FLOOR = 0.55;
+/** A set that still does not fit is scaled by this, at most `MAX_SHRINKS` times; the last try is kept. */
+const SHRINK = 0.8;
+const MAX_SHRINKS = 8;
+
+interface SetEntry {
+  image: Blob | RasterImage;
+  type: string;
+  quality: number;
+  /** The file's own bytes, when they may be sent as they are (no EXIF rotation to apply). */
+  original: Blob | null;
+  /** Upright size. */
+  width: number;
+  height: number;
+  /** What a re-encode draws from, made when first needed. */
+  drawable?: ImageBitmap | HTMLImageElement | CanvasLike;
+}
+
+async function setEntry(
+  item: Blob | RasterImage | DataUrlItem,
+  options: DataUrlOptions,
+): Promise<SetEntry> {
+  const { image, type = options.type ?? 'image/jpeg' } = 'image' in item ? item : { image: item };
+  const entry = { image, type, quality: options.quality ?? 0.9, original: null };
+  if ('data' in image) return { ...entry, width: image.width, height: image.height };
+  const header = await readImageHeader(image);
+  if (header?.orientation === 1) {
+    return { ...entry, original: image, width: header.width, height: header.height };
+  }
+  // A rotation to apply, or a format the header reader does not know: the decoder says the size.
+  const drawable = await loadImage(image);
+  return { ...entry, original: header ? null : image, drawable, ...imageSize(drawable) };
+}
+
+function rasterCanvas(raster: RasterImage): CanvasLike {
+  const canvas = createCanvas(raster.width, raster.height);
+  context2d(canvas).putImageData(new ImageData(raster.data, raster.width, raster.height), 0, 0);
+  return canvas;
+}
+
+async function encodeAt(entry: SetEntry, size: { width: number; height: number }): Promise<Blob> {
+  const options = { type: entry.type, quality: entry.quality };
+  if ('data' in entry.image && size.width === entry.width && size.height === entry.height) {
+    return toBlob(entry.image, options); // the pixels exactly, no resampling
+  }
+  entry.drawable ??=
+    'data' in entry.image ? rasterCanvas(entry.image) : await loadImage(entry.image);
+  return toBlob(resizeCanvas(entry.drawable, size.width, size.height), options);
+}
+
+/** The entry at `size`: its own file when that fits, else encoded, a lossy one lowering its quality to fit. */
+async function fitEntry(
+  entry: SetEntry,
+  size: { width: number; height: number },
+  maxBytes: number,
+): Promise<Blob> {
+  const natural = size.width === entry.width && size.height === entry.height;
+  if (entry.original && natural && entry.original.size <= maxBytes) return entry.original;
+  let encoded = await encodeAt(entry, size);
+  while (
+    encoded.size > maxBytes &&
+    LOSSY_TYPES.has(encoded.type) &&
+    entry.quality > QUALITY_FLOOR
+  ) {
+    entry.quality -= QUALITY_STEP;
+    encoded = await encodeAt(entry, size);
+  }
+  return encoded;
+}
+
 /**
- * An image Blob as a `data:` URL that respects upload limits. A file that is
- * already small enough, in bytes and in pixels, is passed through untouched.
- * Otherwise it is scaled down to `maxDimension` and re-encoded, lowering the
- * quality and then the size in steps until it is under `maxBytes` (or cannot
- * get smaller). Browser only.
+ * Related pictures as `data:` URLs at ONE common pixel size, so references that must line up (the picture
+ * with the area marked, the plain picture, its mask) stay aligned pixel for pixel. They must all be the same
+ * size, a file counting at its upright size (EXIF rotation applied); `RangeError` otherwise.
+ *
+ * A file is sent untouched when the set needs no scaling (longer side within `maxDimension`) and it is within
+ * `maxBytes`, without being decoded. Anything else is drawn at the common size and encoded in its own `type`
+ * (pixels at their own size exactly). A lossy result over `maxBytes` first lowers its quality; when one still
+ * does not fit, the whole set is scaled down a step and encoded again, so the sizes never drift apart. A file
+ * with an EXIF orientation other than 1 is always re-encoded, so every reference holds the upright pixels the
+ * browser shows (a model may ignore the tag). Browser only.
  */
-export async function toDataUrl(blob: Blob, options: DataUrlOptions = {}): Promise<string> {
+export async function toDataUrls(
+  images: readonly (Blob | RasterImage | DataUrlItem)[],
+  options: DataUrlOptions = {},
+): Promise<string[]> {
   const maxBytes = options.maxBytes ?? 4 * 1024 * 1024;
   const maxDimension = options.maxDimension ?? 2048;
-  const type = options.type ?? 'image/jpeg';
-
-  const source = await loadImage(blob);
+  const entries: SetEntry[] = [];
   try {
-    const { width, height } = imageSize(source);
-    if (blob.size <= maxBytes && Math.max(width, height) <= maxDimension) {
-      return await readAsDataUrl(blob);
+    for (const item of images) entries.push(await setEntry(item, options));
+    const first = entries[0];
+    if (!first) return [];
+    if (entries.some((entry) => entry.width !== first.width || entry.height !== first.height)) {
+      throw new RangeError('The images of a set must all be the same size.');
     }
-    let target = fitWithin(width, height, maxDimension);
-    let quality = options.quality ?? 0.9;
-    let encoded = await toBlob(resizeCanvas(source, target.width, target.height), {
-      type,
-      quality,
-    });
-    for (let attempt = 0; attempt < 8 && encoded.size > maxBytes; attempt++) {
-      if (quality > 0.55) {
-        quality -= 0.15;
-      } else {
-        target = {
-          width: Math.max(1, Math.round(target.width * 0.8)),
-          height: Math.max(1, Math.round(target.height * 0.8)),
-        };
+    let size = fitWithin(first.width, first.height, maxDimension);
+    for (let shrinks = 0; ; shrinks++) {
+      const last = shrinks >= MAX_SHRINKS;
+      const encoded: Blob[] = [];
+      for (const entry of entries) {
+        const blob = await fitEntry(entry, size, maxBytes);
+        if (blob.size > maxBytes && !last) break;
+        encoded.push(blob);
       }
-      encoded = await toBlob(resizeCanvas(source, target.width, target.height), { type, quality });
+      if (encoded.length === entries.length) {
+        return await Promise.all(encoded.map((blob) => readAsDataUrl(blob)));
+      }
+      size = {
+        width: Math.max(1, Math.round(size.width * SHRINK)),
+        height: Math.max(1, Math.round(size.height * SHRINK)),
+      };
     }
-    return await readAsDataUrl(encoded);
   } finally {
-    if ('close' in source) source.close();
+    for (const { drawable } of entries) if (drawable && 'close' in drawable) drawable.close();
   }
+}
+
+/**
+ * An image Blob as a `data:` URL that respects upload limits: `toDataUrls` for one picture. A file already
+ * small enough, in bytes and in pixels, with no EXIF rotation to apply, is passed through untouched (and not
+ * decoded). Otherwise it is scaled down to `maxDimension` and re-encoded; a lossy `type` lowers the quality and
+ * then the size in steps until under `maxBytes`, PNG goes straight to smaller sizes (quality does nothing for
+ * it), until it fits or cannot get smaller. Browser only.
+ */
+export async function toDataUrl(blob: Blob, options: DataUrlOptions = {}): Promise<string> {
+  const [url] = await toDataUrls([blob], options);
+  return url!;
 }
