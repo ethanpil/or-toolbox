@@ -4,12 +4,21 @@ import { resultHandle } from '../tool/results';
 import type { ResultHandle, SendItem } from '../tool/types';
 import { imageResultCard, type ImageResultCardOptions } from './image-result-card';
 
-const hoisted = vi.hoisted(() => ({
-  close: vi.fn(),
-  toBlob: vi.fn((_source: unknown, options: { type?: string; quality?: number }) =>
-    Promise.resolve(new Blob([`as ${options.type} q${options.quality ?? '-'}`])),
-  ),
-}));
+const hoisted = vi.hoisted(() => {
+  /** What the fake browser writes when asked for a type (Safari writes PNG when asked for WebP). */
+  const writes = new Map<string, string>();
+  return {
+    close: vi.fn(),
+    writes,
+    toBlob: vi.fn((_source: unknown, options: { type?: string; quality?: number }) =>
+      Promise.resolve(
+        new Blob([`as ${options.type} q${options.quality ?? '-'}`], {
+          type: writes.get(options.type ?? '') ?? options.type,
+        }),
+      ),
+    ),
+  };
+});
 vi.mock('../../core/media/image', () => ({
   loadImage: () => Promise.resolve({ close: hoisted.close }),
   toBlob: hoisted.toBlob,
@@ -17,6 +26,8 @@ vi.mock('../../core/media/image', () => ({
 
 const $ = <T extends HTMLElement = HTMLElement>(root: ParentNode, id: string): T | null =>
   root.querySelector<T>(`[data-testid="${id}"]`);
+const labels = (root: ParentNode): (string | null)[] =>
+  [...root.querySelectorAll('.dropdown-item')].map((item) => item.textContent);
 
 const core = getCore();
 const handles = new Map<ResultHandle, MockInstance>();
@@ -52,6 +63,7 @@ afterEach(() => {
   saved.length = 0;
   hoisted.toBlob.mockClear();
   hoisted.close.mockClear();
+  hoisted.writes.clear();
   document.body.replaceChildren();
 });
 
@@ -118,15 +130,29 @@ describe('imageResultCard', () => {
     expect(hoisted.close).toHaveBeenCalledOnce();
   });
 
-  it('always offers the image itself, e.g. an SVG next to a PNG conversion; JPEG counts as jpg', () => {
+  it('offers an SVG as it is only, never converted', () => {
     const svg = card({
       blob: new Blob(['<svg/>'], { type: 'image/svg+xml' }),
       name: 'logo.svg',
+      formats: ['png', 'jpg', 'webp'],
+    });
+    expect(svg.element.querySelectorAll('.dropdown-item')).toHaveLength(0);
+    expect($(svg.element, 'gen-download')?.textContent).toBe('Download .svg');
+    const unnamed = card({
+      blob: new Blob(['<svg/>'], { type: 'image/svg+xml' }),
+      name: 'logo',
       formats: ['png'],
     });
-    expect(
-      [...svg.element.querySelectorAll('.dropdown-item')].map((item) => item.textContent),
-    ).toEqual(['SVG.svg', 'PNG.png']);
+    expect($(unnamed.element, 'gen-download')?.textContent).toBe('Download .svg');
+  });
+
+  it('always offers the image itself next to the conversions; JPEG counts as jpg', () => {
+    const gif = card({
+      blob: new Blob(['x'], { type: 'image/gif' }),
+      name: 'a.gif',
+      formats: ['png'],
+    });
+    expect(labels(gif.element)).toEqual(['GIF.gif', 'PNG.png']);
     const jpeg = card({
       blob: new Blob(['x'], { type: 'image/jpeg' }),
       name: 'photo',
@@ -172,6 +198,33 @@ describe('imageResultCard', () => {
     expect(document.activeElement).toBe(fallback);
   });
 
+  it('asks focusFallback only after onRemove updated the page, so an empty state it shows takes focus', async () => {
+    const empty = document.createElement('p');
+    empty.tabIndex = -1;
+    empty.hidden = true;
+    const item = card({
+      onRemove: () => {
+        empty.hidden = false;
+      },
+      focusFallback: () => (empty.hidden ? null : empty),
+    });
+    document.body.append(item.element, empty);
+    $<HTMLButtonElement>(item.element, 'gen-remove')!.focus();
+    $<HTMLButtonElement>(item.element, 'gen-remove')!.click();
+    await vi.waitFor(() => expect(item.element.isConnected).toBe(false));
+    expect(document.activeElement).toBe(empty);
+  });
+
+  it('leaves focus where onRemove put it', async () => {
+    const elsewhere = document.createElement('button');
+    const fallback = document.createElement('button');
+    const item = card({ onRemove: () => elsewhere.focus(), focusFallback: () => fallback });
+    document.body.append(item.element, elsewhere, fallback);
+    $<HTMLButtonElement>(item.element, 'gen-remove')!.click();
+    await vi.waitFor(() => expect(item.element.isConnected).toBe(false));
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
   it('keeps the card when beforeRemove says no; remove() from code drops it once without onRemove', async () => {
     const beforeRemove = vi.fn(() => Promise.resolve(false));
     const item = card({ beforeRemove });
@@ -187,5 +240,23 @@ describe('imageResultCard', () => {
     expect(item.element.isConnected).toBe(false);
     expect(removeSpy(item.handle)).toHaveBeenCalledOnce();
     expect(item.onRemove).not.toHaveBeenCalled();
+  });
+
+  // Keep this test last: once a format turns out not to encode, the page stops offering it on every card.
+  it('drops a format the browser cannot encode instead of saving a PNG named .webp', async () => {
+    hoisted.writes.set('image/webp', 'image/png');
+    const first = card();
+    const second = card({ name: 'second.png' });
+    document.body.append(first.element, second.element);
+    $<HTMLButtonElement>(first.element, 'export-webp')!.click();
+    await vi.waitFor(() => expect(labels(first.element)).toEqual(['PNG.png', 'JPG.jpg']));
+    expect(saved).toHaveLength(0);
+    expect(first.handle.result.downloaded).toBe(false);
+    expect(document.body.textContent).toContain('This browser cannot save WEBP images');
+    expect(labels(second.element)).toEqual(['PNG.png', 'JPG.jpg']);
+    expect(labels(card({ name: 'later.png' }).element)).toEqual(['PNG.png', 'JPG.jpg']);
+    // A WebP original is still saved as it is.
+    const webp = card({ blob: new Blob(['x'], { type: 'image/webp' }), name: 'photo.webp' });
+    expect(labels(webp.element)).toEqual(['PNG.png', 'JPG.jpg', 'WEBP.webp']);
   });
 });

@@ -15,6 +15,7 @@ import type { Box } from '../../core/media/image';
 import { isolateImage } from '../../core/media/image-async';
 import type { RunHandle } from '../../core/types';
 import { abortError, debounce, utcDay } from '../../core/util';
+import { compareSlider, type CompareSlider } from '../../ui/components/compare-slider';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
 import { modelPicker } from '../../ui/components/model-picker';
@@ -30,7 +31,6 @@ import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
 import type { ResultHandle, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
 import { retryGate } from '../../ui/tool/retry-gate';
-import { compareSlider, type CompareSlider } from './compare-slider';
 import {
   CONCURRENCY,
   FALLBACK_SETTINGS,
