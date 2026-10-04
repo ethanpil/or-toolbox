@@ -1,0 +1,10 @@
+// Video studio: timeline rows show their clip small, so several fit on screen; the joined video and the frame
+// grabber keep the full-size player.
+
+.or-timeline-clip .or-video {
+  max-height: 16rem;
+}
+
+.or-video-placeholder {
+  min-height: 8rem;
+}
