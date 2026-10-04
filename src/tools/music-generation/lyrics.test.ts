@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { activeLine, insertTag, lyricsText, parseTimedLyrics, validateLyrics } from './lyrics';
+import {
+  activeLine,
+  insertTag,
+  lyricsText,
+  parseTimedLyrics,
+  trimLyrics,
+  validateLyrics,
+  withArticle,
+} from './lyrics';
 
 /** The timed lyrics of the recorded Lyria 3 Clip answer (tests/fixtures/openrouter/music-lyria-clip.recorded.sse.txt). */
 const CLIP = [
@@ -29,22 +37,60 @@ const PRO = [
   '[72.0:] Dusty photos on the mantle place',
 ].join('\n');
 
+/** The text after an edit, and its selection. */
+function applied(value: string, start: number, end: number, tag: string) {
+  const edit = insertTag(value, start, end, tag);
+  const text = value.slice(0, edit.from) + edit.text + value.slice(edit.to);
+  return { text, selected: text.slice(edit.selectionStart, edit.selectionEnd), edit };
+}
+
 describe('insertTag', () => {
   it('puts the tag on a line of its own, after a blank line when there is text before', () => {
-    expect(insertTag('', 0, 0, 'Verse')).toEqual({ value: '[Verse]\n', cursor: 8 });
-    expect(insertTag('Hello', 5, 5, 'Chorus')).toEqual({
-      value: 'Hello\n\n[Chorus]\n',
-      cursor: 16,
+    expect(insertTag('', 0, 0, 'Verse')).toEqual({
+      from: 0,
+      to: 0,
+      text: '[Verse]\n',
+      selectionStart: 8,
+      selectionEnd: 8,
     });
-    expect(insertTag('Line one\n', 9, 9, 'Bridge')).toEqual({
-      value: 'Line one\n\n[Bridge]\n',
-      cursor: 19,
+    expect(applied('Hello', 5, 5, 'Chorus')).toMatchObject({ text: 'Hello\n\n[Chorus]\n' });
+    expect(applied('Hello', 5, 5, 'Chorus').edit.selectionStart).toBe(16);
+    expect(applied('Line one\n', 9, 9, 'Bridge').text).toBe('Line one\n\n[Bridge]\n');
+  });
+
+  it('moves the rest of the line below the tag', () => {
+    expect(applied('abc def', 4, 4, 'Outro').text).toBe('abc\n\n[Outro]\ndef');
+    expect(applied('one\n\ntwo', 3, 3, 'Verse').text).toBe('one\n\n[Verse]\n\ntwo');
+  });
+
+  it('keeps selected text, putting the tag before it and leaving it selected', () => {
+    expect(applied('[Chorsu]\nla la', 0, 8, 'Chorus')).toMatchObject({
+      text: '[Chorus]\n[Chorsu]\nla la',
+      selected: '[Chorsu]',
+    });
+    expect(applied('Intro words\nSing this line', 12, 26, 'Verse')).toMatchObject({
+      text: 'Intro words\n\n[Verse]\nSing this line',
+      selected: 'Sing this line',
     });
   });
 
-  it('moves the rest of the line below the tag, and replaces a selection', () => {
-    expect(insertTag('abc def', 4, 4, 'Outro').value).toBe('abc\n\n[Outro]\ndef');
-    expect(insertTag('[Chorsu]\nla la', 0, 8, 'Chorus').value).toBe('[Chorus]\nla la');
+  it('says "an" before a vowel', () => {
+    expect(withArticle('Intro')).toBe('an Intro');
+    expect(withArticle('Outro')).toBe('an Outro');
+    expect(withArticle('Verse')).toBe('a Verse');
+  });
+});
+
+describe('trimLyrics', () => {
+  it('drops the lines after a cut and ends the one it lands in', () => {
+    const { lines } = parseTimedLyrics('[0.0:3.0] ONE\n[3.0:6.0] TWO\n[6.5:9.0] THREE');
+    const { lyrics, dropped } = trimLyrics({ lines, instrumental: false, untimed: [] }, 5);
+    expect(lyrics.lines.map((line) => [line.text, line.end])).toEqual([
+      ['ONE', 3],
+      ['TWO', 5],
+    ]);
+    expect(dropped).toBe(1);
+    expect(lyricsText(lyrics)).toBe('ONE\nTWO');
   });
 });
 
