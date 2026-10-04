@@ -49,6 +49,12 @@ export type * from './types';
 export interface MountToolOptions {
   /** `'required'` for tools that need multi-threaded ffmpeg (Video studio). */
   isolation?: 'required';
+  /**
+   * `false` for a tool that chooses its models itself (Model arena's contenders): the header shows no model chip
+   * and no free-only substitution note for it. `?model=` still reaches the tool as `ctx.modelOverride`, and Run is
+   * still disabled when free-only mode leaves the primary capability without a model.
+   */
+  modelChip?: false;
 }
 
 /** URL parameters the framework consumes; removed from the address bar once applied (except `model`). */
@@ -67,7 +73,7 @@ export function mountTool(
       header: false,
       ...(options.isolation ? { isolation: options.isolation } : {}),
     },
-    ({ core, main }) => buildTool(core, main, manifest, setup),
+    ({ core, main }) => buildTool(core, main, manifest, setup, options.modelChip !== false),
   );
 }
 
@@ -76,6 +82,7 @@ async function buildTool(
   main: HTMLElement,
   manifest: ToolManifest,
   setup: ToolSetup,
+  showModelChip: boolean,
 ): Promise<void> {
   const params = new URLSearchParams(location.search);
   let modelOverride = params.get('model');
@@ -304,7 +311,7 @@ async function buildTool(
           )
         : null,
     );
-    if (resolved.model && !core.models.isFree(resolved.model)) {
+    if (showModelChip && resolved.model && !core.models.isFree(resolved.model)) {
       void core.models
         .get(resolved.model)
         .then((model) => {
@@ -318,7 +325,7 @@ async function buildTool(
     const keys = core.keys.list();
     replace(
       chips,
-      modelChip,
+      showModelChip ? modelChip : null,
       keys.length > 1
         ? keyPicker({
             keys,
@@ -358,7 +365,7 @@ async function buildTool(
           ),
         ),
       );
-    } else if (resolved.note) {
+    } else if (resolved.note && showModelChip) {
       list.push(
         h(
           'div',
