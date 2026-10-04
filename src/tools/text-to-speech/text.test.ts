@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { countWords, normalizeText, splitText, stripMarkdown } from './text';
+import { countWords, fileStem, normalizeText, splitText, stripMarkdown } from './text';
 
 /** The text with every run of whitespace as one space: what survives a split, whatever the seams were. */
 const flat = (text: string): string => text.replace(/\s+/g, ' ').trim();
@@ -9,6 +9,26 @@ describe('normalizeText', () => {
     expect(normalizeText('  One\t two  \r\n\r\n\r\n\nThree \rfour  ')).toBe(
       'One two\n\nThree\nfour',
     );
+  });
+
+  it('treats no-break and ideographic spaces as spaces', () => {
+    expect(normalizeText('a\u00a0\u00a0b\u3000c\n\u00a0\n\n\u3000\u3000\nd')).toBe('a b c\n\nd');
+  });
+});
+
+describe('fileStem', () => {
+  it('takes the first words, in any script, and stays short', () => {
+    expect(fileStem('Hello there, my friend. How are you?')).toBe('speech-hello-there-my-friend');
+    expect(fileStem("Don't stop")).toBe('speech-dont-stop');
+    expect(fileStem('...')).toBe('speech');
+    const chinese = fileStem('今天天气很好我们去公园散步吧你觉得怎么样好的我们走吧'.repeat(5));
+    expect(chinese.startsWith('speech-')).toBe(true);
+    expect(chinese.length).toBeLessThanOrEqual('speech-'.length + 32);
+    const thai = fileStem('สวัสดีครับวันนี้อากาศดีมากเราไปเดินเล่นที่สวนสาธารณะกันเถอะ'.repeat(5));
+    expect(thai.length).toBeLessThanOrEqual('speech-'.length + 32);
+    // Thai vowel and tone marks are combining marks: they stay with their letters.
+    expect(thai).toContain('สวัสดี');
+    expect(fileStem('x'.repeat(200)).length).toBeLessThanOrEqual('speech-'.length + 32);
   });
 });
 
@@ -78,6 +98,14 @@ describe('splitText', () => {
     }
   });
 
+  it('never throws on, or makes parts of, paragraphs of nothing but spaces', () => {
+    const nbsp = '\u00a0'.repeat(3000);
+    const ideographic = '\u3000'.repeat(3000);
+    expect(splitText(`${nbsp}\n\n${ideographic}`, 100)).toEqual([]);
+    expect(splitText(`Hello.\n\n${nbsp}\n\nWorld.`, 10)).toEqual(['Hello.', 'World.']);
+    expect(splitText(`Hello.${ideographic}World.`, 10)).toEqual(['Hello.', 'World.']);
+  });
+
   it('covers a 10,000-word text in order, every chunk under the limit', () => {
     const paragraph = (n: number): string =>
       Array.from(
@@ -134,5 +162,51 @@ describe('stripMarkdown', () => {
         'A footnote and snake_case_word.',
       ].join('\n\n'),
     );
+  });
+
+  it('removes front matter only when it is YAML at the very start', async () => {
+    expect(await stripMarkdown('---\ntitle: Notes\ntags:\n- a\n  - b\n---\nBody')).toBe('Body');
+    expect(await stripMarkdown('---\ntitle: Notes\n...\nBody')).toBe('Body');
+    // A leading rule around ordinary text is not front matter.
+    expect(await stripMarkdown('---\nHello there.\n---\nMore text.')).toBe(
+      'Hello there.\n\nMore text.',
+    );
+    expect(await stripMarkdown('---\n\nThe start.\n\n---\n\nThe end.')).toBe(
+      'The start.\n\nThe end.',
+    );
+    // Not at the very start: an ordinary paragraph and rule.
+    expect(await stripMarkdown('Intro\n\n---\ntitle: x\n---\nBody')).toContain('Intro');
+  });
+
+  it('drops script and style contents and HTML comments entirely', async () => {
+    expect(
+      await stripMarkdown(
+        [
+          'Before <script>alert(1)</script> after <!-- a note --> end.',
+          '',
+          '<script>',
+          'var hidden = 1;',
+          '</script>',
+          '',
+          '<!--',
+          'A comment over',
+          'several lines',
+          '-->',
+          '',
+          '<style>p { color: red }</style>',
+          '',
+          '<div>Kept <!-- not this --> text</div>',
+        ].join('\n'),
+      ),
+    ).toBe('Before after end.\n\nKept text');
+  });
+
+  it('keeps a * or _ inside a word or a dunder name as written', async () => {
+    expect(await stripMarkdown('3*4*5 is 60, and 2*3 = 6 while 4*5 = 20.')).toBe(
+      '3*4*5 is 60, and 2*3 = 6 while 4*5 = 20.',
+    );
+    expect(
+      await stripMarkdown('Call __init__ first; **bold**, _em_ and *em* lose their marks.'),
+    ).toBe('Call __init__ first; bold, em and em lose their marks.');
   });
 });

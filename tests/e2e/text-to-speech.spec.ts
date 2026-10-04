@@ -240,6 +240,9 @@ test.describe('Text-to-speech', () => {
     await preview.click();
     await expect(note).toHaveText('Preview ready: it plays from memory, at no cost.');
     await expect(page.getByTestId('tts-preview-audio')).toBeVisible();
+    // The button was never disabled, so focus stayed on it.
+    await expect(preview).toBeFocused();
+    await expect(preview).toHaveAttribute('aria-disabled', 'false');
     await preview.click();
     await voice.selectOption('bm_george');
     await expect(note).toContainText('Preview reads one short sentence');
@@ -283,7 +286,54 @@ test.describe('Text-to-speech', () => {
     expect(problems).toEqual([]);
   });
 
-  test('Stop keeps the parts already made; the rest are made later and joined', async ({
+  test('a part that will not decode is found when the join fails, and only it is made again', async ({
+    page,
+    context,
+    mock,
+  }) => {
+    await seedApp(context, {
+      key: true,
+      settings: { tools: { 'text-to-speech': { options: { format: 'wav' } } } },
+    });
+    mockCatalog(mock);
+    // An "MP3" that sniffs as one (an ID3 tag) but holds no audio frames.
+    const broken = Buffer.concat([
+      Buffer.from([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, 0]),
+      Buffer.alloc(400),
+    ]);
+    let brokenSent = false;
+    mock.respond('POST', '/api/v1/audio/speech', (call) => {
+      if (!brokenSent && (call.body as SpeechBody).input.startsWith('Part 2,')) {
+        brokenSent = true;
+        return { body: broken, headers: { 'content-type': 'audio/mpeg' } };
+      }
+      return mp3Answer;
+    });
+    const problems = await watchForProblems(page);
+    await page.goto('tools/text-to-speech/');
+    await expect(page.getByTestId('tts-voice').locator('option')).toHaveCount(54);
+    await page.getByTestId('tool-prompt').fill(paragraphs(3));
+    await page.getByTestId('run-button').click();
+
+    await expect(page.getByTestId('tool-status')).toHaveText(
+      'Joining failed: 1 part could not be decoded',
+      { timeout: 60_000 },
+    );
+    const notice = page.getByTestId('tts-notice');
+    await expect(notice.getByTestId('tts-failed')).toHaveText(
+      'Part 2: its audio could not be decoded',
+    );
+    await notice.getByTestId('tts-retry').click();
+    await expect(page.getByTestId('tts-result')).toBeVisible({ timeout: 60_000 });
+    const calls = mock.calls('/api/v1/audio/speech').map((call) => call.body as SpeechBody);
+    expect(calls).toHaveLength(4);
+    expect(calls[3]?.input).toMatch(/^Part 2,/);
+    const { result, segment } = await decodedLengths(page, SPEECH_MP3.toString('base64'));
+    expect(result).toBe(segment * 3);
+    expect(withoutCancels(problems)).toEqual([]);
+  });
+
+  test('Stop keeps the parts already made; Read aloud makes only the rest and joins them', async ({
     page,
     context,
     mock,
@@ -317,7 +367,8 @@ test.describe('Text-to-speech', () => {
     expect(sent).toBeLessThanOrEqual(5); // two answered, at most three in flight; nothing started after Stop
 
     slow = false;
-    await notice.getByTestId('tts-retry').click();
+    // Read aloud again with the same text continues: only the six missing parts are paid for.
+    await page.getByTestId('run-button').click();
     await expect(page.getByTestId('tts-result')).toBeVisible({ timeout: 120_000 });
     await expect(notice).toBeHidden();
     const retried = mock.calls('/api/v1/audio/speech').slice(sent);
