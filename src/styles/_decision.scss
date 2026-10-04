@@ -1,0 +1,145 @@
+// Decision (src/tools/decision): the question cards, the draggable scale levels, and the drawn answers.
+
+// A level of a score scale: its number, a handle to drag it by, and a drop line while something is over it.
+.or-dec-level {
+  position: relative;
+  border-radius: var(--bs-border-radius-sm);
+}
+
+.or-dec-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  min-height: 1.75rem;
+  color: var(--bs-secondary-color);
+  cursor: grab;
+  touch-action: none;
+
+  &:active {
+    cursor: grabbing;
+  }
+}
+
+.or-dec-dragging {
+  opacity: 0.5;
+}
+
+.or-dec-drop-before {
+  box-shadow: 0 -2px 0 0 var(--bs-primary);
+}
+
+.or-dec-drop-after {
+  box-shadow: 0 2px 0 0 var(--bs-primary);
+}
+
+.or-dec-level-index {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.5rem;
+  height: 1.75rem;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--bs-secondary-color);
+}
+
+// The text field takes the row and the Move buttons wrap under it on a phone.
+.or-dec-level-field {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
+// --- answers ----------------------------------------------------------------------------------------------
+
+// A probability meter. The fill is a full-width bar scaled from the left: `transform` is the only property that
+// moves, and `_motion.scss` zeroes the transition under reduced motion.
+.or-dec-track {
+  position: relative;
+  height: 0.625rem;
+  overflow: hidden;
+  background-color: var(--bs-secondary-bg);
+  border-radius: 999px;
+}
+
+.or-dec-fill {
+  position: absolute;
+  inset: 0;
+  background-color: var(--bs-primary);
+  transform: scaleX(var(--or-fill, 0));
+  transform-origin: left center;
+  transition: transform 0.25s ease-out;
+
+  &.is-muted {
+    background-color: var(--bs-secondary-color);
+  }
+}
+
+// The score scale: a line with a tick per level and a marker at the probability-weighted position. The ends get
+// room so the first and last tick (and a marker sitting on one) are not cut off.
+.or-dec-scale {
+  position: relative;
+  height: 3.5rem;
+  margin: 0 1rem;
+}
+
+.or-dec-scale-line {
+  position: absolute;
+  top: 2rem;
+  right: 0;
+  left: 0;
+  height: 4px;
+  background-color: var(--bs-secondary-bg);
+  border-radius: 2px;
+}
+
+.or-dec-tick {
+  position: absolute;
+  top: 1.75rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform: translateX(-50%);
+
+  &::before {
+    width: 2px;
+    height: 0.75rem;
+    content: '';
+    background-color: var(--bs-secondary-color);
+  }
+}
+
+.or-dec-tick-label {
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--bs-secondary-color);
+}
+
+@keyframes or-dec-appear {
+  from {
+    opacity: 0;
+  }
+}
+
+.or-dec-marker {
+  position: absolute;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.1;
+  color: var(--bs-primary);
+  transform: translateX(-50%);
+  animation: or-dec-appear 0.25s ease-out both;
+}
+
+.or-dec-marker-value {
+  padding: 0 0.375rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--bs-body-color);
+  background-color: var(--bs-secondary-bg);
+  border-radius: var(--bs-border-radius-sm);
+}
