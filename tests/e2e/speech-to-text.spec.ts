@@ -392,24 +392,26 @@ test('a recording in progress is protected from leaving the page', async ({ page
   await recordUntil(page, 1);
   expect(await leavingAsks(page)).toBe(true);
 
-  // An in-app link: the browser asks (beforeunload); staying keeps the recording going.
-  const dialogs: string[] = [];
-  page.on('dialog', (dialog) => {
-    dialogs.push(dialog.type());
-    void dialog.dismiss();
-  });
+  // An in-app link: the app's dialog names the recording in progress; staying keeps it going.
+  const guard = page.getByTestId('leave-guard');
   await page.getByTestId('history-link').click();
-  await expect.poll(() => dialogs).toEqual(['beforeunload']);
+  await expect(guard).toBeVisible();
+  await expect(page.getByTestId('leave-guard-list')).toHaveText('A recording in progress');
+  await page.getByTestId('leave-guard-stay').click();
+  await expect(guard).toBeHidden();
+  await expect(page).toHaveURL(/\/tools\/speech-to-text\/$/);
   await expect(page.getByTestId('stt-record-stop')).toBeVisible();
   const before = await recordedSeconds(page);
   await recordUntil(page, before + 1);
 
-  // Stopped, the recording is a result not yet downloaded: the in-app guard asks now.
+  // Stopped, it is a result not yet downloaded, and that is what the dialog names now.
   await page.getByTestId('stt-record-stop').click();
   await expect(page.getByTestId('stt-source-name')).toHaveText(/^recording-/);
+  expect(await leavingAsks(page)).toBe(true);
   await page.getByTestId('history-link').click();
-  await expect(page.getByTestId('leave-guard')).toBeVisible();
+  await expect(guard).toBeVisible();
   await expect(page.getByTestId('leave-guard-list')).toContainText('not downloaded');
+  await expect(page.getByTestId('leave-guard-list')).not.toContainText('A recording in progress');
   await page.getByTestId('leave-guard-stay').click();
   await expect(page).toHaveURL(/\/tools\/speech-to-text\/$/);
   expect(problems).toEqual([]);

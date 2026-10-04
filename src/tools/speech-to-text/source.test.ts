@@ -20,9 +20,8 @@ vi.mock('../../core/media/audio', async (importOriginal) => ({
   ...(await importOriginal<typeof AudioModule>()),
   decodeAudio: (blob: Blob) => decodeAudio(blob),
 }));
-vi.mock('../../core/media/ffmpeg-ops', () => ({
-  transcodeAudio: (blob: Blob, format: string, options: object) =>
-    transcodeAudio(blob, format, options),
+vi.mock('../../core/media/transcode', () => ({
+  transcode: (blob: Blob, format: string, options: object) => transcodeAudio(blob, format, options),
 }));
 
 const source = (patch: Partial<AudioSource>): AudioSource => ({

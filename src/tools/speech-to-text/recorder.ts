@@ -11,8 +11,8 @@
  *   second under reduced motion, none while paused), Pause/Resume, a timer of the time actually recorded, and
  *   Stop. A few seconds without any signal shows and announces "No sound detected". Recording stops by itself at
  *   `maxSeconds` (announced once a minute before), or when the microphone goes away; what was recorded is kept
- *   either way. While a recording is in progress, leaving the page asks first (`beforeunload`, which in-app
- *   navigation goes through too).
+ *   either way. While a recording is in progress it is held work (`holdWork`, the page's `ui.holdWork`): leaving
+ *   asks first, in the app's dialog and the browser's prompt.
  * - The recording is handed to `onRecorded` as one Blob (WebM/Opus where supported, else Ogg or MP4); the page
  *   keeps it in memory.
  */
@@ -40,6 +40,8 @@ export interface RecorderOptions {
   onBusyChange?: (busy: boolean) => void;
   /** True when motion should be reduced (the OS setting or the app's): the meter then updates four times a second. */
   reducedMotion?: () => boolean;
+  /** Marks a recording in progress as unsaved work (`ui.holdWork`); returns the release. */
+  holdWork?: (description: string) => () => void;
 }
 
 export interface Recorder {
@@ -64,6 +66,8 @@ const SILENCE_SECONDS = 3;
 /** Meter updates under reduced motion. */
 const REDUCED_MOTION_INTERVAL_MS = 250;
 const NO_SOUND = 'No sound detected — check your microphone.';
+/** How the leave-page dialog names a recording in progress. */
+const HELD_WORK = 'A recording in progress';
 const DEVICE_GONE =
   'The chosen microphone is no longer available, so the default microphone is used.';
 
@@ -260,12 +264,8 @@ export function recorder(options: RecorderOptions): Recorder {
     announce(message);
   };
 
-  /** While recording, closing or leaving the page asks first (in-app links end in a navigation too). */
-  const onBeforeUnload = (event: BeforeUnloadEvent): void => {
-    event.preventDefault();
-    // Older Safari and Chromium show the prompt only when returnValue is set.
-    event.returnValue = '';
-  };
+  /** Releases the hold on the page while a recording is in progress (the finished one is a result then). */
+  let releaseHold: (() => void) | null = null;
 
   /** True when focus was on the recorder's buttons as they changed: it follows to the next one. */
   let keepFocus = false;
@@ -303,8 +303,12 @@ export function recorder(options: RecorderOptions): Recorder {
       keepFocus = false;
     }
     if ((was === 'idle') !== (next === 'idle')) {
-      if (next === 'idle') window.removeEventListener('beforeunload', onBeforeUnload);
-      else window.addEventListener('beforeunload', onBeforeUnload);
+      if (next === 'idle') {
+        releaseHold?.();
+        releaseHold = null;
+      } else {
+        releaseHold ??= options.holdWork?.(HELD_WORK) ?? null;
+      }
       options.onBusyChange?.(next !== 'idle');
     }
     if (next === 'recording') runMeter();

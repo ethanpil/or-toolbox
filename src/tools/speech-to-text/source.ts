@@ -18,6 +18,7 @@ import { sniffBlobMime } from '../../core/files';
 import type * as audioMedia from '../../core/media/audio';
 import type { AudioData } from '../../core/media/audio';
 import { mediaDuration } from '../../core/media/media-element';
+import { transcode } from '../../core/media/transcode';
 
 export interface AudioSource {
   /** Changes whenever the source does (keys the cached parts). */
@@ -141,8 +142,10 @@ export interface PrepareOptions {
   /** The model takes only mono 16-bit PCM WAV: never send the file as it is (model-support.ts). */
   pcmWavOnly?: boolean;
   signal: AbortSignal;
-  /** Short progress lines ("Decoding the audio…"). */
+  /** The start of each step ("Decoding the audio…"). */
   onStatus: (text: string) => void;
+  /** Ticking counters within a step ("… 40%"); default `onStatus`. */
+  onProgress?: (text: string) => void;
 }
 
 /** Decodes a source to 16 kHz mono, through ffmpeg when the browser cannot. */
@@ -158,17 +161,16 @@ async function decodeForSpeech(source: AudioSource, options: PrepareOptions): Pr
     if (!(error instanceof InvalidInputError)) throw error;
     options.signal.throwIfAborted();
     options.onStatus('Extracting the audio with ffmpeg…');
-    const { transcodeAudio } = await import('../../core/media/ffmpeg-ops');
-    const wav = await transcodeAudio(source.blob, 'wav', {
+    const tick = options.onProgress ?? options.onStatus;
+    const wav = await transcode(source.blob, 'wav', {
       sampleRate: SPEECH_DECODE.sampleRate,
       channels: 1,
       signal: options.signal,
       onLoadProgress: ({ loaded, total }) =>
-        options.onStatus(
+        tick(
           `Downloading the audio converter (once)… ${total > 0 ? Math.round((loaded / total) * 100) : 0}%`,
         ),
-      onProgress: (ratio) =>
-        options.onStatus(`Extracting the audio with ffmpeg… ${Math.round(ratio * 100)}%`),
+      onProgress: (ratio) => tick(`Extracting the audio with ffmpeg… ${Math.round(ratio * 100)}%`),
     });
     options.signal.throwIfAborted();
     return media.decodeAudio(wav, SPEECH_DECODE);

@@ -22,6 +22,7 @@ import { copyWithToast } from '../../ui/clipboard';
 import { type AudioPlayer, audioPlayer } from '../../ui/components/audio-player';
 import { dropZone } from '../../ui/components/drop-zone';
 import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
+import { progressBar } from '../../ui/components/progress-bar';
 import { focusedKey, focusKey, h, replace, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
@@ -31,6 +32,7 @@ import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { motionReduced } from '../../ui/shell/appearance';
 import { batchSummary, type ItemStatus, runItems } from '../../ui/tool/batch';
+import { type RetryGate, retryGate } from '../../ui/tool/retry-gate';
 import type {
   ResultHandle,
   RunnerState,
@@ -276,6 +278,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   const rec = recorder({
     maxSeconds: MAX_RECORDING_SECONDS,
     reducedMotion: () => motionReduced(ctx.settings.get()),
+    holdWork: (description) => ui.holdWork(description),
     beforeStart: async () => {
       if (runnerState.busy) {
         announce('Wait until the transcription ends, or press Stop.');
@@ -436,21 +439,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     } else downloads.update({ disabled: !has });
   }
 
-  const progressBar = h('div', { class: 'progress-bar' });
-  const progress = h(
-    'div',
-    {
-      class: 'progress flex-grow-1',
-      role: 'progressbar',
-      'aria-label': 'Parts transcribed',
-      'aria-valuemin': '0',
-      'aria-valuemax': '0',
-      'aria-valuenow': '0',
-      hidden: true,
-      'data-testid': 'stt-progress',
-    },
-    progressBar,
-  );
+  const progress = progressBar({
+    label: 'Parts transcribed',
+    hidden: true,
+    class: 'flex-grow-1',
+    testId: 'stt-progress',
+  });
   const partsList = h('ol', {
     class: 'list-unstyled d-flex flex-wrap gap-2 mb-0',
     'aria-label': 'Parts',
@@ -471,7 +465,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       h(
         'div',
         { class: 'd-flex flex-wrap align-items-center gap-2' },
-        progress,
+        progress.element,
         h('div', { class: 'd-flex flex-wrap gap-2 ms-auto' }, copyButton, downloads, sendButton),
       ),
       partsList,
@@ -497,24 +491,24 @@ export function setup(ctx: ToolContext): ToolInstance {
     const open = parts.filter((part) => part.status !== 'done');
     return model ? partsUnfitFor(model, open, Number(partMinutes.value)) : null;
   };
-  const retryBlocked = (): string | null =>
-    runnerState.busy
-      ? 'Wait until the current run ends.'
-      : (retryProblem() ?? runnerState.disabledReason);
-  const setRetryState = (button: HTMLElement): void => {
-    const reason = retryBlocked();
-    button.setAttribute('aria-disabled', String(reason !== null));
-    button.classList.toggle('disabled', reason !== null);
-    button.title = reason ?? '';
+  /** Keeps the Retry buttons in step with Run (set once the runner exists, below). */
+  let gate: RetryGate<number[]> | null = null;
+  /** On top of the gate's state: a button whose parts cannot be retried shows why. */
+  const paintProblem = (button: HTMLElement): void => {
+    const problem = retryProblem();
+    if (!problem) return;
+    button.setAttribute('aria-disabled', 'true');
+    button.classList.add('disabled');
+    button.title = problem;
   };
   const retry = (indexes: number[]): void => {
     if (indexes.length === 0) return;
-    const blocked = retryBlocked();
-    if (blocked) {
-      announce(blocked);
+    const problem = retryProblem();
+    if (problem) {
+      announce(problem);
       return;
     }
-    if (!runner.trigger(indexes).started) announce('This cannot start now.');
+    gate?.retry(indexes, 'This cannot start now.');
   };
   const retryButton = (
     attributes: Record<string, string>,
@@ -526,7 +520,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       { type: 'button', ...attributes, 'data-retry': '', onclick: () => retry(indexes()) },
       ...children,
     );
-    setRetryState(button);
+    gate?.bind(button);
+    paintProblem(button);
     return button;
   };
 
@@ -633,11 +628,9 @@ export function setup(ctx: ToolContext): ToolInstance {
   const updateProgress = (): void => {
     const total = parts.length;
     const done = parts.filter((part) => part.status === 'done').length;
-    progress.hidden = total < 2;
-    progress.setAttribute('aria-valuemax', String(total));
-    progress.setAttribute('aria-valuenow', String(done));
-    progressBar.style.width = total ? `${Math.round((done / total) * 100)}%` : '0%';
-    if (transcribing && total > 1) ui.status(`Transcribed ${done} of ${plural(total, 'part')}`);
+    progress.element.hidden = total < 2;
+    progress.update(done, total, `${done} of ${plural(total, 'part')}`);
+    if (transcribing && total > 1) ui.progress(`Transcribed ${done} of ${plural(total, 'part')}`);
   };
 
   // --- merging --------------------------------------------------------------------------------------------
@@ -816,7 +809,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     source = next;
     prepared = null;
     if (next) {
-      player = audioPlayer({ blob: next.blob, label: next.name, testId: 'stt-player' });
+      // The length is known (measured once, or the recorder's): the player does not measure again.
+      player = audioPlayer({
+        blob: next.blob,
+        label: next.name,
+        ...(next.duration === null ? {} : { seconds: next.duration }),
+        testId: 'stt-player',
+      });
       const follow = (): void => {
         if (transcriptOf?.sourceId === next.id && player) editor.setTime(player.audio.currentTime);
       };
@@ -835,7 +834,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     origin: AudioSource['origin'],
     options: { confirmed?: boolean; seconds?: number } = {},
   ): Promise<void> {
-    if (runnerState.busy) {
+    if (origin === 'recording') {
+      // A result at once, before anything is awaited: the recorder's hold on the page has just been released.
+      // It replaces any earlier recording (the user agreed before recording).
+      recording?.remove();
+      recording = ui.addResult({ kind: 'audio', name, blob });
+    } else if (runnerState.busy) {
       announce('Wait until the transcription ends, or press Stop.');
       return;
     }
@@ -843,11 +847,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     ui.status('Reading the file…');
     const inspected = await inspectSource(blob, name, origin);
     if (inspected.duration === null && options.seconds) inspected.duration = options.seconds;
-    if (origin === 'recording') {
-      // Replaces any earlier recording (the user agreed before recording).
-      recording?.remove();
-      recording = ui.addResult({ kind: 'audio', name, blob });
-    }
     setSource(inspected);
     ui.status(
       `${origin === 'recording' ? 'Recorded' : 'Added'} ${name}${
@@ -961,6 +960,7 @@ export function setup(ctx: ToolContext): ToolInstance {
             pcmWavOnly: support.pcmWavOnly,
             signal: runHandle.signal,
             onStatus: (text) => ui.status(text),
+            onProgress: (text) => ui.progress(text),
           });
           prepared = { sourceId: input.id, seconds, pcmWavOnly: support.pcmWavOnly, parts: cut };
         }
@@ -1056,10 +1056,12 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   const runner = ui.runner<number[]>({ label: 'Transcribe', icon: 'mic', run });
+  gate = retryGate(runner);
+  // After the gate's own subscription: a part that cannot be retried keeps saying why.
   runner.subscribe((state) => {
     runnerState = state;
     for (const button of ui.output.querySelectorAll<HTMLElement>('[data-retry]'))
-      setRetryState(button);
+      paintProblem(button);
   });
   renderSource();
   applyModel(ctx.model().model);
