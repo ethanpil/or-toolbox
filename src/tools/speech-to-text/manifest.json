@@ -6,8 +6,17 @@
   "icon": "mic",
   "capabilities": ["stt"],
   "accepts": ["audio/*", "video/*"],
-  "produces": ["text/plain", "application/x-subrip", "text/vtt", "application/json"],
+  "produces": [
+    "text/plain",
+    "application/x-subrip",
+    "text/vtt",
+    "application/json",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  ],
   "usesJobs": false,
-  "lazyLibs": [],
-  "defaults": {}
+  "lazyLibs": ["@ffmpeg/ffmpeg", "docx"],
+  "defaults": {
+    "timestamps": true,
+    "partMinutes": 5
+  }
 }
