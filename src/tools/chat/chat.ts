@@ -23,18 +23,29 @@
  * `getState`/`applyState` cover the composer (text, model) and the parameters, not the thread: reopening a run
  * from History fills the composer.
  */
+import {
+  ACCEPT_ATTRIBUTE,
+  type AttachmentRef,
+  checkText,
+  keepParsed,
+  MAX_ATTACHMENTS,
+  readAttachment,
+  SIZE_LIMITS,
+  textAttachment,
+} from '../../core/attachments/attachments';
+import { missingInput, parserAddons as parserAddonsFor } from '../../core/attachments/request';
 import { isFreeModelId } from '../../core/models/free';
 import {
   isPdfEngineId,
   PDF_ENGINES,
   pdfEngine,
-  pdfEngineAddon,
   type PdfEngineId,
 } from '../../core/models/pdf-engines';
 import type { ModelInfo, RunAddon, RunHandle, UsageTotals } from '../../core/types';
 import { InvalidInputError, userMessage } from '../../core/errors';
 import { debounce, isFiniteNumber, isString } from '../../core/util';
 import { copyWithToast } from '../../ui/clipboard';
+import { attachmentChip } from '../../ui/components/attachment-chip';
 import { emptyState } from '../../ui/components/empty-state';
 import { exportMenu } from '../../ui/components/export-menu';
 import { modelPicker } from '../../ui/components/model-picker';
@@ -58,30 +69,13 @@ import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { queryWords } from '../../ui/shell/palette-search';
 import type { SendItem, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
-import {
-  ACCEPT_ATTRIBUTE,
-  checkText,
-  MAX_ATTACHMENTS,
-  parsedFiles,
-  pdfPages,
-  readAttachment,
-  SIZE_LIMITS,
-  textAttachment,
-} from './attachments';
 import { toJson, toMarkdown } from './export';
 import { addCodeCopyButtons, codeOf, renderReply } from './markdown-view';
-import {
-  type BuiltRequest,
-  buildRequest,
-  missingInput,
-  type RequestOptions,
-  unparsedPdfs,
-} from './request';
+import { type BuiltRequest, buildRequest, type RequestOptions, unparsedPdfs } from './request';
 import {
   activePath,
   addNode,
   attachmentIds,
-  type AttachmentRef,
   baseOf,
   type ChatNode,
   createThread,
@@ -103,7 +97,6 @@ import {
 import {
   applyRunState,
   composing,
-  KIND_ICONS,
   type MessageActions,
   type MessageContext,
   messageSignature,
@@ -967,37 +960,22 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   /** A composer chip for a file waiting to be sent; built once per file. */
   const pendingItem = (ref: AttachmentRef): HTMLElement => {
     const data = session.get(ref.id);
-    return h(
-      'li',
-      { class: 'or-chat-attachment', 'data-testid': 'composer-attachment' },
-      ref.kind === 'image' && data
-        ? h('img', { class: 'or-chat-thumb', src: data, alt: '' })
-        : icon(KIND_ICONS[ref.kind]),
-      h(
-        'span',
-        { class: 'min-w-0' },
-        h('span', { class: 'd-block text-truncate' }, ref.name),
-        h('span', { class: 'd-block small text-body-secondary' }, formatBytes(ref.size)),
-      ),
-      h(
-        'button',
-        {
-          type: 'button',
-          class: 'btn btn-sm btn-link or-chat-action',
-          'aria-label': `Remove ${ref.name}`,
-          'data-focus-key': `unattach:${ref.id}`,
-          'data-testid': 'composer-attachment-remove',
-          onclick: () => {
-            pending = pending.filter((other) => other.id !== ref.id);
-            releaseUnused();
-            renderComposer();
-            composer.focus();
-            void ui.refreshEstimate();
-          },
+    return attachmentChip({
+      ref,
+      ...(data ? { data } : {}),
+      testId: 'composer-attachment',
+      remove: {
+        focusKey: `unattach:${ref.id}`,
+        testId: 'composer-attachment-remove',
+        onClick: () => {
+          pending = pending.filter((other) => other.id !== ref.id);
+          releaseUnused();
+          renderComposer();
+          composer.focus();
+          void ui.refreshEstimate();
         },
-        icon('x-lg'),
-      ),
-    );
+      },
+    });
   };
 
   const renderComposer = (): void => {
@@ -1707,17 +1685,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           ...(totals.costUnknown ? { costUnknown: true } : {}),
         };
 
-  /** Keeps the parser's text of each PDF the response read; their bytes are then no longer needed. */
-  function keepParsed(refs: readonly AttachmentRef[], annotations: unknown): void {
-    const files = parsedFiles(annotations);
-    for (const ref of refs) {
-      const index = files.findIndex((file) => file.name === ref.name);
-      if (index < 0) continue;
-      ref.parsed = files[index]!.text;
-      files.splice(index, 1);
-    }
-  }
-
   async function perform(action: Action, signal: AbortSignal): Promise<void> {
     const thread = current;
     let path: ChatNode[];
@@ -2041,11 +2008,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   loadCatalog();
 
   /** The paid PDF parser for these PDFs, as run add-ons (none for the free engines). */
-  function parserAddons(pdfs: readonly AttachmentRef[]): RunAddon[] {
-    const pages = pdfs.reduce((sum, ref) => sum + pdfPages(ref), 0);
-    const addon = pdfEngineAddon(params.pdfEngine, pages);
-    return addon ? [addon] : [];
-  }
+  const parserAddons = (pdfs: readonly AttachmentRef[]): RunAddon[] =>
+    parserAddonsFor(params.pdfEngine, pdfs);
 
   return {
     getState: snapshot,

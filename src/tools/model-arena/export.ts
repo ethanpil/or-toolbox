@@ -1,0 +1,117 @@
+/**
+ * A round as Markdown or JSON: the prompt and settings, each panel's model, answer and metrics, and the vote.
+ * Offered only once the names are shown (blind off, or after a vote or a reveal). Attachments are listed by
+ * name; their bytes are never exported.
+ */
+import { formatInt, formatMs, formatUsd } from '../../ui/format';
+import { entryAt, type Metrics, metricsOf, panelLabel, panelLetter, type Round } from './round';
+
+/** `12.3 tok/s` style rate: one decimal below 100. */
+export const formatRate = (perSecond: number): string =>
+  perSecond < 100 ? perSecond.toFixed(1) : String(Math.round(perSecond));
+
+/** A cost as the panels show it: unknown, estimated (≈), or the billed amount. */
+export function formatCost(metrics: Metrics): string {
+  if (metrics.costUnknown) return 'Unknown';
+  if (metrics.costUsd === null) return '—';
+  return `${metrics.costEstimated ? '≈ ' : ''}${formatUsd(metrics.costUsd)}`;
+}
+
+const cell = (value: number | null, format: (value: number) => string): string =>
+  value === null ? '—' : format(value);
+
+/** One line of the vote, e.g. "Model B (Llama 4) won." */
+export function voteLine(round: Round, name: (id: string) => string): string {
+  const vote = round.vote;
+  if (!vote)
+    return round.revealed && round.settings.blind ? 'Revealed without a vote.' : 'No vote.';
+  if (vote.kind === 'tie') return 'Tie.';
+  if (vote.kind === 'bad') return 'All bad.';
+  const entry = entryAt(round, vote.panel);
+  return `${panelLabel(vote.panel)} (${name(entry.model)}) won.`;
+}
+
+export function roundMarkdown(round: Round, name: (id: string) => string): string {
+  const parts: string[] = ['# Model arena round', '## Prompt', round.prompt || '_(no text)_'];
+  if (round.attachments.length > 0) {
+    parts.push(`_Attachments: ${round.attachments.map((file) => file.name).join(', ')}_`);
+  }
+  if (round.settings.system.trim()) {
+    parts.push(`**System prompt:**\n\n${round.settings.system.trim()}`);
+  }
+  if (round.settings.temperature !== null) {
+    parts.push(`**Temperature:** ${round.settings.temperature}`);
+  }
+  round.order.forEach((_, panel) => {
+    const entry = entryAt(round, panel);
+    const metrics = metricsOf(entry);
+    parts.push(`## ${panelLabel(panel)}: ${name(entry.model)} (\`${entry.model}\`)`);
+    if (entry.text) parts.push(entry.text);
+    if (entry.status === 'stopped') parts.push('_(stopped)_');
+    if (entry.status === 'error') parts.push(`_(failed: ${entry.error ?? 'error'})_`);
+    parts.push(
+      [
+        '| First token | Total | Output tokens | Tokens/s | Cost |',
+        '| --- | --- | --- | --- | --- |',
+        `| ${cell(metrics.ttftMs, formatMs)} | ${cell(metrics.totalMs, formatMs)} | ${cell(metrics.completionTokens, formatInt)} | ${cell(metrics.tokensPerSecond, formatRate)} | ${formatCost(metrics)} |`,
+      ].join('\n'),
+    );
+  });
+  parts.push('## Vote', voteLine(round, name));
+  return `${parts.join('\n\n')}\n`;
+}
+
+export interface ExportedRound {
+  startedAt: string;
+  prompt: string;
+  system: string;
+  temperature: number | null;
+  blind: boolean;
+  attachments: { name: string; type: string; size: number }[];
+  contenders: {
+    panel: string;
+    model: string;
+    servedModel?: string;
+    status: string;
+    answer: string;
+    error?: string;
+    metrics: Metrics;
+  }[];
+  vote:
+    { kind: 'winner'; panel: string; model: string } | { kind: 'tie' } | { kind: 'all-bad' } | null;
+}
+
+export function roundJson(round: Round): ExportedRound {
+  const vote = round.vote;
+  return {
+    startedAt: new Date(round.startedAt).toISOString(),
+    prompt: round.prompt,
+    system: round.settings.system,
+    temperature: round.settings.temperature,
+    blind: round.settings.blind,
+    attachments: round.attachments.map(({ name, type, size }) => ({ name, type, size })),
+    contenders: round.order.map((_, panel) => {
+      const entry = entryAt(round, panel);
+      return {
+        panel: panelLetter(panel),
+        model: entry.model,
+        ...(entry.servedModel ? { servedModel: entry.servedModel } : {}),
+        status: entry.status,
+        answer: entry.text,
+        ...(entry.error ? { error: entry.error } : {}),
+        metrics: metricsOf(entry),
+      };
+    }),
+    vote: !vote
+      ? null
+      : vote.kind === 'winner'
+        ? {
+            kind: 'winner',
+            panel: panelLetter(vote.panel),
+            model: entryAt(round, vote.panel).model,
+          }
+        : vote.kind === 'tie'
+          ? { kind: 'tie' }
+          : { kind: 'all-bad' },
+  };
+}

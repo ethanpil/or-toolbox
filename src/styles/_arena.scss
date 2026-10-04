@@ -1,0 +1,123 @@
+// Model arena (src/tools/model-arena): contenders, answer panels, metrics, the vote bar and the tally.
+
+// Contender rows: a number disc, the model, Change and Remove.
+.or-arena-contender {
+  padding: 0.5rem 0.75rem;
+}
+
+.or-arena-slot {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--bs-secondary-color);
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 50%;
+}
+
+// Answer panels.
+.or-arena-panel {
+  transition: border-color 0.15s ease;
+
+  > .card-header {
+    padding: 0.625rem 0.875rem;
+    border-bottom-color: var(--bs-border-color-translucent);
+  }
+
+  > .card-body {
+    padding: 0.875rem;
+  }
+
+  > .card-footer {
+    padding: 0.5rem 0.875rem;
+    background-color: var(--or-inset);
+    border-top-color: var(--bs-border-color-translucent);
+  }
+
+  &.is-pick {
+    border-color: var(--bs-primary);
+    box-shadow: 0 0 0 1px var(--bs-primary);
+  }
+}
+
+.or-arena-letter {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  font-weight: 700;
+  color: var(--bs-primary-text-emphasis);
+  background-color: var(--bs-primary-bg-subtle);
+  border-radius: var(--bs-border-radius);
+}
+
+// The answer scrolls inside its panel, so four long answers stay side by side; it is a focusable region.
+.or-arena-answer {
+  min-height: 6rem;
+  max-height: 28rem;
+  padding: 0.125rem;
+  margin: -0.125rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+
+  &:focus-visible {
+    border-radius: var(--bs-border-radius);
+    outline: 2px solid var(--or-focus-color);
+    outline-offset: 2px;
+  }
+
+  // Headings in an answer structure it; they should not outshout the page.
+  :is(h1, h2, h3, h4, h5, h6) {
+    margin-top: 1rem;
+    font-size: 1rem;
+    font-weight: 600;
+
+    &:first-child {
+      margin-top: 0;
+    }
+  }
+}
+
+.or-arena-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(5.25rem, 1fr));
+  gap: 0.25rem 0.75rem;
+  font-size: 0.8125rem;
+
+  dt {
+    font-weight: 400;
+    color: var(--bs-secondary-color);
+  }
+
+  dd {
+    margin: 0;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+// The vote bar and the verdict that replaces it.
+.or-arena-vote {
+  padding: 1rem;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color-translucent);
+  border-radius: var(--bs-border-radius-lg);
+}
+
+.or-arena-verdict:focus-visible {
+  border-radius: var(--bs-border-radius);
+  outline: 2px solid var(--or-focus-color);
+  outline-offset: 4px;
+}
+
+.or-arena-heading:focus-visible {
+  border-radius: var(--bs-border-radius-sm);
+  outline: 2px solid var(--or-focus-color);
+  outline-offset: 2px;
+}

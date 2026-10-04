@@ -2,7 +2,8 @@
  * Export of a thread's active path: Markdown (also what "Copy conversation" copies) and JSON. Attachments are
  * listed by name; their bytes are never exported. The JSON form is the linear one `parseThread` also reads.
  */
-import { activePath, type AttachmentRef, type ChatNode, type Thread } from './thread';
+import type { AttachmentRef } from '../../core/attachments/attachments';
+import { activePath, type ChatNode, type Thread } from './thread';
 
 const attachmentLine = (refs: readonly AttachmentRef[]): string =>
   `_Attachments: ${refs.map((ref) => ref.name).join(', ')}_`;

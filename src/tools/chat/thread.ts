@@ -12,30 +12,11 @@
  * Every stored change bumps `rev`. A tab that finds a higher `rev` in storage than the one it based its change on
  * merges (`mergeInto`, three-way against `baseOf` that version) instead of writing over the other tab's change.
  */
+import type { AttachmentKind, AttachmentRef } from '../../core/attachments/attachments';
 import { isFiniteNumber, isPlainObject, isString, isUnsafeKey } from '../../core/util';
 import { normalize } from '../../ui/shell/palette-search';
 
 export const THREAD_VERSION = 1;
-
-export type AttachmentKind = 'image' | 'pdf' | 'audio' | 'text';
-
-export interface AttachmentRef {
-  id: string;
-  name: string;
-  /** MIME type. */
-  type: string;
-  size: number;
-  kind: AttachmentKind;
-  /** Text files only: the content, inlined into the message. Binaries are never kept. */
-  text?: string;
-  /**
-   * PDFs only: the parser's text of the file, from the `annotations` of the reply that first read it
-   * (docs/openrouter-api.md §2.5). Later turns send this text instead of uploading and parsing the file again.
-   */
-  parsed?: string;
-  /** PDFs only, this session: pages counted when attached (prices the paid PDF parser). Not read back. */
-  pages?: number;
-}
 
 export interface ReplyUsage {
   promptTokens: number;

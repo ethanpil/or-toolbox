@@ -58,6 +58,9 @@ All notable changes to this project are documented here. The format follows
 - Stage 5 e2e gate for Isolated image: 20 synthetic photos with imperfect mocked isolations, all passing QA, the ZIP of 20 JPGs checked pixel by pixel (ccc8999).
 - Video studio: model-aware form from `/videos/models`; text, first frame, first + last frame and reference modes; Continue from a clip's true last frame (uploads included) and native extend with a public HTTPS link (else Continue); persisted jobs with hand-off and cost booking; auto-extend sequences (chained or 3 at once, repeat, style, spend cap, stop/skip, pause/resume, re-run) that resume after a reload; frame grabber; timeline with reorder, trims, dropped repeated first frames and an ffmpeg join with Stop (cfb9c20).
 - Stage 6 e2e gate: a 5-step chained sequence survives a reload, joins into an MP4 that plays; a spend cap stops a sequence (0ec6971).
+- Model arena: one prompt and files to 2–4 models in parallel (one run each, one `groupId`), streamed side by side with time to first token, total time, tokens, tokens/s and cost, a comparison table marking the fastest and cheapest, per-contender Retry, Stop for all; blind voting (shuffled Model A–D, names and costs hidden until a vote or a reveal) with a local tally (Reset with Undo); Markdown/JSON export of a round (56a80b1).
+- Stage 7 e2e gate: the arena runs 4 models at once (c5e28e2).
+- `mountTool(…, { modelChip: false })` for tools that choose their models themselves (3978bbf).
 
 ### Changed
 
@@ -82,6 +85,7 @@ All notable changes to this project are documented here. The format follows
 - `ChatStreamResult.annotations` (the PDF parser's text) and a `tool-state-changed` bus event from the tool state store (99eae10); Chat streams its PDF turns, hears other tabs on the bus, and uses the runner argument, `streamMarkdown`, PDF add-ons and the focus helpers (81fc471).
 - CSV/TSV keep phone-like values (`+44 20 7946 0958`) as written (c6d74d2).
 - File types: untyped source files (`.py`, `.yaml`, `.js`…) get `text/x-*` types, so `text/*` tools take them (5afda1e).
+- Chat's attachment logic moved to `src/core/attachments/` (kinds, limits, reading, content parts, parser text, token approximation, missing-input checks, parser add-on) and the chip to `attachmentChip()`, shared with Model arena (41e1cbb).
 
 ### Fixed
 

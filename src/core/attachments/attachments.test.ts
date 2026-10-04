@@ -2,9 +2,11 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  type AttachmentRef,
   audioFormat,
   checkText,
   classifyFile,
+  keepParsed,
   PARSED_LIMIT,
   parsedFiles,
   pdfPages,
@@ -32,7 +34,7 @@ describe('classifyFile', () => {
     expect(classifyFile(file)).toBe(kind);
   });
 
-  it('refuses what chat cannot use', () => {
+  it('refuses what a chat request cannot carry', () => {
     expect(classifyFile({ name: 'movie.mp4', type: 'video/mp4' })).toBeNull();
     expect(classifyFile({ name: 'archive.zip', type: 'application/zip' })).toBeNull();
     expect(classifyFile({ name: 'pic.heic', type: 'image/heic' })).toBeNull();
@@ -114,9 +116,12 @@ describe('content parts', () => {
       type: 'image_url',
       image_url: { url: 'data:image/webp;base64,UklG' },
     });
-    expect(toContentPart(image, undefined)).toEqual({
+    // Without its bytes an image has no part; the caller decides what to send instead.
+    expect(toContentPart(image, undefined)).toBeNull();
+    const pdf = { id: 'p', name: 'b.pdf', type: 'application/pdf', size: 1, kind: 'pdf' as const };
+    expect(toContentPart({ ...pdf, parsed: 'Page 1' }, undefined)).toEqual({
       type: 'text',
-      text: '[Attachment "a.webp" (image) is no longer available.]',
+      text: 'Page 1',
     });
     const audio = { id: 'a', name: 'a.wav', type: 'audio/wav', size: 1, kind: 'audio' as const };
     expect(toContentPart(audio, 'data:audio/wav;base64,UklGRg==')).toEqual({
@@ -165,6 +170,23 @@ describe('parser text from annotations', () => {
       },
     ];
     expect(parsedFiles(withImage)).toEqual([{ name: 'b.pdf', text: 'Page 1' }]);
+  });
+
+  it('keeps each PDF’s parser text on its reference, matched by name in order', () => {
+    const pdf = (id: string, name: string): AttachmentRef => ({
+      id,
+      name,
+      type: 'application/pdf',
+      size: 1,
+      kind: 'pdf',
+    });
+    const refs = [pdf('1', 'a.pdf'), pdf('2', 'a.pdf'), pdf('3', 'c.pdf')];
+    const file = (name: string, text: string) => ({
+      type: 'file',
+      file: { name, content: [{ type: 'text', text }] },
+    });
+    keepParsed(refs, [file('a.pdf', 'first'), file('a.pdf', 'second')]);
+    expect(refs.map((ref) => ref.parsed)).toEqual(['first', 'second', undefined]);
   });
 });
 
