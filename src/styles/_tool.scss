@@ -19,7 +19,13 @@
   letter-spacing: 0.06em;
 }
 
-// The Run bar stays in view at the bottom of a long input.
+// The Run bar stays in view at the bottom of a long input. Scrolling a control into view (Tab, a click, a
+// scrollIntoView) stops above it, never under it (WCAG 2.4.11): the page reserves the bar's height, which
+// src/ui/tool/index.ts keeps in `--or-runner-height`.
+:root {
+  scroll-padding-bottom: calc(var(--or-runner-height, 0px) + 0.5rem);
+}
+
 .or-runner {
   position: sticky;
   bottom: 0;

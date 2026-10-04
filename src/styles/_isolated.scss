@@ -1,4 +1,4 @@
-// Isolated image (src/tools/isolated-image): photo list, result grid, before/after slider.
+// Isolated image (src/tools/isolated-image): photo list and result grid.
 
 .or-iso-photo-thumb {
   flex-shrink: 0;
@@ -52,56 +52,4 @@
     border: 1px solid var(--bs-border-color);
     border-radius: var(--bs-border-radius);
   }
-}
-
-// Before/after wipe (compare-slider.ts): the "after" image is clipped to the right of the divider.
-.or-compare {
-  position: relative;
-  aspect-ratio: 1;
-  overflow: hidden;
-  cursor: ew-resize;
-  // Vertical swipes still scroll the page; horizontal drags move the divider.
-  touch-action: pan-y;
-  user-select: none;
-  background-color: #fff;
-  border: 1px solid var(--bs-border-color);
-  border-radius: var(--bs-border-radius-lg);
-}
-
-.or-compare-img {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  pointer-events: none;
-}
-
-.or-compare-after {
-  clip-path: inset(0 0 0 var(--or-compare, 50%));
-}
-
-.or-compare-divider {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: var(--or-compare, 50%);
-  width: 2px;
-  margin-left: -1px;
-  pointer-events: none;
-  background-color: var(--bs-primary);
-}
-
-.or-compare-label {
-  position: absolute;
-  top: 0.5rem;
-  pointer-events: none;
-}
-
-.or-compare-label-start {
-  left: 0.5rem;
-}
-
-.or-compare-label-end {
-  right: 0.5rem;
 }

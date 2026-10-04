@@ -11,6 +11,8 @@ import type { ApiClient, BusEvent, CoreServices, ModelsService, Settings } from 
 import {
   CATALOG_MAX_AGE_MS,
   KV_CATALOG,
+  KV_IMAGE_MODELS,
+  IMAGE_CONTROLS_RETRY_MS,
   REFRESH_FAILURE_BACKOFF_MS,
   createModelsService,
   kvEndpoints,
@@ -251,6 +253,50 @@ describe('queries', () => {
     });
     await models.imageModels({ refresh: true });
     expect(catalog.imageModels).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('imageControls: one policy for image models', () => {
+  it('is ready for a listed model and missing for one the list does not have', async () => {
+    const models = service();
+    const ready = await models.imageControls('openai/gpt-image-2');
+    expect(ready.status).toBe('ready');
+    expect(ready.status === 'ready' && ready.controls.id).toBe('openai/gpt-image-2');
+    expect(await models.imageControls('no/such-model')).toEqual({ status: 'missing' });
+  });
+
+  it('says unknown (bare controls: let the request try) when the list cannot be read, then tries again', async () => {
+    const catalog = catalogApi();
+    catalog.imageModels.mockRejectedValue(new Error('offline'));
+    const models = service(catalog);
+    const first = await models.imageControls('openai/gpt-image-2');
+    expect(first.status).toBe('unknown');
+    expect(first.status === 'unknown' && first.controls.n).toBeNull(); // nothing beyond the prompt
+    await models.imageControls('openai/gpt-image-2'); // within the cool-off: no new request
+    expect(catalog.imageModels).toHaveBeenCalledTimes(1);
+
+    catalog.imageModels.mockResolvedValue(imagesFixture.data);
+    clock += IMAGE_CONTROLS_RETRY_MS;
+    expect((await models.imageControls('openai/gpt-image-2')).status).toBe('ready'); // never latched
+    expect(catalog.imageModels).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats an empty list as unknown, and reads again after models-refreshed', async () => {
+    const catalog = catalogApi();
+    catalog.imageModels.mockResolvedValue([]);
+    const { models, core } = tab(catalog);
+    expect((await models.imageControls('openai/gpt-image-2')).status).toBe('unknown');
+    // Another tab refreshed: it stored the list and said so.
+    await (
+      await getDb()
+    ).put('kv', {
+      key: KV_IMAGE_MODELS,
+      value: { fetchedAt: clock, models: imagesFixture.data },
+      updatedAt: clock,
+    });
+    core.bus.emit({ type: 'models-refreshed' });
+    expect((await models.imageControls('openai/gpt-image-2')).status).toBe('ready');
+    expect(catalog.imageModels).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -26,6 +26,11 @@ export interface PromptsPanelOptions {
   tool: ToolId;
   getState: () => ToolSnapshot;
   applyState: (state: ToolSnapshot) => void;
+  /**
+   * The tool has no main text field (`ToolInstance.promptless`): "Save current" saves a settings-only preset
+   * under a name (required, since there is no text to show), and entries offer no Copy.
+   */
+  promptless?: boolean;
 }
 
 export interface PromptsPanel {
@@ -176,17 +181,27 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
   const saveCurrent = (): void =>
     run(async () => {
       const state = options.getState();
-      if (!state.prompt.trim()) {
+      if (!options.promptless && !state.prompt.trim()) {
         toast({ message: 'Write a prompt first, then save it.', variant: 'warning' });
         return;
       }
-      const name = await promptDialog({
-        title: 'Save current prompt',
-        label: 'Name (optional)',
-        required: false,
-        help: 'Saves the prompt together with this tool’s current settings.',
-        icon: 'bookmark-plus',
-      });
+      const name = await promptDialog(
+        options.promptless
+          ? {
+              title: 'Save current settings',
+              label: 'Name',
+              required: true,
+              help: 'Saves this tool’s current settings as a preset.',
+              icon: 'bookmark-plus',
+            }
+          : {
+              title: 'Save current prompt',
+              label: 'Name (optional)',
+              required: false,
+              help: 'Saves the prompt together with this tool’s current settings.',
+              icon: 'bookmark-plus',
+            },
+      );
       if (name === null) return;
       await core.prompts.save({
         tool,
@@ -204,8 +219,8 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
         title: 'Rename prompt',
         label: 'Name',
         value: entry.name ?? '',
-        required: false,
-        help: 'Leave empty to show the prompt text instead.',
+        required: !entry.text.trim(),
+        help: entry.text.trim() ? 'Leave empty to show the prompt text instead.' : undefined,
         icon: 'pencil',
       });
       if (name === null) return;
@@ -281,7 +296,13 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
       { class: 'list-group-item px-0 py-3', 'data-testid': 'prompt-entry' },
       heading &&
         h('div', { class: 'fw-semibold mb-1 text-break', 'data-testid': 'prompt-name' }, heading),
-      h('div', { class: 'or-prompt-text text-break', 'data-testid': 'prompt-text' }, entry.text),
+      entry.text.trim()
+        ? h('div', { class: 'or-prompt-text text-break', 'data-testid': 'prompt-text' }, entry.text)
+        : h(
+            'div',
+            { class: 'small text-body-secondary', 'data-testid': 'prompt-text' },
+            'Settings only',
+          ),
       h(
         'div',
         { class: 'small text-body-secondary mt-1' },
@@ -313,7 +334,9 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
         entry.kind === 'recent'
           ? actionButton(entry, 'Save', 'bookmark-plus', 'prompt-save', () => saveRecent(entry))
           : actionButton(entry, 'Rename', 'pencil', 'prompt-rename', () => rename(entry)),
-        actionButton(entry, 'Copy', 'clipboard', 'prompt-copy', () => copy(entry)),
+        entry.text.trim()
+          ? actionButton(entry, 'Copy', 'clipboard', 'prompt-copy', () => copy(entry))
+          : null,
         actionButton(entry, 'Delete', 'trash', 'prompt-delete', () => remove(entry)),
       ),
     );
@@ -366,7 +389,9 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
             ? {
                 icon: 'clock-history',
                 title: 'No recent prompts',
-                text: 'Prompts you run in this tool appear here.',
+                text: options.promptless
+                  ? 'This tool has no prompt to list here; save its settings under Saved.'
+                  : 'Prompts you run in this tool appear here.',
                 compact: true,
                 testId: 'prompts-empty',
               }

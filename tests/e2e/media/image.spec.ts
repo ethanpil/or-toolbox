@@ -315,3 +315,423 @@ test('runs the isolated-image pipeline in a worker without freezing the page, an
   ).toBeGreaterThanOrEqual(2);
   expect(problems).toEqual([]);
 });
+
+test('header sizes, EXIF rotation and reference sets that stay aligned', async ({ page }) => {
+  const problems = await openMediaPage(page);
+
+  const result = await page.evaluate(async () => {
+    const { image, helpers } = window.__media as NonNullable<Window['__media']>;
+    const draw = (
+      width: number,
+      height: number,
+      paint: (context: OffscreenCanvasRenderingContext2D) => void,
+    ): OffscreenCanvas => {
+      const canvas = new OffscreenCanvas(width, height);
+      paint(canvas.getContext('2d') as OffscreenCanvasRenderingContext2D);
+      return canvas;
+    };
+    const ascii = (text: string): number[] => [...text].map((c) => c.charCodeAt(0));
+    const bytesOf = async (blob: Blob): Promise<Uint8Array<ArrayBuffer>> =>
+      new Uint8Array(await blob.arrayBuffer());
+    const blobOfUrl = async (url: string): Promise<Blob> => (await fetch(url)).blob();
+    const base64 = (bytes: Uint8Array): string => {
+      let text = '';
+      for (const byte of bytes) text += String.fromCharCode(byte);
+      return btoa(text);
+    };
+    const decodedSize = async (blob: Blob): Promise<{ width: number; height: number }> => {
+      const decoded = await image.loadImage(blob);
+      const size = image.imageSize(decoded);
+      if ('close' in decoded) decoded.close();
+      return size;
+    };
+    /** The box of the pixels `test` picks. */
+    const boxOf = (
+      pixels: ImageData,
+      test: (r: number, g: number, b: number) => boolean,
+    ): number[] => {
+      let [x0, y0, x1, y1] = [Infinity, Infinity, -1, -1];
+      for (let y = 0; y < pixels.height; y++) {
+        for (let x = 0; x < pixels.width; x++) {
+          const i = (y * pixels.width + x) * 4;
+          if (!test(pixels.data[i] ?? 0, pixels.data[i + 1] ?? 0, pixels.data[i + 2] ?? 0))
+            continue;
+          x0 = Math.min(x0, x);
+          y0 = Math.min(y0, y);
+          x1 = Math.max(x1, x);
+          y1 = Math.max(y1, y);
+        }
+      }
+      return [x0, y0, x1 - x0 + 1, y1 - y0 + 1];
+    };
+
+    // readImageSize reads the header and agrees with the decoder, for each format the browser writes and a GIF.
+    const card = draw(64, 48, (context) => {
+      context.fillStyle = '#336699';
+      context.fillRect(0, 0, 64, 48);
+    });
+    const gif = new Blob(
+      [
+        Uint8Array.from([
+          ...ascii('GIF89a'),
+          ...[5, 0, 3, 0, 0x80, 0, 0, 0, 0, 0, 255, 255, 255],
+          ...[0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0, 0x3b],
+        ]),
+      ],
+      { type: 'image/gif' },
+    );
+    const formats: Record<string, Blob> = {
+      png: await card.convertToBlob({ type: 'image/png' }),
+      jpeg: await card.convertToBlob({ type: 'image/jpeg', quality: 0.9 }),
+      webpLossy: await card.convertToBlob({ type: 'image/webp', quality: 0.8 }),
+      webpLossless: await card.convertToBlob({ type: 'image/webp', quality: 1 }),
+      gif,
+    };
+    const sizes: Record<string, unknown> = {};
+    for (const [name, blob] of Object.entries(formats)) {
+      const chunk = String.fromCharCode(...(await bytesOf(blob.slice(12, 16))));
+      sizes[name] = {
+        header: await image.readImageSize(blob),
+        decoded: await decodedSize(blob),
+        kind: `${blob.type} ${name.startsWith('webp') ? chunk : ''}`.trim(),
+      };
+    }
+
+    // A JPEG tagged "rotate 90° clockwise" (EXIF orientation 6): left half red, right half blue as stored.
+    const wide = draw(60, 30, (context) => {
+      context.fillStyle = '#ff0000';
+      context.fillRect(0, 0, 30, 30);
+      context.fillStyle = '#0000ff';
+      context.fillRect(30, 0, 30, 30);
+    });
+    const stored = await bytesOf(await wide.convertToBlob({ type: 'image/jpeg', quality: 0.95 }));
+    const tiff = [0x4d, 0x4d, 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0];
+    const exif = [...ascii('Exif'), 0, 0, ...tiff, 0, 0, 0, 0];
+    const rotated = new Blob(
+      [
+        stored.subarray(0, 2),
+        Uint8Array.from([0xff, 0xe1, 0, exif.length + 2, ...exif]),
+        stored.subarray(2),
+      ],
+      { type: 'image/jpeg' },
+    );
+    const rotatedUrl = await image.toDataUrl(rotated);
+    const rotatedOut = await helpers.pixels(await blobOfUrl(rotatedUrl));
+    const at = (pixels: ImageData, x: number, y: number): number[] =>
+      Array.from(pixels.data.slice((y * pixels.width + x) * 4, (y * pixels.width + x) * 4 + 3));
+    const storedUrl = await image.toDataUrl(new Blob([stored], { type: 'image/jpeg' }));
+
+    // The same tag in a PNG (eXIf chunk after IHDR, with its CRC): the size is whatever the decoder makes of it.
+    const crc32 = (bytes: number[]): number => {
+      let c = ~0;
+      for (const byte of bytes) {
+        c ^= byte;
+        for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+      }
+      return ~c >>> 0;
+    };
+    const png = await bytesOf(await wide.convertToBlob({ type: 'image/png' }));
+    const chunk = [...ascii('eXIf'), ...tiff, 0, 0, 0, 0];
+    const crc = crc32(chunk);
+    const pngRotated = new Blob(
+      [
+        png.subarray(0, 33),
+        Uint8Array.from([
+          0,
+          0,
+          0,
+          chunk.length - 4,
+          ...chunk,
+          crc >>> 24,
+          (crc >> 16) & 255,
+          (crc >> 8) & 255,
+          crc & 255,
+        ]),
+        png.subarray(33),
+      ],
+      { type: 'image/png' },
+    );
+
+    // A reference set: the marked picture, the plain file and the mask, scaled to one size together.
+    const scene = draw(1600, 1200, (context) => {
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, 1600, 1200);
+      context.fillStyle = '#d01010';
+      context.fillRect(400, 300, 480, 360);
+    });
+    const plain = await scene.convertToBlob({ type: 'image/png' });
+    const mask = { width: 1600, height: 1200, data: new Uint8Array(1600 * 1200) };
+    for (let y = 300; y < 660; y++) mask.data.fill(255, y * 1600 + 400, y * 1600 + 880);
+    const marked = image.maskOverlay(image.imageDataFrom(scene), mask, '#FF00FF', 0.5);
+    const set = await Promise.all(
+      (
+        await image.toDataUrls(
+          [
+            { image: marked, type: 'image/png' },
+            plain,
+            { image: image.maskToRaster(mask), type: 'image/png' },
+          ],
+          { maxDimension: 800 },
+        )
+      ).map(async (url) => helpers.pixels(await blobOfUrl(url))),
+    );
+    const [markedOut, plainOut, maskOut] = set as [ImageData, ImageData, ImageData];
+
+    // A noisy plain picture that must shrink to fit the byte limit takes its mask down with it.
+    const noisy = draw(1600, 1200, (context) => {
+      const noise = context.createImageData(1600, 1200);
+      for (let i = 0; i < noise.data.length; i++)
+        noise.data[i] = i % 4 === 3 ? 255 : Math.floor(Math.random() * 256);
+      context.putImageData(noise, 0, 0);
+    });
+    const noisyPng = await noisy.convertToBlob({ type: 'image/png' });
+    const heavyUrls = await image.toDataUrls(
+      [noisyPng, { image: image.maskToRaster(mask), type: 'image/png' }],
+      { maxDimension: 800, maxBytes: 60_000 },
+    );
+    const heavy = await Promise.all(heavyUrls.map(async (url) => blobOfUrl(url)));
+
+    // PNG output skips the quality steps and still gets under the limit by size alone.
+    const started = performance.now();
+    const pngUrl = await image.toDataUrl(noisyPng, {
+      type: 'image/png',
+      maxDimension: 1024,
+      maxBytes: 600_000,
+    });
+    const pngMs = performance.now() - started;
+    const pngOut = await blobOfUrl(pngUrl);
+
+    return {
+      sizes,
+      rotated: {
+        header: await image.readImageSize(rotated),
+        decoded: await decodedSize(rotated),
+        out: [rotatedOut.width, rotatedOut.height],
+        top: at(rotatedOut, 15, 10),
+        bottom: at(rotatedOut, 15, 50),
+        passedThrough: rotatedUrl.endsWith(base64(await bytesOf(rotated))),
+        uprightPassedThrough: storedUrl === `data:image/jpeg;base64,${base64(stored)}`,
+      },
+      pngRotated: {
+        header: await image.readImageSize(pngRotated),
+        decoded: await decodedSize(pngRotated),
+      },
+      set: {
+        sizes: set.map((pixels) => [pixels.width, pixels.height]),
+        plainBox: boxOf(plainOut, (r, g, b) => r > 150 && g < 90 && b < 90),
+        markedBox: boxOf(markedOut, (r, g, b) => r > 150 && b > 60 && g < 90),
+        maskBox: boxOf(maskOut, (r) => r > 127),
+      },
+      heavy: {
+        sizes: await Promise.all(heavy.map((blob) => image.readImageSize(blob))),
+        bytes: heavy.map((blob) => blob.size),
+        types: heavy.map((blob) => blob.type),
+      },
+      png: {
+        type: pngOut.type,
+        bytes: pngOut.size,
+        size: await image.readImageSize(pngOut),
+        pngMs,
+      },
+    };
+  });
+
+  for (const [name, entry] of Object.entries(result.sizes)) {
+    const { header, decoded } = entry as { header: unknown; decoded: unknown };
+    expect(header, name).toEqual(decoded);
+  }
+  console.info(`header sizes: ${JSON.stringify(result.sizes)}`);
+
+  // The browser shows the JPEG upright; the header size says so, and the reference holds those pixels.
+  expect(result.rotated.decoded).toEqual({ width: 30, height: 60 });
+  expect(result.rotated.header).toEqual({ width: 30, height: 60 });
+  expect(result.rotated.out).toEqual([30, 60]);
+  expect(result.rotated.passedThrough).toBe(false);
+  const [topRed, , topBlue] = result.rotated.top as [number, number, number];
+  const [bottomRed, , bottomBlue] = result.rotated.bottom as [number, number, number];
+  expect(topRed).toBeGreaterThan(200);
+  expect(topBlue).toBeLessThan(60);
+  expect(bottomBlue).toBeGreaterThan(200);
+  expect(bottomRed).toBeLessThan(60);
+  expect(result.rotated.uprightPassedThrough).toBe(true);
+  expect(result.pngRotated.header).toEqual(result.pngRotated.decoded);
+  console.info(
+    `PNG with eXIf orientation 6 decodes as ${JSON.stringify(result.pngRotated.decoded)}`,
+  );
+
+  // Scaled together: one size, and the marked area, the red square and the mask cover the same pixels.
+  expect(result.set.sizes).toEqual([
+    [800, 600],
+    [800, 600],
+    [800, 600],
+  ]);
+  for (const box of [result.set.plainBox, result.set.markedBox, result.set.maskBox]) {
+    [200, 150, 240, 180].forEach((expected, i) =>
+      expect(Math.abs((box[i] ?? 0) - expected)).toBeLessThanOrEqual(1),
+    );
+  }
+
+  const [noisySize, maskSize] = result.heavy.sizes;
+  expect(noisySize).toEqual(maskSize);
+  expect(noisySize?.width ?? 800).toBeLessThan(800);
+  expect(Math.abs((noisySize?.width ?? 0) / (noisySize?.height ?? 1) - 4 / 3)).toBeLessThan(0.01);
+  expect(result.heavy.types).toEqual(['image/jpeg', 'image/png']);
+  for (const bytes of result.heavy.bytes) expect(bytes).toBeLessThanOrEqual(60_000);
+
+  expect(result.png.type).toBe('image/png');
+  expect(result.png.bytes).toBeLessThanOrEqual(600_000);
+  expect(result.png.size.width).toBeLessThan(1024);
+  console.info(`noisy PNG to PNG under 600 KB: ${JSON.stringify(result.png)}`);
+  expect(problems).toEqual([]);
+});
+
+test("runs the editor's mask work in the worker, and recovers from a worker that fails to start", async ({
+  page,
+}) => {
+  const workers: string[] = [];
+  page.on('worker', (worker) => {
+    if (/image-worker/.test(worker.url())) workers.push(worker.url());
+  });
+  const problems = await openMediaPage(page);
+
+  const result = await page.evaluate(async () => {
+    const { image, imageAsync } = window.__media as NonNullable<Window['__media']>;
+    const same = (a: { data: ArrayLike<number> }, b: { data: ArrayLike<number> }): boolean => {
+      if (a.data.length !== b.data.length) return false;
+      for (let i = 0; i < a.data.length; i++) if (a.data[i] !== b.data[i]) return false;
+      return true;
+    };
+    const canvas = new OffscreenCanvas(1200, 900);
+    const context = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+    const gradient = context.createLinearGradient(0, 0, 1200, 900);
+    gradient.addColorStop(0, '#1e3a8a');
+    gradient.addColorStop(1, '#f59e0b');
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, 1200, 900);
+    const picture = image.imageDataFrom(canvas);
+    const disc = (width: number, height: number, radius: number) => {
+      const mask = { width, height, data: new Uint8Array(width * height) };
+      for (let y = 0; y < height; y++)
+        for (let x = 0; x < width; x++)
+          if ((x - width / 2) ** 2 + (y - height / 2) ** 2 < radius ** 2)
+            mask.data[y * width + x] = 255;
+      return mask;
+    };
+    const mask = disc(1200, 900, 250);
+    const answer = image.createRaster(1200, 900, '#20a040');
+
+    const identical = {
+      overlay: same(
+        await imageAsync.maskOverlayAsync(picture, mask, '#FF00FF', 0.5),
+        image.maskOverlay(picture, mask, '#FF00FF', 0.5),
+      ),
+      maskRaster: same(await imageAsync.maskToRasterAsync(mask), image.maskToRaster(mask)),
+      feather: same(await imageAsync.featherInsideAsync(mask, 12), image.featherInside(mask, 12)),
+      composite: same(
+        await imageAsync.compositeMaskedAsync(picture, answer, mask, { feather: 12 }),
+        image.compositeMasked(picture, answer, image.featherInside(mask, 12)),
+      ),
+    };
+
+    // The worker has answered, so pixels asked to be transferred are handed over.
+    const moved = {
+      picture: image.imageDataFrom(canvas),
+      answer: image.createRaster(1200, 900, '#20a040'),
+      mask: disc(1200, 900, 250),
+    };
+    await imageAsync.compositeMaskedAsync(
+      moved.picture,
+      moved.answer,
+      moved.mask,
+      { feather: 4 },
+      { transfer: true },
+    );
+    const transferred = [
+      moved.picture.data.length,
+      moved.answer.data.length,
+      moved.mask.data.length,
+    ];
+
+    // A long job is aborted, and the next one runs in a fresh worker.
+    const bigMask = disc(4000, 3000, 1200);
+    const big = image.createRaster(4000, 3000, '#808080');
+    const controller = new AbortController();
+    const aborting = imageAsync.compositeMaskedAsync(
+      big,
+      big,
+      bigMask,
+      { feather: 32 },
+      { signal: controller.signal },
+    );
+    setTimeout(() => controller.abort(), 30);
+    const outcome = await aborting.then(
+      () => 'finished',
+      (error: unknown) => (error instanceof DOMException ? error.name : String(error)),
+    );
+    const afterAbort = (await imageAsync.featherInsideAsync(disc(40, 30, 10), 2)).width;
+    return { identical, transferred, outcome, afterAbort };
+  });
+
+  expect(result.identical).toEqual({
+    overlay: true,
+    maskRaster: true,
+    feather: true,
+    composite: true,
+  });
+  expect(result.transferred).toEqual([0, 0, 0]);
+  expect(result.outcome).toBe('AbortError');
+  expect(result.afterAbort).toBe(40);
+  await expect.poll(() => workers.length).toBeGreaterThanOrEqual(2);
+  const beforeFailure = workers.length;
+
+  // The next worker fails before it ever answers (as a blocked or broken script would): the page runs that
+  // job on its own copy of the pixels, and the job after it gets a new, real worker.
+  const recovery = await page.evaluate(async () => {
+    const { image, imageAsync, imagePipeline } = window.__media as NonNullable<Window['__media']>;
+    imageAsync.disposeImageWorker();
+    const RealWorker = window.Worker;
+    class FailsToStart {
+      onmessage: unknown = null;
+      onerror: ((event: ErrorEvent) => void) | null = null;
+      constructor() {
+        setTimeout(() => this.onerror?.(new ErrorEvent('error', { cancelable: true })), 20);
+      }
+      postMessage(message: unknown, transfer: Transferable[] = []): void {
+        structuredClone(message, { transfer }); // what a real hand-over does to the page's buffers
+      }
+      terminate(): void {}
+    }
+    let first = true;
+    const Wrapped = function (url: string | URL, options?: WorkerOptions): unknown {
+      if (first) {
+        first = false;
+        return new FailsToStart();
+      }
+      return new RealWorker(url, options);
+    };
+    (window as unknown as { Worker: unknown }).Worker = Wrapped;
+    try {
+      const photo = image.createRaster(300, 200, '#fbfbfb');
+      for (let y = 50; y < 150; y++) photo.data.fill(40, (y * 300 + 60) * 4, (y * 300 + 240) * 4);
+      const expected = imagePipeline.isolateRaster(photo, { size: 120 });
+      const failed = await imageAsync.isolateImage(photo, { size: 120 }, { transfer: true });
+      const keptBytes = photo.data.length;
+      const next = await imageAsync.isolateImage(photo, { size: 60 });
+      let sameAsPage = failed.image.data.length === expected.image.data.length;
+      for (let i = 0; sameAsPage && i < expected.image.data.length; i++)
+        if (failed.image.data[i] !== expected.image.data[i]) sameAsPage = false;
+      return { sameAsPage, keptBytes, next: next.image.width, usedFake: !first };
+    } finally {
+      (window as unknown as { Worker: unknown }).Worker = RealWorker;
+    }
+  });
+
+  expect(recovery).toEqual({
+    sameAsPage: true,
+    keptBytes: 300 * 200 * 4,
+    next: 60,
+    usedFake: true,
+  });
+  await expect.poll(() => workers.length).toBe(beforeFailure + 1);
+  expect(problems).toEqual([]);
+});

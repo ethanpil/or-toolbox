@@ -113,12 +113,22 @@ export function createRunner<A = unknown>(
       // runs the same thing again (same argument).
       if (isStop(error)) {
         if (!wasPresented(error)) announce('Stopped.');
-      } else void presentError(error, { retry: () => void trigger(arg) });
+      } else void presentError(error, { retry: () => replay(arg) });
     } finally {
       busy = false;
       controller = null;
       render();
     }
+  }
+
+  /** The error toast's Retry: the same argument, narrowed by `replayArg` (null: nothing left to send). */
+  function replay(arg?: A): void {
+    const next = options.replayArg ? options.replayArg(arg) : arg;
+    if (next === null) {
+      announce('Nothing left to retry: every item already has a result.');
+      return;
+    }
+    void trigger(next);
   }
 
   function stop(): void {
@@ -153,5 +163,20 @@ export function createRunner<A = unknown>(
         listeners.delete(fn);
       };
     },
+  };
+}
+
+/**
+ * A `replayArg` for runners whose argument is a list of item keys: keeps the keys `isDone` says still need doing,
+ * null when none is left. A plain run (no argument) stays a plain run; tools whose Run already skips finished
+ * items need nothing more.
+ */
+export function pendingOnly<K>(
+  isDone: (key: K) => boolean,
+): (keys: readonly K[] | undefined) => K[] | undefined | null {
+  return (keys) => {
+    if (keys === undefined) return undefined;
+    const left = keys.filter((key) => !isDone(key));
+    return left.length > 0 ? left : null;
   };
 }

@@ -32,6 +32,7 @@ import type {
   RawVideoModel,
 } from './api/types';
 import type { Capability, ToolCategory, ToolId, ToolManifest } from '../tools/types';
+import type { ImageModelControls } from './models/image-params';
 
 // ---------------------------------------------------------------------------------------------
 // Identifiers (defined with their runtime constants in src/tools/types.ts)
@@ -274,6 +275,11 @@ export interface ResolvedModel {
   note: string | null;
 }
 
+export type ImageControlsResult =
+  | { status: 'ready'; controls: ImageModelControls }
+  | { status: 'unknown'; controls: ImageModelControls }
+  | { status: 'missing' };
+
 export interface ModelsService {
   /** Cached catalog (IndexedDB), refreshed when older than 24 h or on `refresh`. Works offline from cache. */
   list(opts?: { refresh?: boolean }): Promise<ModelInfo[]>;
@@ -292,6 +298,13 @@ export interface ModelsService {
   resolve(tool: ToolId, cap: Capability, runOverride?: string): ResolvedModel;
   /** `GET /images/models` (cached like the catalog). */
   imageModels(opts?: { refresh?: boolean }): Promise<RawImageModel[]>;
+  /**
+   * What an image model takes, with ONE policy for every image tool: `ready` (from `GET /images/models`);
+   * `missing` (the list was read and does not have it: refuse before the run); `unknown` (the list could not be
+   * read or is empty: let the request try with `controls` = bare controls, the prompt only). A failed read is
+   * tried again on a call after `IMAGE_CONTROLS_RETRY_MS`, and after `models-refreshed`.
+   */
+  imageControls(modelId: string): Promise<ImageControlsResult>;
   /** `GET /videos/models` (cached like the catalog). */
   videoModels(opts?: { refresh?: boolean }): Promise<RawVideoModel[]>;
   /** Per-provider endpoints for a model (`GET /models/{id}/endpoints`, cached). */
@@ -321,7 +334,10 @@ export type EstimateInput =
       images: number;
       width?: number;
       height?: number;
+      /** Reference images sent with each request. */
       references?: number;
+      /** Requests that send them (one with `n`, or one per image); default 1. */
+      requests?: number;
     }
   | {
       kind: 'video';

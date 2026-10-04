@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { JobRecord, KeyInfo } from '../../core/types';
 import { ApiError, NoKeyError } from '../../core/errors';
+import { replace } from '../dom';
 import { wasPresented } from '../feedback/errors';
 import { costBadge } from './cost-badge';
 import { dropZone } from './drop-zone';
@@ -88,6 +89,17 @@ describe('dropZone', () => {
     const click = vi.spyOn(input, 'click').mockImplementation(() => undefined);
     button.click();
     expect(click).toHaveBeenCalledOnce();
+  });
+
+  it('keeps focus on its button when a tool rebuilds it (default focus key, overridable)', () => {
+    const slot = document.createElement('div');
+    document.body.append(slot);
+    replace(slot, dropZone({ onFiles: vi.fn() }));
+    $<HTMLButtonElement>(slot, 'drop-zone-button')!.focus();
+    replace(slot, dropZone({ multiple: true, onFiles: vi.fn() }));
+    expect(document.activeElement).toBe($(slot, 'drop-zone-button'));
+    const custom = dropZone({ focusKey: 'reference-drop', onFiles: vi.fn() });
+    expect($(custom, 'drop-zone-button')?.getAttribute('data-focus-key')).toBe('reference-drop');
   });
 
   it('highlights while files are dragged over it', () => {

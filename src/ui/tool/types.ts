@@ -39,6 +39,11 @@ export interface ToolInstance {
   onFiles?(files: File[]): void;
   /** Items sent from another tool ("Send to…"), filtered by `manifest.accepts`. */
   onReceive?(items: SendItem[]): void;
+  /**
+   * The tool has no main text field (it works on files and settings only): `getState().prompt` is always '', the
+   * `tool-prompt` test id convention does not apply, and Prompts' "Save current" saves named settings presets.
+   */
+  promptless?: boolean;
   /** Fills the form with a ready-to-run example (`?sample=1`, onboarding's "Try a sample"). */
   sample?(): void | Promise<void>;
   /**
@@ -79,6 +84,12 @@ export interface RunnerOptions<A = unknown> {
    * Throw to report failure; errors go through `presentError` with a Retry.
    */
   run: (signal: AbortSignal, arg?: A) => Promise<void>;
+  /**
+   * What the error toast's Retry replays, from the argument of the run that failed. Narrow it to the items still
+   * without a result (`pendingOnly(isDone)`), so a Retry after a fatal error part-way never pays for finished
+   * items again. Return null when nothing is left: Retry then does nothing and says so. Default: the same argument.
+   */
+  replayArg?: (arg: A | undefined) => A | undefined | null;
   /** Text after the button (e.g. a reason it is disabled); also its description. */
   hint?: string;
   /** Where the bar goes; default the end of `ui.input`. */

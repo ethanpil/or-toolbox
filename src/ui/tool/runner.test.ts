@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RunCancelledError } from '../../core/errors';
-import { createRunner } from './runner';
+import { createRunner, pendingOnly } from './runner';
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -151,5 +151,38 @@ describe('createRunner', () => {
     off();
     runner.setDisabled('x');
     expect(states).toHaveLength(5);
+  });
+
+  it('lets the tool narrow what the error Retry replays, so finished items are not paid again', async () => {
+    const seen: (string[] | undefined)[] = [];
+    const done = new Set<string>();
+    const runner = createRunner<string[]>(
+      {
+        run: (_signal, keys) => {
+          seen.push(keys);
+          done.add('a'); // 'a' got its result before the fatal error
+          return Promise.reject(new Error('Payment required'));
+        },
+        replayArg: pendingOnly((key) => done.has(key)),
+      },
+      true,
+    );
+    document.body.append(runner.element);
+    await runner.trigger(['a', 'b']);
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-retry"]')).not.toBeNull(),
+    );
+    document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
+    await vi.waitFor(() => expect(seen).toEqual([['a', 'b'], ['b']]));
+
+    // Everything done by now: the Retry has nothing left to send.
+    done.add('b');
+    document.body.querySelectorAll('[data-testid="toast"]').forEach((node) => node.remove());
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-retry"]')).not.toBeNull(),
+    );
+    document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(seen).toHaveLength(2);
   });
 });

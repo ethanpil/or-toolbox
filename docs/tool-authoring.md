@@ -141,6 +141,8 @@ const retryButton = (keys: string[]) =>
 
 `bind(button)` keeps the button in step with Run (shown unavailable while Run is busy or disabled, with the reason as its title, but still focusable); `retry(arg, fallbackMessage?)` triggers the runner and announces why when it cannot start; `blocked()` is the current reason or null. When a focused Retry button disappears (its item re-rendered as running) and nothing else took focus, focus goes to `fallback()` (default: Run).
 
+A replay must not pay for finished items again: give the runner `replayArg: pendingOnly((key) => hasResult(key))` (from `src/ui/tool/runner.ts`) and the error toast's Retry sends only the items still without a result (none left: it says so and does nothing).
+
 ### Batches: `runItems`
 
 **Every batch tool (pages, documents, segments, images) works through its items with `runItems()`** (`src/ui/tool/batch.ts`, built on `runPool`) inside one run, so statuses, stopping and error reporting are the same everywhere:
@@ -307,6 +309,8 @@ Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manife
 
 Test the round trip (`applyState(getState())` changes nothing, and `getState()` after `applyState(x)` equals `x`).
 
+A tool that works on files and settings only, with no main text field, sets `promptless: true` on its instance: `getState().prompt` stays `''`, and Prompts' "Save current" saves named settings presets (no Copy, no Recent entries).
+
 ## Files in and out
 
 - **Drop and paste:** implement `onFiles(files)`. From the moment the page starts, every file drag over it is caught (a stray drop never opens the file and leaves the page). While your tool takes files (`onFiles` and a non-empty `accepts`), a page-wide overlay shows during the drag; only files matching `manifest.accepts` (wildcards and extension fallback) reach `onFiles`, and skipped ones are named in a toast. A tool without `onFiles` answers a drop with "<Tool> doesn't take files." A paste into a text field that carries text is left to the field.
@@ -318,7 +322,9 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 
 | Component | Use it for |
 | --- | --- |
-| `dropZone(options)` | File input target (drag, keyboard, accept filter). |
+| `dropZone(options)` | File input target (drag, keyboard, accept filter); its Choose files button keeps focus across rebuilds (`focusKey`, default `drop-zone`). |
+| `referencePicker({ ui, min?, max, accepts?, label?, ... })` | Reference images for a request: drop zone, small thumbnails (`imageThumbnail`), remove with focus management, a limits note (`setLimits` when the model changes, `problem()`), `add(items)` for Send to, paste and "use as reference". `dataUrls({ maxSide, maxBytes })` encodes each reference once and caches it until the limits change. |
+| `compareSlider(...)` | A before/after wipe (keyboard and pointer). |
 | `documentInput(options)` | Images and PDFs with thumbnails and page choice (`1-3, 7`, tile toggles); `selection()` lists pages, `loadPage(ref)` renders one for upload (`{ fileName, pageNumber, imageDataUrl, text? }`), `pageImage`/`reveal` show the source. Pair with `runItems()` for per-page requests. |
 | `modelPicker(ctx, { capability, selected })` → `Promise<string \| null>` | Extra model choices (arena contenders, bot B, a secondary capability). The header chip covers the primary capability only. |
 | `keyPicker({ keys, value, onChange, focusKey? })` | A key choice beyond the header's. |
@@ -328,7 +334,7 @@ Test the round trip (`applyState(getState())` changes nothing, and `getState()` 
 | `exportMenu({ filename, formats, resultIds })` | Lazily built downloads in several formats; `update(…)` changes it in place. |
 | `imageViewer({ src \| blob, alt })` | Fit/zoom, checkerboard behind transparency. |
 | `audioResultCard({ ui, blob, name, seconds?, peaks?, metaParts, formats, onRemove, ... })` | One audio result (a recording, joined speech, a song): player, downloads (the file as it is plus converted `formats`), Send to…, Remove with focus management, registered with the leave guard through `ui.addResult`. Returns `{ element, handle, player, remove() }`. |
-| `imageResultCard({ ui, blob, name, meta, formats, onRemove, actions?, viewer?, ... })` | One image result (a generated image, an edited version): viewer, downloads (the file as it is plus `formats` converted through a canvas: `png`, `jpg`, `webp`), Send to…, the tool's own `actions` (`{ label, icon, ariaLabel, onClick, testId }`), Remove with focus management, registered with the leave guard through `ui.addResult`. `viewer: false` for a page that already shows the image (an editor canvas). Returns `{ element, handle, viewer, remove() }`. |
+| `imageResultCard({ ui, blob, name, meta, formats, onRemove, actions?, viewer?, ... })` | One image result (a generated image, an edited version): viewer, downloads (the file as it is plus `formats` converted through a canvas: `png`, `jpg`, `webp`), Send to…, the tool's own `actions` (`{ label, icon, ariaLabel, onClick, testId }`), Remove with focus management, registered with the leave guard through `ui.addResult`. `viewer: false` for a page that already shows the image (an editor canvas). Returns `{ element, handle, viewer, remove() }`. `focusFallback` runs after `onRemove` has updated the page; a format the browser cannot encode (WebP in Safari) is left out of the menu; SVG downloads only as it is. |
 | `progressBar({ label, hidden?, class?, testId? })` | A labelled `role="progressbar"`; `update(done, total, text?)` (text becomes `aria-valuetext`). Pair it with `ui.progress`. |
 | `audioPlayer({ src \| blob, peaks?, label })` | Native controls plus a waveform (`peaks()` from `src/core/media/audio`, or decoded lazily at 8 kHz mono; none beyond 30 minutes). Pass `seconds` when you know the length (nothing is measured); recordings whose duration reads as Infinity are probed before seeking. |
 | `videoPlayer({ src \| blob, label })` | Native controls in a letterboxed frame. |
@@ -345,11 +351,14 @@ Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` 
 - **Lazy only.** Anything heavy loads with `import()` when first needed, and the manifest lists it in `lazyLibs` (a unit test checks they are dependencies). Budget: each tool adds at most 80 KB gzipped JS to the shell's 150 KB; check the `npm run build` output.
 - **PDF:** import `src/core/media/pdf.ts` dynamically only (`const { openPdf } = await import('../../core/media/pdf')`); it brings about 5 MB of pdf.js assets.
 - **Audio:** join TTS or audio segments with `stitchAudio(segments, 'mp3' | 'wav')` (`src/core/media/stitch.ts`: decode → PCM → encode once; a single segment already in the target format comes back as it is, without loading anything). Plain MP3 concatenation leaves gaps at the seams. Convert a file with `transcode(blob, 'mp3' | 'wav')` (`src/core/media/transcode.ts`, loads ffmpeg only when called).
-- **Isolated image:** run the pipeline through `isolateImage()` (`src/core/media/image-async.ts`, a module worker with a fallback), never the raster functions on the main thread.
+- **Images:** run heavy pixel work in the worker (`src/core/media/image-async.ts`: `isolateImage`, `maskOverlayAsync`, `maskToRasterAsync`, `featherInsideAsync`, `compositeMaskedAsync`, each with `{ signal, transfer }` and a page fallback), never pixel loops on the main thread. A failed worker is recreated on the next job; after three failures in a row the page does the work. Encode references that belong together (marked, plain, mask) with `toDataUrls(images, options)`, at one pixel size; `readImageSize(blob)` reads dimensions from the file header without decoding.
+- **Image models:** ask `ctx.models.imageControls(model)`: `ready` (send only the fields its `controls` list), `missing` (refuse before the run) or `unknown` (the list could not be read: send `controls`, the bare prompt-only set, and let the request try). Estimates with references pass `requests` (how many requests upload them).
 - **ZIP:** `zipFiles()` from `src/core/export`, or fflate's `zipSync`. Never fflate's async API (`zip`, `unzip`, `deflate`): it starts `blob:` workers that the CSP blocks, and then never settles.
 - **ffmpeg:** go through `src/core/media/ffmpeg-ops.ts`; any `exec` of your own passes explicit `-threads` limits (multi-threaded ffmpeg crashes on H.264 encodes with the default count).
 
 ## Rules that bite
+
+- The Run bar is sticky at the bottom of the window; the framework keeps focused controls clear of it (scroll padding, plus a correction after Tab). Do not add sticky footers of your own in the input zone.
 
 - DOM only through `h()`; model output only through `renderMarkdown()` (the output panel does it). No `innerHTML`, no inline styles in strings, no remote `src` (load remote media with `fetch` → Blob → object URL).
 - No `fetch` to OpenRouter and no storage access: go through `ctx`.
@@ -362,7 +371,7 @@ Every control has a visible label (or `aria-label` for icon buttons), everything
 
 ## Testing
 
-- **Convention:** the tool's main prompt field (the one `getState().prompt` reads) carries `data-testid="tool-prompt"`. Shared specs (Prompts, onboarding's sample) find it there.
+- **Convention:** the tool's main prompt field (the one `getState().prompt` reads) carries `data-testid="tool-prompt"`. Shared specs (Prompts, onboarding's sample) find it there. A tool without one declares `promptless: true` on its instance.
 - **Unit** (`src/tools/<id>/*.test.ts`, Vitest + jsdom): pipeline logic, request building, parsing, and the tool itself through `createToolTestContext` (`src/ui/tool/testing.ts`). It builds a real `ToolContext` (the same `createToolContext` as the page) over the fake core: real settings, runs, history and models services on fake IndexedDB, one fake key, and an API client whose calls throw unless you provide them.
 
   ```ts

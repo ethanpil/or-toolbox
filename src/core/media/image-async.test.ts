@@ -1,8 +1,17 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isAbortError } from '../errors';
-import { createRaster, type RasterImage } from './image';
+import {
+  compositeMasked,
+  createRaster,
+  featherInside,
+  type Mask,
+  maskOverlay,
+  maskToRaster,
+  type RasterImage,
+} from './image';
 import type * as ImageAsync from './image-async';
+import { MAX_WORKER_FAILURES } from './image-async';
 import type { IsolateResult } from './image-pipeline';
 import { isolateRaster } from './image-pipeline';
 import type { WorkerRequest, WorkerResponse } from './image-worker';
@@ -110,7 +119,13 @@ class FakeWorker {
   }
 
   postMessage(request: WorkerRequest, transfer: Transferable[] = []): void {
-    this.sent.push({ request, transfer });
+    // As a real postMessage: the worker gets a copy, and transferred buffers are emptied on the page.
+    this.sent.push({ request: structuredClone(request, { transfer }), transfer });
+  }
+
+  /** The worker itself fails (script blocked, crashed). */
+  fail(): void {
+    this.onerror?.({ preventDefault: () => undefined } as ErrorEvent);
   }
 
   terminate(): void {
@@ -122,11 +137,12 @@ class FakeWorker {
   }
 }
 
+function stub(): void {
+  FakeWorker.instances = [];
+  vi.stubGlobal('Worker', FakeWorker);
+}
+
 describe('isolateImage with a worker', () => {
-  const stub = (): void => {
-    FakeWorker.instances = [];
-    vi.stubGlobal('Worker', FakeWorker);
-  };
   const resultFor = (size: number): IsolateResult => isolateRaster(photo(), { size });
 
   it('starts one module worker from image-worker.ts and sends it one job at a time', async () => {
@@ -190,7 +206,7 @@ describe('isolateImage with a worker', () => {
 
     expect(FakeWorker.instances).toHaveLength(2);
     const second = FakeWorker.instances[1];
-    expect(second?.sent[0]?.request.options).toEqual({ size: 31 });
+    expect(second?.sent[0]?.request).toMatchObject({ options: { size: 31 } });
     second?.reply({ id: second.sent[0]?.request.id ?? -1, ok: true, result: resultFor(31) });
     expect((await next).image.width).toBe(31);
   });
@@ -207,20 +223,81 @@ describe('isolateImage with a worker', () => {
     expect(FakeWorker.instances[0]?.sent).toHaveLength(1);
   });
 
-  it('runs on the page when the worker cannot start', async () => {
+  it('runs the job on the page when its worker fails, and starts a new worker for the next job', async () => {
     stub();
     const { isolateImage } = await freshModule();
     const job = isolateImage(photo(), { size: 24 });
     const [worker] = FakeWorker.instances;
-    worker?.onerror?.({ preventDefault: () => undefined } as ErrorEvent);
+    worker?.fail();
     expect(worker?.terminated).toBe(true);
     expect((await job).image.width).toBe(24);
-    // Later jobs do not try the worker again.
-    expect((await isolateImage(photo(), { size: 25 })).image.width).toBe(25);
-    expect(FakeWorker.instances).toHaveLength(1);
+
+    const next = isolateImage(photo(), { size: 25 });
+    expect(FakeWorker.instances).toHaveLength(2);
+    const second = FakeWorker.instances[1];
+    second?.reply({ id: second.sent[0]?.request.id ?? -1, ok: true, result: resultFor(25) });
+    expect((await next).image.width).toBe(25);
   });
 
-  it('runs on the page when the Worker constructor throws', async () => {
+  it(`gives up on workers after ${MAX_WORKER_FAILURES} failures with no answer between them`, async () => {
+    stub();
+    const { isolateImage } = await freshModule();
+    const failNext = async (size: number): Promise<void> => {
+      const job = isolateImage(photo(), { size });
+      FakeWorker.instances.at(-1)?.fail();
+      expect((await job).image.width).toBe(size);
+    };
+    await failNext(20);
+    // An answer in between starts the count again.
+    const answered = isolateImage(photo(), { size: 21 });
+    const worker = FakeWorker.instances[1];
+    worker?.reply({ id: worker.sent[0]?.request.id ?? -1, ok: true, result: resultFor(21) });
+    await answered;
+    worker?.fail(); // idle, between jobs
+    await failNext(22);
+    await failNext(23);
+    expect(FakeWorker.instances).toHaveLength(MAX_WORKER_FAILURES + 1);
+    // The page does the work from now on.
+    expect((await isolateImage(photo(), { size: 24 })).image.width).toBe(24);
+    expect(FakeWorker.instances).toHaveLength(MAX_WORKER_FAILURES + 1);
+  });
+
+  it('copies the pixels for a worker that has not answered yet, so the page can run the job if it fails to load', async () => {
+    stub();
+    const { isolateImage } = await freshModule();
+    const source = photo();
+    const job = isolateImage(source, { size: 24 }, { transfer: true });
+    const [worker] = FakeWorker.instances;
+    expect(worker?.sent[0]?.transfer).toEqual([]);
+    expect(source.data.length).toBe(60 * 40 * 4);
+    worker?.fail();
+    expect((await job).image.data).toEqual(isolateRaster(photo(), { size: 24 }).image.data);
+  });
+
+  it('rejects a transferred job whose worker dies, instead of running it on emptied pixels', async () => {
+    stub();
+    const { isolateImage } = await freshModule();
+    const first = isolateImage(photo(), { size: 30 });
+    const [worker] = FakeWorker.instances;
+    worker?.reply({ id: worker.sent[0]?.request.id ?? -1, ok: true, result: resultFor(30) });
+    await first;
+
+    const moved = photo();
+    const job = isolateImage(moved, { size: 31 }, { transfer: true });
+    expect(moved.data.length).toBe(0); // handed over to the worker
+    worker?.fail();
+    await expect(job).rejects.toSatisfy(
+      (error) =>
+        error instanceof Error &&
+        error.name === 'InvalidInputError' &&
+        /stopped/.test(error.message),
+    );
+    // Trying again uses a new worker.
+    void isolateImage(photo(), { size: 32 });
+    expect(FakeWorker.instances).toHaveLength(2);
+  });
+
+  it('runs on the page when the Worker constructor throws, and tries again for the next job', async () => {
     FakeWorker.instances = [];
     vi.stubGlobal(
       'Worker',
@@ -232,5 +309,98 @@ describe('isolateImage with a worker', () => {
     );
     const { isolateImage } = await freshModule();
     expect((await isolateImage(photo(), { size: 22 })).image.width).toBe(22);
+    expect((await isolateImage(photo(), { size: 23 })).image.width).toBe(23);
+  });
+});
+
+describe('the Image editor operations', () => {
+  /** A 50 x 40 picture with a gradient, and a mask with a 20 x 16 block marked. */
+  const picture = (): RasterImage => {
+    const img = createRaster(50, 40);
+    for (let p = 0; p < 50 * 40; p++) img.data.set([p % 256, (p * 7) % 256, 90, 255], p * 4);
+    return img;
+  };
+  const block = (): Mask => {
+    const mask: Mask = { width: 50, height: 40, data: new Uint8Array(50 * 40) };
+    for (let y = 12; y < 28; y++) mask.data.fill(255, y * 50 + 15, y * 50 + 35);
+    return mask;
+  };
+  const result = (): RasterImage => createRaster(50, 40, '#c83214');
+
+  it('give exactly what the pure functions give (on the page, without workers)', async () => {
+    const ops = await freshModule();
+    expect((await ops.maskOverlayAsync(picture(), block(), '#FF00FF', 0.5)).data).toEqual(
+      maskOverlay(picture(), block(), '#FF00FF', 0.5).data,
+    );
+    expect((await ops.maskToRasterAsync(block())).data).toEqual(maskToRaster(block()).data);
+    expect((await ops.featherInsideAsync(block(), 4)).data).toEqual(featherInside(block(), 4).data);
+    expect(
+      (await ops.compositeMaskedAsync(picture(), result(), block(), { feather: 4 })).data,
+    ).toEqual(compositeMasked(picture(), result(), featherInside(block(), 4)).data);
+    expect((await ops.compositeMaskedAsync(picture(), result(), block())).data).toEqual(
+      compositeMasked(picture(), result(), block()).data,
+    );
+  });
+
+  it('send their inputs to the worker, transfer them once it has answered, and can be aborted', async () => {
+    stub();
+    const ops = await freshModule();
+    const first = ops.featherInsideAsync(block(), 3, { transfer: true });
+    const [worker] = FakeWorker.instances;
+    expect(worker?.sent[0]).toMatchObject({
+      request: { op: 'featherInside', radius: 3 },
+      transfer: [],
+    });
+    worker?.reply({
+      id: worker.sent[0]?.request.id ?? -1,
+      ok: true,
+      result: featherInside(block(), 3),
+    });
+    expect((await first).data).toEqual(featherInside(block(), 3).data);
+
+    const original = picture();
+    const mask = block();
+    const answer = result();
+    const composite = ops.compositeMaskedAsync(
+      original,
+      answer,
+      mask,
+      { feather: 6 },
+      { transfer: true },
+    );
+    const sent = worker?.sent[1];
+    expect(sent?.request).toMatchObject({ op: 'compositeMasked', feather: 6 });
+    expect(sent?.transfer).toHaveLength(3);
+    expect([original.data.length, answer.data.length, mask.data.length]).toEqual([0, 0, 0]);
+
+    const controller = new AbortController();
+    const marked = ops.maskOverlayAsync(picture(), block(), '#FF00FF', 0.5, {
+      signal: controller.signal,
+    });
+    controller.abort();
+    await expect(marked).rejects.toSatisfy(isAbortError);
+    expect(worker?.terminated).toBe(false); // it was still waiting
+    worker?.reply({ id: sent?.request.id ?? -1, ok: true, result: createRaster(50, 40) });
+    expect((await composite).width).toBe(50);
+  });
+
+  it('run on the page when the worker fails', async () => {
+    stub();
+    const ops = await freshModule();
+    const job = ops.maskToRasterAsync(block(), { transfer: true });
+    FakeWorker.instances[0]?.fail();
+    expect((await job).data).toEqual(maskToRaster(block()).data);
+  });
+
+  it('transfer a pixel buffer once when two inputs share it', async () => {
+    stub();
+    const ops = await freshModule();
+    const warmUp = ops.maskToRasterAsync(block());
+    const [worker] = FakeWorker.instances;
+    worker?.reply({ id: worker.sent[0]?.request.id ?? -1, ok: true, result: createRaster(50, 40) });
+    await warmUp;
+    const same = picture();
+    void ops.compositeMaskedAsync(same, same, block(), {}, { transfer: true });
+    expect(worker?.sent[1]?.transfer).toHaveLength(2);
   });
 });

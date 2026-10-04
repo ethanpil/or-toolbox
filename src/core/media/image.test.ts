@@ -1,21 +1,37 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type * as Files from '../files';
 import {
   checkIsolated,
+  compositeMasked,
   contentBoundingBox,
   createRaster,
   cropRaster,
+  featherInside,
   fitWithin,
   flattenRaster,
   floodFillWhiteFromEdges,
+  type Mask,
   maskOverlay,
   maskToRaster,
   padToSquare,
   parseColour,
+  readImageSize,
   resizeRaster,
   type RasterImage,
+  toDataUrl,
+  toDataUrls,
   unsharpMask,
 } from './image';
+import { readImageHeader } from './image-header';
+import { gifFile, jpegFile, pngFile, webpFile } from './image-test-files';
+
+// Node has no FileReader: read data URLs with Buffer instead.
+vi.mock('../files', async (importOriginal) => ({
+  ...(await importOriginal<typeof Files>()),
+  readAsDataUrl: async (blob: Blob) =>
+    `data:${blob.type};base64,${Buffer.from(await blob.arrayBuffer()).toString('base64')}`,
+}));
 
 type Rgb = [number, number, number];
 
@@ -419,5 +435,293 @@ describe('masks', () => {
     const raster = maskToRaster({ width: 2, height: 1, data: new Uint8Array([255, 0]) });
     expect(pixel(raster, 0, 0)).toEqual([255, 255, 255, 255]);
     expect(pixel(raster, 1, 0)).toEqual([0, 0, 0, 255]);
+  });
+});
+
+describe('featherInside and compositeMasked', () => {
+  const at = (mask: Mask, x: number, y: number): number => mask.data[y * mask.width + x] ?? -1;
+  /** A 40 x 40 mask with a 20 x 20 square marked in the middle (10..29). */
+  const square = (): Mask => {
+    const mask: Mask = { width: 40, height: 40, data: new Uint8Array(1600) };
+    for (let y = 10; y < 30; y++) mask.data.fill(255, y * 40 + 10, y * 40 + 30);
+    return mask;
+  };
+
+  it('softens only the inside of the mask: zero outside, full deeper than the radius', () => {
+    const soft = featherInside(square(), 3);
+    for (let y = 0; y < 40; y++) {
+      for (let x = 0; x < 40; x++) {
+        const inside = x >= 10 && x < 30 && y >= 10 && y < 30;
+        if (!inside) expect(at(soft, x, y)).toBe(0);
+      }
+    }
+    expect(at(soft, 20, 20)).toBe(255);
+    expect(at(soft, 14, 20)).toBe(255); // depth 4 > radius 3
+    expect(at(soft, 10, 20)).toBeGreaterThan(0);
+    expect(at(soft, 10, 20)).toBeLessThan(255);
+    expect(featherInside(square(), 0).data).toEqual(square().data);
+  });
+
+  it('keeps the original exactly outside the mask and takes the result inside', () => {
+    const original = createRaster(40, 40, [10, 20, 30]);
+    original.data[0] = 99; // a distinctive pixel outside the mask
+    const result = createRaster(40, 40, [200, 100, 50]);
+    const out = compositeMasked(original, result, featherInside(square(), 3));
+    expect(pixel(out, 0, 0)).toEqual([99, 20, 30, 255]);
+    expect(pixel(out, 9, 20)).toEqual([10, 20, 30, 255]);
+    expect(pixel(out, 30, 30)).toEqual([10, 20, 30, 255]);
+    expect(pixel(out, 20, 20)).toEqual([200, 100, 50, 255]);
+    const edge = pixel(out, 10, 20);
+    expect(edge[0]).toBeGreaterThan(10);
+    expect(edge[0]).toBeLessThan(200);
+    expect(() => compositeMasked(original, createRaster(20, 20), square())).toThrow(RangeError);
+  });
+});
+
+// --- data URLs and sizes, against a fake canvas and decoder ---------------------------------
+
+interface Encode {
+  width: number;
+  height: number;
+  type: string;
+  quality: number | undefined;
+}
+
+/**
+ * Stands in for the browser's canvas and decoder: sizes and byte counts, no pixels. An encode is a real
+ * PNG or JPEG header (so results can be measured with `readImageHeader`) plus a body of 3 bytes per pixel
+ * for PNG, `2 x quality` for JPEG. Files decode to the size registered with `file()`.
+ */
+function fakeBrowser() {
+  const encodes: Encode[] = [];
+  const decodes: Blob[] = [];
+  const decoded = new Map<Blob, { width: number; height: number }>();
+  class FakeCanvas {
+    width: number;
+    height: number;
+    constructor(width: number, height: number) {
+      this.width = width;
+      this.height = height;
+    }
+    getContext() {
+      return {
+        drawImage: () => undefined,
+        putImageData: () => undefined,
+        fillRect: () => undefined,
+      };
+    }
+    convertToBlob({ type = 'image/png', quality }: ImageEncodeOptions = {}): Promise<Blob> {
+      encodes.push({ width: this.width, height: this.height, type, quality });
+      const png = type === 'image/png';
+      const head = png ? pngFile(this.width, this.height) : jpegFile(this.width, this.height);
+      const body = new Uint8Array(
+        Math.round(this.width * this.height * (png ? 3 : 2 * (quality ?? 0.92))),
+      );
+      return Promise.resolve(new Blob([head as BlobPart, body], { type }));
+    }
+  }
+  class FakeImageData {
+    data: Uint8ClampedArray;
+    width: number;
+    height: number;
+    constructor(data: Uint8ClampedArray, width: number, height: number) {
+      this.data = data;
+      this.width = width;
+      this.height = height;
+    }
+  }
+  vi.stubGlobal('OffscreenCanvas', FakeCanvas);
+  vi.stubGlobal('ImageData', FakeImageData);
+  vi.stubGlobal('createImageBitmap', (blob: Blob) => {
+    decodes.push(blob);
+    const size = decoded.get(blob);
+    return size
+      ? Promise.resolve({ ...size, close: () => undefined })
+      : Promise.reject(new Error('The fake decoder does not know this file.'));
+  });
+  return {
+    encodes,
+    decodes,
+    /** A file of `bytes` that decodes to `upright` (its size with any EXIF rotation applied). */
+    file(bytes: Uint8Array, type: string, upright: { width: number; height: number }): Blob {
+      const blob = new Blob([bytes as BlobPart], { type });
+      decoded.set(blob, upright);
+      return blob;
+    },
+  };
+}
+
+const bytesOfUrl = (url: string): Uint8Array =>
+  Uint8Array.from(Buffer.from(url.slice(url.indexOf(',') + 1), 'base64'));
+const sizeOfUrl = async (url: string): Promise<[number, number, string]> => {
+  const header = await readImageHeader(new Blob([bytesOfUrl(url) as BlobPart]));
+  return [header?.width ?? -1, header?.height ?? -1, url.slice(5, url.indexOf(';'))];
+};
+const sizes = (encodes: Encode[]): string[] =>
+  encodes.map((encode) => `${encode.width}x${encode.height}`);
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('toDataUrl', () => {
+  it('passes a small upright file through untouched, without decoding it', async () => {
+    const fake = fakeBrowser();
+    const bytes = pngFile(800, 600);
+    const url = await toDataUrl(fake.file(bytes, 'image/png', { width: 800, height: 600 }));
+    expect(bytesOfUrl(url)).toEqual(bytes);
+    expect(fake.decodes).toHaveLength(0);
+    expect(fake.encodes).toHaveLength(0);
+  });
+
+  it('goes straight to smaller sizes for PNG output, whose size the quality does not change', async () => {
+    const fake = fakeBrowser();
+    const big = fake.file(pngFile(3000, 2000), 'image/png', { width: 3000, height: 2000 });
+    const url = await toDataUrl(big, { type: 'image/png', maxBytes: 4 * 1024 * 1024 });
+    // 3 bytes per pixel: 2048 x 1365 and 1638 x 1092 are over 4 MiB, 1310 x 874 fits.
+    expect(sizes(fake.encodes)).toEqual(['2048x1365', '1638x1092', '1310x874']);
+    expect(await sizeOfUrl(url)).toEqual([1310, 874, 'image/png']);
+  });
+
+  it('lowers the quality of a JPEG before its size', async () => {
+    const fake = fakeBrowser();
+    const big = fake.file(pngFile(3000, 2000), 'image/png', { width: 3000, height: 2000 });
+    const url = await toDataUrl(big, { maxBytes: 3_000_000 });
+    expect(sizes(fake.encodes)).toEqual(Array(4).fill('2048x1365'));
+    expect(fake.encodes.map((encode) => encode.type)).toEqual(Array(4).fill('image/jpeg'));
+    const qualities = fake.encodes.map((encode) => encode.quality ?? 0);
+    [0.9, 0.75, 0.6, 0.45].forEach((quality, i) => expect(qualities[i]).toBeCloseTo(quality));
+    expect(await sizeOfUrl(url)).toEqual([2048, 1365, 'image/jpeg']);
+  });
+
+  it('re-encodes a small file with an EXIF rotation, so the reference holds the upright pixels', async () => {
+    const fake = fakeBrowser();
+    const bytes = jpegFile(40, 30, { orientation: 6 });
+    const url = await toDataUrl(fake.file(bytes, 'image/jpeg', { width: 30, height: 40 }));
+    expect(bytesOfUrl(url)).not.toEqual(bytes);
+    expect(sizes(fake.encodes)).toEqual(['30x40']);
+    expect(await sizeOfUrl(url)).toEqual([30, 40, 'image/jpeg']);
+
+    // Orientation 1 says "as stored": nothing to apply, so it passes through.
+    const upright = jpegFile(40, 30, { orientation: 1 });
+    const same = await toDataUrl(fake.file(upright, 'image/jpeg', { width: 40, height: 30 }));
+    expect(bytesOfUrl(same)).toEqual(upright);
+  });
+});
+
+describe('toDataUrls', () => {
+  /** A raster of the given size (its pixels do not matter to the fake canvas). */
+  const raster = (width: number, height: number): RasterImage => createRaster(width, height);
+
+  it('encodes the marked picture, the plain file and the mask at one common size', async () => {
+    const fake = fakeBrowser();
+    const plain = fake.file(pngFile(300, 200), 'image/png', { width: 300, height: 200 });
+    const urls = await toDataUrls(
+      [
+        { image: raster(300, 200), type: 'image/png' },
+        plain,
+        { image: raster(300, 200), type: 'image/png' },
+      ],
+      { maxDimension: 100 },
+    );
+    expect(await Promise.all(urls.map(sizeOfUrl))).toEqual([
+      [100, 67, 'image/png'],
+      [100, 67, 'image/jpeg'],
+      [100, 67, 'image/png'],
+    ]);
+  });
+
+  it('shrinks the whole set when one picture does not fit, so the sizes stay equal', async () => {
+    const fake = fakeBrowser();
+    const plain = fake.file(pngFile(300, 200), 'image/png', { width: 300, height: 200 });
+    // At 200 x 133 the JPEG (47,880 bytes) fits under 60,000 but the PNG (79,800) does not: both go to 160 x 106.
+    const urls = await toDataUrls([plain, { image: raster(300, 200), type: 'image/png' }], {
+      maxDimension: 200,
+      maxBytes: 60_000,
+    });
+    expect(sizes(fake.encodes)).toEqual(['200x133', '200x133', '160x106', '160x106']);
+    expect(await Promise.all(urls.map(sizeOfUrl))).toEqual([
+      [160, 106, 'image/jpeg'],
+      [160, 106, 'image/png'],
+    ]);
+  });
+
+  it('passes an upright file through when the set needs no scaling, and encodes pixels at its size', async () => {
+    const fake = fakeBrowser();
+    const bytes = pngFile(120, 80);
+    const urls = await toDataUrls([
+      fake.file(bytes, 'image/png', { width: 120, height: 80 }),
+      { image: raster(120, 80), type: 'image/png' },
+    ]);
+    expect(bytesOfUrl(urls[0] ?? '')).toEqual(bytes);
+    expect(fake.decodes).toHaveLength(0);
+    expect(sizes(fake.encodes)).toEqual(['120x80']);
+  });
+
+  it('counts a rotated file at its upright size and re-encodes it', async () => {
+    const fake = fakeBrowser();
+    const rotated = fake.file(jpegFile(80, 120, { orientation: 6 }), 'image/jpeg', {
+      width: 120,
+      height: 80,
+    });
+    const urls = await toDataUrls([rotated, { image: raster(120, 80), type: 'image/png' }]);
+    expect(await Promise.all(urls.map(sizeOfUrl))).toEqual([
+      [120, 80, 'image/jpeg'],
+      [120, 80, 'image/png'],
+    ]);
+  });
+
+  it('refuses pictures of different sizes, and returns nothing for an empty set', async () => {
+    const fake = fakeBrowser();
+    const plain = fake.file(pngFile(300, 200), 'image/png', { width: 300, height: 200 });
+    await expect(toDataUrls([plain, raster(300, 201)])).rejects.toThrow(RangeError);
+    expect(await toDataUrls([])).toEqual([]);
+  });
+});
+
+describe('readImageSize', () => {
+  it('reads PNG, JPEG, WebP and GIF sizes from the header, without decoding', async () => {
+    const fake = fakeBrowser();
+    const unknown = { width: -1, height: -1 };
+    expect(await readImageSize(fake.file(pngFile(64, 48), 'image/png', unknown))).toEqual({
+      width: 64,
+      height: 48,
+    });
+    expect(await readImageSize(fake.file(webpFile('VP8L', 33, 22), '', unknown))).toEqual({
+      width: 33,
+      height: 22,
+    });
+    expect(await readImageSize(fake.file(gifFile(5, 3), 'image/gif', unknown))).toEqual({
+      width: 5,
+      height: 3,
+    });
+    // A JPEG's rotation is applied by every browser: 5-8 swap the sides.
+    const rotated = jpegFile(4032, 3024, { orientation: 6 });
+    expect(await readImageSize(fake.file(rotated, 'image/jpeg', unknown))).toEqual({
+      width: 3024,
+      height: 4032,
+    });
+    const flipped = jpegFile(4032, 3024, { orientation: 3 });
+    expect(await readImageSize(fake.file(flipped, 'image/jpeg', unknown))).toEqual({
+      width: 4032,
+      height: 3024,
+    });
+    expect(fake.decodes).toHaveLength(0);
+  });
+
+  it('decodes other formats, and PNG or WebP files with a rotation', async () => {
+    const fake = fakeBrowser();
+    const svg = fake.file(
+      new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"/>'),
+      'image/svg+xml',
+      { width: 3, height: 2 },
+    );
+    expect(await readImageSize(svg)).toEqual({ width: 3, height: 2 });
+    const rotated = fake.file(pngFile(64, 32, { orientation: 6 }), 'image/png', {
+      width: 32,
+      height: 64,
+    });
+    expect(await readImageSize(rotated)).toEqual({ width: 32, height: 64 });
+    expect(fake.decodes).toEqual([svg, rotated]);
   });
 });

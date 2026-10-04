@@ -128,6 +128,41 @@
   color: var(--bs-primary-text-emphasis);
 }
 
+// Reference picker (reference-picker.ts): 72 px thumbnails with a remove button on the corner (28 px target).
+.or-ref-item {
+  position: relative;
+}
+
+.or-ref-thumb {
+  display: grid;
+  place-items: center;
+  width: 4.5rem;
+  height: 4.5rem;
+  overflow: hidden;
+  font-size: 1.5rem;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius);
+
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+}
+
+.or-ref-remove {
+  position: absolute;
+  top: -0.5rem;
+  right: -0.5rem;
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border-radius: 50%;
+}
+
 .or-drop-overlay {
   position: fixed;
   inset: 0;
@@ -438,4 +473,56 @@
 
 .or-connect {
   max-width: 34rem;
+}
+
+// Before/after wipe (src/ui/components/compare-slider.ts): the "after" image is clipped to the right of the divider.
+.or-compare {
+  position: relative;
+  aspect-ratio: 1;
+  overflow: hidden;
+  cursor: ew-resize;
+  // Vertical swipes still scroll the page; horizontal drags move the divider.
+  touch-action: pan-y;
+  user-select: none;
+  background-color: #fff;
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius-lg);
+}
+
+.or-compare-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.or-compare-after {
+  clip-path: inset(0 0 0 var(--or-compare, 50%));
+}
+
+.or-compare-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--or-compare, 50%);
+  width: 2px;
+  margin-left: -1px;
+  pointer-events: none;
+  background-color: var(--bs-primary);
+}
+
+.or-compare-label {
+  position: absolute;
+  top: 0.5rem;
+  pointer-events: none;
+}
+
+.or-compare-label-start {
+  left: 0.5rem;
+}
+
+.or-compare-label-end {
+  right: 0.5rem;
 }

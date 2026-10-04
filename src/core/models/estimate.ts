@@ -132,7 +132,13 @@ export function estimateTranscription(
  */
 export function estimateImage(
   model: ModelInfo,
-  input: { images: number; width?: number; height?: number; references?: number },
+  input: {
+    images: number;
+    width?: number;
+    height?: number;
+    references?: number;
+    requests?: number;
+  },
 ): number | null {
   const raw = model.pricing.raw;
   const perToken = priceNumber(raw['image_output']) ?? priceNumber(raw['image_token']);
@@ -146,7 +152,8 @@ export function estimateImage(
     const perReference =
       (imagePrice >= PER_IMAGE_THRESHOLD ? imagePrice : imagePrice * REFERENCE_IMAGE_TOKENS) +
       (model.pricing.prompt ?? 0) * REFERENCE_IMAGE_TOKENS;
-    total += references * perReference;
+    // Every request uploads its references again: one request with `n`, or one per image.
+    total += references * Math.max(1, input.requests ?? 1) * perReference;
   }
   return total;
 }

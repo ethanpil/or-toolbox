@@ -8,6 +8,10 @@
  * ```
  *
  * A drop on the zone does not reach the tool page's full-page drop overlay (it stops propagation).
+ *
+ * The button carries `data-focus-key` (`focusKey`, default `drop-zone`), so a tool that rebuilds the zone with
+ * `replace()` (a new label, `multiple` after a file was added) gives focus back to the new button after a file
+ * dialog. Two zones rebuilt inside one container need keys of their own.
  */
 import { h } from '../dom';
 import { toast } from '../feedback/toast';
@@ -28,6 +32,8 @@ export interface DropZoneOptions {
   /** Called with refused files; default: a toast naming what is accepted. */
   onReject?: (files: File[]) => void;
   compact?: boolean;
+  /** `data-focus-key` of the Choose button; default `drop-zone`. */
+  focusKey?: string;
   testId?: string;
 }
 
@@ -71,6 +77,7 @@ export function dropZone(options: DropZoneOptions): HTMLElement {
       type: 'button',
       class: 'btn btn-sm btn-outline-primary',
       'aria-describedby': `${labelId} ${hintId}`,
+      'data-focus-key': options.focusKey ?? 'drop-zone',
       'data-testid': 'drop-zone-button',
       onclick: (event: MouseEvent) => {
         event.stopPropagation();

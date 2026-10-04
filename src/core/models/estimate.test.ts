@@ -148,6 +148,17 @@ describe('image', () => {
     expect(withRef - base).toBeCloseTo(2 * 4096 * 0.000008, 8);
   });
 
+  it('charges the references once per request that uploads them', () => {
+    const gpt = model('openai/gpt-image-2');
+    const perReference = 4096 * 0.000008;
+    const one = estimateImage(gpt, { images: 4, references: 2 }) ?? 0;
+    const each = estimateImage(gpt, { images: 4, references: 2, requests: 4 }) ?? 0;
+    expect(each - one).toBeCloseTo(3 * 2 * perReference, 8);
+    expect(estimateImage(gpt, { images: 4, references: 0, requests: 4 })).toBe(
+      estimateImage(gpt, { images: 4 }),
+    );
+  });
+
   it('returns null for models without an image price', () => {
     expect(estimateImage(model('openai/gpt-6.1-sol'), { images: 1 })).toBeNull();
   });

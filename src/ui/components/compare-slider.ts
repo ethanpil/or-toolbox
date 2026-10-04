@@ -3,10 +3,16 @@
  * to the right of a divider, the "before" image to the left. The divider follows a real range input (Arrow keys,
  * Page Up/Down, Home/End, and the screen reader's own gestures) and a drag on the frame.
  *
- * Kept in the tool folder until a second tool needs it.
+ * ```ts
+ * const slider = compareSlider({
+ *   before: { src: originalUrl, alt: 'Original photo', label: 'Before' },
+ *   after: { src: resultUrl, alt: 'Isolated product', label: 'After' },
+ *   label: 'Compare before and after',
+ * });
+ * ```
  */
-import { h } from '../../ui/dom';
-import { uid } from '../../ui/id';
+import { h } from '../dom';
+import { uid } from '../id';
 
 export interface CompareSliderOptions {
   before: { src: string; alt: string; label: string };

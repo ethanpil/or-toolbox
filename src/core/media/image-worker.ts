@@ -1,32 +1,26 @@
 /**
- * Module worker that runs the isolated-image pipeline off the main thread.
- * Started by image-async.ts (`new Worker(new URL('./image-worker.ts', import.meta.url),
- * { type: 'module' })`: a same-origin script, so `worker-src 'self'` allows it).
- * Do not import this file for its code; import `isolateImage` instead.
+ * Module worker that runs the image operations of image-ops.ts (the isolated-image pipeline, the editor's mask
+ * work) off the main thread. Started by image-async.ts (`new Worker(new URL('./image-worker.ts',
+ * import.meta.url), { type: 'module' })`: a same-origin script, so `worker-src 'self'` allows it).
+ * Do not import this file for its code; import the functions of image-async.ts instead.
  */
-import type { RasterImage } from './image';
-import { type IsolateOptions, type IsolateResult, isolateRaster } from './image-pipeline';
+import { type ImageOpOutput, type ImageOpRequest, pixelBuffers, runImageOp } from './image-ops';
 
-export interface WorkerRequest {
-  id: number;
-  op: 'isolate';
-  image: RasterImage;
-  options: IsolateOptions;
-}
+export type WorkerRequest = ImageOpRequest & { id: number };
 
 export type WorkerResponse =
-  { id: number; ok: true; result: IsolateResult } | { id: number; ok: false; message: string };
+  { id: number; ok: true; result: ImageOpOutput } | { id: number; ok: false; message: string };
 
 self.onmessage = (event: MessageEvent<WorkerRequest>): void => {
-  const { id, image, options } = event.data;
+  const request = event.data;
   try {
-    const result = isolateRaster(image, options);
-    const response: WorkerResponse = { id, ok: true, result };
+    const result = runImageOp(request);
+    const response: WorkerResponse = { id: request.id, ok: true, result };
     // The result's pixels move to the page instead of being copied.
-    self.postMessage(response, { transfer: [result.image.data.buffer] });
+    self.postMessage(response, { transfer: pixelBuffers(result) });
   } catch (error) {
     const response: WorkerResponse = {
-      id,
+      id: request.id,
       ok: false,
       message: error instanceof Error ? error.message : String(error),
     };
