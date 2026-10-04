@@ -6,10 +6,13 @@
  *
  * - One job at a time. The wasm instance is single-tasking and its log and
  *   progress events are global, so jobs queue up behind each other.
- * - Files live in ffmpeg's in-memory file system (it counts against the
- *   2 GB wasm heap: input + output + temporaries, so budget about three times
- *   the size of the inputs). Every file a job wrote is deleted when it ends,
- *   whether it succeeded or failed.
+ * - Files live in ffmpeg's in-memory file system: one ArrayBuffer per file in
+ *   ffmpeg's worker, outside the wasm heap (fixed at 1 GiB on the
+ *   multi-threaded core, growing to 2 GiB on the single-threaded one), which
+ *   holds ffmpeg's own working memory. Writing a file briefly holds it twice,
+ *   and reading one out copies it. Every file a job wrote is deleted when it
+ *   ends, whether it succeeded or failed; `concatVideos` deletes them as soon
+ *   as it can (see `MAX_JOIN_BYTES` for the size limit).
  * - An `AbortSignal` stops the job by terminating the instance and calling
  *   `disposeFfmpeg()`; the promise rejects with an `AbortError`. The next job
  *   starts a fresh instance (a few seconds, plus the 32 MB core from cache).
@@ -20,7 +23,7 @@
  */
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
 import { InvalidInputError } from '../errors';
-import { extensionForMime, sniffBlobMime } from '../files';
+import { extensionForMime, formatBytes, sniffBlobMime } from '../files';
 import { abortError, throwIfAborted } from '../util';
 import { disposeFfmpeg, loadFfmpeg, type LoadFfmpegOptions } from './ffmpeg';
 import { type MediaInfo, parseMediaInfo } from './ffmpeg-probe';
@@ -455,6 +458,15 @@ const ENCODE_AUDIO = ['-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2']
 const even = (value: number): number => Math.max(2, Math.round(value / 2) * 2);
 
 /**
+ * The largest file a join takes or makes. ffmpeg's file system keeps each file in one ArrayBuffer of its
+ * worker, outside the wasm heap (so the heap is not the limit: 1.35 GB of files sat next to the
+ * multi-threaded core's fixed 1 GiB heap, and ffmpeg still ran), and Chromium refuses one ArrayBuffer of
+ * 2 GiB (1.75 GiB allocated, 2 GiB less a byte did not; measured 2026-10). A file being written grows by
+ * an eighth at a time, so 1.5 GiB leaves room for the last step.
+ */
+export const MAX_JOIN_BYTES = 1.5 * 1024 ** 3;
+
+/**
  * Joins clips, in order, into one MP4.
  *
  * - **Stream copy** (fast, lossless) when no clip is trimmed, every clip is
@@ -465,8 +477,18 @@ const even = (value: number): number => Math.max(2, Math.round(value / 2) * 2);
  *   clip is converted on its own to the first clip's size and frame rate
  *   (letterboxed if the shape differs) as H.264/AAC 44.1 kHz stereo, with
  *   silence added to clips that have no sound when others do; then the
- *   results are stream-copied together. One clip in memory at a time keeps
- *   long sequences inside the wasm heap.
+ *   results are stream-copied together.
+ *
+ * Memory: clips are probed one at a time (written, probed, deleted). A
+ * re-encode writes each clip again just before its encode and deletes it
+ * after, so ffmpeg's file system holds the parts made so far plus one clip;
+ * the final join holds the parts and the result, and the parts are deleted
+ * before the result is copied out. A stream copy needs every clip at once
+ * (the concat demuxer reads them in one run), then frees them the same way.
+ * Either way the peak is about twice the result. A clip, or an estimated
+ * result (each clip's size times the share of it kept), over
+ * `MAX_JOIN_BYTES` is refused with an `InvalidInputError`: an oversized clip
+ * before ffmpeg loads, an oversized result after probing, before any encode.
  *
  * Re-encoding costs roughly the length of the footage in processing time on
  * the single-threaded core. Joins can leave a click of a few milliseconds at
@@ -474,19 +496,33 @@ const even = (value: number): number => Math.max(2, Math.round(value / 2) * 2);
  */
 export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): Promise<Blob> {
   if (clips.length === 0) throw new RangeError('Nothing to join.');
+  const large = clips.findIndex((clip) => clip.blob.size > MAX_JOIN_BYTES);
+  if (large >= 0) {
+    return Promise.reject(
+      new InvalidInputError(
+        `Clip ${large + 1} is ${formatBytes(clips[large]!.blob.size)}, more than the ${formatBytes(MAX_JOIN_BYTES)} a join in the browser can take. Leave it out of the join.`,
+      ),
+    );
+  }
+  const refuseOver = (estimate: number): void => {
+    if (estimate <= MAX_JOIN_BYTES) return;
+    throw new InvalidInputError(
+      `The joined video would be about ${formatBytes(estimate)}, more than the ${formatBytes(MAX_JOIN_BYTES)} a join in the browser can make. Leave some clips out of the join, or trim them.`,
+    );
+  };
   return withFfmpeg(options, async (job) => {
-    // 1. Load and probe every clip.
-    const sources: { name: string; info: MediaInfo }[] = [];
+    // 1. Probe the clips one at a time, so a long sequence is never in the file system at once.
+    const sources: { extension: string; info: MediaInfo }[] = [];
     for (const [index, clip] of clips.entries()) {
-      const name = await job.write(
-        clip.blob,
-        `c${index}`,
-        (await describeInput(clip.blob)).extension,
-      );
+      const { extension } = await describeInput(clip.blob);
+      const name = await job.write(clip.blob, `p${index}`, extension);
       const info = parseMediaInfo(await job.capture(['-i', name]));
+      await job.remove(name);
       if (!info.video) throw new InvalidInputError(`Clip ${index + 1} has no video.`);
-      sources.push({ name, info });
+      sources.push({ extension, info });
     }
+    const write = (index: number): Promise<string> =>
+      job.write(clips[index]!.blob, `c${index}`, sources[index]!.extension);
 
     const trimmed = clips.some(
       (clip) => (clip.trimStart ?? 0) > 0 || (clip.trimEnd ?? 0) > 0 || clip.dropFirstFrame,
@@ -499,14 +535,18 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
     );
 
     if (!options.reencode && !trimmed && matching && copyable) {
+      refuseOver(clips.reduce((sum, clip) => sum + clip.blob.size, 0));
       const total = sources.reduce((sum, { info }) => sum + info.duration, 0);
+      const names: string[] = [];
+      for (const index of clips.keys()) names.push(await write(index));
       const list = job.name('list', 'txt');
-      await job.ffmpeg.writeFile(list, sources.map(({ name }) => `file '${name}'`).join('\n'));
+      await job.ffmpeg.writeFile(list, names.map((name) => `file '${name}'`).join('\n'));
       const output = job.name('out', 'mp4');
       await job.run(
         ['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', output],
         (time, ratio) => options.onProgress?.(total > 0 ? Math.min(1, time / total) : ratio),
       );
+      for (const name of [...names, list]) await job.remove(name);
       options.onProgress?.(1);
       return job.read(output, 'video/mp4');
     }
@@ -543,6 +583,14 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
       length > 0 ? length : (sources[index]?.info.duration ?? 0),
     );
     const total = lengths.reduce((sum, value) => sum + value, 0) || 1;
+    // Each part is estimated at its clip's own bit rate: the clip's size times the share of it kept.
+    refuseOver(
+      clips.reduce((sum, clip, index) => {
+        const duration = sources[index]?.info.duration ?? 0;
+        const kept = duration > 0 ? Math.min(1, (lengths[index] ?? 0) / duration) : 1;
+        return sum + clip.blob.size * kept;
+      }, 0),
+    );
 
     const encoded: string[] = [];
     let done = 0;
@@ -550,6 +598,8 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
       const plan = plans[index];
       const length = lengths[index] ?? 0;
       if (!plan) continue;
+      // Written only now, and deleted right after its encode: one clip in the file system at a time.
+      const input = await write(index);
       const output = job.name(`n${index}`, 'mp4');
       const needsSilence = withAudio && !source.info.audio;
       const args = [
@@ -558,7 +608,7 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
         ...(length > 0 ? ['-t', seconds(length)] : []),
         ...job.threads.decode,
         '-i',
-        source.name,
+        input,
         ...(needsSilence
           ? [
               '-f',
@@ -587,8 +637,7 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
       });
       done += length;
       encoded.push(output);
-      // Free the source before the next clip is loaded into the wasm heap.
-      await job.remove(source.name);
+      await job.remove(input);
     }
 
     // 3. The clips now share every parameter: join them without another encode.
@@ -608,6 +657,7 @@ export function concatVideos(clips: ConcatClip[], options: ConcatOptions = {}): 
       '+faststart',
       output,
     ]);
+    for (const name of [...encoded, list]) await job.remove(name);
     options.onProgress?.(1);
     return job.read(output, 'video/mp4');
   });

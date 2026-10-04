@@ -146,7 +146,11 @@ export interface Runner<A = unknown> {
 
 export interface ResultHandle {
   readonly result: SessionResult;
-  /** A Download button that turns into "Downloaded" (still clickable) once saved. */
+  /**
+   * The result's Download button, which turns into "Downloaded" (still clickable) once saved. Every call returns
+   * the same element (with the latest `label`), so a redraw puts it into its new markup and adds no subscription;
+   * it listens until `remove()`. A redraw that moves it while it has focus gives focus back once the redraw is done.
+   */
   button(label?: string): HTMLButtonElement;
   download(): void;
   remove(): void;
