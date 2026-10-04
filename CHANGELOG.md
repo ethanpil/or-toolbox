@@ -64,6 +64,7 @@ All notable changes to this project are documented here. The format follows
 - `trimMedia` takes `fadeOut` and `bitrate` for audio cuts (da8b7b9).
 - Image estimates treat a zero catalog price as unknown, not free (f6af99d).
 - Video estimates take an `images` count and add per-image input prices (`cents_per_image_input`) (e7aaee5).
+- Video studio uses the framework's job cost (`usage`), `run.cancel()` for "Stop waiting" (History shows it stopped at once), opt-in job notifications (one per sequence), `outcomeUnknown` (no Retry toast) and `videoResultCard`; a sequence step the provider failed no longer counts against the spend cap (9fb1171).
 - Image pipeline: opt-in `adaptThreshold` (threshold kept below the picture's own background and noise) and `despeckle` (background filled on the picture and small light specks removed before the product box); `IsolateResult.threshold` (fdb6368).
 
 - Stage 0 review fixes: COEP `require-corp` only, isolation reload limited to pages that need threads, manifest-based offline shell, hardened `h()` and Markdown sanitising, dev-server CSP and isolation, TypeScript 6, single gated CI pipeline (cb1cc69).
