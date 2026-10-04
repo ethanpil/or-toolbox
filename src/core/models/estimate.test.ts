@@ -151,6 +151,12 @@ describe('image', () => {
   it('returns null for models without an image price', () => {
     expect(estimateImage(model('openai/gpt-6.1-sol'), { images: 1 })).toBeNull();
   });
+
+  it('treats a zero image price as unknown, not free (Ming lists "0")', () => {
+    expect(
+      estimateImage(model('inclusionai/ming-image-0.1-design-layer'), { images: 1 }),
+    ).toBeNull();
+  });
 });
 
 describe('video', () => {
