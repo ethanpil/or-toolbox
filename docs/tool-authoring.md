@@ -11,7 +11,7 @@ src/tools/<id>/*.ts            your pipeline, UI pieces and *.test.ts (never imp
 ```
 
 ```ts
-mountTool(manifest: ToolManifest, setup: ToolSetup, options?: { isolation?: 'required' }): void
+mountTool(manifest: ToolManifest, setup: ToolSetup, options?: { isolation?: 'required'; modelChip?: false }): void
 type ToolSetup = (ctx: ToolContext) => ToolInstance | Promise<ToolInstance>;
 
 interface ToolInstance {
@@ -35,7 +35,7 @@ All types live in `src/ui/tool/types.ts` and are re-exported from `src/ui/tool/i
 4. computes the first estimate (`estimate`, if you provide it);
 5. applies the URL: `?run=<id>` (History → `applyState`), `?prompt=<id>` (a saved or recent prompt), `?sample=1` (`sample()`), `?receive=<id>` (Send to… hand-over → `onReceive`); these are removed from the address bar afterwards. `?model=<id>` stays and overrides the primary model for this visit ("re-run with another model").
 
-Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No other tool does.
+Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No other tool does. Model arena passes `{ modelChip: false }`: a tool that picks its models itself (its contenders) has no model chip in the header; `?model=` still arrives as `ctx.modelOverride`, and the tool decides what it means.
 
 ## The context
 
@@ -326,6 +326,7 @@ A tool that works on files and settings only, with no main text field, sets `pro
 | Component | Use it for |
 | --- | --- |
 | `dropZone(options)` | File input target (drag, keyboard, accept filter); its Choose files button keeps focus across rebuilds (`focusKey`, default `drop-zone`). |
+| `attachmentChip({ ref, data?, missing?, remove? })` | One file sent with a chat request (thumbnail or kind icon, name, size, optional Remove). The files themselves: `src/core/attachments/` (`readAttachment`, `toContentPart`, `missingInput`, `parserAddons`, `keepParsed`), as Chat and Model arena use them. |
 | `referencePicker({ ui, min?, max, accepts?, label?, ... })` | Reference images for a request: drop zone, small thumbnails (`imageThumbnail`), remove with focus management, a limits note (`setLimits` when the model changes, `problem()`), `add(items)` for Send to, paste and "use as reference". `dataUrls({ maxSide, maxBytes })` encodes each reference once and caches it until the limits change. |
 | `compareSlider(...)` | A before/after wipe (keyboard and pointer). |
 | `documentInput(options)` | Images and PDFs with thumbnails and page choice (`1-3, 7`, tile toggles); `selection()` lists pages, `loadPage(ref)` renders one for upload (`{ fileName, pageNumber, imageDataUrl, text? }`), `pageImage`/`reveal` show the source. Pair with `runItems()` for per-page requests. |
