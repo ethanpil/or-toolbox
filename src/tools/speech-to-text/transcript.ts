@@ -7,9 +7,11 @@
  *   Times are clamped to the part's own span (a model may report an end slightly past the audio it got).
  * - A part without segments gets them from its words (pauses, sentence ends, speaker changes), and a part without
  *   any timestamps (timestamps off, or a model that gives none) becomes one segment spanning the part.
- * - Seams: the cut is made in a pause, but a word on the cut can still be heard in both parts. When the words that
- *   end one part start the next (compared without case, accents or punctuation) and both sit within a couple of
- *   seconds of the seam, the repeat is dropped from the later part, words included. A segment that ends after the
+ * - Seams: parts are cut in pauses and never share audio, so words said twice across a seam ("Okay." "Okay.") are
+ *   real and stay. Only when the model's own times overlap the next part's (it reports sound past the end of the
+ *   audio it got) and the words that end one part start the next (compared without case, Latin accents or
+ *   punctuation; other scripts' vowel and tone marks count) and those words fit inside the overlap, the repeat is
+ *   dropped from the later part, words included. Untimed parts are never compared. A segment that ends after the
  *   next part's first one starts is trimmed back to it. Overlaps inside a part (two people talking at once) are the
  *   model's to report and are kept.
  * - Speakers: models number speakers per request, and nothing in the API ties speaker 0 of one request to speaker
@@ -75,8 +77,8 @@ const WORD_GAP_SECONDS = 1;
 /** Segments built from words end at a sentence end once this long, and always at this length. */
 const MIN_SENTENCE_SECONDS = 2;
 const MAX_SEGMENT_SECONDS = 12;
-/** How close to a seam a repeated word may be. */
-const SEAM_WINDOW_SECONDS = 2;
+/** Slack for rounding in the times models report, when checking that a repeat lies inside a seam overlap. */
+const SEAM_TOLERANCE_SECONDS = 0.1;
 /** The longest repeat looked for at a seam. */
 const MAX_SEAM_WORDS = 6;
 
@@ -143,13 +145,17 @@ export function segmentsFromWords(words: readonly Word[]): LocalSegment[] {
   return segments;
 }
 
-/** A token as compared at seams: lower case, no accents, letters and digits only. */
+/**
+ * A token as compared at seams: lower case, without Latin accents (the U+0300 block) and punctuation. Other
+ * combining marks (Mn/Mc: Devanagari vowel signs, Thai tone marks\u2026) are part of the word and stay: \u0939\u0948 is not \u0939\u094b.
+ */
 export function seamToken(token: string): string {
   return token
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\p{L}\p{N}]/gu, '');
+    .replace(/[^\p{L}\p{M}\p{N}]/gu, '')
+    .normalize('NFC');
 }
 
 const tokens = (text: string): string[] => text.split(/\s+/).filter(Boolean);
@@ -172,33 +178,51 @@ export function seamRepeat(before: readonly string[], after: readonly string[]):
 const clamp = (value: number, low: number, high: number): number =>
   Math.min(high, Math.max(low, value));
 
+/** Times as the model reported them, moved onto the recording but not clamped to the part (for seam checks). */
+interface Raw {
+  rawStart: number;
+  rawEnd: number;
+}
+
+interface PlacedPart {
+  segments: (Segment & Raw)[];
+  words: (Word & Raw)[];
+  timed: boolean;
+}
+
 /** One part's segments and words on the recording's timeline (not yet de-duplicated against its neighbour). */
-function placePart(
-  part: PartInput,
-  perPart: boolean,
-): { segments: Segment[]; words: Word[]; timed: boolean } {
+function placePart(part: PartInput, perPart: boolean): PlacedPart {
   const { result, offset, index } = part;
   const end = offset + Math.max(0, part.duration);
-  const at = (seconds: number): number => clamp(offset + seconds, offset, end);
+  const within = (seconds: number): number => clamp(seconds, offset, end);
   const key = (raw: string | undefined): string | undefined =>
     raw === undefined ? undefined : speakerKey(raw, index, perPart);
 
-  const words: Word[] = [];
+  const words: (Word & Raw)[] = [];
   for (const word of result.words) {
     if (!word.word) continue;
-    const placed: Word = { start: at(word.start), end: at(word.end), word: word.word };
+    const rawStart = offset + word.start;
+    const rawEnd = offset + word.end;
+    const placed: Word & Raw = {
+      start: within(rawStart),
+      end: within(rawEnd),
+      word: word.word,
+      rawStart,
+      rawEnd,
+    };
     const speaker = key(word.speaker);
     if (speaker !== undefined) placed.speaker = speaker;
     words.push(placed);
   }
-  words.sort((a, b) => a.start - b.start);
+  words.sort((a, b) => a.rawStart - b.rawStart);
 
+  // On the recording's timeline, unclamped.
   let local: LocalSegment[] = result.segments
     .filter((segment) => segment.text)
     .map((segment) => {
       const placed: LocalSegment = {
-        start: at(segment.start),
-        end: at(segment.end),
+        start: offset + segment.start,
+        end: offset + segment.end,
         text: segment.text,
       };
       const speaker = key(segment.speaker);
@@ -206,20 +230,31 @@ function placePart(
       return placed;
     });
   let timed = true;
-  if (local.length === 0 && words.length > 0) local = segmentsFromWords(words);
+  if (local.length === 0 && words.length > 0) {
+    local = segmentsFromWords(
+      words.map((word) => {
+        const raw: Word = { start: word.rawStart, end: word.rawEnd, word: word.word };
+        if (word.speaker !== undefined) raw.speaker = word.speaker;
+        return raw;
+      }),
+    );
+  }
   if (local.length === 0 && result.text) {
     local = [{ start: offset, end, text: result.text }];
     timed = false;
   }
   local.sort((a, b) => a.start - b.start);
 
-  const segments = local.map((segment, n): Segment => {
-    const placed: Segment = {
+  const segments = local.map((segment, n): Segment & Raw => {
+    const start = within(segment.start);
+    const placed: Segment & Raw = {
       id: `${index}:${n}`,
       part: index,
-      start: segment.start,
-      end: Math.max(segment.start, segment.end),
+      start,
+      end: Math.max(start, within(segment.end)),
       text: segment.text.replace(/\s+/g, ' ').trim(),
+      rawStart: segment.start,
+      rawEnd: segment.end,
     };
     if (segment.speaker !== undefined) placed.speaker = segment.speaker;
     return placed;
@@ -228,61 +263,87 @@ function placePart(
 }
 
 /**
- * Drops a repeat at the seam between the last segment so far and the next part's first segment (and its words),
- * in place; a first segment left empty is removed.
+ * Drops a repeat at the seam between the previous part's last segment and the next part's first segment (and its
+ * words), in place, when both parts heard it: the model's times overlap and the repeat lies inside the overlap. A
+ * first segment left empty is removed.
  */
 function dropSeamRepeat(
-  previous: Segment | undefined,
-  next: Segment[],
-  nextWords: Word[],
-  seam: number,
+  previous: (Segment & Raw) | undefined,
+  previousWords: readonly (Word & Raw)[],
+  next: (Segment & Raw)[],
+  nextWords: (Word & Raw)[],
 ): void {
   const first = next[0];
   if (!previous || !first) return;
-  if (previous.end < seam - SEAM_WINDOW_SECONDS || first.start > seam + SEAM_WINDOW_SECONDS) return;
+  // The previous part still hears something after this one started; parts that meet in a pause never overlap.
+  const overlap = previous.rawEnd - first.rawStart;
+  if (!(overlap > 0)) return;
   const firstTokens = tokens(first.text);
   const repeat = seamRepeat(tokens(previous.text), firstTokens);
   if (repeat === 0) return;
   const dropped = firstTokens.slice(0, repeat).map(seamToken);
-  // The repeated words, if the model gave words and they start the part.
   const leading = nextWords.slice(0, repeat);
-  if (
-    leading.length === repeat &&
-    leading.every((word, i) => seamToken(word.word) === dropped[i])
-  ) {
+  const haveWords =
+    leading.length === repeat && leading.every((word, i) => seamToken(word.word) === dropped[i]);
+  if (haveWords) {
+    // Every repeated word starts before the previous part's sound ends, and its copy there ends after this
+    // part's sound starts.
+    if (leading.some((word) => word.rawStart >= previous.rawEnd + SEAM_TOLERANCE_SECONDS)) return;
+    const tail = previousWords.slice(-repeat);
+    if (
+      tail.length === repeat &&
+      tail.some((word) => word.rawEnd <= first.rawStart - SEAM_TOLERANCE_SECONDS)
+    ) {
+      return;
+    }
     nextWords.splice(0, repeat);
     first.start = Math.max(first.start, leading.at(-1)?.end ?? first.start);
+  } else {
+    // Without word times: the repeat's share of the segment must fit inside the overlap.
+    const share = ((first.rawEnd - first.rawStart) * repeat) / firstTokens.length;
+    if (share > overlap + SEAM_TOLERANCE_SECONDS) return;
   }
   first.text = firstTokens.slice(repeat).join(' ');
   if (!first.text) next.shift();
   else first.end = Math.max(first.start, first.end);
 }
 
+/** Without the seam-check times. */
+function withoutRaw<T extends Raw>(item: T): Omit<T, keyof Raw> {
+  const copy: Partial<T> = { ...item };
+  delete copy.rawStart;
+  delete copy.rawEnd;
+  return copy as Omit<T, keyof Raw>;
+}
+
 /** Merges the parts transcribed so far (any order, gaps allowed) into one transcript. */
 export function mergeParts(parts: readonly PartInput[], options: MergeOptions): Transcript {
   const perPart = options.partCount > 1;
   const ordered = [...parts].sort((a, b) => a.index - b.index);
-  const segments: Segment[] = [];
-  const words: Word[] = [];
+  const placedSegments: (Segment & Raw)[] = [];
+  const placedWords: (Word & Raw)[] = [];
   let timed = true;
   let language: string | null = null;
-  let previousIndex = -2;
+  let previous: (PlacedPart & { index: number }) | null = null;
 
   for (const part of ordered) {
     const placed = placePart(part, perPart);
     timed &&= placed.timed;
     language ??= part.result.language;
-    // Only neighbours share a seam: a failed part between two others leaves a real gap.
-    if (part.index === previousIndex + 1) {
-      dropSeamRepeat(segments.at(-1), placed.segments, placed.words, part.offset);
-      const last = segments.at(-1);
+    // Only timed neighbours share a seam: a failed part between two others leaves a real gap, and a part without
+    // timestamps cannot say what it heard where.
+    if (previous && part.index === previous.index + 1 && previous.timed && placed.timed) {
+      dropSeamRepeat(placedSegments.at(-1), previous.words, placed.segments, placed.words);
+      const last = placedSegments.at(-1);
       const first = placed.segments[0];
       if (last && first && last.end > first.start) last.end = Math.max(last.start, first.start);
     }
-    segments.push(...placed.segments);
-    words.push(...placed.words);
-    previousIndex = part.index;
+    placedSegments.push(...placed.segments);
+    placedWords.push(...placed.words);
+    previous = { ...placed, index: part.index };
   }
+  const segments: Segment[] = placedSegments.map(withoutRaw);
+  const words: Word[] = placedWords.map(withoutRaw);
 
   // Stable: equal starts keep their part and model order.
   segments.sort((a, b) => a.start - b.start || a.part - b.part);
@@ -454,11 +515,50 @@ export function subtitleSegments(
 
 const ms = (seconds: number): number => Math.round(seconds * 1000) / 1000;
 
+/** How one part was transcribed (a retry may use another model or other options than the first run). */
+export interface PartMeta {
+  index: number;
+  start: number;
+  duration: number;
+  model: string;
+  /** ISO-639-1 sent, or null for auto-detection. */
+  language: string | null;
+  timestamps: boolean;
+  diarize: boolean;
+  /** Vocabulary terms sent. */
+  keyterms: number;
+}
+
 export interface TranscriptMeta {
   source: string;
-  model: string;
   /** Length of the recording in seconds, when known. */
   duration: number | null;
+  /** The transcribed parts. */
+  parts: readonly PartMeta[];
+}
+
+/** The models used, in part order, each once. */
+export function modelsUsed(parts: readonly PartMeta[]): string[] {
+  return [...new Set([...parts].sort((a, b) => a.index - b.index).map((part) => part.model))];
+}
+
+/** "openai/whisper-1 (parts 1 and 3), deepgram/nova-3 (part 2)" when parts used different models, else null. */
+export function mixedModelsNote(parts: readonly PartMeta[]): string | null {
+  const models = modelsUsed(parts);
+  if (models.length < 2) return null;
+  return models
+    .map((model) => {
+      const numbers = parts
+        .filter((part) => part.model === model)
+        .map((part) => part.index + 1)
+        .sort((a, b) => a - b);
+      const list =
+        numbers.length === 1
+          ? `part ${numbers[0]}`
+          : `parts ${numbers.slice(0, -1).join(', ')} and ${numbers.at(-1)}`;
+      return `${model} (${list})`;
+    })
+    .join(', ');
 }
 
 /** The JSON export: segments (with speaker names and edit marks) and words, times in seconds to the millisecond. */
@@ -468,11 +568,26 @@ export function transcriptJson(
   meta: TranscriptMeta,
 ): Record<string, unknown> {
   const name = (key: string): string => speakerName(key, names, transcript.speakersPerPart);
+  const models = modelsUsed(meta.parts);
   return {
     format: 'ortoolbox-transcript',
     version: 1,
     source: meta.source,
-    model: meta.model,
+    // Never a silent mix: "mixed" with every model listed, and each part says which one it had.
+    model: models.length === 1 ? models[0] : models.length === 0 ? null : 'mixed',
+    models,
+    parts: [...meta.parts]
+      .sort((a, b) => a.index - b.index)
+      .map((part) => ({
+        part: part.index + 1,
+        start: ms(part.start),
+        end: ms(part.start + part.duration),
+        model: part.model,
+        language: part.language,
+        timestamps: part.timestamps,
+        speakerLabels: part.diarize,
+        keyterms: part.keyterms,
+      })),
     language: transcript.language,
     duration: meta.duration === null ? null : ms(meta.duration),
     timestamps: transcript.timed,
