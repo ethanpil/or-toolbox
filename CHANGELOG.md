@@ -49,10 +49,13 @@ All notable changes to this project are documented here. The format follows
 - Text-to-speech: voices from `supported_voices` with readable names and cached previews (cost shown, free on the free Fish model), speed where known to work, TXT/MD input (Markdown read into plain text), long text split at paragraph, sentence (CJK included), clause and word boundaries and read three parts at a time, joined gaplessly into one MP3 or WAV, per-part retry and Stop, MP3/WAV downloads (ecd0144).
 - Music generation: song form with a lyrics editor (section tags, validation), reference image, Lyria 3 Clip/Pro choice with prices, 1–3 variations side by side in one run, streamed MP3 with timed lyrics that follow playback, a target length cut in the browser with a fade-out, MP3/WAV downloads (7f76ad8).
 - Stage 4 e2e gates for the audio tools: a 10,000-word text joined with no gaps (MP3 and PCM parts), a Lyria stream into a playable, trimmable MP3.
+- Isolated image: product photos edited on `/images` (data-URL reference, fixed instruction, soft shadow on request), post-processed in the worker onto a pure white square with a QA verdict and reason per photo; review with a before/after slider, side by side, per-photo margin and threshold without a new request; retry, retry with another model; JPG/PNG downloads and a ZIP with a file name pattern (aa282c3).
+- Stage 5 e2e gate for Isolated image: 20 synthetic photos with imperfect mocked isolations, all passing QA, the ZIP of 20 JPGs checked pixel by pixel (ccc8999).
 
 ### Changed
 
 - `trimMedia` takes `fadeOut` and `bitrate` for audio cuts (da8b7b9).
+- Image pipeline: opt-in `adaptThreshold` (threshold kept below the picture's own background and noise) and `despeckle` (background filled on the picture and small light specks removed before the product box); `IsolateResult.threshold` (fdb6368).
 
 - Stage 0 review fixes: COEP `require-corp` only, isolation reload limited to pages that need threads, manifest-based offline shell, hardened `h()` and Markdown sanitising, dev-server CSP and isolation, TypeScript 6, single gated CI pipeline (cb1cc69).
 - Errors share one `OrError` base with codes; shared helpers moved to `util.ts` (6b469ef).
