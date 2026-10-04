@@ -1,17 +1,30 @@
 import { describe, expect, it } from 'vitest';
-import type { RasterImage } from '../../core/media/image';
-import { compositeMasked } from './mask';
+import { compositeMasked, featherInside, type RasterImage } from '../../core/media/image';
 import {
   fitResult,
-  outpaintAlpha,
+  OUTPAINT_FILL,
+  type OutpaintPlan,
   outpaintMask,
   outpaintPlan,
-  placeOnCanvas,
+  pictureMask,
   planFromAspect,
   planFromMargins,
   planProblem,
   scaledPlan,
 } from './outpaint';
+
+/** The picture on the grey canvas, as the editor draws it before compositing. */
+function onCanvas(picture: RasterImage, plan: OutpaintPlan): RasterImage {
+  const data = new Uint8ClampedArray(plan.width * plan.height * 4);
+  for (let i = 0; i < data.length; i += 4) data.set([...OUTPAINT_FILL, 255], i);
+  for (let y = 0; y < picture.height; y++) {
+    data.set(
+      picture.data.subarray(y * picture.width * 4, (y + 1) * picture.width * 4),
+      ((plan.offsetY + y) * plan.width + plan.offsetX) * 4,
+    );
+  }
+  return { width: plan.width, height: plan.height, data };
+}
 
 describe('outpaint plans', () => {
   it('adds margins in percent of the picture’s width and height', () => {
@@ -70,64 +83,56 @@ describe('outpaint plans', () => {
   });
 });
 
-describe('the new canvas and its mask', () => {
-  const picture: RasterImage = {
-    width: 2,
-    height: 1,
-    data: new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255]),
-  };
+describe('the new canvas and its masks', () => {
   const plan = planFromMargins(2, 1, { top: 100, right: 50, bottom: 100, left: 50 });
 
-  it('places the picture at its offset on a grey canvas', () => {
+  it('marks exactly the new area, and keeps exactly the picture', () => {
     expect(plan).toEqual({ width: 4, height: 3, offsetX: 1, offsetY: 1 });
-    const canvas = placeOnCanvas(picture, plan);
-    const pixel = (x: number, y: number) => [
-      ...canvas.data.subarray((y * 4 + x) * 4, (y * 4 + x) * 4 + 4),
-    ];
-    expect(pixel(0, 0)).toEqual([128, 128, 128, 255]);
-    expect(pixel(1, 1)).toEqual([255, 0, 0, 255]);
-    expect(pixel(2, 1)).toEqual([0, 255, 0, 255]);
-    expect(pixel(3, 1)).toEqual([128, 128, 128, 255]);
+    expect([...outpaintMask(plan, 2, 1).data]).toEqual([
+      255, 255, 255, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+    ]);
+    expect([...pictureMask(plan, 2, 1).data]).toEqual([0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0]);
   });
 
-  it('marks exactly the new area', () => {
-    const mask = outpaintMask(plan, 2, 1);
-    expect([...mask.data]).toEqual([255, 255, 255, 255, 255, 0, 0, 255, 255, 255, 255, 255]);
+  it('also keeps the canvas where a fitted result does not reach', () => {
+    const kept = pictureMask(plan, 2, 1, { x: 0, y: 1, width: 4, height: 2 });
+    expect([...kept.data]).toEqual([255, 255, 255, 255, 0, 255, 255, 0, 0, 0, 0, 0]);
   });
 });
 
-describe('outpaint compositing', () => {
+describe('outpaint compositing (the pure pair the worker runs)', () => {
   const white = (width: number, height: number): RasterImage => ({
     width,
     height,
     data: new Uint8ClampedArray(width * height * 4).fill(255),
   });
+  const plan = planFromMargins(40, 20, { top: 0, right: 50, bottom: 0, left: 50 });
+  // compositeMaskedAsync(result, canvas, pictureMask, { feather }) is compositeMasked(result, canvas, featherInside(...)).
+  const composite = (result: RasterImage, feather: number) =>
+    compositeMasked(
+      result,
+      onCanvas(white(40, 20), plan),
+      featherInside(pictureMask(plan, 40, 20), feather),
+    );
 
   it('never blends the grey filler into the new area (white picture, white result, feather 6)', () => {
-    const picture = white(40, 20);
-    const plan = planFromMargins(40, 20, { top: 0, right: 50, bottom: 0, left: 50 });
-    const canvas = placeOnCanvas(picture, plan);
-    const result = white(plan.width, plan.height);
-    const out = compositeMasked(canvas, result, outpaintAlpha(plan, 40, 20, 6));
-    const grey = [...out.data].filter((value) => value !== 255).length;
-    expect(grey).toBe(0);
+    const out = composite(white(plan.width, plan.height), 6);
+    expect([...out.data].filter((value) => value !== 255)).toHaveLength(0);
   });
 
   it('puts the soft edge on the picture’s side of the seam; the new area is all result', () => {
-    const plan = planFromMargins(40, 20, { top: 0, right: 50, bottom: 0, left: 50 });
-    const alpha = outpaintAlpha(plan, 40, 20, 6);
-    const at = (x: number, y: number) => alpha.data[y * plan.width + x] ?? -1;
-    for (let x = 0; x < plan.offsetX; x++) expect(at(x, 10)).toBe(255);
-    expect(at(plan.offsetX, 10)).toBeGreaterThan(0);
-    expect(at(plan.offsetX, 10)).toBeLessThan(255);
-    expect(at(plan.offsetX + 20, 10)).toBe(0); // the middle of the picture stays exactly as it was
-    expect(outpaintAlpha(plan, 40, 20, 0).data).toEqual(outpaintMask(plan, 40, 20).data);
+    const kept = featherInside(pictureMask(plan, 40, 20), 6);
+    const at = (x: number) => kept.data[10 * plan.width + x] ?? -1;
+    for (let x = 0; x < plan.offsetX; x++) expect(at(x)).toBe(0); // all result
+    expect(at(plan.offsetX)).toBeGreaterThan(0);
+    expect(at(plan.offsetX)).toBeLessThan(255);
+    expect(at(plan.offsetX + 20)).toBe(255); // the middle of the picture stays exactly as it was
   });
-
-  it('scales a plan to the size the model sees, keeping the picture’s box consistent', () => {
+});
+describe('the plan at the size the model sees', () => {
+  it('scales a plan, keeping the picture’s box consistent', () => {
     const plan = planFromAspect(3000, 2000, 16 / 9); // 3556 x 2000, picture at x 278
-    const scaled = scaledPlan(plan, 3000, 2000, { width: 2048, height: 1152 });
-    expect(scaled).toEqual({
+    expect(scaledPlan(plan, 3000, 2000, { width: 2048, height: 1152 })).toEqual({
       width: 2048,
       height: 1152,
       offsetX: 160,

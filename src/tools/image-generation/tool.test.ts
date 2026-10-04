@@ -4,20 +4,19 @@ import type { ImageRequest, ImageResult, RawImageModel, RawModel } from '../../c
 import { ApiError, KeyLockedError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient } from '../../core/types';
+import type * as Media from '../../core/media/image';
 import type * as Errors from '../../ui/feedback/errors';
 import { presentError, wasPresented } from '../../ui/feedback/errors';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
 import { stemFrom, setup } from './tool';
 
-vi.mock('../../core/media/image', () => ({
+// jsdom cannot decode: sizes come from a stand-in header read, references from a stand-in encoder.
+vi.mock('../../core/media/image', async (importOriginal) => ({
+  ...(await importOriginal<typeof Media>()),
   loadImage: () => Promise.resolve({ width: 1024, height: 1024, close: () => undefined }),
-  imageSize: (image: { width: number; height: number }) => ({
-    width: image.width,
-    height: image.height,
-  }),
+  readImageSize: () => Promise.resolve({ width: 1024, height: 1024 }),
   toDataUrl: (blob: Blob) => Promise.resolve(`data:${blob.type};base64,REF`),
-  toBlob: () => Promise.resolve(new Blob(['x'], { type: 'image/png' })),
 }));
 
 // The shell's error presenter opens dialogs; here it only records what reached it.
@@ -37,7 +36,7 @@ const catalog: RawModel[] = [
     created: 1,
     context_length: null,
     architecture: { input_modalities: ['text', 'image'], output_modalities: ['image'] },
-    pricing: { prompt: '0', completion: '0', image_output: String(PER_TOKEN) },
+    pricing: { prompt: '0', completion: '0', image: '0.001', image_output: String(PER_TOKEN) },
   },
   {
     id: MULTI,
@@ -113,6 +112,7 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string): T =>
 beforeAll(() => {
   URL.createObjectURL = () => 'blob:test';
   URL.revokeObjectURL = () => undefined;
+  HTMLCanvasElement.prototype.getContext = () => null;
 });
 beforeEach(async () => {
   isolateChannels();
@@ -410,6 +410,47 @@ describe('Image generation', () => {
     expect(card.querySelector('[data-testid="imagegen-vary"]')).not.toBeNull();
     expect(card.querySelector('[data-testid="imagegen-edit"]')).toBeNull();
     expect(card.querySelector('[data-testid="imagegen-use-reference"]')).toBeNull();
+  });
+
+  it('prices references once per request that uploads them', async () => {
+    const tool = await mount();
+    tool.applyState({ prompt: 'A cat', settings: { count: 2 } });
+    await t.ctx.ui.refreshEstimate();
+    const without = t.estimate()!;
+    tool.onFiles!([new File(['x'], 'ref.png', { type: 'image/png' })]);
+    await vi.waitFor(() =>
+      expect(t.zones.input.querySelectorAll('[data-testid="imagegen-reference"]')).toHaveLength(1),
+    );
+    await t.ctx.ui.refreshEstimate();
+    // FLUX.2 klein makes one image per request: two requests, each uploading the reference ($0.001).
+    expect(t.estimate()! - without).toBeCloseTo(2 * 0.001, 8);
+  });
+
+  it('a Retry from the error toast sends only the requests without images', async () => {
+    let attempt = 0;
+    const images: ApiClient['images'] = (body) => {
+      calls.push(body);
+      attempt++;
+      if (attempt === 2) return Promise.reject(new ApiError('Not enough credits', 402));
+      return Promise.resolve({
+        created: 0,
+        images: [{ blob: png(), mediaType: 'image/png' }],
+        usage: { cost: 0.014 },
+        generationId: null,
+      });
+    };
+    const tool = await mount({ images });
+    tool.applyState({ prompt: 'A fox', settings: { count: 2, seed: 10, seedLocked: true } });
+    vi.mocked(presentError).mockClear();
+    await t.runners[0]!.trigger();
+    expect(calls.map((call) => call.seed)).toEqual([10, 11]);
+    // The 402 stops the batch and reaches the shell, whose toast offers Retry.
+    const [, options] = vi.mocked(presentError).mock.calls.at(-1)!;
+    options!.retry!();
+    await vi.waitFor(() => expect(calls).toHaveLength(3));
+    await vi.waitFor(() => expect(t.runners[0]!.busy).toBe(false));
+    expect(calls[2]?.seed).toBe(11); // only the second request again; the first image is not paid twice
+    expect(t.zones.output.querySelectorAll('[data-testid="imagegen-result"]')).toHaveLength(2);
   });
 
   it('names files after the prompt', () => {

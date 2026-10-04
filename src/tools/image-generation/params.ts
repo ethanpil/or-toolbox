@@ -7,17 +7,9 @@
  * takes, so switching models never loses a choice and never sends one the model refuses.
  */
 import type { ImageRequest } from '../../core/api/types';
-import {
-  aspectValue,
-  bareImageControls,
-  type ImageModelControls,
-  imageModelControls,
-} from '../../core/models/image-params';
+import { aspectValue, type ImageModelControls } from '../../core/models/image-params';
 
-export type ModelControls = ImageModelControls;
-export const modelControls = imageModelControls;
-export const bareControls = bareImageControls;
-export const ratioOf = aspectValue;
+type ModelControls = ImageModelControls;
 
 /** The user's choices, kept as asked (also what Prompts and History store). Empty strings: the model's default. */
 export interface GenerationForm {
@@ -169,7 +161,7 @@ export function approxDimensions(value: Effective): { width: number; height: num
   const explicit = value.size ? parseSize(value.size) : null;
   if (explicit) return explicit;
   const side = longSide(value.resolution);
-  const ratio = (value.aspectRatio ? ratioOf(value.aspectRatio) : null) ?? 1;
+  const ratio = (value.aspectRatio ? aspectValue(value.aspectRatio) : null) ?? 1;
   return ratio >= 1
     ? { width: side, height: Math.round(side / ratio) }
     : { width: Math.round(side * ratio), height: side };
@@ -213,26 +205,6 @@ export function buildRequests(input: {
     }
     return { body, images };
   });
-}
-
-/** Why the form cannot run on this model as it stands, or null. */
-export function referenceProblem(
-  count: number,
-  controls: Pick<ModelControls, 'references' | 'name'>,
-): string | null {
-  const limits = controls.references;
-  if (!limits || limits.max === 0) {
-    return count > 0
-      ? `${controls.name} does not take reference images; remove them or choose another model.`
-      : null;
-  }
-  if (count < limits.min) {
-    return `${controls.name} needs at least ${limits.min} reference ${limits.min === 1 ? 'image' : 'images'}.`;
-  }
-  if (count > limits.max) {
-    return `${controls.name} takes at most ${limits.max} reference ${limits.max === 1 ? 'image' : 'images'}; remove ${count - limits.max}.`;
-  }
-  return null;
 }
 
 /** Reads a stored form: unknown or invalid fields fall back to the defaults. */

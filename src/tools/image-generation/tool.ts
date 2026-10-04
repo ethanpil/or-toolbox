@@ -6,18 +6,20 @@
  * One Generate press is one run. Several images go out as one request with `n` when the model takes it, else
  * as several requests (`runItems`, three at a time), each with its own seed so a locked seed does not repeat
  * one picture. Streaming models (OpenAI) send partial images, shown in the waiting card. A failed request
- * keeps its card with Retry (a run of one, same seed). Each image is an `imageResultCard` with Variations (a
- * run of one with a new seed), Use as reference and Edit (Send to Image editor). History keeps the prompt and
- * settings, never the images.
+ * keeps its card with Retry (a run of one, same seed); the error toast's Retry sends only the requests still
+ * without images (`replayArg`), never paying twice. Each image is an `imageResultCard` with Variations (a run
+ * of one with a new seed), Use as reference and Edit (Send to Image editor). Reference images go through
+ * `referencePicker` (each encoded once). History keeps the prompt and settings, never the images.
  */
-import type { GeneratedImage, ImageRequest, RawImageModel } from '../../core/api/types';
-import { InvalidInputError, userMessage } from '../../core/errors';
-import { imageSize, loadImage, toDataUrl } from '../../core/media/image';
-import type { RunHandle } from '../../core/types';
-import { dropZone } from '../../ui/components/drop-zone';
+import type { GeneratedImage, ImageRequest } from '../../core/api/types';
+import { userMessage } from '../../core/errors';
+import { readImageSize } from '../../core/media/image';
+import { aspectValue, type ImageModelControls } from '../../core/models/image-params';
+import type { ImageControlsResult, RunHandle } from '../../core/types';
 import { emptyState } from '../../ui/components/empty-state';
-import { describeAccept, mimeMatches, partitionFiles } from '../../ui/components/file-types';
+import { mimeMatches } from '../../ui/components/file-types';
 import { imageResultCard } from '../../ui/components/image-result-card';
+import { referencePicker } from '../../ui/components/reference-picker';
 import { progressBar } from '../../ui/components/progress-bar';
 import { switchField } from '../../ui/components/switch-field';
 import { h, replace } from '../../ui/dom';
@@ -30,10 +32,10 @@ import { uid } from '../../ui/id';
 import { type ItemStatus, runItems } from '../../ui/tool/batch';
 import type { ToolContext, ToolInstance } from '../../ui/tool/index';
 import { retryGate } from '../../ui/tool/retry-gate';
+import { pendingOnly } from '../../ui/tool/runner';
 import { sendItems } from '../../ui/tool/send-to';
 import {
   approxDimensions,
-  bareControls,
   buildRequests,
   DEFAULT_FORM,
   effective,
@@ -41,20 +43,15 @@ import {
   type GenerationForm,
   MAX_IMAGES,
   MAX_SEED,
-  type ModelControls,
-  modelControls,
   parseForm,
   parseSize,
   planRequests,
-  ratioOf,
-  referenceProblem,
   type RequestPlan,
   runSettings,
 } from './params';
 
 /** References are scaled to this before upload: plenty to guide a model, and well under body limits. */
-const REFERENCE_MAX_SIDE = 2048;
-const REFERENCE_MAX_BYTES = 4 * 1024 * 1024;
+const REFERENCE_ENCODING = { maxSide: 2048, maxBytes: 4 * 1024 * 1024 };
 /** Requests in flight at once. */
 const CONCURRENCY = 3;
 const EXTENSION: Record<string, string> = {
@@ -63,12 +60,6 @@ const EXTENSION: Record<string, string> = {
   'image/webp': 'webp',
   'image/svg+xml': 'svg',
 };
-
-interface Reference {
-  id: string;
-  file: File;
-  url: string;
-}
 
 /** One Generate press (or a variation): its heading, grid and requests. */
 interface Group {
@@ -81,6 +72,8 @@ interface Group {
   grid: HTMLElement;
   bar: ReturnType<typeof progressBar>;
   items: Item[];
+  /** Failed cards for images a request did not deliver (not run items of their own). */
+  remainders: Item[];
 }
 
 /** One request: a waiting card until it settles, then its images' cards (or a failed card). */
@@ -103,7 +96,8 @@ interface Generation {
   name: string;
 }
 
-type RunArg = { retry: Item } | { variation: Generation };
+/** Retry some requests (a failed card, or what a toast's Retry still needs), or make a variation. */
+type RunArg = { retry: Item[] } | { variation: Generation };
 
 const randomSeed = (): number => (crypto.getRandomValues(new Uint32Array(1))[0] ?? 0) % MAX_SEED;
 
@@ -119,18 +113,9 @@ export function stemFrom(prompt: string): string {
   return words.join('-').slice(0, 48) || 'image';
 }
 
-async function dimensionsOf(blob: Blob): Promise<{ width: number; height: number } | null> {
-  try {
-    const image = await loadImage(blob);
-    try {
-      return imageSize(image);
-    } finally {
-      if ('close' in image) image.close();
-    }
-  } catch {
-    return null;
-  }
-}
+/** The picture's size from its header (no decode), or null when it cannot be read. */
+const dimensionsOf = (blob: Blob): Promise<{ width: number; height: number } | null> =>
+  readImageSize(blob).catch(() => null);
 
 const shorten = (text: string, max: number): string =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
@@ -156,38 +141,18 @@ export function setup(ctx: ToolContext): ToolInstance {
     seedHelp: uid('imagegen-seed-help'),
   };
 
-  // --- the image models (supported_parameters) --------------------------------------------------------------
-  let imageModels: RawImageModel[] | null = null;
-  let imageModelsFailed = false;
-  let loading: Promise<void> | null = null;
-  /** Reads the list (the cache when it has one); `reread` after a refresh elsewhere, never forcing the network. */
-  const loadImageModels = (reread = false): Promise<void> => {
-    if (loading && !reread) return loading;
-    loading = ctx.models
-      .imageModels()
-      .then((list) => {
-        imageModels = list;
-        imageModelsFailed = false;
-      })
-      .catch(() => {
-        imageModelsFailed = imageModels === null;
-      });
-    return loading;
-  };
-  /** The model's controls; null when the image endpoint does not serve it. Loads the list on first use. */
-  const controlsFor = async (model: string): Promise<ModelControls | null> => {
-    await loadImageModels();
-    if (imageModelsFailed) return bareControls(model);
-    const raw = imageModels?.find((entry) => entry.id === model);
-    return raw ? modelControls(raw) : null;
-  };
+  // --- the image models: one policy for every image tool (models.imageControls) ---------------------------------
+  /** The model's controls: `ready`, `unknown` (prompt only: let the request try) or `missing` (refused). */
+  const controlsFor = (model: string): Promise<ImageControlsResult> =>
+    ctx.models.imageControls(model);
+  const usable = (result: ImageControlsResult): ImageModelControls | null =>
+    result.status === 'missing' ? null : result.controls;
 
-  let current: { model: string | null; controls: ModelControls | null; missing: boolean } = {
-    model: null,
-    controls: null,
-    missing: false,
-  };
-
+  let current: {
+    model: string | null;
+    controls: ImageModelControls | null;
+    status: ImageControlsResult['status'] | null;
+  } = { model: null, controls: null, status: null };
   // --- prompt ----------------------------------------------------------------------------------------------
   const prompt = h('textarea', {
     id: ids.prompt,
@@ -236,7 +201,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   );
   const chip = (value: string): HTMLElement => {
     const id = uid('imagegen-aspect-option');
-    const ratio = ratioOf(value);
+    const ratio = aspectValue(value);
     const box = h('span', {
       class: ['or-aspect-box', ratio === null && 'is-auto'],
       'aria-hidden': 'true',
@@ -326,127 +291,16 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- reference images ------------------------------------------------------------------------------------
-  const references: Reference[] = [];
-  const referenceList = h('ul', {
-    class: 'list-unstyled d-flex flex-wrap gap-3 mb-0 empty-hidden',
-    'aria-label': 'Reference images',
-    'data-testid': 'imagegen-references',
+  const picker = referencePicker({
+    ui,
+    max: 0,
+    accepts: ctx.manifest.accepts,
+    hint: 'PNG, JPEG or WebP: the model follows their content or style',
+    focusFallback: () => prompt,
+    testId: 'imagegen',
   });
-  const referenceCount = h('span', {
-    class: 'small text-body-secondary',
-    'data-testid': 'imagegen-reference-count',
-  });
-  const referenceDrop = h('div');
-  const referenceNote = h('div', { class: 'form-text', 'data-testid': 'imagegen-reference-note' });
-  const referenceHeading = uid('imagegen-references-heading');
-  const referenceSection = h(
-    'section',
-    { class: 'd-flex flex-column gap-2', 'aria-labelledby': referenceHeading },
-    h(
-      'div',
-      { class: 'd-flex align-items-baseline gap-2' },
-      h(
-        'h3',
-        { id: referenceHeading, class: 'form-label fw-semibold fs-6 mb-0 me-auto' },
-        'Reference images',
-      ),
-      referenceCount,
-    ),
-    referenceList,
-    referenceDrop,
-    referenceNote,
-  );
+  picker.onChange(() => formChanged());
   const referenceMax = (): number => current.controls?.references?.max ?? 0;
-  const modelName = (): string => current.controls?.name ?? 'This model';
-
-  const renderReferences = (): void => {
-    const max = referenceMax();
-    replace(
-      referenceList,
-      references.map((reference, index) =>
-        h(
-          'li',
-          { class: 'or-reference', 'data-testid': 'imagegen-reference' },
-          h('img', {
-            src: reference.url,
-            alt: `Reference ${index + 1}: ${reference.file.name}`,
-            class: 'rounded border object-fit-cover',
-            width: 72,
-            height: 72,
-          }),
-          h(
-            'button',
-            {
-              type: 'button',
-              class: 'btn btn-sm btn-light border or-reference-remove',
-              'aria-label': `Remove reference ${index + 1}, ${reference.file.name}`,
-              'data-focus-key': `reference-remove:${reference.id}`,
-              'data-testid': 'imagegen-reference-remove',
-              onclick: () => removeReference(reference),
-            },
-            icon('x-lg'),
-          ),
-        ),
-      ),
-    );
-    referenceCount.textContent = max > 0 ? `${references.length} of ${max}` : '';
-    const room = max - references.length;
-    replace(
-      referenceDrop,
-      room > 0
-        ? dropZone({
-            accept: ctx.manifest.accepts,
-            multiple: room > 1,
-            compact: true,
-            label: room > 1 ? 'Drop reference images (optional)' : 'Drop a reference image',
-            hint: 'PNG, JPEG or WebP: the model follows their content or style',
-            testId: 'imagegen-reference-drop',
-            onFiles: (files) => addReferences(files),
-          })
-        : null,
-    );
-    const limits = current.controls?.references;
-    referenceNote.textContent = !current.controls
-      ? ''
-      : (referenceProblem(references.length, current.controls) ??
-        (limits && limits.max > 0 && room === 0 ? `That is as many as ${modelName()} takes.` : ''));
-    referenceSection.hidden = (!limits || limits.max === 0) && references.length === 0;
-  };
-
-  const addReferences = (offered: readonly File[]): void => {
-    // Only the picture types references are sent as (PNG, JPEG, WebP): never an SVG or anything else.
-    const { accepted: files, rejected } = partitionFiles([...offered], ctx.manifest.accepts);
-    if (rejected.length > 0 && files.length === 0) {
-      ui.status(`Reference images must be ${describeAccept(ctx.manifest.accepts)}.`);
-      return;
-    }
-    const room = Math.max(0, referenceMax() - references.length);
-    const taken = files.slice(0, room);
-    for (const file of taken) {
-      references.push({ id: uid('ref'), file, url: URL.createObjectURL(file) });
-    }
-    if (taken.length < files.length) {
-      ui.status(
-        room === 0
-          ? `${modelName()} takes no more reference images.`
-          : `Added ${plural(taken.length, 'reference image')}; ${files.length - taken.length} did not fit.`,
-      );
-    } else if (taken.length > 0) {
-      announce(`Added ${plural(taken.length, 'reference image')}.`);
-    }
-    renderReferences();
-    formChanged();
-  };
-  const removeReference = (reference: Reference): void => {
-    const at = references.indexOf(reference);
-    if (at < 0) return;
-    references.splice(at, 1);
-    URL.revokeObjectURL(reference.url);
-    renderReferences();
-    formChanged();
-    announce(`Removed reference ${at + 1}.`);
-  };
-
   // --- model notes -----------------------------------------------------------------------------------------
   const notes = h('div', {
     class: 'd-flex flex-column gap-2 empty-hidden',
@@ -454,7 +308,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   });
   const renderNotes = (): void => {
     const list: HTMLElement[] = [];
-    if (current.missing && current.model) {
+    if (current.status === 'missing' && current.model) {
       list.push(
         h(
           'div',
@@ -466,7 +320,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           `${current.model} is not served by the image endpoint. Choose another model with the model button above.`,
         ),
       );
-    } else if (imageModelsFailed && current.model) {
+    } else if (current.status === 'unknown' && current.model) {
       list.push(
         h(
           'div',
@@ -514,7 +368,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       count,
       countHelp,
     ),
-    referenceSection,
+    picker.element,
     notes,
   );
 
@@ -726,7 +580,11 @@ export function setup(ctx: ToolContext): ToolInstance {
     transparent.input.disabled = !(controls?.backgrounds?.includes('transparent') ?? false);
     count.value = String(form.count);
     renderSeed();
-    renderReferences();
+    picker.setLimits({
+      min: controls?.references?.min ?? 0,
+      max: controls?.references?.max ?? 0,
+      ...(controls ? { owner: controls.name } : {}),
+    });
     formChanged();
   };
 
@@ -743,10 +601,12 @@ export function setup(ctx: ToolContext): ToolInstance {
   const syncModel = async (): Promise<void> => {
     const mine = ++syncGeneration;
     const model = ctx.model().model;
-    const controls = model ? await controlsFor(model) : null;
+    const result = model ? await controlsFor(model) : null;
     if (mine !== syncGeneration) return;
-    current = { model, controls, missing: model !== null && controls === null };
-    runner.setDisabled(current.missing ? `${model} is not available for image generation.` : null);
+    current = { model, controls: result ? usable(result) : null, status: result?.status ?? null };
+    runner.setDisabled(
+      current.status === 'missing' ? `${model} is not available for image generation.` : null,
+    );
     renderModel();
   };
 
@@ -851,7 +711,7 @@ export function setup(ctx: ToolContext): ToolInstance {
                   class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
                   'aria-label': `Retry ${title.toLowerCase()}`,
                   'data-testid': 'imagegen-retry',
-                  onclick: () => gate.retry({ retry: item }, 'Generate cannot start now.'),
+                  onclick: () => gate.retry({ retry: [item] }, 'Generate cannot start now.'),
                 },
                 icon('arrow-clockwise'),
                 'Retry',
@@ -881,22 +741,10 @@ export function setup(ctx: ToolContext): ToolInstance {
     );
   };
 
+  /** The picker says when there is no room, or when the model takes no references at all. */
   const useAsReference = (generation: Generation): void => {
-    if (!isReferenceType(generation.blob.type)) {
-      ui.status(`Reference images must be ${describeAccept(ctx.manifest.accepts)}.`);
-      return;
-    }
-    const max = referenceMax();
-    if (references.length >= max) {
-      ui.status(
-        max === 0
-          ? `${modelName()} does not take reference images.`
-          : `${modelName()} takes at most ${plural(max, 'reference image')}.`,
-      );
-      return;
-    }
-    addReferences([new File([generation.blob], generation.name, { type: generation.blob.type })]);
-    ui.status(`${generation.name} is now a reference image.`);
+    const [added] = picker.add([{ blob: generation.blob, name: generation.name }]);
+    if (added) ui.status(`${generation.name} is now a reference image.`);
   };
 
   const sendToEditor = (generation: Generation): void => {
@@ -1046,6 +894,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         slot: h('div', { class: 'col' }),
         partialUrl: null,
       };
+      item.group.remainders.push(remainder);
     }
     await showImages(item, result.images, remainder?.slot ?? null);
     if (remainder) drawFailed(remainder);
@@ -1080,6 +929,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       grid,
       bar,
       items: [],
+      remainders: [],
     };
     let first = 1;
     group.items = plans.map((plan) => {
@@ -1179,9 +1029,10 @@ export function setup(ctx: ToolContext): ToolInstance {
     model: string,
     estimateForm: GenerationForm,
     images: number,
+    requests: number,
     referenceCount: number,
   ): Promise<number | null> => {
-    const controls = await controlsFor(model);
+    const controls = usable(await controlsFor(model));
     if (!controls) return null;
     const { width, height } = approxDimensions(effective(estimateForm, controls));
     return ctx.models.estimate({
@@ -1191,17 +1042,46 @@ export function setup(ctx: ToolContext): ToolInstance {
       width,
       height,
       references: Math.min(referenceCount, controls.references?.max ?? 0),
+      requests,
     });
   };
 
-  /** A failed request again: a run of one, same body (same seed). */
-  const retryItem = async (signal: AbortSignal, item: Item): Promise<void> => {
-    const group = item.group;
-    if (!item.slot.isConnected || item.status === 'done') return;
+  /** A request has its images (or its card was removed): a Retry has nothing to send for it. */
+  const isDone = (item: Item): boolean => item.status === 'done' || !item.slot.isConnected;
+  const pending = pendingOnly(isDone);
+  /** The group a fresh Generate made, for its toast's Retry (null until the run started a group). */
+  let freshGroup: Group | null = null;
+  /** The group each variation made, by its argument (the toast's Retry replays the same object). */
+  const variationGroups = new WeakMap<Generation, Group>();
+  const pendingOf = (group: Group): RunArg | null => {
+    const left = pending([...group.items, ...group.remainders]);
+    return left ? { retry: left } : null;
+  };
+  /**
+   * The error toast's Retry: only requests without images. A fresh run that made a group retries that group's
+   * unfinished requests (a 402 part-way never pays again for the images made); one refused before it started
+   * (no key, a budget) runs again as it was.
+   */
+  const replayArg = (arg: RunArg | undefined): RunArg | undefined | null => {
+    if (!arg) return freshGroup ? pendingOf(freshGroup) : undefined;
+    if ('retry' in arg) {
+      const left = pending(arg.retry);
+      return left ? { retry: left } : null;
+    }
+    const group = variationGroups.get(arg.variation);
+    return group ? pendingOf(group) : arg;
+  };
+
+  /** Failed requests again (a card's Retry, or what a toast's Retry still needs): same bodies, same seeds. */
+  const retryItems = async (signal: AbortSignal, asked: Item[]): Promise<void> => {
+    const items = asked.filter((item) => !isDone(item));
+    const group = items[0]?.group;
+    if (!group) return;
     const estimateUsd = await estimateFor(
       group.model,
       group.form,
-      item.plan.images,
+      items.reduce((sum, item) => sum + item.plan.images, 0),
+      items.length,
       group.references.length,
     );
     const handle = await ctx.beginRun(
@@ -1214,17 +1094,16 @@ export function setup(ctx: ToolContext): ToolInstance {
       },
       signal,
     );
-    item.error = null;
+    for (const item of items) item.error = null;
     try {
-      await runGroup(handle, group, [item]);
+      await runGroup(handle, group, items);
     } catch (error) {
-      // The card shows what happened, with Retry; no second message for it. Errors that need an action (no key,
+      // The cards show what happened, with Retry; no second message for it. Errors that need an action (no key,
       // locked keys, budget, storage) still reach the shell, which opens the dialog that fixes them.
       if (!isStop(error) && !needsAction(error)) markPresented(error);
       throw error;
     }
   };
-
   /** A variation: the same request and references with a new seed, one image. */
   const vary = async (signal: AbortSignal, generation: Generation): Promise<void> => {
     const source = generation.group;
@@ -1237,7 +1116,13 @@ export function setup(ctx: ToolContext): ToolInstance {
       seedLocked: false,
       seed: body.seed ?? null,
     };
-    const estimateUsd = await estimateFor(source.model, variationForm, 1, source.references.length);
+    const estimateUsd = await estimateFor(
+      source.model,
+      variationForm,
+      1,
+      1,
+      source.references.length,
+    );
     const handle = await ctx.beginRun(
       {
         model: source.model,
@@ -1257,12 +1142,14 @@ export function setup(ctx: ToolContext): ToolInstance {
         .filter(Boolean)
         .join(' · '),
     );
+    variationGroups.set(generation, group);
     await runGroup(handle, group, group.items);
   };
 
   const run = async (signal: AbortSignal, arg?: RunArg): Promise<void> => {
-    if (arg && 'retry' in arg) return retryItem(signal, arg.retry);
+    if (arg && 'retry' in arg) return retryItems(signal, arg.retry);
     if (arg && 'variation' in arg) return vary(signal, arg.variation);
+    freshGroup = null;
     const model = ctx.model().model;
     if (!model) return;
     const asked: GenerationForm = { ...form };
@@ -1271,15 +1158,15 @@ export function setup(ctx: ToolContext): ToolInstance {
       prompt.focus();
       return;
     }
-    const controls = await controlsFor(model);
+    const controls = usable(await controlsFor(model));
     if (!controls) {
       ui.status(`${model} is not available for image generation. Choose another model.`);
       return;
     }
-    const problem = referenceProblem(references.length, controls);
+    const problem = picker.problem();
     if (problem) {
       ui.status(problem);
-      (referenceSection.querySelector<HTMLElement>('button') ?? prompt).focus();
+      if (!picker.focus()) prompt.focus();
       return;
     }
     // The run's seed: the locked one, else a new one (shown in the field once the run is on).
@@ -1290,22 +1177,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       : null;
     const sentForm: GenerationForm = { ...asked, seed: runSeed ?? asked.seed };
 
-    // References are read before anything is sent: one that cannot be read stops here, at no cost.
-    let urls: string[];
-    try {
-      urls = await Promise.all(
-        references.map((reference) =>
-          toDataUrl(reference.file, {
-            maxDimension: REFERENCE_MAX_SIDE,
-            maxBytes: REFERENCE_MAX_BYTES,
-          }),
-        ),
-      );
-    } catch (error) {
-      throw new InvalidInputError(
-        `A reference image could not be read (${userMessage(error)}). Remove it or choose another.`,
-      );
-    }
+    // References are read before anything is sent (each encoded once): one that cannot be read stops here.
+    const urls = await picker.dataUrls(REFERENCE_ENCODING);
     const plans = buildRequests({
       model,
       form: sentForm,
@@ -1334,10 +1207,11 @@ export function setup(ctx: ToolContext): ToolInstance {
       .filter(Boolean)
       .join(' · ');
     const group = startGroup(model, sentForm, urls, plans, heading);
+    freshGroup = group;
     await runGroup(handle, group, group.items);
   };
 
-  const runner = ui.runner<RunArg>({ label: 'Generate', icon: 'image', run });
+  const runner = ui.runner<RunArg>({ label: 'Generate', icon: 'image', run, replayArg });
   const gate = retryGate(runner, {
     fallback: () => (runner.busy ? runner.stopButton : runner.button),
   });
@@ -1358,19 +1232,19 @@ export function setup(ctx: ToolContext): ToolInstance {
     modelReady = syncModel();
   });
   ctx.bus.on('models-refreshed', () => {
-    modelReady = loadImageModels(true).then(syncModel);
+    modelReady = syncModel();
   });
   renderModel();
   modelReady = syncModel();
-  const whenReady = (files: File[]): void => {
-    void modelReady.then(() => addReferences(files));
+  const whenReady = (items: readonly (File | { blob: Blob; name: string })[]): void => {
+    void modelReady.then(() => picker.add(items));
   };
 
   return {
     getState: () => ({ prompt: form.prompt, settings: formSettings(form) }),
     applyState: ({ prompt: text, settings }) => applyForm(parseForm(text, settings)),
     estimate: async (model) => {
-      const controls = await controlsFor(model);
+      const controls = usable(await controlsFor(model));
       if (!controls) return null;
       const { width, height } = approxDimensions(effective(form, controls));
       return ctx.models.estimate({
@@ -1379,14 +1253,16 @@ export function setup(ctx: ToolContext): ToolInstance {
         images: Math.max(1, Math.min(MAX_IMAGES, form.count)),
         width,
         height,
-        references: Math.min(references.length, controls.references?.max ?? 0),
+        references: Math.min(picker.references().length, controls.references?.max ?? 0),
+        // Every request uploads the references (one with `n`, or one per image).
+        requests: planRequests(form.count, controls).length,
       });
     },
     onFiles: whenReady,
     onReceive: (items) => {
       whenReady(
         items.flatMap((item) =>
-          item.kind === 'file' ? [new File([item.blob], item.name, { type: item.blob.type })] : [],
+          item.kind === 'file' ? [{ blob: item.blob, name: item.name }] : [],
         ),
       );
     },

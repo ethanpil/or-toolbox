@@ -20,7 +20,10 @@ vi.mock('../../core/media/image', async (importOriginal) => ({
     ...size,
     data: new Uint8ClampedArray(size.width * size.height * 4),
   }),
+  readImageSize: () => Promise.resolve({ width: 64, height: 32 }),
   toBlob: () => Promise.resolve(new Blob(['png'], { type: 'image/png' })),
+  toDataUrls: (items: readonly unknown[]) =>
+    Promise.resolve(items.map(() => 'data:image/png;base64,REF')),
 }));
 vi.mock('./pixels', () => ({
   drawToRaster: (_source: unknown, width: number, height: number) => ({
@@ -28,7 +31,6 @@ vi.mock('./pixels', () => ({
     height,
     data: new Uint8ClampedArray(width * height * 4),
   }),
-  referenceUrl: () => Promise.resolve('data:image/png;base64,REF'),
 }));
 
 const KLEIN = 'black-forest-labs/flux.2-klein-4b';

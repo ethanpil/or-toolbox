@@ -270,7 +270,14 @@ test.describe('Image editor', () => {
     await thumbs.nth(1).click();
     await page.getByTestId('editor-compare').click();
     await expect(page.getByTestId('editor-compare')).toHaveAttribute('aria-pressed', 'true');
+    // A before/after wipe of the version and the one it was made from.
+    await expect(page.getByTestId('editor-compare-slider')).toBeVisible();
+    await expect(page.getByTestId('compare-range')).toHaveAttribute(
+      'aria-label',
+      'Compare version 1 with original',
+    );
     await page.getByTestId('editor-compare').click();
+    await expect(page.getByTestId('editor-compare-slider')).toHaveCount(0);
 
     await expectNoSeriousA11yViolations(page);
     await page.emulateMedia({ colorScheme: 'dark' });

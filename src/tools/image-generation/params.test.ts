@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { RawImageModel } from '../../core/api/types';
+import { imageModelControls as modelControls } from '../../core/models/image-params';
 import {
   approxDimensions,
   buildRequests,
@@ -8,10 +9,8 @@ import {
   foldPrompt,
   formSettings,
   type GenerationForm,
-  modelControls,
   parseForm,
   planRequests,
-  referenceProblem,
   runSettings,
 } from './params';
 
@@ -270,19 +269,6 @@ describe('planRequests, sizes and references', () => {
       width: 576,
       height: 1024,
     });
-  });
-
-  it('explains reference counts the model cannot take', () => {
-    expect(referenceProblem(0, modelControls(FLUX_PRO))).toBeNull();
-    expect(referenceProblem(9, modelControls(FLUX_PRO))).toBe(
-      'Black Forest Labs: FLUX.2 Pro takes at most 8 reference images; remove 1.',
-    );
-    expect(referenceProblem(0, modelControls(MING))).toBe(
-      'Ming design layer needs at least 1 reference image.',
-    );
-    expect(referenceProblem(1, modelControls(RIVERFLOW))).toBe(
-      'Riverflow does not take reference images; remove them or choose another model.',
-    );
   });
 });
 

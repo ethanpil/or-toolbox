@@ -20,22 +20,26 @@
  * instruction and settings only.
  */
 import type { ImageModelControls } from '../../core/models/image-params';
-import { imageModelControls } from '../../core/models/image-params';
-import { InvalidInputError, userMessage } from '../../core/errors';
-import type { RawImageModel } from '../../core/api/types';
+import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
 import {
   fitWithin,
-  imageDataFrom,
   imageSize,
   loadImage,
   type Mask,
-  maskOverlay,
-  maskToRaster,
   type RasterImage,
+  readImageSize,
   resizeCanvas,
   toBlob,
+  toDataUrls,
 } from '../../core/media/image';
+import {
+  compositeMaskedAsync,
+  maskOverlayAsync,
+  maskToRasterAsync,
+} from '../../core/media/image-async';
+import type { ImageControlsResult } from '../../core/types';
 import { debounce } from '../../core/util';
+import { type CompareSlider, compareSlider } from '../../ui/components/compare-slider';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
 import { type ImageResultCard, imageResultCard } from '../../ui/components/image-result-card';
@@ -49,20 +53,19 @@ import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import type { ToolContext, ToolInstance } from '../../ui/tool/index';
 import { canvasEditor } from './canvas-editor';
-import { clipMask, compositeMasked, featherInside, scaleMask } from './mask';
+import { clipMask, scaleMask } from './mask';
 import {
   EXTEND_RATIOS,
   fitResult,
   type Margins,
   OUTPAINT_FILL,
-  outpaintAlpha,
   outpaintMask,
   outpaintPlan,
-  placeOnCanvas,
+  pictureMask,
   planProblem,
   scaledPlan,
 } from './outpaint';
-import { drawToRaster, referenceUrl } from './pixels';
+import { drawToRaster } from './pixels';
 import {
   buildEditRequest,
   EDIT_MODES,
@@ -86,6 +89,14 @@ const WORK_SIDE = 2048;
 const MAX_PIXELS = 16_777_216;
 /** How long the outpaint preview waits for typing in the margins to stop. */
 const PREVIEW_DELAY_MS = 150;
+/** References (marked, plain, mask) are encoded together at one size under these limits. */
+const REFERENCE_ENCODING = {
+  maxDimension: WORK_SIDE,
+  maxBytes: 4 * 1024 * 1024,
+  type: 'image/png',
+};
+/** With the model's limits unknown (the list could not be read), every reference is sent: let it try. */
+const ALL_REFERENCES = 3;
 
 const MODE_LABEL: Record<EditMode, string> = {
   inpaint: 'Inpaint',
@@ -125,27 +136,19 @@ export function setup(ctx: ToolContext): ToolInstance {
     featherHelp: uid('editor-feather-help'),
   };
 
-  // --- image models ----------------------------------------------------------------------------------------
-  let imageModels: RawImageModel[] | null = null;
-  let loading: Promise<void> | null = null;
-  /** Reads the list (the cache when it has one); `reread` after a refresh elsewhere, never forcing the network. */
-  const loadImageModels = (reread = false): Promise<void> => {
-    if (loading && !reread) return loading;
-    loading = ctx.models
-      .imageModels()
-      .then((list) => {
-        imageModels = list;
-      })
-      .catch(() => undefined);
-    return loading;
-  };
-  const controlsFor = async (model: string): Promise<ImageModelControls | null> => {
-    await loadImageModels();
-    const raw = imageModels?.find((entry) => entry.id === model);
-    return raw ? imageModelControls(raw) : null;
-  };
-  let controls: ImageModelControls | null = null;
-
+  // --- image models: one policy for every image tool (models.imageControls) --------------------------------
+  const controlsFor = (model: string): Promise<ImageControlsResult> =>
+    ctx.models.imageControls(model);
+  /** The current model's answer, for the notes. */
+  let modelState: ImageControlsResult | null = null;
+  /** The references an edit sends in `mode` for this model (all of them when its limits are unknown). */
+  const rolesFor = (mode: EditMode, result: ImageControlsResult) =>
+    referenceRoles(
+      mode,
+      result.status === 'unknown'
+        ? ALL_REFERENCES
+        : ((result.status === 'ready' ? result.controls.references?.max : 0) ?? 0),
+    );
   // --- versions and decoded pictures -----------------------------------------------------------------------
   type Decoded = ImageBitmap | HTMLImageElement;
   const versions = new VersionHistory();
@@ -427,6 +430,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     'data-testid': 'editor-versions',
   });
   const versionSlot = h('div', { 'data-testid': 'editor-version-slot' });
+  /** The before/after wipe while "Show before" is pressed. */
+  const compareSlot = h('div', { hidden: true, 'data-testid': 'editor-compare-slot' });
   const versionsHeading = uid('editor-versions-heading');
   const versionsSection = h(
     'section',
@@ -438,6 +443,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       compare,
     ),
     strip,
+    compareSlot,
     versionSlot,
   );
   const workspace = h(
@@ -449,29 +455,38 @@ export function setup(ctx: ToolContext): ToolInstance {
   ui.output.append(empty, workspace);
 
   let comparing = false;
-  /** The "before" picture while comparing; closed when comparing ends. */
-  let before: Decoded | null = null;
+  let slider: CompareSlider | null = null;
+  /** "Show before": a before/after wipe of the version on screen and the one it was made from. */
   const setCompare = (on: boolean): void => {
     const working = versions.working;
     const parent = working ? versions.parentOf(working.id) : null;
-    comparing = on && parent !== null;
+    comparing = on && working !== null && parent !== null;
     compare.setAttribute('aria-pressed', String(comparing));
-    if (comparing && parent) {
-      void loadImage(parent.blob).then((bitmap) => {
-        close(before);
-        before = bitmap;
-        const size = workSize(parent);
-        if (comparing) editor.preview(bitmap, size.width, size.height);
-      });
-      announce(`Showing ${versionLabel(parent).toLowerCase()}, before this edit.`);
-    } else {
-      close(before);
-      before = null;
-      showModePreview();
-      if (!on) announce('Showing the current version.');
+    compareSlot.hidden = !comparing;
+    if (!comparing || !working || !parent) {
+      replace(compareSlot);
+      slider = null;
+      if (!on) announce('Comparison closed.');
+      return;
     }
+    const images = {
+      before: { src: thumbOf(parent), alt: `${versionLabel(parent)}, before this edit` },
+      after: { src: thumbOf(working), alt: `${versionLabel(working)}, after it` },
+    };
+    if (slider) slider.setImages(images);
+    else {
+      slider = compareSlider({
+        before: { ...images.before, label: versionLabel(parent) },
+        after: { ...images.after, label: versionLabel(working) },
+        label: `Compare ${versionLabel(working).toLowerCase()} with ${versionLabel(parent).toLowerCase()}`,
+        testId: 'editor-compare-slider',
+      });
+      replace(compareSlot, slider.element);
+    }
+    announce(
+      `Comparing ${versionLabel(working).toLowerCase()} with ${versionLabel(parent).toLowerCase()}.`,
+    );
   };
-
   const thumbOf = (version: Version): string => {
     let url = thumbs.get(version.id);
     if (!url) {
@@ -538,11 +553,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     onScreen = { id: version.id, bitmap };
     const size = workSize(version);
     editor.setImage(bitmap, size.width, size.height, { keepMask });
-    comparing = false;
-    close(before);
-    before = null;
-    compare.setAttribute('aria-pressed', 'false');
     renderVersions();
+    if (comparing) setCompare(false);
     modeChanged();
   };
 
@@ -675,7 +687,6 @@ export function setup(ctx: ToolContext): ToolInstance {
   const drawModePreview = (): void => {
     const working = versions.working;
     const plan = settings.mode === 'outpaint' ? currentPlan() : null;
-    if (comparing) return;
     if (!working || !plan || planProblem(plan, working.width, working.height) || !onScreen) {
       editor.preview(null);
       return;
@@ -728,7 +739,9 @@ export function setup(ctx: ToolContext): ToolInstance {
   const renderNotes = (): void => {
     const list: HTMLElement[] = [];
     const model = ctx.model().model;
-    if (model && imageModels && !controls) {
+    const state = modelState;
+    const controls = state && state.status !== 'missing' ? state.controls : null;
+    if (model && state?.status === 'missing') {
       list.push(
         h(
           'div',
@@ -738,6 +751,14 @@ export function setup(ctx: ToolContext): ToolInstance {
             'data-testid': 'editor-missing',
           },
           `${model} is not served by the image endpoint. Choose another model with the model button above.`,
+        ),
+      );
+    } else if (state?.status === 'unknown') {
+      list.push(
+        h(
+          'div',
+          { class: 'alert alert-info small mb-0', role: 'note', 'data-testid': 'editor-unknown' },
+          'The model options could not be loaded: the edit is sent with every reference picture, and the model may refuse it.',
         ),
       );
     } else if (controls && (controls.references?.max ?? 0) === 0) {
@@ -802,7 +823,7 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   const syncModel = async (): Promise<void> => {
     const model = ctx.model().model;
-    controls = model ? await controlsFor(model) : null;
+    modelState = model ? await controlsFor(model) : null;
     renderNotes();
   };
 
@@ -825,7 +846,11 @@ export function setup(ctx: ToolContext): ToolInstance {
    * The references for an edit of the working version, all at one size (the canvas fitted in WORK_SIDE) and
    * from the decoded, upright pixels, so the marked picture, the plain one and the mask line up exactly.
    */
-  const prepare = async (model: string, modelControls: ImageModelControls): Promise<Prepared> => {
+  const prepare = async (
+    model: string,
+    modelControls: ImageModelControls,
+    roles: ReturnType<typeof referenceRoles>,
+  ): Promise<Prepared> => {
     const working = versions.working!;
     const mode = settings.mode;
     const plan = mode === 'outpaint' ? currentPlan() : null;
@@ -846,16 +871,17 @@ export function setup(ctx: ToolContext): ToolInstance {
         plain = drawToRaster(bitmap, refSize.width, refSize.height);
         if (mode === 'inpaint') mask = scaleMask(editor.mask(), refSize.width, refSize.height);
       }
-      const roles = referenceRoles(mode, modelControls.references?.max ?? 0);
-      const references = await Promise.all(
+      // The marked picture and the mask picture are made in the worker; the set is encoded at one size.
+      const pictures = await Promise.all(
         roles.map((role) =>
           role === 'plain'
-            ? referenceUrl(plain, true)
+            ? Promise.resolve(plain)
             : role === 'marked'
-              ? referenceUrl(maskOverlay(plain, mask!, MASK_COLOUR, MASK_ALPHA), true)
-              : referenceUrl(maskToRaster(mask!), false),
+              ? maskOverlayAsync(plain, mask!, MASK_COLOUR, MASK_ALPHA)
+              : maskToRasterAsync(mask!),
         ),
       );
+      const references = await toDataUrls(pictures, REFERENCE_ENCODING);
       const body = buildEditRequest({
         model,
         mode,
@@ -894,20 +920,32 @@ export function setup(ctx: ToolContext): ToolInstance {
     const bitmap = await decode(working);
     const answer = await loadImage(result);
     try {
-      const picture = imageDataFrom(bitmap, { width: working.width, height: working.height });
-      const base = plan ? placeOnCanvas(picture, plan) : picture;
-      const radius = Math.round((settings.feather * canvas.width) / refSize.width);
-      const alphaFull = plan
-        ? outpaintAlpha(plan, working.width, working.height, radius)
-        : featherInside(scaleMask(prepared.mask!, canvas.width, canvas.height), radius);
+      const feather = Math.round((settings.feather * canvas.width) / refSize.width);
       const { width, height } = imageSize(answer);
       const fit = fitResult(width, height, canvas.width, canvas.height);
       const laid = drawToRaster(answer, canvas.width, canvas.height, { box: fit.box });
-      const alpha = fit.fill ? alphaFull : clipMask(alphaFull, fit.box);
-      return {
-        blob: await toBlob(compositeMasked(base, laid, alpha), { type: 'image/png' }),
-        fitted: !fit.fill,
-      };
+      let out: RasterImage;
+      if (plan) {
+        // The picture on the grey canvas. Here the picture is the mask that is kept (with what the result does
+        // not reach), so its soft edge lies on the picture's side and the grey never blends into the result.
+        const base = drawToRaster(bitmap, plan.width, plan.height, {
+          box: { x: plan.offsetX, y: plan.offsetY, width: working.width, height: working.height },
+          fill: OUTPAINT_FILL,
+        });
+        const kept = pictureMask(plan, working.width, working.height, fit.fill ? null : fit.box);
+        out = await compositeMaskedAsync(laid, base, kept, { feather }, { transfer: true });
+      } else {
+        const picture = drawToRaster(bitmap, working.width, working.height);
+        const mask = scaleMask(prepared.mask!, canvas.width, canvas.height);
+        out = await compositeMaskedAsync(
+          picture,
+          laid,
+          fit.fill ? mask : clipMask(mask, fit.box),
+          { feather },
+          { transfer: true },
+        );
+      }
+      return { blob: await toBlob(out, { type: 'image/png' }), fitted: !fit.fill };
     } finally {
       release(bitmap);
       close(answer);
@@ -923,16 +961,17 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     const model = ctx.model().model;
     if (!model) return;
-    const modelControls = await controlsFor(model);
-    if (!modelControls) {
+    const state = await controlsFor(model);
+    if (state.status === 'missing') {
       ui.status(`${model} is not available for image editing. Choose another model.`);
       return;
     }
-    if ((modelControls.references?.max ?? 0) === 0) {
-      ui.status(`${modelControls.name} cannot take a picture to edit. Choose another model.`);
+    const mode = settings.mode;
+    const roles = rolesFor(mode, state);
+    if (roles.length === 0) {
+      ui.status(`${state.controls.name} cannot take a picture to edit. Choose another model.`);
       return;
     }
-    const mode = settings.mode;
     if (mode !== 'outpaint' && !instruction.value.trim()) {
       ui.status('Describe the change first.');
       instruction.focus();
@@ -955,7 +994,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     // Everything is encoded before the run starts: a picture that cannot be read costs nothing.
     let prepared: Prepared;
     try {
-      prepared = await prepare(model, modelControls);
+      prepared = await prepare(model, state.controls, roles);
     } catch (error) {
       throw new InvalidInputError(`The picture could not be prepared (${userMessage(error)}).`);
     }
@@ -982,10 +1021,17 @@ export function setup(ctx: ToolContext): ToolInstance {
       const image = result.images[0]!;
       let blob = image.blob;
       let fitted = false;
-      if (keep) ({ blob, fitted } = await compositeKeepingOutside(prepared, image.blob));
-      const decoded = await loadImage(blob);
-      const size = imageSize(decoded);
-      close(decoded);
+      /** The answer is paid for: if keeping the outside fails, the model's own picture becomes the version. */
+      let keepFailed: string | null = null;
+      if (keep) {
+        try {
+          ({ blob, fitted } = await compositeKeepingOutside(prepared, image.blob));
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          keepFailed = `The outside of the mask could not be kept (${userMessage(error).replace(/\.$/, '')}): this is the model's own picture.`;
+        }
+      }
+      const size = await readImageSize(blob);
       const extension =
         blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/webp' ? 'webp' : 'png';
       const version = versions.add({
@@ -1001,7 +1047,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       version.name = `${stemOf(originalName)}-v${version.number}.${extension}`;
       const fitNote = fitted
         ? 'The model answered in another shape than the picture: its result was fitted inside and centred, not stretched; check the edges.'
-        : null;
+        : keepFailed;
       cards.set(
         version.id,
         imageResultCard({
@@ -1014,7 +1060,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           meta: [
             MODE_LABEL[mode],
             `${size.width} × ${size.height}`,
-            keep ? 'outside kept' : null,
+            keep && !keepFailed ? 'outside kept' : null,
             formatBytes(blob.size),
           ],
           formats: ['png', 'jpg', 'webp'],
@@ -1086,7 +1132,7 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   ctx.settings.subscribe(() => void syncModel());
   ctx.bus.on('models-refreshed', () => {
-    void loadImageModels(true).then(syncModel);
+    void syncModel();
   });
   renderSource();
   applySettings(settings);
@@ -1106,8 +1152,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       applySettings(parseSettings(saved));
     },
     estimate: async (model) => {
-      const modelControls = await controlsFor(model);
-      if (!modelControls) return null;
+      const state = await controlsFor(model);
+      if (state.status === 'missing') return null;
       const working = versions.working;
       const plan = settings.mode === 'outpaint' ? currentPlan() : null;
       const canvas = plan ?? (working ? { width: working.width, height: working.height } : null);
@@ -1118,7 +1164,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         model,
         images: 1,
         ...(size ? { width: size.width, height: size.height } : {}),
-        references: referenceRoles(settings.mode, modelControls.references?.max ?? 0).length,
+        references: rolesFor(settings.mode, state).length,
       });
     },
     onFiles: (files) => firstImage(files),

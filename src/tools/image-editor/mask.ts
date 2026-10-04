@@ -1,13 +1,13 @@
 /**
- * The painted mask and what is done with it: brush and eraser strokes as replayable operations (undo/redo
- * replays them from blank, so no snapshots are kept), invert, coverage, the inward feather, and the composite
- * that puts the original back outside the mask.
+ * The painted mask: brush and eraser strokes as replayable operations (undo/redo replays them from blank, so no
+ * snapshots are kept), invert, coverage, and the mask at another size or clipped to a box. Feathering and
+ * compositing run in the image worker (`featherInsideAsync`, `compositeMaskedAsync`).
  *
  * A mask is one byte per pixel (`Mask` from src/core/media/image.ts): 255 = marked for change, 0 = keep.
  * Strokes paint hard-edged discs; softness comes only from `featherInside` at composite time, and it never
  * reaches past the mask, so pixels outside it stay exactly the original.
  */
-import type { Box, Mask, RasterImage } from '../../core/media/image';
+import type { Box, Mask } from '../../core/media/image';
 
 export type MaskTool = 'brush' | 'eraser';
 
@@ -143,70 +143,6 @@ export function isMaskEmpty(mask: Mask): boolean {
   return true;
 }
 
-/** One box-blur pass of `radius` along rows (`horizontal`) or columns, edges clamped. */
-function boxBlur(
-  source: Float32Array,
-  target: Float32Array,
-  width: number,
-  height: number,
-  radius: number,
-  horizontal: boolean,
-): void {
-  const lines = horizontal ? height : width;
-  const length = horizontal ? width : height;
-  const at = (line: number, i: number): number =>
-    horizontal ? line * width + i : i * width + line;
-  const size = radius * 2 + 1;
-  for (let line = 0; line < lines; line++) {
-    let sum = 0;
-    for (let k = -radius; k <= radius; k++) {
-      sum += source[at(line, Math.min(length - 1, Math.max(0, k)))] ?? 0;
-    }
-    for (let i = 0; i < length; i++) {
-      target[at(line, i)] = sum / size;
-      const out = Math.max(0, i - radius);
-      const into = Math.min(length - 1, i + radius + 1);
-      sum += (source[at(line, into)] ?? 0) - (source[at(line, out)] ?? 0);
-    }
-  }
-}
-
-/**
- * The mask with a soft inner edge, for compositing: a box blur of `radius` pixels, then never more than the
- * mask itself. Outside the mask it stays 0 (the original is kept exactly); deeper than `radius` inside it is
- * 255 (the result is taken exactly); the band between blends.
- */
-export function featherInside(mask: Mask, radius: number): Mask {
-  return feather(mask, radius, Math.min);
-}
-
-/**
- * The mask with a soft outer edge: a box blur of `radius` pixels, never less than the mask itself. Inside the
- * mask it stays 255; the band of `radius` pixels outside it blends. For outpaint, where the mask is the new
- * area and only the picture's side of the seam has anything to blend with.
- */
-export function featherOutside(mask: Mask, radius: number): Mask {
-  return feather(mask, radius, Math.max);
-}
-
-function feather(mask: Mask, radius: number, clamp: (a: number, b: number) => number): Mask {
-  const r = Math.max(0, Math.round(radius));
-  const out = createMask(mask.width, mask.height);
-  if (r === 0) {
-    out.data.set(mask.data);
-    return out;
-  }
-  const { width, height } = mask;
-  const a = Float32Array.from(mask.data);
-  const b = new Float32Array(a.length);
-  boxBlur(a, b, width, height, r, true);
-  boxBlur(b, a, width, height, r, false);
-  for (let i = 0; i < out.data.length; i++) {
-    out.data[i] = clamp(mask.data[i] ?? 0, Math.round(a[i] ?? 0));
-  }
-  return out;
-}
-
 /** The mask with everything outside `box` set to 0 (where a fitted result does not reach). */
 export function clipMask(mask: Mask, box: Box): Mask {
   const out = createMask(mask.width, mask.height);
@@ -235,41 +171,4 @@ export function scaleMask(mask: Mask, width: number, height: number): Mask {
     }
   }
   return out;
-}
-
-/**
- * The result inside the mask, the original outside: `alpha` 0 copies the original pixel exactly, 255 the
- * result pixel exactly, values between blend. All three must be the same size.
- */
-export function compositeMasked(
-  original: RasterImage,
-  result: RasterImage,
-  alpha: Mask,
-): RasterImage {
-  if (
-    original.width !== result.width ||
-    original.height !== result.height ||
-    alpha.width !== original.width ||
-    alpha.height !== original.height
-  ) {
-    throw new RangeError('The image, the result and the mask must be the same size.');
-  }
-  const out = new Uint8ClampedArray(original.data);
-  for (let p = 0; p < alpha.data.length; p++) {
-    const a = alpha.data[p] ?? 0;
-    if (a === 0) continue;
-    const i = p * 4;
-    if (a === 255) {
-      out[i] = result.data[i] ?? 0;
-      out[i + 1] = result.data[i + 1] ?? 0;
-      out[i + 2] = result.data[i + 2] ?? 0;
-      out[i + 3] = result.data[i + 3] ?? 0;
-      continue;
-    }
-    const t = a / 255;
-    for (let c = 0; c < 4; c++) {
-      out[i + c] = (original.data[i + c] ?? 0) * (1 - t) + (result.data[i + c] ?? 0) * t;
-    }
-  }
-  return { width: original.width, height: original.height, data: out };
 }
