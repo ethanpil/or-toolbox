@@ -186,7 +186,7 @@ test.describe('Video studio gate', () => {
 
     // Join: one MP4 of about 5 x 1.04 s minus the 4 dropped frames, which decodes and plays.
     await page.getByTestId('video-join').click();
-    await expect(page.getByTestId('video-export')).toHaveCount(1, { timeout: 600_000 });
+    await expect(page.getByTestId('video-export-result')).toHaveCount(1, { timeout: 600_000 });
     const joined = await page
       .getByTestId('video-export-player')
       .locator('video')

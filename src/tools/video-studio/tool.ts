@@ -5,10 +5,11 @@
  *
  * - **Jobs:** every clip is one run and one persisted job. The run is handed off (`run.handOff`) as soon as the
  *   job is queued, so Generate is free again at once and leaving the page is safe. The job polls
- *   `GET /videos/{id}` (quick at first, then every 30 s) and succeeds with the completed status's cost; the tab
- *   that sees it finish re-attaches the run, books the cost, places the clip and settles its sequence step in one
- *   locked update (delivery.ts), then downloads the video. A clip OpenRouter no longer has (404) is marked expired
- *   (its cost stays booked). `POST /videos` is never sent again by itself once it may have reached OpenRouter.
+ *   `GET /videos/{id}` (quick at first, then every 30 s) and succeeds with the completed status's cost, which the
+ *   core books on the run; the tab that sees it finish ends the run, places the clip and settles its sequence step
+ *   in one locked update (delivery.ts), then downloads the video. A clip OpenRouter no longer has (404) is marked
+ *   expired (its cost stays booked). `POST /videos` is never sent again by itself once it may have reached
+ *   OpenRouter. "Stop waiting" ends the run as stopped (`run.cancel`).
  * - **Persisted state** (`ctx.state`, JSON only): the timeline and the sequence run, written under one Web Lock
  *   (store.ts). Form edits reach a stored run field by field (only what this tab's user changed), and every change
  *   of the stored run, here or in another tab, is read back into the form.
@@ -23,27 +24,26 @@ import {
   BudgetBlockedError,
   FreeOnlyError,
   InvalidInputError,
+  isOutcomeUnknown,
   KeyLockedError,
   NoKeyError,
   OrError,
+  userMessage,
 } from '../../core/errors';
 import { isFinalState, webLocks } from '../../core/jobs';
 import { toDataUrl } from '../../core/media/image';
 import { captureFrame, getVideoMetadata } from '../../core/media/video';
 import type { BudgetCheck, JobRecord, RunHandle, Usage } from '../../core/types';
-import { abortError } from '../../core/util';
 import { bindJobList, jobList } from '../../ui/components/job-list';
 import type { ReferenceInput } from '../../ui/components/reference-picker';
 import { switchField } from '../../ui/components/switch-field';
-import { exportMenu } from '../../ui/components/export-menu';
-import { videoPlayer } from '../../ui/components/video-player';
+import { videoResultCard } from '../../ui/components/video-result-card';
 import { mimeMatches } from '../../ui/components/file-types';
 import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
-import { isStop, markPresented, presentError } from '../../ui/feedback/errors';
-import { toast } from '../../ui/feedback/toast';
-import { formatBytes, formatDuration, formatUsd, plural } from '../../ui/format';
+import { isStop, presentError } from '../../ui/feedback/errors';
+import { formatBytes, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { budgetConfirm } from '../../ui/shell/budget-confirm';
@@ -137,14 +137,14 @@ const shorten = (text: string, max: number): string =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
 /** Usage for a request that reached OpenRouter without a known cost: the run books its reservation. */
-const unknownUsage = (model: string, latencyMs = 0): Usage => ({
+const unknownUsage = (model: string): Usage => ({
   model,
   promptTokens: 0,
   completionTokens: 0,
   costUsd: 0,
   costEstimated: false,
   costUnknown: true,
-  latencyMs,
+  latencyMs: 0,
 });
 
 /** The resolution label an exact size bills at (its short side), when the model lists it. */
@@ -431,27 +431,23 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- notifications --------------------------------------------------------------------------------------
+  /** The drawer's switch: one-clip jobs opt in to the core's notification with it (`jobs.add` `notify`). */
+  const notifyOn = (): boolean => ctx.options.get()['notify'] === true;
   const notifyAllowed = (): boolean =>
-    ctx.options.get()['notify'] === true &&
-    typeof Notification !== 'undefined' &&
-    Notification.permission === 'granted';
-  /** The last sequence job delivered per run: its notification is replaced by the sequence's (never two). */
-  const lastJobOf = new Map<string, string>();
-  /** A browser notification when a sequence ends while the tab is in the background. */
+    notifyOn() && typeof Notification !== 'undefined' && Notification.permission === 'granted';
+  /**
+   * One browser notification when a sequence ends while the tab is in the background. Its step jobs do not notify:
+   * a chained sequence has no open job between steps, so the core's per-group notification would fire after step 1.
+   */
   const noteFinish = (before: SequenceRun | null, after: SequenceRun): void => {
     const ended = after.status === 'done' || after.status === 'stopped';
     if (!ended || before?.id !== after.id || before.status === after.status) return;
     announce(after.message ?? 'The sequence ended.');
     if (!notifyAllowed() || document.visibilityState !== 'hidden') return;
-    const job = lastJobOf.get(after.id);
     try {
       new Notification(
         `${ctx.manifest.name}: sequence ${after.status === 'done' ? 'finished' : 'stopped'}`,
-        {
-          body: after.message ?? '',
-          // The same tag as the job notification of its last clip, which this one replaces.
-          tag: job ? `ortoolbox-job-${job}` : `ortoolbox-sequence-${after.id}`,
-        },
+        { body: after.message ?? '', tag: `ortoolbox-sequence-${after.id}` },
       );
     } catch {
       // Some browsers only show notifications from a service worker; the page still says it.
@@ -1170,6 +1166,8 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   // --- jobs -----------------------------------------------------------------------------------------------
   // Polling only reads the status; the video is downloaded when the clip is delivered (and again after a reload).
+  // The completed status's cost goes back as `usage`: the core books it on the run before the job turns final, so
+  // it counts whatever happens to the download.
   ctx.jobs.register<VideoJobPayload, VideoJobResult>(VIDEO_JOB, {
     intervalMs: (job) => pollInterval(Date.now() - job.createdAt),
     poll: async (job, signal) => {
@@ -1177,7 +1175,11 @@ export function setup(ctx: ToolContext): ToolInstance {
       const status = await ctx.api.videos.status(job.remoteId, { keyId: job.keyId, signal });
       if (!status.done) return { state: 'running', progress: null, remoteStatus: 'Generating' };
       if (status.status === 'completed') {
-        return { state: 'succeeded', result: { costUsd: status.costUsd, outputs: status.outputs } };
+        return {
+          state: 'succeeded',
+          result: { costUsd: status.costUsd, outputs: status.outputs },
+          usage: { costUsd: status.costUsd },
+        };
       }
       return {
         state: 'failed',
@@ -1186,34 +1188,22 @@ export function setup(ctx: ToolContext): ToolInstance {
     },
   });
 
-  /** Ends a job's run: books the completed status's cost, or fails it with the job's reason. */
+  /**
+   * Ends a job's run (the core already booked its cost: the completed status's, or the reservation when it gave
+   * up). "Stop waiting" ends it as stopped, booking the reservation (the job may still finish and bill).
+   */
   const settleRun = async (job: JobRecord, payload: VideoJobPayload): Promise<void> => {
     if (!job.runId) return;
     const handle = await ctx.runs.reattach(job.runId).catch(() => null);
     if (!handle) return; // already final (another tab, or the page-start sweep)
-    const latencyMs = Math.max(0, job.updatedAt - job.createdAt);
     if (job.state === 'succeeded') {
-      const { costUsd } = parseResult(job.result);
-      handle.addUsage({
-        ...unknownUsage(handle.model, latencyMs),
-        costUsd: costUsd ?? 0,
-        costUnknown: costUsd === null,
-      });
       await handle.finish({
         output: `Video clip ready: ${payload.label}.`,
         meta: { videoJobIds: [job.remoteId] },
       });
-      return;
-    }
-    if (job.state === 'cancelled') {
-      // "Stop waiting": not an error. The job may still be billed, so its reservation is booked; the run ends as
-      // aborted (a handed-off run ignores aborts here, so the next page-start sweep finalizes it).
-      handle.addUsage(unknownUsage(handle.model, latencyMs));
-      await handle.checkpoint({ meta: { stoppedWaiting: true } });
-      await handle.fail(abortError('Stopped waiting for the video job.'));
-      return;
-    }
-    await handle.fail(jobFailure(job.error ?? 'The video job failed.'));
+    } else if (job.state === 'cancelled') {
+      await handle.cancel('Stopped waiting for the video job.');
+    } else await handle.fail(jobFailure(job.error ?? 'The video job failed.'));
   };
 
   /** Puts a finished job's clip on the timeline (or records its failure), once. */
@@ -1224,7 +1214,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     delivering.add(job.id);
     try {
       await settleRun(job, payload).catch((error: unknown) => console.error(error));
-      if (payload.sequenceId) lastJobOf.set(payload.sequenceId, job.id);
       if (job.state === 'succeeded') await placeClip(job, payload);
       else {
         const error =
@@ -1233,13 +1222,15 @@ export function setup(ctx: ToolContext): ToolInstance {
             : (job.error ?? 'The video job failed.');
         if (payload.sequenceId && payload.slotKey) {
           const key = payload.slotKey;
-          // A failed or abandoned job may still have been billed: its reservation counts against the cap.
+          // As its run books it: a job the provider failed cost nothing; one abandoned ("Stop waiting") or given up
+          // on may still bill, so its reservation counts against the cap.
+          const billed = job.state === 'failed' && job.failureKind === 'remote' ? 'no' : 'maybe';
           await saveSequence((current) =>
             current?.id === payload.sequenceId
               ? markFailed(
                   current,
                   key,
-                  { jobId: job.id, attempt: payload.attempt, error, billed: 'maybe' },
+                  { jobId: job.id, attempt: payload.attempt, error, billed },
                   Date.now(),
                 )
               : current,
@@ -1339,18 +1330,23 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   /**
    * Sends one request in `handle`'s run and queues its job; the run is handed off to the job. A request that may
-   * have reached OpenRouter is never sent again: if anything after it fails, the run books its reservation and the
-   * error is marked as sent (sequence-runner.ts `billedBy`).
+   * have reached a provider without an answer is the API client's (it books the unknown cost and marks the error
+   * `outcomeUnknown`). One OpenRouter accepted that this page then cannot follow (no job id, the job not stored) is
+   * this function's: the run books its reservation and the error says so, marked as sent (sequence-runner.ts
+   * `billedBy`). Neither is ever sent again by itself.
    */
   const submitJob = async (
     handle: RunHandle,
     body: VideoRequest,
     payload: VideoJobPayload,
   ): Promise<JobRecord> => {
-    let submitted = false;
+    const status = await ctx.api.videos
+      .submit(body, { run: handle })
+      .catch(async (error: unknown) => {
+        await handle.fail(error);
+        throw error;
+      });
     try {
-      const status = await ctx.api.videos.submit(body, { run: handle });
-      submitted = true;
       if (!status.id) throw new InvalidInputError('OpenRouter did not return a job id.');
       const job = await ctx.jobs.add<VideoJobPayload, VideoJobResult>({
         tool,
@@ -1361,15 +1357,20 @@ export function setup(ctx: ToolContext): ToolInstance {
         runId: handle.id,
         groupId: payload.sequenceId,
         state: 'running',
+        // A sequence notifies once when it ends (noteFinish), not per step.
+        notify: payload.sequenceId === null && notifyOn(),
       });
       handle.handOff(job.id);
       return job;
-    } catch (error) {
-      if (submitted) {
-        markSent(error);
-        handle.addUsage(unknownUsage(handle.model));
-      }
-      await handle.fail(error);
+    } catch (cause) {
+      handle.addUsage(unknownUsage(handle.model));
+      await handle.fail(cause);
+      const error = new OrError(
+        'api',
+        `OpenRouter accepted the video request, but this page could not keep track of it (${userMessage(cause).replace(/\.$/, '')}). It is probably being made and billed: check your OpenRouter activity before sending it again.`,
+        { cause },
+      );
+      markSent(error);
       throw error;
     }
   };
@@ -1485,14 +1486,10 @@ export function setup(ctx: ToolContext): ToolInstance {
         delivered: false,
       });
     } catch (error) {
-      if (!isStop(error) && billedBy(error) === 'maybe') {
-        // It may have reached OpenRouter: a Retry would pay twice. Say so instead of offering one.
-        markPresented(error);
-        toast({
-          variant: 'warning',
-          message:
-            'The request may have reached OpenRouter before the connection failed, so it may be billed. It was not sent again: check the Jobs list and your OpenRouter activity before trying again.',
-        });
+      // Accepted by OpenRouter but not followed here: shown without the runner's Retry, which would pay twice.
+      // (A request without an answer is `outcomeUnknown`: the runner itself offers no Retry for it.)
+      if (!isStop(error) && !isOutcomeUnknown(error) && billedBy(error) === 'maybe') {
+        void presentError(error);
       }
       throw error;
     }
@@ -1791,103 +1788,27 @@ export function setup(ctx: ToolContext): ToolInstance {
     exportCount++;
     const first = clipById(clipIds[0] ?? null);
     const name = `${stemFrom(first?.prompt || first?.name || 'video')}-joined-${exportCount}.mp4`;
-    const handle = ui.addResult({ kind: 'video', name, blob });
-    const player = videoPlayer({ blob, label: name, testId: 'video-export-player' });
     // Downloading the joined video also counts its generated clips as saved.
     const clipResults = clipIds.flatMap((id) => {
       const result = media.result(id);
       return result ? [result.result.id] : [];
     });
-    const menu = exportMenu({
-      filename: name.replace(/\.mp4$/, ''),
-      formats: [{ label: 'MP4', extension: 'mp4', icon: 'file-earmark-play', build: () => blob }],
-      resultIds: () => [handle.result.id, ...clipResults],
-      testId: 'video-export-download',
+    const card = videoResultCard({
+      ui,
+      blob,
+      name,
+      meta: [plural(clipIds.length, 'clip'), formatBytes(blob.size)],
+      covers: () => clipResults,
+      onRemove: () => undefined,
+      // No joined video left: back to Join (it focuses the clip list when Join is unavailable).
+      focusFallback: () => {
+        timeline.focusJoin('join');
+        return null;
+      },
+      headingLevel: 4,
+      testId: 'video-export',
     });
-    const meta = h(
-      'span',
-      { class: 'small text-body-secondary', 'data-testid': 'video-export-meta' },
-      `${plural(clipIds.length, 'clip')} · ${formatBytes(blob.size)}`,
-    );
-    const removeKey = `export-remove:${exportCount}`;
-    const card: HTMLElement = h(
-      'article',
-      { class: 'card', 'data-testid': 'video-export', 'data-export-remove': removeKey },
-      h(
-        'div',
-        { class: 'card-body d-flex flex-column gap-2' },
-        h(
-          'div',
-          { class: 'd-flex flex-wrap align-items-baseline gap-2' },
-          h('h4', { class: 'h6 mb-0 me-auto text-break' }, name),
-          meta,
-        ),
-        player.element,
-        h(
-          'div',
-          { class: 'd-flex flex-wrap gap-2' },
-          menu,
-          h(
-            'button',
-            {
-              type: 'button',
-              class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
-              'data-testid': 'video-export-send',
-              onclick: () => ui.sendTo([{ kind: 'file', blob, name }]),
-            },
-            icon('send'),
-            'Send to…',
-          ),
-          h(
-            'button',
-            {
-              type: 'button',
-              class: 'btn btn-sm btn-outline-danger d-inline-flex align-items-center gap-1 ms-auto',
-              'aria-label': `Remove ${name}`,
-              'data-focus-key': removeKey,
-              'data-testid': 'video-export-remove',
-              onclick: async () => {
-                if (!handle.result.downloaded) {
-                  const sure = await confirmDialog({
-                    title: 'Remove the joined video?',
-                    message: `${name} was not downloaded. You can join the clips again.`,
-                    confirmLabel: 'Remove',
-                    tone: 'danger',
-                  });
-                  if (!sure) return;
-                }
-                // The card focus contract: the next joined video's Remove, else the previous one's, else Join.
-                const cards = [...timeline.exports.children].filter(
-                  (candidate): candidate is HTMLElement => candidate instanceof HTMLElement,
-                );
-                const at = cards.indexOf(card);
-                const neighbour = cards[at + 1] ?? cards[at - 1];
-                player.dispose();
-                handle.remove();
-                card.remove();
-                announce(`Removed ${name}.`);
-                const key = neighbour?.getAttribute('data-export-remove');
-                const target = key
-                  ? neighbour?.querySelector<HTMLElement>(`[data-focus-key="${CSS.escape(key)}"]`)
-                  : null;
-                if (target) target.focus();
-                else timeline.focusJoin('join');
-              },
-            },
-            icon('trash'),
-            'Remove',
-          ),
-        ),
-      ),
-    );
-    timeline.exports.prepend(card);
-    void getVideoMetadata(blob)
-      .then(({ duration }) => {
-        if (duration > 0) {
-          meta.textContent = `${plural(clipIds.length, 'clip')} · ${formatDuration(duration)} · ${formatBytes(blob.size)}`;
-        }
-      })
-      .catch(() => undefined);
+    timeline.exports.prepend(card.element);
   };
 
   // --- runner ---------------------------------------------------------------------------------------------

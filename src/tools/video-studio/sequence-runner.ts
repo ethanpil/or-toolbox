@@ -19,7 +19,13 @@
  * left alone.
  */
 import type { VideoRequest } from '../../core/api/types';
-import { ApiError, InvalidInputError, isAbortError, OrError, userMessage } from '../../core/errors';
+import {
+  InvalidInputError,
+  isAbortError,
+  isOutcomeUnknown,
+  OrError,
+  userMessage,
+} from '../../core/errors';
 import { isFinalState } from '../../core/jobs';
 import type { JobRecord, RunHandle } from '../../core/types';
 import { abortError } from '../../core/util';
@@ -62,13 +68,14 @@ export function markSent(error: unknown): void {
   if (typeof error === 'object' && error !== null) sentErrors.add(error);
 }
 
-/** Whether a failed request may have cost money: refused answers did not; a lost or unclear one may have. */
+/**
+ * Whether a failed request may have cost money: one the API client marks `outcomeUnknown`, one OpenRouter accepted
+ * (`markSent`), and an abort or anything unexpected may have; other OrErrors are answers that billed nothing.
+ */
 export function billedBy(error: unknown): Billed {
+  if (isOutcomeUnknown(error)) return 'maybe';
   if (typeof error === 'object' && error !== null && sentErrors.has(error)) return 'maybe';
-  if (error instanceof ApiError)
-    return error.status >= 500 && error.status !== 503 ? 'maybe' : 'no';
-  if (error instanceof OrError) return error.code === 'network' ? 'maybe' : 'no';
-  return 'maybe'; // an abort after sending, or anything unexpected: assume it may have arrived
+  return error instanceof OrError ? 'no' : 'maybe';
 }
 
 /**

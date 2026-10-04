@@ -6,13 +6,13 @@ import type { RawVideoModel, VideoJobStatus, VideoRequest } from '../../core/api
 import type * as Media from '../../core/media/image';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient } from '../../core/types';
-import { NetworkError } from '../../core/errors';
+import { ApiError, NetworkError } from '../../core/errors';
 import type * as Errors from '../../ui/feedback/errors';
 import { presentError } from '../../ui/feedback/errors';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
 import { DEFAULT_SETTINGS, settingsJson } from './params';
-import { TIMELINE_KEY } from './store';
+import { SEQUENCE_KEY, TIMELINE_KEY } from './store';
 import { setup, stemFrom } from './tool';
 
 // jsdom cannot decode images or video: stand-ins for the header reads, encoders and frame grabs.
@@ -90,6 +90,21 @@ async function mount(api: Partial<ApiClient> = {}) {
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T =>
   document.querySelector<T>(`[data-testid="${id}"]`)!;
+
+/** One 1 s clip ($0.05 on Grok at 480p). */
+const oneSecond = () =>
+  settingsJson({ ...DEFAULT_SETTINGS, format: { ...DEFAULT_SETTINGS.format, duration: 1 } });
+/** A one-step sequence of 1 s clips. */
+const oneStepSequence = () =>
+  settingsJson({
+    ...DEFAULT_SETTINGS,
+    tab: 'sequence',
+    format: { ...DEFAULT_SETTINGS.format, duration: 1 },
+    sequence: {
+      ...DEFAULT_SETTINGS.sequence,
+      steps: [{ id: 'a', prompt: 'One', imageRole: 'references' }],
+    },
+  });
 
 beforeAll(() => {
   URL.createObjectURL = () => 'blob:test';
@@ -283,8 +298,10 @@ describe('Video studio', () => {
     expect(record?.model).toBe(GROK);
   });
 
-  it('never resends a request that may have reached OpenRouter, and says so instead of offering Retry', async () => {
+  it('leaves a request that may have reached OpenRouter to the framework, which offers no Retry for it', async () => {
+    // The API client marks a paid request that may have gone through.
     const failure = new NetworkError();
+    failure.outcomeUnknown = true;
     const tool = await mount({
       videos: {
         submit: (body) => {
@@ -295,22 +312,122 @@ describe('Video studio', () => {
         content: () => Promise.resolve(new Blob(['mp4'])),
       },
     });
-    tool.applyState({
-      prompt: 'A boat',
-      settings: settingsJson({
-        ...DEFAULT_SETTINGS,
-        format: { ...DEFAULT_SETTINGS.format, duration: 1 },
-      }),
-    });
+    tool.applyState({ prompt: 'A boat', settings: oneSecond() });
     vi.mocked(presentError).mockClear();
     await t.runners[0]!.trigger();
     expect(submits).toHaveLength(1);
-    // Explained once (a toast) instead of an error with a Retry that would send it again.
-    expect(document.body.textContent).toContain('may have reached OpenRouter');
-    expect(vi.mocked(presentError).mock.calls.map((call) => call[0])).toEqual([failure]);
-    // (The real API client reports a lost paid request as an unknown cost, so the run books its reservation.)
+    // No toast of its own: the runner's presentError explains it (and keeps Retry back).
+    expect(document.body.textContent).not.toContain('may have reached OpenRouter');
+    const calls = vi.mocked(presentError).mock.calls;
+    expect(calls.map((call) => call[0])).toEqual([failure]);
+    expect(calls[0]?.[1]?.retryUnknownOutcome).toBeUndefined();
     const [record] = await t.core.history.query({ tool: 'video-studio' });
     expect(record?.status).toBe('error');
+  });
+
+  it('says a request OpenRouter accepted but this page cannot follow may be billed, with no Retry', async () => {
+    const tool = await mount({
+      videos: {
+        submit: (body) => {
+          submits.push(body);
+          // Accepted (202) without a job id: nothing to follow.
+          return Promise.resolve({ ...completed(''), status: 'pending', done: false });
+        },
+        status: (id) => Promise.resolve(completed(id)),
+        content: () => Promise.resolve(new Blob(['mp4'])),
+      },
+    });
+    tool.applyState({ prompt: 'A boat', settings: oneSecond() });
+    vi.mocked(presentError).mockClear();
+    await t.runners[0]!.trigger();
+    expect(submits).toHaveLength(1);
+    // Shown first without a Retry (the runner's later call finds it already shown).
+    const [first] = vi.mocked(presentError).mock.calls;
+    expect(String((first?.[0] as Error).message)).toContain(
+      'OpenRouter accepted the video request',
+    );
+    expect(first?.[1]?.retry).toBeUndefined();
+    const [record] = await t.core.history.query({ tool: 'video-studio' });
+    expect(record?.status).toBe('error');
+    expect(record?.usage.costUnknown).toBe(true);
+  });
+
+  it('"Stop waiting" ends the run as stopped at once, booking its reservation', async () => {
+    const tool = await mount({
+      videos: {
+        submit: (body) => {
+          submits.push(body);
+          return Promise.resolve({ ...completed('gen-vid-1-1'), status: 'pending', done: false });
+        },
+        status: (id) => Promise.resolve({ ...completed(id), status: 'pending', done: false }),
+        content: () => Promise.resolve(new Blob(['mp4'])),
+      },
+    });
+    tool.applyState({ prompt: 'A boat', settings: oneSecond() });
+    await t.runners[0]!.trigger();
+    const [job] = await t.core.jobs.list({ tool: 'video-studio' });
+    await t.core.jobs.cancel(job!.id);
+    await vi.waitFor(async () => {
+      const [record] = await t.core.history.query({ tool: 'video-studio' });
+      expect(record?.status).toBe('aborted');
+      expect(record?.usage.costUnknown).toBe(true);
+    });
+  });
+
+  it('a clip job notifies only when the switch is on; sequence steps leave it to the sequence', async () => {
+    const tool = await mount();
+    tool.applyState({ prompt: 'A boat', settings: oneSecond() });
+    await t.runners[0]!.trigger();
+    t.ctx.options.set({ notify: true });
+    await t.runners[0]!.trigger();
+    tool.applyState({ prompt: '', settings: oneStepSequence() });
+    await t.runners[0]!.trigger();
+    await vi.waitFor(async () =>
+      expect(await t.core.jobs.list({ tool: 'video-studio' })).toHaveLength(3),
+    );
+    const jobs = await t.core.jobs.list({ tool: 'video-studio' });
+    const notify = (sequence: boolean) =>
+      jobs
+        .filter(
+          (job) =>
+            ((job.payload as { sequenceId: string | null }).sequenceId !== null) === sequence,
+        )
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .map((job) => job.notify);
+    expect(notify(false)).toEqual([false, true]);
+    expect(notify(true)).toEqual([false]);
+  });
+
+  it.each([
+    ['the provider failed it: nothing counts against the cap', 'remote', 0, false],
+    ['the page gave up asking: its reservation counts', 'gave-up', 0.05, true],
+  ] as const)('a failed sequence step: %s', async (_, kind, spentUsd, spentEstimated) => {
+    const tool = await mount({
+      videos: {
+        submit: (body) => {
+          submits.push(body);
+          return Promise.resolve({ ...completed('gen-vid-1-1'), status: 'pending', done: false });
+        },
+        status: (id) =>
+          kind === 'remote'
+            ? Promise.resolve({
+                ...completed(id),
+                status: 'failed',
+                costUsd: null,
+                error: 'Failed.',
+              })
+            : Promise.reject(new ApiError('Not found', 404)),
+        content: () => Promise.resolve(new Blob(['mp4'])),
+      },
+    });
+    tool.applyState({ prompt: '', settings: oneStepSequence() });
+    await t.runners[0]!.trigger();
+    await vi.waitFor(async () => {
+      const [job] = await t.core.jobs.list({ tool: 'video-studio' });
+      expect(job?.failureKind).toBe(kind);
+      const stored = await t.ctx.state.get<{ slots: { status: string }[] }>(SEQUENCE_KEY);
+      expect(stored?.slots[0]).toMatchObject({ status: 'failed', spentUsd, spentEstimated });
+    });
   });
 
   it("writes only this tab's edits over a stored run: a cap lowered elsewhere stays, and the form follows it", async () => {

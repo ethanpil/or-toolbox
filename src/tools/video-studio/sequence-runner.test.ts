@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { VideoRequest } from '../../core/api/types';
 import { ApiError, NetworkError, NoKeyError } from '../../core/errors';
 import type { JobRecord, RunHandle, ToolStateStore } from '../../core/types';
+import { abortError } from '../../core/util';
 import { DEFAULT_FORMAT } from './format';
 import type { VideoJobPayload } from './job-payload';
 import { videoControls } from './params';
@@ -356,8 +357,13 @@ describe('sequence runner', () => {
   });
 
   it('a send that may have reached OpenRouter counts as spent and is never sent again by itself', async () => {
+    // The API client marks a paid request that may have gone through (`outcomeUnknown`).
+    const unknown = <E extends ApiError | NetworkError>(error: E): E => {
+      error.outcomeUnknown = true;
+      return error;
+    };
     const t = await harness(newRun({ onFailure: 'skip', capUsd: 1 }), {
-      submit: () => Promise.reject(new NetworkError()),
+      submit: () => Promise.reject(unknown(new NetworkError())),
     });
     await t.runner.advance();
     await settle();
@@ -369,7 +375,13 @@ describe('sequence runner', () => {
     });
     expect(billedBy(new ApiError('Bad', 400))).toBe('no');
     expect(billedBy(new ApiError('Busy', 503))).toBe('no');
-    expect(billedBy(new ApiError('Gateway', 502))).toBe('maybe');
+    expect(billedBy(unknown(new ApiError('Gateway', 502)))).toBe('maybe');
+    // Not marked: the client knows nothing was billed (an all-free request).
+    expect(billedBy(new ApiError('Gateway', 502))).toBe('no');
+    expect(billedBy(new NetworkError())).toBe('no');
+    // Stopped while the request was on its way: it may have arrived.
+    expect(billedBy(abortError())).toBe('maybe');
+    // Accepted by OpenRouter, then not followed here (its job could not be stored).
     const lost = new NoKeyError();
     markSent(lost);
     expect(billedBy(lost)).toBe('maybe');
