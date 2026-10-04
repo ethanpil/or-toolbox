@@ -26,6 +26,11 @@ export interface AudioPlayerOptions {
 export interface AudioPlayer {
   readonly element: HTMLElement;
   readonly audio: HTMLAudioElement;
+  /**
+   * Moves playback to `seconds` once that can stick: after the metadata, and after the probe of a stream with no
+   * length (its rewind to 0 would otherwise undo a seek made meanwhile). Use it instead of setting `currentTime`.
+   */
+  seek(seconds: number): Promise<void>;
   setPeaks(peaks: Float32Array): void;
   dispose(): void;
 }
@@ -67,6 +72,19 @@ export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
     if (audio.duration === Infinity) probe ??= resolveDuration(audio);
     return probe ?? Promise.resolve();
   };
+  /** Settles once the metadata is in (or the element failed), so a probe that is due has started. */
+  const metadata = (): Promise<void> =>
+    audio.readyState >= HTMLMediaElement.HAVE_METADATA || audio.error
+      ? Promise.resolve()
+      : new Promise((resolve) => {
+          const done = (): void => {
+            audio.removeEventListener('loadedmetadata', done);
+            audio.removeEventListener('error', done);
+            resolve();
+          };
+          audio.addEventListener('loadedmetadata', done);
+          audio.addEventListener('error', done);
+        });
 
   const draw = (): void => {
     const context = canvas.getContext('2d');
@@ -138,6 +156,11 @@ export function audioPlayer(options: AudioPlayerOptions): AudioPlayer {
   return {
     element,
     audio,
+    async seek(seconds) {
+      await metadata();
+      await measured();
+      audio.currentTime = Math.max(0, seconds);
+    },
     setPeaks(next) {
       peaks = next;
       draw();

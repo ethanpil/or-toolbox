@@ -555,6 +555,15 @@ export function recorder(options: RecorderOptions): Recorder {
         finishRecording('The microphone went away; what was recorded is kept.'),
       );
     }
+    // Recorded time counts from when the recorder really started, which on a busy machine is a while after
+    // start(); counting from start() showed time in which nothing was recorded.
+    mediaRecorder.addEventListener(
+      'start',
+      () => {
+        if (state === 'recording' && recordedMs === 0) stretchStart = performance.now();
+      },
+      { once: true },
+    );
     // A slice a second, so a long recording never sits in one buffer.
     mediaRecorder.start(1000);
     recordedMs = 0;
