@@ -9,7 +9,7 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from '../mock/index.ts';
 import { seedApp } from './app.ts';
-import { watchForProblems } from './support.ts';
+import { isDevServer, watchForProblems } from './support.ts';
 import {
   mockVideoCatalog,
   mockVideoJobs,
@@ -213,6 +213,14 @@ test.describe('Video studio gate', () => {
     expect(joined.duration).toBeGreaterThan(expected - 0.15);
     expect(joined.duration).toBeLessThan(expected + 0.15);
     expect(joined.played).toBeGreaterThan(0.1);
+    // The dev server isolates the page (multi-threaded ffmpeg); the build without its service worker does not
+    // (the single-threaded fallback). Either way the join above worked.
+    const isolated = await page.evaluate(() => crossOriginIsolated);
+    expect(isolated).toBe(isDevServer(test.info()));
+    test.info().annotations.push({
+      type: 'ffmpeg',
+      description: isolated ? 'multi-threaded (isolated page)' : 'single-threaded (not isolated)',
+    });
     expect(problems).toEqual([]);
   });
 

@@ -369,8 +369,8 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
       'data-testid': 'seq-failure',
       onchange: () => host.onSpec({ onFailure: failure.value as FailurePolicy }),
     },
-    h('option', { value: 'stop' }, 'Stop the sequence'),
-    h('option', { value: 'skip' }, 'Skip it and go on'),
+    h('option', { value: 'stop' }, 'Stop'),
+    h('option', { value: 'skip' }, 'Skip it'),
   );
   const estimate = h('p', { class: 'small mb-0', 'data-testid': 'seq-estimate' });
 
