@@ -353,6 +353,7 @@ describe('jobList', () => {
     progress: null,
     remoteStatus: 'in_progress',
     error: null,
+    failureKind: null,
     createdAt: 0,
     updatedAt: Date.now(),
     attempts: 0,

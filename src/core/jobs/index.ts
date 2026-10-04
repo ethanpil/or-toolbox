@@ -6,9 +6,14 @@
  *
  * Failures: storage errors are logged and retried with backoff. A poll error backs off (×2 per failure, up
  * to 60 s) and counts in `attempts`; a non-retryable error (4xx other than 408/429, no key, invalid input)
- * or MAX_POLL_FAILURES failures in a row mark the job `failed`. KeyLockedError pauses polling until the
- * keys change (unlock) instead. Results are applied with a read-modify-write that skips jobs that became
- * final meanwhile, so a cancel from another tab is never overwritten by a late poll.
+ * or MAX_POLL_FAILURES failures in a row mark the job `failed` with `failureKind: 'gave-up'` (a handler's own
+ * `failed` is `'remote'`). KeyLockedError pauses polling until the keys change (unlock) instead. Results are
+ * applied with a read-modify-write that skips jobs that became final meanwhile, so a cancel from another tab is
+ * never overwritten by a late poll.
+ *
+ * Cost: before a job is marked final, its run (`runId`) is re-attached and given what the end says about cost:
+ * a `succeeded` result's `usage`, or an unknown cost when the core gave up (the work may still bill). It is
+ * stored before the job turns final, so whichever tab then finishes the run books it.
  */
 
 import type {
@@ -17,11 +22,12 @@ import type {
   JobPollResult,
   JobRecord,
   JobState,
+  JobUsage,
   JobsService,
 } from '../types';
 import { ApiError, InvalidInputError, KeyLockedError, OrError, userMessage } from '../errors';
 import { getDb } from '../storage/db';
-import { MAX_TIMEOUT_MS, sleep } from '../util';
+import { MAX_TIMEOUT_MS, isFiniteNumber, sleep } from '../util';
 import { getTool } from '../../tools/registry';
 
 export const DEFAULT_POLL_MS = 5000;
@@ -67,20 +73,61 @@ export function webLocks(): LockManager | null {
   }
 }
 
-/** Browser notification on completion, only when the page is hidden and permission was already granted. */
-function notifyCompletion(job: JobRecord): void {
+/** Records stored before `failureKind` existed read as null. */
+const normalize = (job: JobRecord): JobRecord => ({ ...job, failureKind: job.failureKind ?? null });
+
+/** Notifications are shown only while the page is hidden and permission was already granted (never asked). */
+function canNotify(): boolean {
   try {
-    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') return;
-    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
-    const name = getTool(job.tool).name;
-    const ok = job.state === 'succeeded';
-    new Notification(ok ? `${name}: finished` : `${name}: failed`, {
-      body: ok ? 'Your result is ready.' : (job.error ?? 'The job failed.'),
-      tag: `ortoolbox-job-${job.id}`,
-    });
+    return (
+      typeof document !== 'undefined' &&
+      document.visibilityState === 'hidden' &&
+      typeof Notification !== 'undefined' &&
+      Notification.permission === 'granted'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function showNotification(title: string, body: string, tag: string): void {
+  try {
+    new Notification(title, { body, tag });
   } catch {
     // Some browsers only allow notifications from a service worker; the in-page state still updates.
   }
+}
+
+/** One job's notification: finished, failed (remote) or stopped checking (gave up). */
+function notifyJob(job: JobRecord): void {
+  const name = getTool(job.tool).name;
+  const [title, body] =
+    job.state === 'succeeded'
+      ? [`${name}: finished`, 'Your result is ready.']
+      : job.failureKind === 'gave-up'
+        ? [`${name}: stopped checking`, job.error ?? 'The job stopped answering.']
+        : [`${name}: failed`, job.error ?? 'The job failed.'];
+  showNotification(title, body, `ortoolbox-job-${job.id}`);
+}
+
+/** A group's one notification, summing up its ended jobs (cancelled ones left out). */
+function notifyGroup(job: JobRecord, group: JobRecord[], groupId: string): void {
+  const name = getTool(job.tool).name;
+  const ok = group.filter((j) => j.state === 'succeeded').length;
+  const failed = group.filter((j) => j.state === 'failed').length;
+  const title =
+    failed === 0
+      ? `${name}: finished`
+      : ok === 0
+        ? `${name}: failed`
+        : `${name}: finished with failures`;
+  const body =
+    failed > 0
+      ? `${ok} ready, ${failed} failed.`
+      : ok === 1
+        ? 'Your result is ready.'
+        : `${ok} results are ready.`;
+  showNotification(title, body, `ortoolbox-job-group-${groupId}`);
 }
 
 export function createJobsService(core: CoreServices): JobsService {
@@ -105,8 +152,10 @@ export function createJobsService(core: CoreServices): JobsService {
     return job;
   };
 
-  const read = async (id: string): Promise<JobRecord | undefined> =>
-    remember(await (await getDb()).get('jobs', id));
+  const read = async (id: string): Promise<JobRecord | undefined> => {
+    const stored = await (await getDb()).get('jobs', id);
+    return remember(stored && normalize(stored));
+  };
 
   const dispatch = (job: JobRecord): void => {
     for (const fn of [...subscribers]) {
@@ -148,6 +197,8 @@ export function createJobsService(core: CoreServices): JobsService {
       createdAt: stored.createdAt,
       updatedAt: Date.now(),
     };
+    // Only a failed job has a failure kind (a cancelled, reopened or succeeded one has none).
+    next.failureKind = next.state === 'failed' ? (next.failureKind ?? null) : null;
     await tx.store.put(next);
     await tx.done;
     remember(next);
@@ -168,6 +219,50 @@ export function createJobsService(core: CoreServices): JobsService {
       signal.addEventListener('abort', done, { once: true });
     });
 
+  /** Jobs whose cost this page has added to their run, so a retried final write never adds it twice. */
+  const booked = new Set<string>();
+
+  /**
+   * Adds what a job's end says about cost to its run and waits until that is stored. Called before the job is
+   * marked final, so a tab that finishes the run when it sees the job end (`runs.reattach`) books it too.
+   */
+  const bookOnRun = async (job: JobRecord, usage: JobUsage): Promise<void> => {
+    if (!job.runId || booked.has(job.id)) return;
+    const run = await core.runs.reattach(job.runId);
+    if (!run) return; // already final
+    const cost = isFiniteNumber(usage.costUsd) && usage.costUsd >= 0 ? usage.costUsd : null;
+    booked.add(job.id);
+    run.addUsage({
+      model: run.model,
+      promptTokens: 0,
+      completionTokens: 0,
+      costUsd: cost ?? 0,
+      costEstimated: cost !== null && usage.costEstimated === true,
+      costUnknown: cost === null, // unknown is never free: the run books its reservation
+      latencyMs: Math.max(0, Date.now() - job.createdAt),
+    });
+    await run.checkpoint({});
+  };
+
+  /** Groups this page has shown its one notification for. */
+  const notifiedGroups = new Set<string>();
+
+  /** The notification for a job that just ended by polling, if it opted in (`notify`). */
+  const notifyEnd = async (job: JobRecord): Promise<void> => {
+    if (!job.notify || !canNotify()) return;
+    const groupId = job.notify === 'group' ? job.groupId : null;
+    if (!groupId) return notifyJob(job);
+    if (notifiedGroups.has(groupId)) return;
+    const group = await (await getDb()).getAllFromIndex('jobs', 'groupId', groupId);
+    if (notifiedGroups.has(groupId) || group.some((j) => !isFinalState(j.state))) return;
+    notifiedGroups.add(groupId);
+    notifyGroup(job, group, groupId);
+  };
+
+  const ended = (job: JobRecord | undefined): void => {
+    if (job) void notifyEnd(job).catch((error: unknown) => console.error(error));
+  };
+
   /** Writes a poll result; true when the job is now final (or gone). */
   const apply = async (job: JobRecord, result: JobPollResult<unknown>): Promise<boolean> => {
     if (result.state === 'running') {
@@ -182,14 +277,16 @@ export function createJobsService(core: CoreServices): JobsService {
       }
       return false;
     }
-    const done = await write(
-      job.id,
-      result.state === 'succeeded'
-        ? { state: 'succeeded', result: result.result, error: null }
-        : { state: 'failed', error: result.error },
-      true,
+    if (result.state === 'succeeded' && result.usage) await bookOnRun(job, result.usage);
+    ended(
+      await write(
+        job.id,
+        result.state === 'succeeded'
+          ? { state: 'succeeded', result: result.result, error: null }
+          : { state: 'failed', error: result.error, failureKind: 'remote' },
+        true,
+      ),
     );
-    if (done) notifyCompletion(done);
     return true;
   };
 
@@ -221,9 +318,17 @@ export function createJobsService(core: CoreServices): JobsService {
         const permanent = isPermanent(error) || failures >= MAX_POLL_FAILURES;
         try {
           const patch: Partial<JobRecord> = { attempts: job.attempts + 1 };
-          if (permanent) Object.assign(patch, { state: 'failed', error: userMessage(error) });
+          if (permanent) {
+            // The core gives up; the remote work may still finish and bill.
+            await bookOnRun(job, { costUsd: null });
+            Object.assign(patch, {
+              state: 'failed',
+              error: userMessage(error),
+              failureKind: 'gave-up',
+            });
+          }
           const done = await write(id, patch, true);
-          if (permanent && done) notifyCompletion(done);
+          if (permanent) ended(done);
         } catch (storageError) {
           console.error(storageError);
         }
@@ -327,6 +432,7 @@ export function createJobsService(core: CoreServices): JobsService {
       runId?: string | null;
       groupId?: string | null;
       state?: JobState;
+      notify?: JobRecord['notify'];
     }) {
       const now = Date.now();
       const job: JobRecord<P, R> = {
@@ -343,6 +449,8 @@ export function createJobsService(core: CoreServices): JobsService {
         progress: null,
         remoteStatus: null,
         error: null,
+        failureKind: null,
+        notify: input.notify ?? false,
         createdAt: now,
         updatedAt: now,
         attempts: 0,
@@ -382,7 +490,7 @@ export function createJobsService(core: CoreServices): JobsService {
                 ).flat()
               : await db.getAll('jobs');
       return jobs
-        .map(remember)
+        .map((job) => remember(normalize(job)))
         .filter(
           (job) =>
             (filter.tool === undefined || job.tool === filter.tool) &&

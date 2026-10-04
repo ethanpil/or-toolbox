@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { InvalidInputError, isAbortError } from '../errors';
-import { concatVideos, probeMedia, transcodeAudio, trimMedia } from './ffmpeg-ops';
+import { concatVideos, MAX_JOIN_BYTES, probeMedia, transcodeAudio, trimMedia } from './ffmpeg-ops';
 
 /**
  * A stand-in for the shared ffmpeg loader and instance. `exec` records its arguments, can be held
@@ -15,6 +15,9 @@ const fake = vi.hoisted(() => {
     terminated = false;
     files = new Map<string, Uint8Array>();
     execs: string[][] = [];
+    /** The files in the file system as each exec started, and as each read started. */
+    filesAtExec: string[][] = [];
+    filesAtRead: string[][] = [];
     probeLog = '';
     gate: Promise<void> | undefined;
     private readonly logListeners: Listener[] = [];
@@ -31,6 +34,7 @@ const fake = vi.hoisted(() => {
       return Promise.resolve(true);
     };
     readFile = (name: string): Promise<Uint8Array> => {
+      this.filesAtRead.push([...this.files.keys()]);
       const file = this.files.get(name);
       return file ? Promise.resolve(file) : Promise.reject(new Error(`no such file ${name}`));
     };
@@ -38,6 +42,7 @@ const fake = vi.hoisted(() => {
       this.files.delete(name) ? Promise.resolve(true) : Promise.reject(new Error('missing'));
     exec = async (args: string[]): Promise<number> => {
       this.execs.push(args);
+      this.filesAtExec.push([...this.files.keys()]);
       if (this.gate) await this.gate;
       if (this.terminated) throw new Error('called FFmpeg.terminate()');
       if (args.length === 2 && args[0] === '-i') {
@@ -313,6 +318,79 @@ describe('probeMedia and concatVideos', () => {
   it('refuses a clip without video with an input error', async () => {
     fake.state.instance.probeLog = AUDIO_ONLY_LOG;
     await expect(concatVideos([{ blob: mp3() }])).rejects.toThrow(InvalidInputError);
+  });
+
+  /** Each exec with the files that were in the file system when it started. */
+  const steps = () =>
+    fake.state.instance.execs.map((args, at) => ({
+      args,
+      files: [...(fake.state.instance.filesAtExec[at] ?? [])].sort(),
+    }));
+  const isProbe = (args: string[]): boolean => args.length === 2 && args[0] === '-i';
+  const input = (args: string[]): string => args[args.indexOf('-i') + 1] ?? '';
+  /** A Blob that says it is `size` bytes long (its content stays small). */
+  const sized = (blob: Blob, size: number): Blob =>
+    Object.defineProperty(blob, 'size', { value: size });
+
+  it('probes one clip at a time, writes each source just before its encode and frees it after', async () => {
+    fake.state.instance.probeLog = VIDEO_LOG;
+    await concatVideos([{ blob: mp4() }, { blob: mp4(), dropFirstFrame: true }, { blob: mp4() }]);
+    const all = steps();
+
+    const probes = all.filter(({ args }) => isProbe(args));
+    expect(probes).toHaveLength(3);
+    for (const { args, files } of probes) expect(files).toEqual([input(args)]);
+
+    const encodes = all.filter(({ args }) => args.includes('-vf'));
+    expect(encodes).toHaveLength(3);
+    const parts = encodes.map(({ args }) => args.at(-1) ?? '');
+    for (const [index, { args, files }] of encodes.entries()) {
+      // Its own source and the parts made so far: never another clip's source.
+      expect(files).toEqual([input(args), ...parts.slice(0, index)].sort());
+    }
+
+    const join = all.at(-1)!;
+    expect(join.args).toContain('concat');
+    expect(join.files).toEqual([input(join.args), ...parts].sort());
+    // The parts and the list are gone before the joined file is copied out.
+    expect(fake.state.instance.filesAtRead).toEqual([[join.args.at(-1)]]);
+  });
+
+  it('stream-copies matching clips and frees the sources before the result is copied out', async () => {
+    fake.state.instance.probeLog = VIDEO_LOG;
+    await concatVideos([{ blob: mp4() }, { blob: mp4() }]);
+    const all = steps();
+    for (const { args, files } of all.filter((step) => isProbe(step.args))) {
+      expect(files).toEqual([input(args)]);
+    }
+    const join = all.at(-1)!;
+    expect(join.args).toContain('copy');
+    expect(all.some(({ args }) => args.includes('-vf'))).toBe(false);
+    expect(join.files).toHaveLength(3); // the list and both sources: the concat demuxer reads them in one run
+    expect(fake.state.instance.filesAtRead).toEqual([[join.args.at(-1)]]);
+  });
+
+  it('refuses a clip too large for the file system before loading ffmpeg', async () => {
+    const big = sized(mp4(), MAX_JOIN_BYTES + 1);
+    await expect(concatVideos([{ blob: mp4() }, { blob: big }])).rejects.toThrow(InvalidInputError);
+    await expect(concatVideos([{ blob: mp4() }, { blob: big }])).rejects.toThrow(/Clip 2/);
+    expect(fake.state.loads).toBe(0);
+  });
+
+  it('refuses a join whose result would be too large after probing, before encoding anything', async () => {
+    fake.state.instance.probeLog = VIDEO_LOG; // 2 s clips
+    const clip = (): Blob => sized(mp4(), MAX_JOIN_BYTES * 0.6);
+    await expect(concatVideos([{ blob: clip() }, { blob: clip() }])).rejects.toThrow(
+      InvalidInputError,
+    );
+    expect(fake.state.instance.execs.every(isProbe)).toBe(true);
+
+    // Half of each clip is kept: the estimate is half their size, and the join goes ahead.
+    await concatVideos([
+      { blob: clip(), trimEnd: 1 },
+      { blob: clip(), trimStart: 1 },
+    ]);
+    expect(fake.state.instance.execs.at(-1)).toContain('concat');
   });
 
   it('normalises odd-sized clips to even dimensions when it re-encodes', async () => {

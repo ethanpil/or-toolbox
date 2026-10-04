@@ -110,10 +110,17 @@ export function createRunner<A = unknown>(
     } catch (error) {
       // Stop and a declined budget confirmation are silent; an error the output panel already showed inline
       // (`output.fail(error)`) is not shown again; anything else goes through presentError once, and its Retry
-      // runs the same thing again (same argument).
+      // runs the same thing again (same argument). A paid request that may have gone through gets no Retry
+      // (presentError offers `safeAction` instead) unless the tool set `retryUnknownOutcome`.
       if (isStop(error)) {
         if (!wasPresented(error)) announce('Stopped.');
-      } else void presentError(error, { retry: () => replay(arg) });
+      } else {
+        void presentError(error, {
+          retry: () => replay(arg),
+          ...(options.safeAction ? { safeAction: options.safeAction } : {}),
+          ...(options.retryUnknownOutcome ? { retryUnknownOutcome: true } : {}),
+        });
+      }
     } finally {
       busy = false;
       controller = null;

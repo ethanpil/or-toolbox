@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { RunCancelledError } from '../../core/errors';
+import { NetworkError, RunCancelledError } from '../../core/errors';
 import { createRunner, pendingOnly } from './runner';
 
 afterEach(() => {
@@ -184,5 +184,68 @@ describe('createRunner', () => {
     document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(seen).toHaveLength(2);
+  });
+
+  /** What the API client throws when a paid request may have gone through. */
+  const mayHaveGoneThrough = (): NetworkError => {
+    const error = new NetworkError('Could not reach OpenRouter.');
+    error.outcomeUnknown = true;
+    return error;
+  };
+
+  it('never resends a paid request that may have gone through; the toast offers the tool’s safe action', async () => {
+    const run = vi.fn(() => Promise.reject(mayHaveGoneThrough()));
+    const check = vi.fn();
+    const runner = createRunner<string>(
+      { run, safeAction: { label: 'Check status', onClick: check } },
+      true,
+    );
+    document.body.append(runner.element);
+    await runner.trigger('clip-1');
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-safe-action"]')).not.toBeNull(),
+    );
+    expect(document.querySelector('[data-testid="toast-retry"]')).toBeNull();
+    document.querySelector<HTMLButtonElement>('[data-testid="toast-safe-action"]')!.click();
+    expect(check).toHaveBeenCalledOnce();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(run).toHaveBeenCalledOnce();
+
+    // No safe action: the toast says to check first and links to OpenRouter's activity, still no Retry.
+    document.body.replaceChildren();
+    const plain = createRunner({ run }, true);
+    await plain.trigger();
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-activity"]')).not.toBeNull(),
+    );
+    expect(document.querySelector('[data-testid="toast-retry"]')).toBeNull();
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays after an unknown outcome only when the tool opts in, still through replayArg', async () => {
+    const seen: (string[] | undefined)[] = [];
+    const done = new Set<string>();
+    const runner = createRunner<string[]>(
+      {
+        run: (_signal, keys) => {
+          seen.push(keys);
+          done.add('a');
+          return Promise.reject(mayHaveGoneThrough());
+        },
+        replayArg: pendingOnly((key) => done.has(key)),
+        retryUnknownOutcome: true,
+      },
+      true,
+    );
+    document.body.append(runner.element);
+    await runner.trigger(['a', 'b']);
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-retry"]')).not.toBeNull(),
+    );
+    expect(document.querySelector('[data-testid="error-toast"]')?.textContent).toContain(
+      'may have gone through',
+    );
+    document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
+    await vi.waitFor(() => expect(seen).toEqual([['a', 'b'], ['b']]));
   });
 });

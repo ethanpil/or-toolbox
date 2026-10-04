@@ -30,6 +30,11 @@ export type ErrorCode =
 export class OrError extends Error {
   override readonly name: string = 'OrError';
   readonly code: ErrorCode;
+  /**
+   * Set by the API client only: this error ended a paid, non-idempotent request that a provider may have run, and
+   * billed, without an answer saying so. Sending it again may pay twice. See `isOutcomeUnknown`.
+   */
+  outcomeUnknown = false;
 
   constructor(code: ErrorCode, message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -217,6 +222,15 @@ export function isAbortError(error: unknown): boolean {
       (error.name === 'AbortError' || error.name === 'TimeoutError')) ||
     (error instanceof Error && error.name === 'AbortError')
   );
+}
+
+/**
+ * True when a paid request may have gone through although it failed: the connection was lost after sending, or
+ * OpenRouter answered 408 or a 5xx other than 503 (a POST that is not all-free; the API client sets it). Never
+ * offer a plain Retry for it: offer a way to check, or say to check before sending again.
+ */
+export function isOutcomeUnknown(error: unknown): boolean {
+  return error instanceof OrError && error.outcomeUnknown;
 }
 
 /** The code of an OrError, `'aborted'` for aborts, or `'unknown'`. */

@@ -474,6 +474,48 @@ describe('page unload and reattach', () => {
     });
   });
 
+  it('cancel() ends a handed-off run as aborted and books its reservation', async () => {
+    const run = await core.runs.begin({ ...spec, tool: 'video-studio', estimateUsd: 0.08 });
+    run.handOff('job-1');
+    const record = await run.cancel('Stopped waiting for the video job.');
+    expect(record).toMatchObject({
+      status: 'aborted',
+      error: 'Stopped waiting for the video job.',
+    });
+    expect(await stored(run.id)).toMatchObject({ status: 'aborted', jobId: 'job-1' });
+    expect(run.signal.aborted).toBe(true);
+    expect(events).toContainEqual({
+      type: 'run-finished',
+      id: run.id,
+      tool: 'video-studio',
+      status: 'aborted',
+    });
+    // The job may still finish and bill: unknown cost books the reservation.
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.08);
+    expect(await run.cancel()).toEqual(record);
+    expect((await run.finish()).status).toBe('aborted');
+  });
+
+  it('cancel() ends a run reattached in another page', async () => {
+    const run = await core.runs.begin({ ...spec, tool: 'video-studio', estimateUsd: 0.08 });
+    run.handOff('job-1');
+    await until(async () => (await stored(run.id))?.jobId === 'job-1');
+    const handle = (await createTestCore().core.runs.reattach(run.id))!;
+    handle.addUsage(usage({ costUsd: 0.1 }));
+    expect(await handle.cancel()).toMatchObject({ status: 'aborted', error: null });
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.1); // max(actual, reservation)
+  });
+
+  it('cancel() on a run never handed off books what it used', async () => {
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.08 });
+    run.addUsage(usage({ costUsd: 0.01 }));
+    expect(await run.cancel('No longer needed.')).toMatchObject({
+      status: 'aborted',
+      error: 'No longer needed.',
+    });
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.01);
+  });
+
   it('returns null for unknown or finished runs', async () => {
     expect(await core.runs.reattach('nope')).toBeNull();
     const run = await core.runs.begin(spec);
@@ -511,6 +553,26 @@ describe('cost booking', () => {
     expect((await stored(run.id))?.usage.requests).toBe(1);
     await vi.advanceTimersByTimeAsync(CHECKPOINT_INTERVAL_MS);
     await until(async () => (await stored(run.id))?.usage.requests === 3);
+  });
+
+  it('an empty checkpoint waits for the last write instead of scheduling another', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const run = await core.runs.begin(spec);
+    run.addUsage(usage()); // written at once
+    let saved = false;
+    void run.checkpoint({}).then(() => (saved = true));
+    await until(() => saved); // no timer advanced
+    expect((await stored(run.id))?.usage.requests).toBe(1);
+
+    void run.checkpoint({ output: 'more' }); // something new: throttled as before
+    run.addUsage(usage());
+    saved = false;
+    void run.checkpoint({}).then(() => (saved = true)); // waits for that trailing write
+    await settle();
+    expect(saved).toBe(false);
+    await vi.advanceTimersByTimeAsync(CHECKPOINT_INTERVAL_MS);
+    await until(() => saved);
+    expect(await stored(run.id)).toMatchObject({ output: 'more', usage: { requests: 2 } });
   });
 });
 

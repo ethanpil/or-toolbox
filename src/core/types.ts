@@ -462,12 +462,21 @@ export interface RunHandle {
   /**
    * Persists partial output (throttled: at most one write per interval, the latest wins). Pass `output` as a
    * function to build long text only when a write actually happens; it is also read once more by `finish()`
-   * when the result has no output of its own.
+   * when the result has no output of its own. With nothing new since the last write (e.g. `checkpoint({})` right
+   * after `addUsage`), it resolves when that write is stored.
    */
   checkpoint(partial: RunCheckpoint): Promise<void>;
   finish(result?: RunResult): Promise<RunRecord>;
   /** AbortError → status 'aborted'; anything else → 'error' with a user-safe message. */
   fail(error: unknown): Promise<RunRecord>;
+  /**
+   * Ends the run as `aborted` on a deliberate stop, also after `handOff` or `runs.reattach` (e.g. "Stop waiting"
+   * for a job), so History and Stats show it stopped, not failed. `reason` becomes the record's `error`. A
+   * handed-off run's cost is then unknown (its job may still finish and bill), so it books max(actual, reservation).
+   * A live run is stopped with `abort()` and ended by `fail()`; call this on one only when no request is in flight.
+   * It does not cancel the job (`jobs.cancel`).
+   */
+  cancel(reason?: string): Promise<RunRecord>;
   /**
    * The run continues as a persisted job (video): from now on, page unload and aborts do not finalize it; the
    * job's completion handler calls `runs.reattach(id)` and finishes it. Call right after the job is queued.
@@ -704,6 +713,30 @@ export interface PromptsService {
 
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
+/**
+ * Why a job failed. `remote`: the handler reported `failed` (the provider failed the work; usually not billed).
+ * `gave-up`: the core stopped asking (a non-retryable read error such as 404 after retention, a missing key, or
+ * MAX_POLL_FAILURES failed polls in a row); the work may still have finished and been billed, so the core books an
+ * unknown cost on the job's run (it books its reservation).
+ */
+export type JobFailureKind = 'remote' | 'gave-up';
+
+/**
+ * Browser notifications for a job (`jobs.add`). `false` (default): never. `true`: one when this job ends. `'group'`:
+ * one for its whole `groupId` instead, when a job of the group ends and none of the group's jobs is still open; at
+ * most once per group in a page. A group that gets its next job only after the previous one ended (a chained
+ * sequence) has no open job in between: its tool should notify once the sequence ends instead.
+ */
+export type JobNotify = boolean | 'group';
+
+/** What a finished job cost (`JobPollResult` `succeeded`), booked by the core on the job's run. */
+export interface JobUsage {
+  /** USD as the provider reported it; null when it reported none (unknown: the run books its reservation). */
+  costUsd: number | null;
+  /** True when `costUsd` is the tool's own estimate. */
+  costEstimated?: boolean;
+}
+
 export interface JobRecord<P = unknown, R = unknown> {
   id: string;
   tool: ToolId;
@@ -721,6 +754,10 @@ export interface JobRecord<P = unknown, R = unknown> {
   progress: number | null;
   remoteStatus: string | null;
   error: string | null;
+  /** Set with `state: 'failed'`, else null. Records stored before the field existed read as null. */
+  failureKind: JobFailureKind | null;
+  /** The `notify` option given to `add()`; absent means false. */
+  notify?: JobNotify;
   createdAt: number;
   updatedAt: number;
   attempts: number;
@@ -728,9 +765,14 @@ export interface JobRecord<P = unknown, R = unknown> {
   removed?: true;
 }
 
+/**
+ * A poll's answer. `succeeded` may carry `usage`: the core books it on the job's run (`runs.reattach` +
+ * `addUsage`) before it marks the job succeeded, so the cost counts even if a later step (downloading the result)
+ * fails; the tool then only finishes or fails the run. Without `usage` the tool books the cost itself.
+ */
 export type JobPollResult<R> =
   | { state: 'running'; progress?: number | null; remoteStatus?: string }
-  | { state: 'succeeded'; result: R }
+  | { state: 'succeeded'; result: R; usage?: JobUsage }
   | { state: 'failed'; error: string };
 
 export interface JobHandler<P = unknown, R = unknown> {
@@ -751,6 +793,8 @@ export interface JobsService {
     runId?: string | null;
     groupId?: string | null;
     state?: JobState;
+    /** Default false: the core shows no notification for this job (see `JobNotify`). */
+    notify?: JobNotify;
   }): Promise<JobRecord<P, R>>;
   update<P, R>(
     id: string,
@@ -763,8 +807,9 @@ export interface JobsService {
   /** Start polling every non-final job of a registered type. Only one tab polls a given job at a time. */
   resume(): void;
   /**
-   * Fires on every change, local or from another tab. Shows a browser notification on completion when the page
-   * is hidden and permission was granted. A removed job (`remove()`, data deletion or reset) is reported once as
+   * Fires on every change, local or from another tab. Jobs that opted in (`notify`) also show a browser
+   * notification when they end, only while the page is hidden and permission was already granted (never asked;
+   * never for a cancel). A removed job (`remove()`, data deletion or reset) is reported once as
    * a tombstone: the last record this tab saw with `state: 'cancelled'` and `removed: true` (only `id`, `state`
    * and `removed` are guaranteed when the tab never saw the job).
    */

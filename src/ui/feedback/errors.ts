@@ -14,10 +14,14 @@
  * | `storage-full` | a link to Settings → Data |
  * | anything else | `userMessage(error)`, with Retry when given |
  *
+ * Before the codes: a paid request that may have gone through (`isOutcomeUnknown`, set by the API client) never gets
+ * a plain Retry. The toast says it may be billed and offers `safeAction` (e.g. Check status), or else a link to
+ * OpenRouter's activity log; Retry is added only when the caller says a resend is safe (`retryUnknownOutcome`).
+ *
  * Each error is shown once: one already presented (or marked by `markPresented`, as `outputPanel.fail` does
  * when it shows an error inline) is ignored.
  */
-import { errorCode, userMessage } from '../../core/errors';
+import { ApiError, errorCode, isOutcomeUnknown, userMessage } from '../../core/errors';
 import { connectKey } from '../components/connect-key';
 import { h } from '../dom';
 import { settingsUrl } from '../shell/links';
@@ -59,9 +63,22 @@ export function isStop(error: unknown): boolean {
 }
 
 export interface PresentErrorOptions {
-  /** Re-runs the failed action; offered as a button and called after unlocking or adding a key. */
+  /**
+   * Re-runs the failed action; offered as a button and called after unlocking or adding a key. Not offered when a
+   * paid request may have gone through (`isOutcomeUnknown`) unless `retryUnknownOutcome` is set.
+   */
   retry?: () => void;
+  /**
+   * Offered instead of Retry when a paid request may have gone through: a way to look without paying again, e.g.
+   * `{ label: 'Check status', onClick: refreshJobs }` or a link. Default: OpenRouter's activity page.
+   */
+  safeAction?: ToastAction;
+  /** Also offer `retry` after an unknown outcome: the caller knows sending again cannot pay twice. */
+  retryUnknownOutcome?: boolean;
 }
+
+/** OpenRouter's log of every request and its cost (linked from its FAQ, checked 2026-10-04). */
+const OPENROUTER_ACTIVITY_URL = 'https://openrouter.ai/activity';
 
 export async function presentError(
   error: unknown,
@@ -73,6 +90,28 @@ export async function presentError(
 
   if (wasPresented(error)) return;
   markPresented(error);
+  if (isOutcomeUnknown(error)) {
+    const cause =
+      error instanceof ApiError
+        ? `OpenRouter answered with an error (${error.status}) instead of the result.`
+        : 'The connection dropped after the request was sent.';
+    toast({
+      variant: 'warning',
+      title: 'This may have gone through',
+      message: `${cause} The provider may still have done the work and billed it, so check before sending it again.`,
+      action: options.safeAction
+        ? { testId: 'toast-safe-action', ...options.safeAction }
+        : {
+            label: 'OpenRouter activity',
+            href: OPENROUTER_ACTIVITY_URL,
+            external: true,
+            testId: 'toast-activity',
+          },
+      ...(options.retryUnknownOutcome && retryAction ? { actions: [retryAction] } : {}),
+      testId: 'error-toast',
+    });
+    return;
+  }
   switch (errorCode(error)) {
     case 'aborted':
     case 'cancelled':

@@ -195,6 +195,7 @@ function jobRecord(id: string, partial: Partial<JobRecord> = {}): JobRecord {
     progress: null,
     remoteStatus: null,
     error: null,
+    failureKind: null,
     createdAt: 1,
     updatedAt: 100,
     attempts: 0,
@@ -713,7 +714,12 @@ describe('validation of imported files', () => {
         { ...runRecord('bad'), usage: 'lots' },
         { ...runRecord('x'), title: 3 },
       ],
-      jobs: [jobRecord('j'), { id: 'half', tool: 'chat' }],
+      jobs: [
+        jobRecord('j'),
+        { id: 'half', tool: 'chat' },
+        { ...jobRecord('kind'), state: 'failed', failureKind: 'lost' },
+        { ...jobRecord('noisy'), notify: 'always' },
+      ],
       toolState: [
         { key: 'tool:chat:a', value: 1, updatedAt: 1 },
         { key: 'tool:chat:b', value: 1, updatedAt: 'yesterday' },
@@ -726,7 +732,7 @@ describe('validation of imported files', () => {
     expect(preview.changes).toEqual(
       expect.arrayContaining([
         'Skip 2 runs (invalid records)',
-        'Skip 1 job (invalid records)',
+        'Skip 3 jobs (invalid records)',
         'Skip 2 tool state entries (invalid records)',
         'Skip 1 recent prompt (invalid records)',
       ]),
@@ -738,8 +744,15 @@ describe('validation of imported files', () => {
     delete old.reservedUsd;
     delete old.jobId;
     delete (old.usage as Partial<RunRecord['usage']>).costUnknown;
-    await core.backup.import(backupBlob({ runs: [old] }), { mode: 'merge' });
+    const oldJob: Partial<JobRecord> = jobRecord('old-job', { state: 'failed', error: 'x' });
+    delete oldJob.failureKind;
+    const kept = jobRecord('kept', { state: 'failed', failureKind: 'gave-up', notify: 'group' });
+    await core.backup.import(backupBlob({ runs: [old], jobs: [oldJob, kept] }), { mode: 'merge' });
     expect(await (await getDb()).get('runs', 'old')).toEqual(runRecord('old'));
+    expect(await (await getDb()).get('jobs', 'old-job')).toEqual(
+      jobRecord('old-job', { state: 'failed', error: 'x' }),
+    );
+    expect(await (await getDb()).get('jobs', 'kept')).toEqual(kept);
   });
 
   it.each([
