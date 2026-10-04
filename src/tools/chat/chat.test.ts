@@ -320,7 +320,10 @@ describe('chat tool', () => {
     await mount({ chatStream });
     await send('Question');
     $$('message-regenerate')[0]!.click();
-    await vi.waitFor(() => expect(count).toBe(2));
+    // The click starts a run; wait for it to end (↑ does nothing while a reply is running).
+    expect(t!.runners[0]!.busy).toBe(true);
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false), { timeout: 5000 });
+    expect(count).toBe(2);
     await vi.waitFor(() => expect(contents()).toEqual(['Question', 'answer 2']));
     expect($$('sibling-position')[0]?.textContent).toContain('2/2');
 

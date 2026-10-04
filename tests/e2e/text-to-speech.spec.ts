@@ -100,24 +100,6 @@ async function download(page: Page, extension: 'mp3' | 'wav'): Promise<Buffer> {
   return readFileSync(await file.path());
 }
 
-/**
- * Requests the page cancels on purpose: an `<audio>` element reads its `blob:` source in ranges and cancels the
- * read it no longer needs (once it has the metadata, or on a seek), and Stop aborts the speech requests in
- * flight. Chromium reports both as aborted requests; nothing else may fail.
- */
-function withoutCancels(problems: string[], { stopped = false } = {}): string[] {
-  return problems.filter(
-    (problem) =>
-      !/^request failed: blob:http:\/\/localhost:\d+\/[0-9a-f-]+ \(net::ERR_ABORTED\)$/.test(
-        problem,
-      ) &&
-      !(
-        stopped &&
-        problem === 'request failed: https://openrouter.ai/api/v1/audio/speech (net::ERR_ABORTED)'
-      ),
-  );
-}
-
 test.describe('Text-to-speech', () => {
   test.setTimeout(300_000);
 
@@ -177,7 +159,7 @@ test.describe('Text-to-speech', () => {
     await expect(page.getByTestId('tool-status')).toHaveText(
       new RegExp(`^Generated \\d+:\\d\\d of audio, ${bodies.length} parts$`),
     );
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('gate: raw PCM parts (Gemini TTS) joined as MP3; both downloads; axe in both themes', async ({
@@ -235,7 +217,7 @@ test.describe('Text-to-speech', () => {
     await expectNoSeriousA11yViolations(page);
     await page.emulateMedia({ colorScheme: 'dark' });
     await expectNoSeriousA11yViolations(page);
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('a voice preview is made once and then played from memory', async ({
@@ -272,7 +254,7 @@ test.describe('Text-to-speech', () => {
       [PREVIEW_TEXT, 'af_alloy'],
       [PREVIEW_TEXT, 'bm_george'],
     ]);
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('the free Fish model previews for free, with its own voice', async ({
@@ -298,7 +280,7 @@ test.describe('Text-to-speech', () => {
       input: PREVIEW_TEXT,
       response_format: 'mp3',
     });
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('Stop keeps the parts already made; the rest are made later and joined', async ({
@@ -317,7 +299,8 @@ test.describe('Text-to-speech', () => {
       answered += 1;
       return { ...mp3Answer, delayMs: slow && answered > 2 ? 20_000 : 0 };
     });
-    const problems = await watchForProblems(page);
+    // Stop aborts the speech requests in flight.
+    const problems = await watchForProblems(page, { allowAborted: ['/api/v1/audio/speech'] });
     await page.goto('tools/text-to-speech/');
     await expect(page.getByTestId('tts-voice').locator('option')).toHaveCount(54);
     await page.getByTestId('tool-prompt').fill(paragraphs(8));
@@ -341,6 +324,6 @@ test.describe('Text-to-speech', () => {
     expect(retried).toHaveLength(6);
     const { result, segment } = await decodedLengths(page, SPEECH_MP3.toString('base64'));
     expect(result).toBe(segment * 8);
-    expect(withoutCancels(problems, { stopped: true })).toEqual([]);
+    expect(problems).toEqual([]);
   });
 });

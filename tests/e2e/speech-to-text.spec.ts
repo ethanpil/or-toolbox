@@ -153,19 +153,6 @@ const srtTime = (seconds: number, separator: ',' | '.' = ','): string => {
   )}${separator}${String(total % 1000).padStart(3, '0')}`;
 };
 
-/**
- * Accepts the aborted requests the page causes on purpose; everything else still counts:
- * - Stop aborts the transcription requests in flight;
- * - the player's `<audio preload="metadata">` stops reading a large recording's `blob:` URL once it has the
- *   metadata, which Chromium reports as an aborted request.
- */
-const withoutAborted = (problems: string[], stopped = false): string[] =>
-  problems.filter(
-    (problem) =>
-      !(stopped && problem.includes(`${PATH} (net::ERR_ABORTED)`)) &&
-      !/^request failed: blob:\S+ \(net::ERR_ABORTED\)$/.test(problem),
-  );
-
 test('a short upload goes as it is: transcript, exports, Send to, light and dark', async ({
   page,
   context,
@@ -369,7 +356,8 @@ test('Stop ends the parts in flight and keeps what arrived', async ({ page, cont
       duration: 59,
     },
   }));
-  const problems = await watchForProblems(page);
+  // Stop aborts the transcription requests in flight.
+  const problems = await watchForProblems(page, { allowAborted: [PATH] });
   await page.goto('tools/speech-to-text/');
   await addSynthesisedWav(page, 150, 'two-and-a-half-minutes.wav');
   await expect(page.getByTestId('stt-source-plan')).toHaveText(
@@ -386,7 +374,7 @@ test('Stop ends the parts in flight and keeps what arrived', async ({ page, cont
   await expect(page.getByTestId('stt-segment-text')).toHaveValue('First part.');
   await expect(page.getByTestId('stt-retry-failed')).toHaveText('Retry them');
   expect(mock.calls(PATH)).toHaveLength(3);
-  expect(withoutAborted(problems, true)).toEqual([]);
+  expect(problems).toEqual([]);
 });
 
 test('the sample loads a short spoken clip, ready to transcribe', async ({
@@ -511,5 +499,5 @@ test('Stage 4 gate: a 60-minute recording is cut into parts and merged with cont
     );
   });
   await expect(page.getByTestId('stt-segment')).toHaveCount(360);
-  expect(withoutAborted(problems)).toEqual([]);
+  expect(problems).toEqual([]);
 });

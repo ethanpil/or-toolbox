@@ -66,35 +66,10 @@ async function download(page: Page, testId: string): Promise<Buffer> {
 }
 
 /**
- * Accepts the request failures the app causes on purpose when it has its answer: the API client cancels a
- * stream's body as soon as it has read `data: [DONE]` (src/core/api/sse.ts). Against the production build that
- * cancel can land before Chromium has seen the end of the (mocked, already complete) body, and Chromium then
- * reports `request failed: … (net::ERR_ABORTED)` for a request whose 200 answer was read in full. Only those are
- * dropped from `watchForProblems` output: an aborted request with no 200 event stream behind it still counts.
+ * The API client cancels a stream's body as soon as it has read `data: [DONE]` (src/core/api/sse.ts), which
+ * Chromium can report as an aborted request; Stop aborts the pages in flight.
  */
-function acceptStreamCancels(page: Page): (problems: string[]) => string[] {
-  const accepted: string[] = [];
-  page.on('requestfailed', (request) => {
-    if (request.failure()?.errorText !== 'net::ERR_ABORTED') return;
-    void request
-      .response()
-      .then((response) => {
-        const type = response?.headers()['content-type'] ?? '';
-        if (response?.status() === 200 && type.includes('text/event-stream'))
-          accepted.push(`request failed: ${request.url()} (net::ERR_ABORTED)`);
-      })
-      .catch(() => undefined);
-  });
-  return (problems) => {
-    const left = [...accepted];
-    return problems.filter((problem) => {
-      const at = left.indexOf(problem);
-      if (at < 0) return true;
-      left.splice(at, 1);
-      return false;
-    });
-  };
-}
+const APP_CANCELS = { allowAborted: ['/api/v1/chat/completions'] };
 
 /** True when `parts` appear in `text` in this order. */
 function inOrder(text: string, parts: string[]): boolean {
@@ -125,8 +100,7 @@ test('a 20-page PDF: 20 page results in order, exports, a failed page retried', 
     }
     return pageStream(n);
   });
-  const problems = await watchForProblems(page);
-  const withoutStreamCancels = acceptStreamCancels(page);
+  const problems = await watchForProblems(page, APP_CANCELS);
   await page.goto('tools/ocr/');
   await addPdf(page);
   await page.getByTestId('run-button').click();
@@ -191,9 +165,8 @@ test('a 20-page PDF: 20 page results in order, exports, a failed page retried', 
   // History holds the combined text of the retry run.
   await page.emulateMedia({ colorScheme: 'dark' });
   await expectNoSeriousA11yViolations(page);
-  // The mocked 400 shows up as a failed response (and Chromium logs it); a stream cancelled after its
-  // [DONE] is the app's own doing; nothing else may go wrong.
-  expect(withoutStreamCancels(problems).filter((problem) => !problem.includes('400'))).toEqual([]);
+  // The mocked 400 shows up as a failed response (and Chromium logs it); nothing else may go wrong.
+  expect(problems.filter((problem) => !problem.includes('400'))).toEqual([]);
 });
 
 test('Stop ends the remaining pages and keeps what was read', async ({ page, context, mock }) => {
@@ -202,8 +175,7 @@ test('Stop ends the remaining pages and keeps what was read', async ({ page, con
     ...pageStream(pageOf(call)),
     delayMs: pageOf(call) <= 1 ? 0 : 4000,
   }));
-  const problems = await watchForProblems(page);
-  const withoutStreamCancels = acceptStreamCancels(page);
+  const problems = await watchForProblems(page, APP_CANCELS);
   await page.goto('tools/ocr/');
   await addPdf(page);
   await page.getByTestId('run-button').click();
@@ -217,18 +189,7 @@ test('Stop ends the remaining pages and keeps what was read', async ({ page, con
   await page.getByTestId('ocr-view-pages').click();
   await expect(page.locator('[data-testid="ocr-page"][data-status="done"]')).toHaveCount(1);
   await expect(page.locator('[data-testid="ocr-page"][data-status="stopped"]')).toHaveCount(19);
-  // Stop aborts the requests in flight on purpose (pages 2 and 3): those, and stream cancels after [DONE], are
-  // the app's own doing.
-  const stopped = mock
-    .calls('/api/v1/chat/completions')
-    .filter((call) => pageOf(call) > 1)
-    .map(() => 'request failed: https://openrouter.ai/api/v1/chat/completions (net::ERR_ABORTED)');
-  const left = withoutStreamCancels(problems);
-  for (const expected of stopped) {
-    const at = left.indexOf(expected);
-    if (at >= 0) left.splice(at, 1);
-  }
-  expect(left).toEqual([]);
+  expect(problems).toEqual([]);
   // Nothing marks the unread pages as read in the exports: they say they were not read.
   await page.getByTestId('ocr-view-combined').click();
   await expect(page.getByTestId('output-content')).toContainText(
@@ -249,8 +210,7 @@ test('free-only mode refuses the paid PDF parser and says why; the free one read
     },
   });
   mock.respond('POST', '/api/v1/chat/completions', (call) => pageStream(pageOf(call)));
-  const problems = await watchForProblems(page);
-  const withoutStreamCancels = acceptStreamCancels(page);
+  const problems = await watchForProblems(page, APP_CANCELS);
   await page.goto('tools/ocr/');
   // Free-only swaps in the free vision model, and says so.
   await expect(page.getByTestId('model-note')).toContainText('Free-only mode: using');
@@ -276,5 +236,5 @@ test('free-only mode refuses the paid PDF parser and says why; the free one read
   expect((calls[0]!.body as { plugins?: unknown }).plugins).toEqual([
     { id: 'file-parser', pdf: { engine: 'cloudflare-ai' } },
   ]);
-  expect(withoutStreamCancels(problems)).toEqual([]);
+  expect(problems).toEqual([]);
 });

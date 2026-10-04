@@ -73,20 +73,8 @@ function mockLyria(mock: OpenRouterMock): void {
   mock.respond('POST', '/api/v1/chat/completions', () => lyriaStream());
 }
 
-/**
- * Failures the page causes on purpose: the API client cancels a stream once it has read `[DONE]`, and seeking an
- * `<audio>` cancels its pending range read of the `blob:` URL; Chromium reports both as aborted requests.
- */
-function withoutCancels(problems: string[]): string[] {
-  return problems.filter(
-    (problem) =>
-      problem !==
-        'request failed: https://openrouter.ai/api/v1/chat/completions (net::ERR_ABORTED)' &&
-      !/^request failed: blob:http:\/\/localhost:\d+\/[0-9a-f-]+ \(net::ERR_ABORTED\)$/.test(
-        problem,
-      ),
-  );
-}
+/** The API client cancels a stream once it has read `[DONE]`; Chromium may report that as an aborted request. */
+const STREAM_CANCELS = { allowAborted: ['/api/v1/chat/completions'] };
 
 /** Decoded seconds of the audio in the `index`-th music player on the page. */
 function decodedSeconds(page: Page, index = 0): Promise<number> {
@@ -120,7 +108,7 @@ test.describe('Music generation', () => {
   }) => {
     await seedApp(context, { key: true });
     mockLyria(mock);
-    const problems = await watchForProblems(page);
+    const problems = await watchForProblems(page, STREAM_CANCELS);
     await page.goto('tools/music-generation/');
     await expect(page.getByTestId('music-length-clip')).toBeChecked();
     await expect(page.getByTestId('cost-estimate-value')).toHaveText('≈ $0.04');
@@ -206,7 +194,7 @@ test.describe('Music generation', () => {
     expect(cut).toBeGreaterThan(7.9);
     expect(cut).toBeLessThan(8.15);
     expect(await decodedSeconds(page, 1)).toBeCloseTo(full, 2);
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('three variations side by side, MP3 and WAV downloads, axe in both themes', async ({
@@ -216,7 +204,7 @@ test.describe('Music generation', () => {
   }) => {
     await seedApp(context, { key: true });
     mockLyria(mock);
-    const problems = await watchForProblems(page);
+    const problems = await watchForProblems(page, STREAM_CANCELS);
     await page.goto('tools/music-generation/');
     await expect(page.getByTestId('cost-estimate-value')).toHaveText('≈ $0.04');
     await openDrawer(page);
@@ -265,7 +253,7 @@ test.describe('Music generation', () => {
     await expectNoSeriousA11yViolations(page);
     await page.emulateMedia({ colorScheme: 'dark' });
     await expectNoSeriousA11yViolations(page);
-    expect(withoutCancels(problems)).toEqual([]);
+    expect(problems).toEqual([]);
   });
 
   test('free-only mode shows the notice: no music model is free', async ({
