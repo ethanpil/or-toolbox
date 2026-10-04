@@ -358,7 +358,7 @@ test.describe('Video studio', () => {
     await expect(page.getByTestId('tool-status')).toHaveText('Join stopped.');
     await expect(page.getByTestId('video-join')).toBeVisible();
     await expect(page.getByTestId('video-join')).toBeFocused();
-    await expect(page.getByTestId('video-export')).toHaveCount(0);
+    await expect(page.getByTestId('video-export-result')).toHaveCount(0);
     expect(problems).toEqual([]);
   });
 
