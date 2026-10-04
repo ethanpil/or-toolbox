@@ -35,15 +35,35 @@ function list(words: readonly string[]): string {
 }
 
 export function qaReport(
-  result: { check: IsolatedCheck; box: Box; threshold: number },
+  result: {
+    check: IsolatedCheck;
+    box: Box;
+    threshold: number;
+    /** The pipeline found no background to read and used the fixed threshold. */
+    backgroundUnclear?: boolean;
+    /** Border pixels of the exported JPG, decoded again, that are not exactly #FFFFFF. */
+    encodedBorderFlaws?: number;
+  },
   source: { width: number; height: number },
   wantedThreshold: number,
 ): QaReport {
   const reasons: string[] = [];
   const { check } = result;
+  const are = (count: number): string => (count === 1 ? 'is' : 'are');
   if (!check.borderPureWhite) {
     reasons.push(
-      `${plural(check.nonWhiteBorderPixels, 'border pixel')} ${check.nonWhiteBorderPixels === 1 ? 'is' : 'are'} not pure white.`,
+      `${plural(check.nonWhiteBorderPixels, 'border pixel')} ${are(check.nonWhiteBorderPixels)} not pure white.`,
+    );
+  }
+  const flaws = result.encodedBorderFlaws ?? 0;
+  if (flaws > 0) {
+    reasons.push(
+      `After JPG compression ${plural(flaws, 'border pixel')} ${are(flaws)} not pure white: export as PNG or use a larger margin.`,
+    );
+  }
+  if (result.backgroundUnclear) {
+    reasons.push(
+      'The background could not be told apart at the edges of the edited photo, so the fixed threshold was used: check this one.',
     );
   }
   if (check.touchesEdge) reasons.push('The product touches the edge of the square.');

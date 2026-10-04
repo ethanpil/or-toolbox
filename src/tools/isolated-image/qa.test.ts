@@ -59,6 +59,34 @@ describe('qaReport', () => {
     expect(everywhere.reasons[0]).toContain("The model's background is not white");
   });
 
+  it('checks the exported file: a JPG whose decoded border is not pure white fails', () => {
+    const report = qaReport(
+      { check: clean, box: inside, threshold: 245, encodedBorderFlaws: 35 },
+      source,
+      245,
+    );
+    expect(report.pass).toBe(false);
+    expect(report.reasons).toEqual([
+      'After JPG compression 35 border pixels are not pure white: export as PNG or use a larger margin.',
+    ]);
+    expect(
+      qaReport({ check: clean, box: inside, threshold: 245, encodedBorderFlaws: 0 }, source, 245)
+        .pass,
+    ).toBe(true);
+  });
+
+  it('asks for a look when the background could not be read', () => {
+    const report = qaReport(
+      { check: clean, box: inside, threshold: 245, backgroundUnclear: true },
+      source,
+      245,
+    );
+    expect(report.pass).toBe(false);
+    expect(report.reasons).toEqual([
+      'The background could not be told apart at the edges of the edited photo, so the fixed threshold was used: check this one.',
+    ]);
+  });
+
   it('notes a threshold that went lower for this photo without failing it', () => {
     const report = qaReport({ check: clean, box: inside, threshold: 231 }, source, 245);
     expect(report.pass).toBe(true);

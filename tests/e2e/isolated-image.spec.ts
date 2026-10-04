@@ -342,8 +342,9 @@ test('a failed photo is retried on its own; the review compares, and a margin ch
   await addPhotos(page, photos);
   await expect(page.getByTestId('iso-count')).toHaveText('3 photos · ≈ $0.043');
   await page.getByTestId('run-button').click();
+  // The run's last status says what went wrong, and where.
   await expect(page.getByTestId('tool-status')).toHaveText(
-    'Done · 2 of 3 photos; 1 failed · 2 passed QA',
+    /^Done · 2 of 3 photos; 1 failed · 2 passed QA · 02-bottle\.png: .+/,
     { timeout: 240_000 },
   );
   const failed = page.locator('[data-testid="iso-card"][data-phase="failed"]');
@@ -404,6 +405,8 @@ test('a failed photo is retried on its own; the review compares, and a margin ch
   const before = await detail.getByTestId('compare-after').getAttribute('src');
   await expect(detail).toHaveAttribute('data-margin', '0.08');
   await detail.getByTestId('iso-margin').focus();
+  // The range moves in the setting's 0.5% steps.
+  await page.keyboard.press('ArrowRight');
   await page.keyboard.press('ArrowRight');
   await expect(detail.getByTestId('iso-margin-value')).toHaveText('9%');
   await expect(detail).toHaveAttribute('data-margin', '0.09', { timeout: 60_000 });
@@ -437,6 +440,43 @@ test('a failed photo is retried on its own; the review compares, and a margin ch
   expect(workers.some((url) => /image-worker/.test(url) && url.startsWith(origin))).toBe(true);
   // The mocked 502 shows up as a failed response (and Chromium logs it); nothing else may go wrong.
   expect(problems.filter((problem) => !problem.includes('502'))).toEqual([]);
+});
+
+test('a JPG keeps its border pure white even with a 0.5% margin: QA holds for the exported file', async ({
+  page,
+  context,
+  mock,
+}) => {
+  test.setTimeout(300_000);
+  // 2000 px, JPG 92, a coloured product (navy, a yellow band) and a margin of 0.5% (10 px).
+  await seedApp(context, {
+    key: true,
+    settings: { tools: { 'isolated-image': { options: { margin: 0.005 } } } },
+  });
+  const photos = testPhotos(1);
+  mockModels(mock);
+  mockEdits(mock, photos);
+  const problems = await watchForProblems(page);
+  await page.goto('tools/isolated-image/');
+  await addPhotos(page, photos);
+  await page.getByTestId('run-button').click();
+  const card = page.getByTestId('iso-card');
+  await expect(card).toHaveAttribute('data-phase', 'done', { timeout: 240_000 });
+  await expect(card).toHaveAttribute('data-qa', 'pass');
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    card.getByTestId('result-download').click(),
+  ]);
+  expect(download.suggestedFilename()).toBe('01-box-white.jpg');
+  const stats = await measure(page, new Uint8Array(readFileSync(await download.path())));
+  expect(stats.borderNotWhite, JSON.stringify(stats)).toBe(0);
+  // JPG keeps at least 24 px of white whatever the margin, so compression cannot tint the border.
+  // (Resampling and compression may tint a pixel or two of that band next to the product, never the border.)
+  const { left, top, right, bottom } = stats.margins;
+  expect(Math.min(left, top, right, bottom), JSON.stringify(stats)).toBeGreaterThanOrEqual(20);
+  await card.getByTestId('iso-review').click();
+  await expect(page.getByTestId('iso-margin-value')).toHaveText('0.5% (JPG uses 1.2%)');
+  expect(problems).toEqual([]);
 });
 
 test('free-only mode: no image model is free, so the tool says so and cannot run (with the sample)', async ({

@@ -55,29 +55,37 @@ export interface IsolateResult {
   check: IsolatedCheck;
   /** The white threshold used: `whiteThreshold`, or lower with `adaptThreshold`. */
   threshold: number;
+  /**
+   * True when `adaptThreshold` was asked for but the picture's border showed no background to read (a scene,
+   * or a product covering most of it): `whiteThreshold` was used as it is, and the result needs a look.
+   */
+  backgroundUnclear: boolean;
 }
 
 /** `adaptiveThreshold` never goes below this: a background darker than that is grey, not off-white. */
 export const MIN_ADAPTIVE_THRESHOLD = 200;
 
-/** `despeckle` treats groups up to this share of the image as specks. */
-const SPECK_SHARE = 0.001;
-/** A speck has no pixel darker than this below the threshold: darker groups are things, not noise. */
+/**
+ * What `fillAndDespeckle` whitens: groups of at most this many pixels, no longer than `SPECK_SIDE` and no more
+ * than three times as long as wide (so a thread or a thin line is never one), with no pixel more than
+ * `SPECK_DEPTH` below the threshold and no such darker pixel within `SPECK_CLEARANCE` (so a pale detail next to
+ * the product stays). Noise and the fringe of a soft shadow are single pixels and small clumps.
+ */
+const SPECK_AREA = 64;
+const SPECK_SIDE = 12;
 const SPECK_DEPTH = 40;
+const SPECK_CLEARANCE = 3;
 
 /**
  * The background fill on the photo itself, for noisy pictures. Fills from the edges through near-white pixels
- * like `floodFillWhiteFromEdges`, then looks at each group of pixels the fill did not reach (4-neighbour): one
- * that does not touch the image's edge, has at most `maxSpeck` pixels and no pixel more than 40 below the
- * threshold is a speck (noise, or the fringe of a soft shadow fading through the threshold) and becomes
- * #FFFFFF too. Everything inside a product belongs to the product's own group (white parts included), so it
- * stays, as do darker or larger groups (a separate part, the core of a shadow). Returns a new image.
+ * (4-neighbour) like `floodFillWhiteFromEdges`, then looks at each group of pixels the fill did not reach,
+ * joined through corners too (8-neighbour, so a diagonal line is one group, and one with the product it leaves).
+ * A group that is a speck (see `SPECK_AREA`: small, compact, pale, away from anything darker, off the image's
+ * edge) becomes #FFFFFF too. Everything inside a product belongs to the product's group (white parts and their
+ * print included), so it stays, as do threads, beads and parts of any size that are not compact specks.
+ * Returns a new image.
  */
-export function fillAndDespeckle(
-  image: RasterImage,
-  threshold: number,
-  maxSpeck: number,
-): RasterImage {
+export function fillAndDespeckle(image: RasterImage, threshold: number): RasterImage {
   const { width, height } = image;
   const pixels = width * height;
   const data = new Uint8ClampedArray(image.data);
@@ -118,48 +126,95 @@ export function fillAndDespeckle(
   const whiten = (p: number): void => {
     data.fill(255, p * 4, p * 4 + 4);
   };
+  const dark = (p: number): boolean => !atLeast(p, threshold - SPECK_DEPTH);
+  /** True when a pixel darker than a speck may be lies within `SPECK_CLEARANCE` of (x, y). */
+  const darkNear = (x: number, y: number): boolean => {
+    for (let dy = -SPECK_CLEARANCE; dy <= SPECK_CLEARANCE; dy++) {
+      const yy = y + dy;
+      if (yy < 0 || yy >= height) continue;
+      for (let dx = -SPECK_CLEARANCE; dx <= SPECK_CLEARANCE; dx++) {
+        const xx = x + dx;
+        if (xx >= 0 && xx < width && dark(yy * width + xx)) return true;
+      }
+    }
+    return false;
+  };
   for (let start = 0; start < pixels; start++) {
     if (reached[start] === 1 || grouped[start] === 1) continue;
     let size = 0;
     let keep = false;
+    let left = width;
+    let right = -1;
+    let upper = height;
+    let lower = -1;
     grouped[start] = 1;
     stack[top++] = start;
     while (top > 0) {
       const p = stack[--top] ?? 0;
       group[size++] = p;
       const x = p % width;
-      const onEdge = x === 0 || x === width - 1 || p < width || p >= pixels - width;
-      if (onEdge || size > maxSpeck || !atLeast(p, threshold - SPECK_DEPTH)) keep = true;
-      const take = (q: number): void => {
-        if (reached[q] === 1 || grouped[q] === 1) return;
-        grouped[q] = 1;
-        stack[top++] = q;
-      };
-      if (x > 0) take(p - 1);
-      if (x < width - 1) take(p + 1);
-      if (p >= width) take(p - width);
-      if (p < pixels - width) take(p + width);
+      const y = (p - x) / width;
+      left = Math.min(left, x);
+      right = Math.max(right, x);
+      upper = Math.min(upper, y);
+      lower = Math.max(lower, y);
+      if (x === 0 || x === width - 1 || y === 0 || y === height - 1 || dark(p)) keep = true;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= height) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= width) continue;
+          const q = yy * width + xx;
+          if (reached[q] === 1 || grouped[q] === 1) continue;
+          grouped[q] = 1;
+          stack[top++] = q;
+        }
+      }
     }
-    if (!keep) for (let k = 0; k < size; k++) whiten(group[k] ?? 0);
+    if (keep || size > SPECK_AREA) continue;
+    const long = Math.max(right - left, lower - upper) + 1;
+    const short = Math.min(right - left, lower - upper) + 1;
+    if (long > SPECK_SIDE || long > 3 * short) continue;
+    let alone = true;
+    for (let k = 0; k < size && alone; k++) {
+      const p = group[k] ?? 0;
+      alone = !darkNear(p % width, Math.floor(p / width));
+    }
+    if (alone) for (let k = 0; k < size; k++) whiten(group[k] ?? 0);
   }
   for (let p = 0; p < pixels; p++) if (reached[p] === 1) whiten(p);
   return { width, height, data };
 }
 
+/** The background must hold at least this share of the border for `adaptiveThreshold` to read it. */
+const MIN_BACKGROUND_SHARE = 0.25;
+/** A darker population on the border (a product reaching the frame) counts from this share on. */
+const MIN_OTHER_SHARE = 0.02;
+
 /**
- * The white threshold for an image whose background may be off-white or noisy. The outermost pixels are the
- * background of a product shot, so their lightness (each pixel's darkest channel, over white) is read, and the
- * threshold is kept at least a margin below their median: seven median absolute deviations plus 3, about six
- * standard deviations of Gaussian noise. So no background pixel, even in the image's interior, falls below it,
- * and the faint tail of a soft shadow does not cross it inside the noise (where it would leave specks). A clean
- * background (flat 251 and up at 245) keeps `threshold`; it is never raised. Median and deviation ignore a
- * product that reaches the frame on part of the border. When the result would go below
- * `MIN_ADAPTIVE_THRESHOLD` (a grey or busy border: a scene that was not removed), `threshold` is returned
- * unchanged, so the result still fails the QA instead of being bleached.
+ * The white threshold for an image whose background may be off-white or noisy, read from the picture's
+ * outermost pixels (each pixel's lightness: its darkest channel, over white).
+ *
+ * The background is the **lightest** population there, not the border's median, so a pale product covering
+ * most of the frame is never taken for it: its level is the median of the pixels near the border's 90th
+ * percentile, and its noise their median absolute deviation (both read twice, the second time in a window
+ * sized by the first). The threshold is kept seven deviations plus 3 below that level (about six standard
+ * deviations of Gaussian noise), so no background pixel and no faint shadow tail inside the noise falls below
+ * it, and above the lightest of any darker population on the border (by 3), so a pale product reaching the
+ * frame stays content. A clean background (flat 251 and up at 245) keeps `threshold`; it is never raised.
+ *
+ * `found` is false, and `threshold` comes back unchanged, when the background cannot be read: it holds under a
+ * quarter of the border, it is darker than `MIN_ADAPTIVE_THRESHOLD` (a scene that was not removed), or a pale
+ * product and the background's noise overlap. Such a result needs a look.
  */
-export function adaptiveThreshold(image: RasterImage, threshold: number): number {
+export function adaptiveThreshold(
+  image: RasterImage,
+  threshold: number,
+): { threshold: number; found: boolean } {
   const { width, height, data } = image;
-  if (width < 1 || height < 1) return threshold;
+  const unread = { threshold, found: false };
+  if (width < 1 || height < 1) return unread;
   const histogram = new Uint32Array(256);
   let samples = 0;
   const sample = (x: number, y: number): void => {
@@ -179,24 +234,48 @@ export function adaptiveThreshold(image: RasterImage, threshold: number): number
     if (width > 1) sample(width - 1, y);
   }
 
-  /** The value below which `fraction` of the border lies, from a 256-bin histogram. */
-  const percentile = (bins: Uint32Array, fraction: number): number => {
-    const target = fraction * samples;
+  /** Pixels with a lightness in [low, high]. */
+  const count = (low: number, high: number): number => {
+    let total = 0;
+    for (let value = Math.max(0, low); value <= Math.min(255, high); value++) {
+      total += histogram[value] ?? 0;
+    }
+    return total;
+  };
+  /** The value under which `fraction` of the pixels in [low, high] lie. */
+  const percentile = (low: number, high: number, fraction: number): number => {
+    const target = fraction * count(low, high);
     let seen = 0;
-    for (let value = 0; value < bins.length; value++) {
-      seen += bins[value] ?? 0;
+    for (let value = Math.max(0, low); value <= Math.min(255, high); value++) {
+      seen += histogram[value] ?? 0;
       if (seen > target) return value;
     }
-    return bins.length - 1;
+    return Math.min(255, high);
   };
-  const median = percentile(histogram, 0.5);
-  const deviations = new Uint32Array(256);
-  for (let value = 0; value < 256; value++) {
-    const distance = Math.abs(value - median);
-    deviations[distance] = (deviations[distance] ?? 0) + (histogram[value] ?? 0);
+  /** Median and median absolute deviation of the pixels in [low, 255]. */
+  const population = (low: number): { level: number; spread: number } => {
+    const level = percentile(low, 255, 0.5);
+    const half = count(low, 255) / 2;
+    let spread = 0;
+    while (spread < 255 && count(Math.max(low, level - spread), level + spread) <= half)
+      spread += 1;
+    return { level, spread };
+  };
+
+  const top = percentile(0, 255, 0.9);
+  if (top < MIN_ADAPTIVE_THRESHOLD) return unread;
+  const first = population(top - 8);
+  const low = first.level - Math.max(8, 5 * first.spread);
+  const { level, spread } = population(low);
+  if (count(low, 255) < MIN_BACKGROUND_SHARE * samples) return unread;
+  let adapted = Math.floor(level - 7 * spread - 3);
+  // A darker population on the border: a product reaching the frame. Stay above its lightest pixels.
+  if (count(0, low - 1) >= MIN_OTHER_SHARE * samples) {
+    adapted = Math.max(adapted, percentile(0, low - 1, 0.99) + 3);
+    if (adapted > level - 3 * spread - 1) return unread;
   }
-  const adapted = Math.floor(median - 7 * percentile(deviations, 0.5) - 3);
-  return adapted < MIN_ADAPTIVE_THRESHOLD ? threshold : Math.min(threshold, adapted);
+  if (adapted < MIN_ADAPTIVE_THRESHOLD) return unread;
+  return { threshold: Math.min(threshold, adapted), found: true };
 }
 
 /** Images above this many pixels are resized by the canvas instead of by `resizeRaster`. */
@@ -224,14 +303,11 @@ export function resizeAuto(image: RasterImage, width: number, height: number): R
  */
 export function isolateRaster(image: RasterImage, options: IsolateOptions = {}): IsolateResult {
   const wanted = options.whiteThreshold ?? 245;
-  const threshold = options.adaptThreshold ? adaptiveThreshold(image, wanted) : wanted;
-  const source = options.despeckle
-    ? fillAndDespeckle(
-        image,
-        threshold,
-        Math.max(4, Math.round(image.width * image.height * SPECK_SHARE)),
-      )
-    : image;
+  const read = options.adaptThreshold
+    ? adaptiveThreshold(image, wanted)
+    : { threshold: wanted, found: true };
+  const threshold = read.threshold;
+  const source = options.despeckle ? fillAndDespeckle(image, threshold) : image;
   const box = options.box ??
     contentBoundingBox(source, { whiteThreshold: threshold }) ?? {
       x: 0,
@@ -255,5 +331,6 @@ export function isolateRaster(image: RasterImage, options: IsolateOptions = {}):
     box,
     check: checkIsolated(result, { whiteThreshold: threshold }),
     threshold,
+    backgroundUnclear: !read.found,
   };
 }

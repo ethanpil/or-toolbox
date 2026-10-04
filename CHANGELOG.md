@@ -79,6 +79,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Stage 5 review, Isolated image: JPGs keep at least 24 px of white and their decoded border is part of the QA; the automatic threshold reads the lightest border population (a pale product can no longer lower it to its own value; an unreadable background is flagged); despeckle removes only compact specks (thin lines, threads and beads stay); a replayed Retry skips photos already made; results finishing after a pattern change get the new name; the review's margin and Previous/Next stay in step; focus and announcements (dab4103, a4cf3b0).
 - Audio player seeks in recordings whose duration reads as Infinity; a single segment already in the target format is not re-encoded (ed3a51f). E2E: shared abort filtering in `watchForProblems`, chat reloads wait for stored replies, two load-sensitive unit tests made steady (53646cf).
 - Stats: the ledger counts a multi-model run as one run and one error, and tracks the estimated part of spend (shown as ≈ on the page); relative ranges roll over at UTC midnight; a series hidden in a chart comes back when its legend goes away; the tooltip names the hovered day when nothing happened on it; one ledger read per load.
 - History: runs in progress are never deleted (and Undo cannot bring one back); the model filter comes from the runs (routed ids included); JSON output keeps big numbers and every value as stored; "Show more" appends rows.

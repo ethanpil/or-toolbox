@@ -1,13 +1,27 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import {
+  appliedMargin,
   FALLBACK_SETTINGS,
   type IsolateSettings,
+  MIN_JPG_MARGIN_PX,
   outputName,
   processingKey,
   readSettings,
 } from './options';
 import manifest from './manifest.json';
+
+describe('appliedMargin', () => {
+  it('keeps at least 24 px of white for JPG, so compression cannot tint the border', () => {
+    expect(MIN_JPG_MARGIN_PX).toBe(24);
+    expect(appliedMargin(0.005, { format: 'jpg', size: 2000 })).toBe(0.012);
+    expect(appliedMargin(0.01, { format: 'jpg', size: 500 })).toBe(0.048);
+    expect(appliedMargin(0.08, { format: 'jpg', size: 2000 })).toBe(0.08);
+    // PNG is lossless: the margin is the one asked for, even 0.
+    expect(appliedMargin(0.005, { format: 'png', size: 2000 })).toBe(0.005);
+    expect(appliedMargin(0, { format: 'png', size: 2000 })).toBe(0);
+  });
+});
 
 describe('readSettings', () => {
   it('starts from the manifest defaults, which match the fallback', () => {

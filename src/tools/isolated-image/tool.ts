@@ -32,12 +32,15 @@ import type { ResultHandle, ToolContext, ToolInstance, ToolSnapshot } from '../.
 import { retryGate } from '../../ui/tool/retry-gate';
 import { compareSlider, type CompareSlider } from './compare-slider';
 import {
+  appliedMargin,
   CONCURRENCY,
   FALLBACK_SETTINGS,
   type IsolateSettings,
   MARGIN_RANGE,
+  MIN_JPG_MARGIN_PX,
   OUTPUT_FORMATS,
   OUTPUT_SIZES,
+  type OutputFormat,
   outputName,
   processingKey,
   QUALITY_RANGE,
@@ -47,7 +50,13 @@ import {
   THRESHOLD_RANGE,
 } from './options';
 import { qaLine, qaReport, type QaReport } from './qa';
-import { decodeRaster, encodeRaster, referenceDataUrl, samplePhoto } from './raster-io';
+import {
+  decodeRaster,
+  encodedBorderFlaws,
+  encodeRaster,
+  referenceDataUrl,
+  samplePhoto,
+} from './raster-io';
 import { buildInstruction, buildRequest, editSupport } from './request';
 
 /** Where a photo is in a run: waiting, at the model, being post-processed, or settled. */
@@ -60,11 +69,14 @@ interface Processed {
   handle: ResultHandle;
   url: string;
   qa: QaReport;
-  /** The threshold and margin used. */
+  /** The threshold and margin used (the margin raised for JPG; see `appliedMargin`). */
   threshold: number;
   margin: number;
   box: Box;
   source: { width: number; height: number };
+  /** What the Blob is: its file name follows these, not settings changed since. */
+  format: OutputFormat;
+  size: number;
 }
 
 interface Photo {
@@ -315,7 +327,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       ids.margin,
       'Margin (%)',
       marginInput,
-      'Empty white border on each side, as a share of the side.',
+      `Empty white border on each side, as a share of the side. A JPG keeps at least ${MIN_JPG_MARGIN_PX} px (1.2% at 2000 px), so compression cannot tint its border; PNG keeps any margin.`,
     ),
     field(
       ids.threshold,
@@ -400,14 +412,15 @@ export function setup(ctx: ToolContext): ToolInstance {
     placeholder: 'For example: the product is the left shoe; remove the price sticker',
     'data-testid': 'tool-prompt',
   });
+  const drop = dropZone({
+    accept: ctx.manifest.accepts,
+    multiple: true,
+    label: 'Drop product photos here',
+    onFiles: (files) => addPhotos(files),
+    testId: 'iso-drop-zone',
+  });
   ui.input.append(
-    dropZone({
-      accept: ctx.manifest.accepts,
-      multiple: true,
-      label: 'Drop product photos here',
-      onFiles: (files) => addPhotos(files),
-      testId: 'iso-drop-zone',
-    }),
+    drop,
     h(
       'div',
       { class: 'vstack gap-2' },
@@ -568,6 +581,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     for (const photo of [...photos]) if (!inRun(photo)) discard(photo);
     afterRemoval();
+    // The button hides with the list: hand focus to the place where photos come in again.
+    if (removeAllButton.hidden) drop.querySelector('button')?.focus();
     announce('All photos removed.');
   };
 
@@ -833,8 +848,14 @@ export function setup(ctx: ToolContext): ToolInstance {
     if (done.length > 0) parts.push(`${passed} of ${plural(done.length, 'result')} passed QA`);
     if (notIsolated > 0) parts.push(`${notIsolated} not isolated`);
     summary.textContent = parts.join(' · ');
-    retryFailedButton.hidden = notIsolated === 0 || running;
+    const hideRetry = notIsolated === 0 || running;
+    // A focused "Retry failed" that hides (its run started) hands focus to Stop, or Run when idle.
+    if (hideRetry && !retryFailedButton.hidden && document.activeElement === retryFailedButton) {
+      (runner.stopButton.hidden ? runner.button : runner.stopButton).focus();
+    }
+    retryFailedButton.hidden = hideRetry;
     zipButton.disabled = done.length === 0;
+    updateNavigation();
   };
 
   // --- review (one photo) ---------------------------------------------------------------------------------
@@ -857,6 +878,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     thresholdReset: HTMLButtonElement;
     updating: HTMLElement;
     downloadSlot: HTMLElement;
+    previousButton: HTMLButtonElement;
+    nextButton: HTMLButtonElement;
     shownHandle: ResultHandle | null;
     shownUrl: string | null;
   }
@@ -864,6 +887,30 @@ export function setup(ctx: ToolContext): ToolInstance {
   let compareMode: 'compare' | 'side' = 'compare';
 
   const photoOf = (key: string): Photo | undefined => photos.find((photo) => photo.key === key);
+
+  /** The photo with a result before or after `key`'s, as the list is now. */
+  const neighbourOf = (key: string, step: 1 | -1): Photo | undefined => {
+    const list = withResults();
+    const at = list.findIndex((candidate) => candidate.key === key);
+    return at < 0 ? undefined : list[at + step];
+  };
+
+  /** Previous/Next follow the photos as they are added, removed or finished. */
+  const updateNavigation = (): void => {
+    if (!detail) return;
+    const buttons = [
+      [detail.previousButton, -1, 'Previous'],
+      [detail.nextButton, 1, 'Next'],
+    ] as const;
+    for (const [button, step, label] of buttons) {
+      const target = neighbourOf(detail.key, step);
+      if (!target && document.activeElement === button) detail.heading.focus();
+      button.disabled = !target;
+      button.setAttribute('aria-label', target ? `${label}: ${target.name}` : label);
+    }
+  };
+
+  const percent = (fraction: number): string => `${Math.round(fraction * 1000) / 10}%`;
 
   const openDetail = (photo: Photo): void => {
     if (!photo.result) return;
@@ -921,13 +968,13 @@ export function setup(ctx: ToolContext): ToolInstance {
       class: 'form-range',
       min: String(MARGIN_RANGE.min * 100),
       max: String(MARGIN_RANGE.max * 100),
-      step: '1',
-      value: String(Math.round((photo.margin ?? settings.margin) * 100)),
+      step: '0.5',
+      value: String(Math.round((photo.margin ?? settings.margin) * 1000) / 10),
       'data-testid': 'iso-margin',
       oninput: () => {
         const current = photoOf(photo.key);
         if (!current) return;
-        current.margin = Number(marginRange.value) / 100;
+        current.margin = Math.round(Number(marginRange.value) * 10) / 1000;
         current.failedKey = null;
         paintControls(current);
         scheduleReconcile();
@@ -978,13 +1025,20 @@ export function setup(ctx: ToolContext): ToolInstance {
       { id: headingId, class: 'h5 mb-0 text-truncate me-auto min-w-0', tabIndex: -1 },
       photo.name,
     );
-    const neighbour = (step: 1 | -1): Photo | undefined => {
-      const list = withResults();
-      const at = list.findIndex((candidate) => candidate.key === photo.key);
-      return at < 0 ? undefined : list[at + step];
-    };
-    const previous = neighbour(-1);
-    const next = neighbour(1);
+    const navButton = (step: 1 | -1, glyph: string, testId: string): HTMLButtonElement =>
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'btn btn-sm btn-outline-secondary',
+          'data-testid': testId,
+          onclick: () => {
+            const target = neighbourOf(photo.key, step);
+            if (target) openDetail(target);
+          },
+        },
+        icon(glyph),
+      );
 
     detail = {
       key: photo.key,
@@ -1010,23 +1064,12 @@ export function setup(ctx: ToolContext): ToolInstance {
         'Updating…',
       ),
       downloadSlot: h('span'),
+      previousButton: navButton(-1, 'chevron-left', 'iso-previous'),
+      nextButton: navButton(1, 'chevron-right', 'iso-next'),
       shownHandle: null,
       shownUrl: null,
     };
     const d = detail;
-    const navButton = (target: Photo | undefined, label: string, glyph: string, testId: string) =>
-      h(
-        'button',
-        {
-          type: 'button',
-          class: 'btn btn-sm btn-outline-secondary',
-          'aria-label': target ? `${label}: ${target.name}` : label,
-          disabled: !target,
-          'data-testid': testId,
-          onclick: () => target && openDetail(target),
-        },
-        icon(glyph),
-      );
 
     replace(
       detailView,
@@ -1048,8 +1091,8 @@ export function setup(ctx: ToolContext): ToolInstance {
             'All results',
           ),
           heading,
-          navButton(previous, 'Previous', 'chevron-left', 'iso-previous'),
-          navButton(next, 'Next', 'chevron-right', 'iso-next'),
+          d.previousButton,
+          d.nextButton,
         ),
         d.qaBox,
         h(
@@ -1126,7 +1169,12 @@ export function setup(ctx: ToolContext): ToolInstance {
   /** The review's labels follow the photo's choices at once; the images follow when the result is made. */
   const paintControls = (photo: Photo): void => {
     if (!detail || detail.key !== photo.key) return;
-    const margin = `${Math.round((photo.margin ?? settings.margin) * 1000) / 10}%`;
+    const asked = photo.margin ?? settings.margin;
+    const applied = appliedMargin(asked, settings);
+    // Following the setting, the range shows it (and moves when the setting does).
+    if (photo.margin === null) detail.marginRange.value = String(Math.round(asked * 1000) / 10);
+    const margin =
+      applied > asked ? `${percent(asked)} (JPG uses ${percent(applied)})` : percent(asked);
     detail.marginValue.textContent = margin;
     detail.marginRange.setAttribute('aria-valuetext', margin);
     detail.marginReset.hidden = photo.margin === null;
@@ -1191,6 +1239,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       ),
     );
     paintControls(photo);
+    updateNavigation();
   };
 
   // --- post-processing ------------------------------------------------------------------------------------
@@ -1200,7 +1249,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     if (!edited) return;
     const s = settings;
     const key = processingKey(s, photo);
-    const margin = photo.margin ?? s.margin;
+    const margin = appliedMargin(photo.margin ?? s.margin, s);
     const wanted = photo.threshold ?? s.whiteThreshold;
     const adapt = photo.threshold === null;
     const made = await limited(signal, async () => {
@@ -1220,40 +1269,69 @@ export function setup(ctx: ToolContext): ToolInstance {
         { signal, transfer: true },
       );
       const blob = await encodeRaster(result.image, s.format, s.jpegQuality / 100);
-      return { blob, source, box: result.box, check: result.check, threshold: result.threshold };
+      // The QA holds for what is saved: a JPG is decoded again and its border checked.
+      const flaws = s.format === 'jpg' ? await encodedBorderFlaws(blob) : 0;
+      return {
+        blob,
+        source,
+        box: result.box,
+        check: result.check,
+        threshold: result.threshold,
+        backgroundUnclear: result.backgroundUnclear,
+        encodedBorderFlaws: flaws,
+      };
     });
     signal.throwIfAborted();
     // Removed, or edited again, while this was made: it is not this photo's result any more.
     if (!photos.includes(photo) || photo.edited !== edited) throw abortError();
-    const name = outputName(s.filenamePattern, {
-      fileName: photo.name,
-      n: photos.indexOf(photo) + 1,
-      format: s.format,
-      size: s.size,
+    const output = { format: s.format, size: s.size };
+    // Named under the pattern as it is now, which may have changed while this was being made.
+    const handle = ui.addResult({
+      kind: 'image',
+      name: resultName(photo, output),
+      blob: made.blob,
     });
-    const handle = ui.addResult({ kind: 'image', name, blob: made.blob });
     const previous = photo.result;
+    const qa = qaReport(made, made.source, wanted);
     photo.result = {
       key,
       blob: made.blob,
       handle,
       url: ctx.results.objectUrl(handle.result.id),
-      qa: qaReport(made, made.source, wanted),
+      qa,
       threshold: made.threshold,
       margin,
       box: made.box,
       source: made.source,
+      ...output,
     };
     photo.failedKey = null;
     if (!inRun(photo)) {
       photo.phase = 'done';
       photo.error = null;
+      // A result made again (review or settings) whose verdict turned is said out loud.
+      if (previous && previous.qa.pass !== qa.pass) {
+        announce(
+          qa.pass
+            ? `${photo.name}: QA passed.`
+            : `${photo.name}: QA failed. ${qa.reasons.join(' ')}`,
+        );
+      }
     }
     previous?.handle.remove();
   };
 
+  /** A result's file name under the current pattern, for the format and size it was made in. */
+  const resultName = (photo: Photo, output: { format: OutputFormat; size: number }): string =>
+    outputName(settings.filenamePattern, {
+      fileName: photo.name,
+      n: photos.indexOf(photo) + 1,
+      ...output,
+    });
+
   /** Brings every photo's result in line with the current settings and review choices (no requests). */
   const reconcile = (): void => {
+    const started: Photo[] = [];
     for (const photo of photos) {
       if (!photo.edited || inRun(photo)) continue;
       const key = processingKey(settings, photo);
@@ -1262,6 +1340,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       photo.job?.controller.abort();
       const job = { key, controller: new AbortController() };
       photo.job = job;
+      started.push(photo);
       const refresh = (): void => {
         if (!photos.includes(photo)) return;
         updateCard(photo);
@@ -1286,20 +1365,18 @@ export function setup(ctx: ToolContext): ToolInstance {
         },
       );
     }
+    // "Updating…" is said once: for the photo, or for how many.
+    if (started.length === 1) announce(`Updating ${started[0]!.name}…`);
+    else if (started.length > 1) announce(`Updating ${plural(started.length, 'result')}…`);
   };
   const scheduleReconcile = debounce(reconcile, RECONCILE_DELAY_MS);
 
   /** Gives every result its name under the current pattern (positions change when photos are removed). */
   const renameAll = (): void => {
-    photos.forEach((photo, index) => {
+    photos.forEach((photo) => {
       const result = photo.result;
       if (!result) return;
-      const name = outputName(settings.filenamePattern, {
-        fileName: photo.name,
-        n: index + 1,
-        format: settings.format,
-        size: settings.size,
-      });
+      const name = resultName(photo, result);
       if (name === result.handle.result.name) return;
       const handle = ui.addResult({ kind: 'image', name, blob: result.blob });
       if (result.handle.result.downloaded) ctx.results.markDownloaded(handle.result.id);
@@ -1328,6 +1405,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     if (before.filenamePattern !== settings.filenamePattern) scheduleRename();
     if (before.sendSize !== settings.sendSize) void ui.refreshEstimate();
+    // The review shows the setting a photo follows (its margin range included).
+    updateDetail();
   };
 
   // --- running --------------------------------------------------------------------------------------------
@@ -1377,9 +1456,33 @@ export function setup(ctx: ToolContext): ToolInstance {
       .map((photo) => qaLine(photo.name, photo.result?.qa ?? null, photo.error))
       .join('\n');
 
+  /**
+   * Photos each retry argument has already made. The error toast's Retry replays the same argument after a
+   * fatal error (a 402 mid-batch): it must not pay again for photos that got their result the first time.
+   */
+  const madeBy = new WeakMap<RunArg, Set<string>>();
+
+  /** One line naming what went wrong in a run: a request's error, else the first QA reason (two at most). */
+  const problemsOf = (list: readonly Photo[]): string[] => {
+    const problems = list.flatMap((photo) =>
+      photo.error
+        ? [`${photo.name}: ${photo.error}`]
+        : photo.result && !photo.result.qa.pass
+          ? [`${photo.name}: ${photo.result.qa.reasons[0] ?? 'QA failed'}`]
+          : [],
+    );
+    return problems.length > 2
+      ? [...problems.slice(0, 2), `${problems.length - 2} more`]
+      : problems;
+  };
+
   const run = async (signal: AbortSignal, arg?: RunArg): Promise<void> => {
+    const made = arg ? (madeBy.get(arg) ?? new Set<string>()) : null;
+    if (arg && made) madeBy.set(arg, made);
     let targets = arg
-      ? photos.filter((photo) => arg.keys.includes(photo.key) && !inRun(photo))
+      ? photos.filter(
+          (photo) => arg.keys.includes(photo.key) && !made?.has(photo.key) && !inRun(photo),
+        )
       : pending();
     if (targets.length === 0) {
       if (!arg) {
@@ -1442,8 +1545,10 @@ export function setup(ctx: ToolContext): ToolInstance {
         work: (photo, itemSignal) => isolate(handle, photo, request, itemSignal),
         onItem: ({ item: photo, status, error }) => {
           if (status === 'running') photo.phase = 'editing';
-          else if (status === 'done') photo.phase = 'done';
-          else if (status === 'failed') {
+          else if (status === 'done') {
+            photo.phase = 'done';
+            made?.add(photo.key);
+          } else if (status === 'failed') {
             photo.phase = 'failed';
             photo.error = userMessage(error);
           } else photo.phase = status;
@@ -1454,14 +1559,13 @@ export function setup(ctx: ToolContext): ToolInstance {
         },
       });
       const passed = targets.filter((photo) => photo.result?.qa.pass).length;
-      const made = targets.filter((photo) => photo.result).length;
+      const results = targets.filter((photo) => photo.result).length;
       await handle.finish({
         output: historyText(),
-        meta: { photos: targets.length, passedQa: passed, failedQa: made - passed },
+        meta: { photos: targets.length, passedQa: passed, failedQa: results - passed },
       });
-      ui.status(
-        `${batchSummary(outcome, 'photo')} · ${passed} passed QA${made > passed ? `, ${made - passed} failed QA` : ''}`,
-      );
+      const counts = `${batchSummary(outcome, 'photo')} · ${passed} passed QA${results > passed ? `, ${results - passed} failed QA` : ''}`;
+      ui.status([counts, ...problemsOf(targets)].join(' · '));
     } catch (error) {
       ui.status(isStop(error) ? 'Stopped' : 'Failed');
       await handle.fail(error);
@@ -1479,6 +1583,7 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   const runner = ui.runner<RunArg>({ label: 'Isolate', icon: 'bounding-box', run });
   const gate = retryGate(runner);
+  gate.bind(retryFailedButton);
 
   const retry = (list: readonly Photo[], model?: string): void => {
     if (list.length === 0) return;
