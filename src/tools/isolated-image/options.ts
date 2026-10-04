@@ -99,6 +99,22 @@ export function readSettings(
   return next;
 }
 
+/**
+ * The white a JPG keeps around the product at least, in pixels. JPEG codes 16 x 16 blocks (8 x 8 with chroma at
+ * half size) and the decoder smooths chroma across block edges, so a block holding any of the product can tint
+ * its border pixels. With 24 px the outermost block row and column hold only white, which decodes exactly.
+ */
+export const MIN_JPG_MARGIN_PX = 24;
+
+/** The margin a result is made with: the one asked for, raised for JPG to `MIN_JPG_MARGIN_PX`. */
+export function appliedMargin(
+  margin: number,
+  output: { format: OutputFormat; size: number },
+): number {
+  if (output.format !== 'jpg') return margin;
+  return Math.max(margin, Math.round((MIN_JPG_MARGIN_PX / output.size) * 10_000) / 10_000);
+}
+
 /** One photo's own review choices; null follows the settings (for the threshold: automatic). */
 export interface PhotoOverrides {
   margin: number | null;

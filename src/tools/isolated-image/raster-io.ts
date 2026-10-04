@@ -53,6 +53,53 @@ export async function encodeRaster(
   }
 }
 
+/** A small 2D canvas for reading pixels back (OffscreenCanvas where there is one). */
+function stripContext(
+  width: number,
+  height: number,
+): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null {
+  if (typeof OffscreenCanvas !== 'undefined') {
+    return new OffscreenCanvas(width, height).getContext('2d', { willReadFrequently: true });
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return canvas.getContext('2d', { willReadFrequently: true });
+}
+
+/**
+ * Decodes an exported file again and counts its border pixels that are not exactly #FFFFFF: the QA of what is
+ * actually saved (JPEG compression can tint the border). Only the four edge strips are drawn and read.
+ */
+export async function encodedBorderFlaws(blob: Blob): Promise<number> {
+  const bitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none' });
+  try {
+    const { width, height } = bitmap;
+    const strip = (sx: number, sy: number, w: number, h: number): Uint8ClampedArray => {
+      const context = stripContext(w, h);
+      if (!context) throw new InvalidInputError('This browser could not check the exported image.');
+      context.drawImage(bitmap, sx, sy, w, h, 0, 0, w, h);
+      return context.getImageData(0, 0, w, h).data;
+    };
+    // Top and bottom rows whole, the side columns between them (each pixel counted once).
+    const strips = [strip(0, 0, width, 1)];
+    if (height > 1) strips.push(strip(0, height - 1, width, 1));
+    if (height > 2) {
+      strips.push(strip(0, 1, 1, height - 2));
+      if (width > 1) strips.push(strip(width - 1, 1, 1, height - 2));
+    }
+    let flaws = 0;
+    for (const data of strips) {
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i] !== 255 || data[i + 1] !== 255 || data[i + 2] !== 255) flaws += 1;
+      }
+    }
+    return flaws;
+  } finally {
+    bitmap.close();
+  }
+}
+
 /** A sample product photo for `?sample=1`: a mug with a white label on a busy table. */
 export async function samplePhoto(): Promise<File> {
   const width = 960;

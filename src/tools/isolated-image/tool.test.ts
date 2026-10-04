@@ -14,6 +14,17 @@ import { setup } from './tool';
  * off-white background between 241 and 247 (partly below the 245 threshold), or the same product cut off by
  * the left edge. The pipeline itself (`isolateImage`, which runs on the page without workers) is the real one.
  */
+/**
+ * Test controls for the replaced raster I/O: `flaws` is what decoding an exported JPG's border finds, `hold`
+ * keeps decoding waiting until it resolves, `decoded` counts decodes.
+ */
+const io = vi.hoisted(() => ({ flaws: 0, hold: null as Promise<void> | null, decoded: 0 }));
+const announced = vi.hoisted(() => [] as string[]);
+vi.mock('../../ui/feedback/announce', () => ({
+  announce: (text: string) => {
+    announced.push(text);
+  },
+}));
 vi.mock('./raster-io', async () => {
   const { createRaster } = await import('../../core/media/image');
   const picture = (cut: boolean) => {
@@ -36,13 +47,18 @@ vi.mock('./raster-io', async () => {
   };
   return {
     referenceDataUrl: (file: File) => Promise.resolve(`data:${file.type};base64,${file.name}`),
-    decodeRaster: async (blob: Blob) => picture((await blob.text()).startsWith('cut')),
+    decodeRaster: async (blob: Blob) => {
+      io.decoded += 1;
+      if (io.hold) await io.hold;
+      return picture((await blob.text()).startsWith('cut'));
+    },
     encodeRaster: (raster: { width: number; height: number }, format: string) =>
       Promise.resolve(
         new Blob([`${format}:${raster.width}x${raster.height}`], {
           type: format === 'png' ? 'image/png' : 'image/jpeg',
         }),
       ),
+    encodedBorderFlaws: () => Promise.resolve(io.flaws),
     samplePhoto: () => Promise.reject(new Error('no canvas in jsdom')),
   };
 });
@@ -136,6 +152,10 @@ beforeEach(async () => {
   await resetDb();
   localStorage.clear();
   okImages.mockClear();
+  io.flaws = 0;
+  io.hold = null;
+  io.decoded = 0;
+  announced.length = 0;
   urls = 0;
   URL.createObjectURL = vi.fn(() => `blob:test-${++urls}`);
   URL.revokeObjectURL = vi.fn();
@@ -266,7 +286,10 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     const failed = cardFor(t, 'b.png')!;
     expect(failed.dataset['phase']).toBe('failed');
     expect($(failed, 'iso-error')?.textContent).toBe('Mocked error 502');
-    expect(t.status()).toBe('Done · 2 of 3 photos; 1 failed · 2 passed QA');
+    // The run's last status names what went wrong.
+    expect(t.status()).toBe(
+      'Done · 2 of 3 photos; 1 failed · 2 passed QA · b.png: Mocked error 502',
+    );
 
     $<HTMLButtonElement>(failed, 'iso-retry')!.click();
     await vi.waitFor(() => expect(cardFor(t!, 'b.png')?.dataset['qa']).toBe('pass'));
@@ -343,6 +366,8 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     margin.dispatchEvent(new Event('input'));
     expect($(detail, 'iso-margin-value')?.textContent).toBe('12%');
     await vi.waitFor(() => expect(detail.dataset['margin']).toBe('0.12'), { timeout: 10_000 });
+    // Making it again is announced, politely.
+    expect(announced).toContain('Updating a.png…');
 
     const threshold = $<HTMLInputElement>(detail, 'iso-threshold')!;
     threshold.value = '250';
@@ -350,10 +375,14 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     await vi.waitFor(() => expect(detail.dataset['threshold']).toBe('250'), { timeout: 10_000 });
     // At 250 the 241-247 background is content now: the box reaches every edge, and the QA says why.
     expect($(detail, 'iso-qa')?.textContent).toContain("The model's background is not white");
+    await vi.waitFor(() =>
+      expect(announced).toContainEqual(expect.stringMatching(/^a\.png: QA failed\. The model's/)),
+    );
     $<HTMLButtonElement>(detail, 'iso-threshold-reset')!.click();
     await vi.waitFor(() => expect(detail.dataset['threshold']).toBe(String(automatic)), {
       timeout: 10_000,
     });
+    await vi.waitFor(() => expect(announced).toContain('a.png: QA passed.'));
     await settled(t);
 
     expect(okImages).toHaveBeenCalledTimes(2);
@@ -427,5 +456,137 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     expect($$(t.zones.input, 'iso-photo').map((row) => row.textContent)).toEqual([
       expect.stringContaining('x.jpg'),
     ]);
+  });
+
+  it('keeps at least 24 px of white for JPG, and checks the border of the file it exports', async () => {
+    t = context();
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500, margin: 0.005 } });
+    tool.onFiles?.([photo('a.png')]);
+    await t.runners[0]!.trigger();
+    expect(cardFor(t, 'a.png')?.dataset['qa']).toBe('pass');
+    $<HTMLButtonElement>(cardFor(t, 'a.png')!, 'iso-review')!.click();
+    const detail = $(t.zones.output, 'iso-detail')!;
+    // 24 px of 500 is 4.8%: that, not the 0.5% asked for, is the margin of the JPG.
+    expect(detail.dataset['margin']).toBe('0.048');
+    expect($(detail, 'iso-margin-value')?.textContent).toBe('0.5% (JPG uses 4.8%)');
+    // PNG is lossless: it gets the margin asked for.
+    tool.applyState({ prompt: '', settings: { size: 500, margin: 0.005, format: 'png' } });
+    await vi.waitFor(() => expect(detail.dataset['margin']).toBe('0.005'), { timeout: 10_000 });
+    // A JPG whose decoded border is not pure white fails the QA, saying why.
+    io.flaws = 3;
+    tool.applyState({ prompt: '', settings: { size: 500, margin: 0.005, format: 'jpg' } });
+    await vi.waitFor(() => expect(cardFor(t!, 'a.png')?.dataset['qa']).toBe('fail'), {
+      timeout: 10_000,
+    });
+    expect($(detail, 'iso-qa')?.textContent).toContain(
+      'After JPG compression 3 border pixels are not pure white',
+    );
+  });
+
+  it('a replayed retry (the error toast’s Retry) sends only the photos still without a result', async () => {
+    let refuse = true;
+    const images = vi.fn<Images>((body) =>
+      photoOf(body) === 'b.png' && refuse
+        ? Promise.reject(new ApiError('Payment required', 402))
+        : Promise.resolve(answer(`edited:${photoOf(body)}`)),
+    );
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500, concurrency: 1 } });
+    tool.onFiles?.([photo('a.png'), photo('b.png'), photo('c.png')]);
+    const keys = $$(t.zones.input, 'iso-photo').map((row) => row.dataset['key']!);
+    // One retry argument, replayed as the runner's Retry does: a.png is made, b.png's 402 stops the batch.
+    const arg = { keys };
+    await t.runners[0]!.trigger(arg);
+    expect(images.mock.calls.map(([body]) => photoOf(body))).toEqual(['a.png', 'b.png']);
+    refuse = false;
+    await t.runners[0]!.trigger(arg);
+    expect(images.mock.calls.map(([body]) => photoOf(body))).toEqual([
+      'a.png',
+      'b.png',
+      'b.png',
+      'c.png',
+    ]);
+    // A new request for a photo that has a result ("Edit again") is still sent.
+    await t.runners[0]!.trigger({ keys: [keys[0]!] });
+    expect(images).toHaveBeenCalledTimes(5);
+  });
+
+  it('names a result that finishes after a new file name pattern with that pattern', async () => {
+    t = context();
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png')]);
+    let release = (): void => undefined;
+    io.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const running = t.runners[0]!.trigger();
+    await vi.waitFor(() => expect(io.decoded).toBe(1));
+    const pattern = $<HTMLInputElement>(t.zones.drawer, 'iso-pattern')!;
+    pattern.value = 'renamed-{n}';
+    pattern.dispatchEvent(new Event('change'));
+    await new Promise((resolve) => setTimeout(resolve, 500)); // past the rename's debounce
+    release();
+    await running;
+    expect(t.core.results.pending().map((result) => result.name)).toEqual(['renamed-1.jpg']);
+  });
+
+  it('keeps the review in step: the margin follows the setting, Previous and Next the photos', async () => {
+    t = context();
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png'), photo('b.png')]);
+    await t.runners[0]!.trigger();
+    $<HTMLButtonElement>(cardFor(t, 'a.png')!, 'iso-review')!.click();
+    const detail = $(t.zones.output, 'iso-detail')!;
+    const range = $<HTMLInputElement>(detail, 'iso-margin')!;
+    expect(range.value).toBe('8');
+    expect($<HTMLButtonElement>(detail, 'iso-previous')!.disabled).toBe(true);
+    expect($<HTMLButtonElement>(detail, 'iso-next')!.disabled).toBe(false);
+    // The global margin changes: the photo follows it, and so does its range.
+    const setting = $<HTMLInputElement>(t.zones.drawer, 'iso-margin-setting')!;
+    setting.value = '12';
+    setting.dispatchEvent(new Event('change'));
+    expect(range.value).toBe('12');
+    expect(range.getAttribute('aria-valuetext')).toBe('12%');
+    await vi.waitFor(() => expect(detail.dataset['margin']).toBe('0.12'), { timeout: 10_000 });
+    // b.png goes: there is no next photo any more.
+    for (const result of t.core.results.pending()) t.core.results.markDownloaded(result.id);
+    $<HTMLButtonElement>($$(t.zones.input, 'iso-photo')[1]!, 'iso-photo-remove')!.click();
+    await vi.waitFor(() => expect($<HTMLButtonElement>(detail, 'iso-next')!.disabled).toBe(true));
+  });
+
+  it('keeps focus when Retry failed or Remove all hides itself', async () => {
+    let failB = true;
+    const images = vi.fn<Images>((body) => {
+      if (photoOf(body) === 'b.png' && failB) {
+        failB = false;
+        return Promise.reject(new ApiError('Mocked error 502', 502));
+      }
+      return Promise.resolve(answer(`edited:${photoOf(body)}`));
+    });
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png'), photo('b.png')]);
+    await t.runners[0]!.trigger();
+    const retryFailed = $<HTMLButtonElement>(t.zones.output, 'iso-retry-failed')!;
+    expect(retryFailed.hidden).toBe(false);
+    retryFailed.focus();
+    retryFailed.click();
+    await vi.waitFor(() => expect(retryFailed.hidden).toBe(true));
+    expect([t.runners[0]!.stopButton, t.runners[0]!.button]).toContain(document.activeElement);
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+
+    // Remove all, with nothing left to download: focus goes to the drop zone's button.
+    for (const result of t.core.results.pending()) t.core.results.markDownloaded(result.id);
+    const removeAll = $<HTMLButtonElement>(t.zones.input, 'iso-remove-all')!;
+    removeAll.focus();
+    removeAll.click();
+    await vi.waitFor(() => expect($$(t!.zones.input, 'iso-photo')).toHaveLength(0));
+    expect(removeAll.hidden).toBe(true);
+    expect(document.activeElement).toBe($(t.zones.input, 'drop-zone-button'));
   });
 });
