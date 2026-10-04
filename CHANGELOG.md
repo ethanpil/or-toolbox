@@ -44,6 +44,7 @@ All notable changes to this project are documented here. The format follows
 - Stage 3 e2e gates for the document tools, a 20-page PDF fixture with its generator, and `mock.respond()` for request-dependent mocks.
 - Framework for batch and multi-model tools: `runner.trigger(arg)` with Retry replaying the argument, `runItems()` batches, `RunSpec.addons` and `ToolInstance.addons()` for paid extras with one PDF engine table, `run.checkpoint({ output: () => text })`, `streamMarkdown()`, `exportMenu().update()`, `focusKey()`/`focusedKey()` and `replaceWith()` (08eb65c, cac4ab0, a60a24a, 7bcb412).
 - Chat tool: branching threads (edit and regenerate keep the old branch, ‹ 1/3 ›), per-chat model switch, fallback models, image/PDF/audio/text attachments, system prompt presets, reasoning effort, streamed Markdown replies with tokens, cost and latency, context trimming, Markdown and JSON export, thread search, rename and delete with Undo (b820a75, 90fa95b, fef8d74).
+- Speech-to-text tool: microphone recording and audio/video files; long recordings cut at pauses and merged with continuous timestamps, per-part retry and Stop; speaker labels (Deepgram, MAI-Transcribe) and key terms where supported; editable transcript that follows playback, speaker renaming, search; TXT, SRT, VTT, JSON and Word exports; Stage 4 gate for a 60-minute recording (fdcb324, 1df5345, fb49433).
 
 ### Changed
 
