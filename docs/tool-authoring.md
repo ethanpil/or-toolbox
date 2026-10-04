@@ -96,6 +96,7 @@ try {
 - An error the output panel already showed inline (`output.fail(error)` marks it) is not shown again.
 - Errors that need an action (no key → Connect / paste a key, locked → unlock, free-only, budget blocked, storage full) always go to `presentError`, which opens the right dialog and retries.
 - Anything else is shown once: inline by the output panel, or by `presentError` (a toast with Retry) when there is no panel.
+- **Unknown outcome:** a paid request that may have gone through (`isOutcomeUnknown(error)`: connection lost after sending, 408, or a 5xx other than 503) never gets a plain Retry. Give the runner a `safeAction` (e.g. `{ label: 'Check status', onClick }`); without one the toast links to OpenRouter's activity page. Set `retryUnknownOutcome` only when sending again cannot pay twice.
 
 Outside the runner (reading a dropped file, an export, a button of your own), catch and call `presentError(error)` yourself; never show the same error twice and never `console.error` it away.
 
@@ -232,7 +233,7 @@ const handle = ctx.ui.addResult({ kind: 'image', name: 'product-1.png', blob });
 card.append(imageViewer({ src: ctx.results.objectUrl(handle.result.id), alt: 'Product 1' }).element, handle.button());
 ```
 
-`handle.button()` downloads and turns into "Downloaded"; it stops listening when it leaves the page or the result is removed, so re-rendering a list of results leaks nothing. Until a result is downloaded, leaving through a link asks first (listing "3 images and 1 video not downloaded", with Download all), and reloading or closing the tab triggers the browser's own prompt. Call `handle.remove()` when the user discards a result.
+`handle.button()` downloads and turns into "Downloaded"; it returns the same button on every call (a redraw adds no subscription) and listens until `remove()`. Until a result is downloaded, leaving through a link asks first (listing "3 images and 1 video not downloaded", with Download all), and reloading or closing the tab triggers the browser's own prompt. Call `handle.remove()` when the user discards a result.
 
 For text and table exports use `exportMenu({ filename, formats, resultIds })`, where `resultIds: () => readonly string[]` is read at click time: each format's Blob is built only when chosen (`toCsv`, `toXlsx`, `toDocx`, `zipFiles`, `toSrt`… from `src/core/export`), and the listed results are marked downloaded. Build it once and change it with `menu.update(formats)` or `menu.update({ formats, disabled })`: the menu stays in place, so one the user has open stays open.
 
@@ -297,6 +298,8 @@ ctx.jobs.subscribe((record) => {
 });
 ```
 
+**Completion is not download.** Return `usage: { costUsd }` with `succeeded` (metadata and cost only): the core books it on the run before the job turns final, so a download that fails later still counts. Download the content separately, with its own retries; when it cannot happen any more (retention), mark the result expired: the cost is already booked. Read `failureKind` on a failed job: `'remote'` (the provider failed, usually free) or `'gave-up'` (the core stopped asking: poll failures, a 404 after retention, a missing key; it may still be billed, and the reservation is booked). Notifications are opt-in: `jobs.add({ …, notify: true })`, or `'group'` for one per group. A deliberate "Stop waiting" ends the run with `run.cancel(reason)` (aborted, not an error).
+
 Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`. Work that only lives in this page until a later step (a sequence being assembled, parts not yet joined) is protected with `ui.holdWork(description)`. Handed-off runs do not count for the leave guard: the job carries on without the page.
 
 ## Prompts, History and the form state
@@ -333,6 +336,7 @@ A tool that works on files and settings only, with no main text field, sets `pro
 | `streamMarkdown(target, options)` | The output panel's streaming renderer without the panel, for custom layouts. |
 | `exportMenu({ filename, formats, resultIds })` | Lazily built downloads in several formats; `update(…)` changes it in place. |
 | `imageViewer({ src \| blob, alt })` | Fit/zoom, checkerboard behind transparency. |
+| `videoResultCard({ ui, blob, name, seconds?, meta, covers?, onRemove, beforeRemove?, focusFallback?, ... })` | One video result: player, Download (`covers` marks the results it includes as downloaded too), Send to…, Remove (asks while not downloaded) with the card focus contract, leave guard through `ui.addResult`. Returns `{ element, handle, player, remove() }`. |
 | `audioResultCard({ ui, blob, name, seconds?, peaks?, metaParts, formats, onRemove, ... })` | One audio result (a recording, joined speech, a song): player, downloads (the file as it is plus converted `formats`), Send to…, Remove with focus management, registered with the leave guard through `ui.addResult`. Returns `{ element, handle, player, remove() }`. |
 | `imageResultCard({ ui, blob, name, meta, formats, onRemove, actions?, viewer?, ... })` | One image result (a generated image, an edited version): viewer, downloads (the file as it is plus `formats` converted through a canvas: `png`, `jpg`, `webp`), Send to…, the tool's own `actions` (`{ label, icon, ariaLabel, onClick, testId }`), Remove with focus management, registered with the leave guard through `ui.addResult`. `viewer: false` for a page that already shows the image (an editor canvas). Returns `{ element, handle, viewer, remove() }`. `focusFallback` runs after `onRemove` has updated the page; a format the browser cannot encode (WebP in Safari) is left out of the menu; SVG downloads only as it is. |
 | `progressBar({ label, hidden?, class?, testId? })` | A labelled `role="progressbar"`; `update(done, total, text?)` (text becomes `aria-valuetext`). Pair it with `ui.progress`. |
@@ -354,7 +358,7 @@ Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` 
 - **Images:** run heavy pixel work in the worker (`src/core/media/image-async.ts`: `isolateImage`, `maskOverlayAsync`, `maskToRasterAsync`, `featherInsideAsync`, `compositeMaskedAsync`, each with `{ signal, transfer }` and a page fallback), never pixel loops on the main thread. A failed worker is recreated on the next job; after three failures in a row the page does the work. Encode references that belong together (marked, plain, mask) with `toDataUrls(images, options)`, at one pixel size; `readImageSize(blob)` reads dimensions from the file header without decoding.
 - **Image models:** ask `ctx.models.imageControls(model)`: `ready` (send only the fields its `controls` list), `missing` (refuse before the run) or `unknown` (the list could not be read: send `controls`, the bare prompt-only set, and let the request try). Estimates with references pass `requests` (how many requests upload them).
 - **ZIP:** `zipFiles()` from `src/core/export`, or fflate's `zipSync`. Never fflate's async API (`zip`, `unzip`, `deflate`): it starts `blob:` workers that the CSP blocks, and then never settles.
-- **ffmpeg:** go through `src/core/media/ffmpeg-ops.ts`; any `exec` of your own passes explicit `-threads` limits (multi-threaded ffmpeg crashes on H.264 encodes with the default count).
+- **ffmpeg:** go through `src/core/media/ffmpeg-ops.ts` (`concatVideos` refuses a clip or a result over `MAX_JOIN_BYTES`, 1.5 GiB, before encoding); any `exec` of your own passes explicit `-threads` limits (multi-threaded ffmpeg crashes on H.264 encodes with the default count).
 
 ## Rules that bite
 
