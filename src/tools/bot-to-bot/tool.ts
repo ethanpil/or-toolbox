@@ -108,7 +108,7 @@ export const RANGES = {
 export interface BotSettings {
   /** As typed; '' shows and sends the default name. */
   name: string;
-  /** null: the tool's model (the header's). */
+  /** null: the tool's default text model (`ctx.model()`: a `?model=` visit, the tool binding, the text default). */
   model: string | null;
   persona: string;
 }

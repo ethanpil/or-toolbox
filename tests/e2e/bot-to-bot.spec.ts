@@ -100,6 +100,8 @@ const status = (page: Page) => page.getByTestId('tool-status');
 async function open(page: Page): Promise<void> {
   await page.goto(PAGE);
   await expect(page.getByTestId('bot-a-model')).toContainText('Test: Text Model');
+  // Each bot has its own model picker: no header chip.
+  await expect(page.getByTestId('model-chip')).toHaveCount(0);
 }
 
 async function setLimits(
