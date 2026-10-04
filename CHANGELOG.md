@@ -61,6 +61,9 @@ All notable changes to this project are documented here. The format follows
 - Model arena: one prompt and files to 2–4 models in parallel (one run each, one `groupId`), streamed side by side with time to first token, total time, tokens, tokens/s and cost, a comparison table marking the fastest and cheapest, per-contender Retry, Stop for all; blind voting (shuffled Model A–D, names and costs hidden until a vote or a reveal) with a local tally (Reset with Undo); Markdown/JSON export of a round (56a80b1).
 - Stage 7 e2e gate: the arena runs 4 models at once (c5e28e2).
 - `mountTool(…, { modelChip: false })` for tools that choose their models themselves (3978bbf).
+- Decision: text or key-value situation, question builder for Yes/No, Choice and Score (slug ids, criteria, options and a scale reordered by drag or Move buttons, thresholds), answer cards with meter, bars and scale, Clear / Needs review that re-labels without a new run, starter templates, saved deciders with Undo, JSON download and copy, free-only on Mercury Decide (099f5dd, eefc703).
+- Model picker help text per capability (`CAPABILITY_INFO.help`), used to say which decision models are verified (95ee388).
+- Stage 7 e2e gate for Decision: each question type with Jev, Mercury and thin responses, key-value state as the tutorial request, saved deciders, 429 and Stop, History reopen, 320 px by keyboard (44e6570).
 
 ### Changed
 

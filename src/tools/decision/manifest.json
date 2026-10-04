@@ -9,5 +9,5 @@
   "produces": ["application/json"],
   "usesJobs": false,
   "lazyLibs": [],
-  "defaults": {}
+  "defaults": { "threshold": 80 }
 }

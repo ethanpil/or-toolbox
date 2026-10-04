@@ -46,6 +46,7 @@ export function modelPicker(
   let models: ModelInfo[] | null = null;
   const searchId = uid('model-search');
   const capabilityLabel = CAPABILITY_INFO[options.capability].label;
+  const help = CAPABILITY_INFO[options.capability].help;
 
   const search = h('input', {
     id: searchId,
@@ -265,6 +266,7 @@ export function modelPicker(
     body: [
       h('label', { class: 'visually-hidden', htmlFor: searchId }, 'Search models'),
       h('div', { class: 'or-sticky-search' }, search),
+      help && h('p', { class: 'form-text mt-2 mb-0', 'data-testid': 'model-picker-help' }, help),
       results,
       status,
     ],

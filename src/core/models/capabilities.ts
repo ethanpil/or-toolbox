@@ -5,7 +5,8 @@
  * - `title`: the display name (Settings rows, announcements),
  * - `badge`: the short tag on a model card,
  * - `filter`: the text of the Models page's capability filter,
- * - `icon`: a Bootstrap Icons name without `bi-`.
+ * - `icon`: a Bootstrap Icons name without `bi-`,
+ * - `help`: a note the model picker shows under its search box, where the catalog alone does not say enough.
  */
 import type { Capability } from '../types';
 
@@ -15,6 +16,7 @@ export interface CapabilityInfo {
   badge: string;
   filter: string;
   icon: string;
+  help?: string;
 }
 
 export const CAPABILITY_INFO: Readonly<Record<Capability, CapabilityInfo>> = {
@@ -73,5 +75,6 @@ export const CAPABILITY_INFO: Readonly<Record<Capability, CapabilityInfo>> = {
     badge: 'Decisions',
     filter: 'Decisions',
     icon: 'signpost-split',
+    help: 'Jev and Mercury Decide are the only models verified to accept the Decision tool’s questions. Others in this list may refuse them or answer in another shape.',
   },
 };
