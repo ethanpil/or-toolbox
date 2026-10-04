@@ -1,0 +1,69 @@
+// Speech-to-text (src/tools/speech-to-text): the recorder's level meter and the transcript editor.
+
+// Live microphone level: decorative (aria-hidden); the timer and the status line say what happens.
+.or-level {
+  height: 0.5rem;
+  overflow: hidden;
+  background-color: var(--or-inset);
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius-pill);
+}
+
+.or-level-bar {
+  width: 100%;
+  height: 100%;
+  background-color: var(--bs-success);
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+.or-stt-search {
+  min-width: 10rem;
+  max-width: 20rem;
+}
+
+// The segment list scrolls on its own; the page follows playback by scrolling only this list, measured from it
+// (position: relative), which also keeps .visually-hidden children inside it on phones.
+.or-stt-segments {
+  position: relative;
+  max-height: 60vh;
+  padding: 0.25rem;
+  overflow-y: auto;
+}
+
+.or-stt-segment {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius);
+
+  // The segment being played: a bar on its start edge, no colour behind the text (contrast stays as is).
+  &.is-active {
+    border-color: var(--bs-primary);
+    box-shadow: inset 4px 0 0 var(--bs-primary);
+  }
+}
+
+.or-stt-time {
+  font-size: 0.8125rem;
+  text-decoration: none;
+}
+
+.or-stt-segment-text {
+  // Grows with its text where supported; `rows` is the fallback.
+  field-sizing: content;
+  min-height: 0;
+  resize: vertical;
+}
+
+.or-stt-text {
+  max-height: 60vh;
+  padding: 0.75rem;
+  overflow-y: auto;
+  background-color: var(--or-inset);
+  border-radius: var(--bs-border-radius);
+
+  &:focus-visible {
+    outline: 2px solid var(--or-focus-color);
+    outline-offset: 2px;
+  }
+}
