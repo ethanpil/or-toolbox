@@ -77,14 +77,19 @@ export const IMAGE_MODELS = [
   },
 ];
 
-/** A buffered `/images` answer with `count` copies of `picture` (JPEG). */
-export function imagesJson(picture: Buffer, count = 1, cost = 0.014): SequenceResponse {
+/** A buffered `/images` answer with `count` copies of `picture` (JPEG unless `mediaType` says otherwise). */
+export function imagesJson(
+  picture: Buffer,
+  count = 1,
+  cost = 0.014,
+  mediaType = 'image/jpeg',
+): SequenceResponse {
   return {
     body: {
       created: 0,
       data: Array.from({ length: count }, () => ({
         b64_json: picture.toString('base64'),
-        media_type: 'image/jpeg',
+        media_type: mediaType,
       })),
       usage: { prompt_tokens: 19, completion_tokens: 4096 * count, cost },
     },

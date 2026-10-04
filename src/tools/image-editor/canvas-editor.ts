@@ -1,7 +1,9 @@
 /**
  * The mask painting surface: the picture on a canvas with the mask over it (magenta, as the model sees it),
- * brush and eraser, a size slider, undo/redo of strokes, clear, invert, show/hide the mask, zoom (wheel,
- * pinch, buttons, fit) and pan (the hand tool, Space or the middle button, two fingers).
+ * brush and eraser, a size slider, undo/redo of strokes, clear, invert, show/hide the mask, zoom (Ctrl/Cmd+wheel
+ * or a pinch, buttons, fit; a plain wheel scrolls the page) and pan (the hand tool, Space or the middle button,
+ * two fingers). Screen readers hear the brush position after keyboard moves and the mask's coverage after
+ * painting, both debounced.
  *
  * Keyboard (inside the editor): B brush, E eraser, H hand, [ and ] brush size, M show/hide the mask, 0 fit,
  * + and - zoom, Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z or Ctrl+Y redo. On the canvas: arrows move the brush
@@ -11,6 +13,7 @@
  * replays them from blank (`replayOps`), so memory does not grow with the picture size.
  */
 import type { Box, Mask } from '../../core/media/image';
+import { debounce } from '../../core/util';
 import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { icon } from '../../ui/icon';
@@ -60,6 +63,8 @@ export interface CanvasEditor {
   preview(source: CanvasImageSource | null, width?: number, height?: number): void;
   /** Clears the mask as one undoable step. */
   clearMask(): void;
+  /** Counts committed mask changes (strokes, undo, redo, clear, invert, a new picture). */
+  revision(): number;
   undo(): void;
   redo(): void;
   fit(): void;
@@ -71,6 +76,10 @@ const MAX_SCALE = 16;
 const MIN_SIZE = 2;
 const MAX_SIZE = 400;
 const KEY_STEP = 10;
+/** Quiet time before the brush position or the mask's coverage is announced. */
+const ANNOUNCE_DELAY_MS = 700;
+/** CSS pixels per wheel "line" (Firefox reports lines). */
+const LINE_PIXELS = 16;
 
 const describeOp = (op: MaskOp): string =>
   op.type === 'stroke' ? (op.tool === 'brush' ? 'brush stroke' : 'eraser stroke') : `${op.type}`;
@@ -303,7 +312,8 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
       'p',
       { id: ids.help, class: 'form-text mb-0' },
       'Paint over what should change. Keys: B brush, E eraser, H hand, [ and ] size, M show the mask, 0 fit, ' +
-        'Ctrl+Z undo. On the canvas, arrows move the brush, Shift+arrows paint, Enter paints a dot.',
+        'Ctrl+Z undo. On the canvas, arrows move the brush, Shift+arrows paint, Enter paints a dot; ' +
+        'Ctrl+wheel or a pinch zooms.',
     ),
   );
 
@@ -323,6 +333,8 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
     const ctx = context(imageCanvas);
     if (!ctx) return;
     ctx.clearRect(0, 0, display.width, display.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(display.source, 0, 0, display.width, display.height);
   };
 
@@ -392,10 +404,29 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
     viewport.classList.toggle('is-panning', tool === 'pan' || !canPaint);
   };
 
+  let revision = 0;
   const changed = (): void => {
+    revision += 1;
     syncButtons();
     options.onMaskChange?.();
   };
+
+  /** Polite and debounced: a run of strokes or key presses is announced once. */
+  const announceCoverage = debounce(() => {
+    if (!source) return;
+    const coverage = maskCoverage(maskData);
+    announce(
+      coverage === 0
+        ? 'The mask is empty.'
+        : `Mask covers ${coverage < 0.001 ? 'under 0.1' : (coverage * 100).toFixed(1)}% of the picture.`,
+    );
+  }, ANNOUNCE_DELAY_MS);
+  const announcePosition = debounce(() => {
+    if (!pointer || width === 0) return;
+    announce(
+      `Brush at ${Math.round((pointer.x / width) * 100)}%, ${Math.round((pointer.y / height) * 100)}%.`,
+    );
+  }, ANNOUNCE_DELAY_MS);
 
   // --- view ------------------------------------------------------------------------------------------------
   const fit = (): void => {
@@ -468,6 +499,7 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
     renderOverlay(box);
     changed();
     if (op.type !== 'stroke') announce(op.type === 'clear' ? 'Mask cleared.' : 'Mask inverted.');
+    else announceCoverage();
   };
 
   const clearMask = (): void => {
@@ -612,6 +644,7 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
         ops.push(op);
         redoOps = [];
         changed();
+        announceCoverage();
       }
     }
   };
@@ -625,9 +658,16 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
   viewport.addEventListener(
     'wheel',
     (event) => {
-      if (!source) return;
+      // A plain wheel scrolls the page; Ctrl/Cmd+wheel (and a trackpad pinch, which browsers send as one) zooms.
+      if (!source || !(event.ctrlKey || event.metaKey)) return;
       event.preventDefault();
-      zoomAt(event.clientX, event.clientY, Math.exp(-event.deltaY * 0.0015));
+      const pixels =
+        event.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? event.deltaY * LINE_PIXELS
+          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? event.deltaY * Math.max(1, viewport.clientHeight)
+            : event.deltaY;
+      zoomAt(event.clientX, event.clientY, Math.exp(-pixels * 0.0015));
     },
     { passive: false },
   );
@@ -674,7 +714,7 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
             [to.x, to.y],
           ],
         });
-      }
+      } else announcePosition();
       drawOutline();
       return;
     }
@@ -802,6 +842,7 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
       drawOutline();
     },
     clearMask,
+    revision: () => revision,
     undo,
     redo,
     fit,

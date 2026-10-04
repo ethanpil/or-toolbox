@@ -7,6 +7,13 @@
  * tinted magenta, the plain picture and the mask as a PNG, with an instruction naming the marked area
  * (request.ts). Models decide what they change; "Keep outside the mask" composites the result back onto the
  * picture through the mask (with a soft inner edge), so every pixel outside the mask stays exactly as it was.
+ * Outpaint has nothing to blend under its new area, so its soft edge lies on the picture's side of the seam.
+ *
+ * Sizes: the editor paints at the size the model sees (at most 2048 px a side), and all references of an edit
+ * are built from the decoded, upright pixels at that one size; compositing works on the full-size picture.
+ * Pictures beyond what browsers can draw are scaled down on load. Only the picture on screen stays decoded.
+ * A result of another shape is fitted inside the canvas, never stretched, and the version says so.
+ * While an edit runs, loading, switching versions and painting wait for it.
  *
  * Every result is a new version (thumbnail strip); any version can be compared with the one it came from,
  * edited further, downloaded or removed. Versions are session results (leave guard); History keeps the
@@ -17,6 +24,7 @@ import { imageModelControls } from '../../core/models/image-params';
 import { InvalidInputError, userMessage } from '../../core/errors';
 import type { RawImageModel } from '../../core/api/types';
 import {
+  fitWithin,
   imageDataFrom,
   imageSize,
   loadImage,
@@ -24,9 +32,10 @@ import {
   maskOverlay,
   maskToRaster,
   type RasterImage,
+  resizeCanvas,
   toBlob,
-  toDataUrl,
 } from '../../core/media/image';
+import { debounce } from '../../core/util';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
 import { type ImageResultCard, imageResultCard } from '../../ui/components/image-result-card';
@@ -40,16 +49,20 @@ import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import type { ToolContext, ToolInstance } from '../../ui/tool/index';
 import { canvasEditor } from './canvas-editor';
-import { compositeMasked, featherInside } from './mask';
+import { clipMask, compositeMasked, featherInside, scaleMask } from './mask';
 import {
   EXTEND_RATIOS,
+  fitResult,
   type Margins,
   OUTPAINT_FILL,
+  outpaintAlpha,
   outpaintMask,
   outpaintPlan,
   placeOnCanvas,
   planProblem,
+  scaledPlan,
 } from './outpaint';
+import { drawToRaster, referenceUrl } from './pixels';
 import {
   buildEditRequest,
   EDIT_MODES,
@@ -64,9 +77,15 @@ import {
 } from './request';
 import { type Version, VersionHistory, versionLabel } from './versions';
 
-/** References are scaled to this before upload. */
-const REFERENCE_MAX_SIDE = 2048;
-const REFERENCE_MAX_BYTES = 4 * 1024 * 1024;
+/** The size the model sees, and the editor paints at: at most this many pixels a side. */
+const WORK_SIDE = 2048;
+/**
+ * The most pixels a picture may have: Safari's canvas area limit (4096 x 4096), the lowest of the browsers.
+ * Bigger pictures are scaled down on load.
+ */
+const MAX_PIXELS = 16_777_216;
+/** How long the outpaint preview waits for typing in the margins to stop. */
+const PREVIEW_DELAY_MS = 150;
 
 const MODE_LABEL: Record<EditMode, string> = {
   inpaint: 'Inpaint',
@@ -109,8 +128,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   // --- image models ----------------------------------------------------------------------------------------
   let imageModels: RawImageModel[] | null = null;
   let loading: Promise<void> | null = null;
-  /** Reads the list (the cache when it has one); 
-eread after a refresh elsewhere, never forcing the network. */
+  /** Reads the list (the cache when it has one); `reread` after a refresh elsewhere, never forcing the network. */
   const loadImageModels = (reread = false): Promise<void> => {
     if (loading && !reread) return loading;
     loading = ctx.models
@@ -129,35 +147,34 @@ eread after a refresh elsewhere, never forcing the network. */
   let controls: ImageModelControls | null = null;
 
   // --- versions and decoded pictures -----------------------------------------------------------------------
+  type Decoded = ImageBitmap | HTMLImageElement;
   const versions = new VersionHistory();
-  const bitmaps = new Map<string, ImageBitmap | HTMLImageElement>();
-  const rasters = new Map<string, RasterImage>();
   const thumbs = new Map<string, string>();
   const cards = new Map<string, ImageResultCard>();
   let originalName = 'image.png';
+  /** The one decoded picture kept: the version on screen. Others stay Blobs and are decoded when needed. */
+  let onScreen: { id: string; bitmap: Decoded } | null = null;
+  /** An edit in flight, from the moment its run starts until its version is shown (or it fails). */
+  let editing = false;
 
-  const bitmapOf = async (version: Version): Promise<ImageBitmap | HTMLImageElement> => {
-    const known = bitmaps.get(version.id);
-    if (known) return known;
-    const decoded = await loadImage(version.blob);
-    bitmaps.set(version.id, decoded);
-    return decoded;
-  };
-  const rasterOf = async (version: Version): Promise<RasterImage> => {
-    const known = rasters.get(version.id);
-    if (known) return known;
-    const raster = imageDataFrom(await bitmapOf(version), {
-      width: version.width,
-      height: version.height,
-    });
-    rasters.set(version.id, raster);
-    return raster;
-  };
-  const forget = (id: string): void => {
-    const bitmap = bitmaps.get(id);
+  const close = (bitmap: Decoded | null | undefined): void => {
     if (bitmap && 'close' in bitmap) bitmap.close();
-    bitmaps.delete(id);
-    rasters.delete(id);
+  };
+  /** The version's decoded picture: the one on screen, or a fresh decode the caller closes (`release`). */
+  const decode = async (version: Version): Promise<Decoded> =>
+    onScreen?.id === version.id ? onScreen.bitmap : loadImage(version.blob);
+  const release = (bitmap: Decoded): void => {
+    if (onScreen?.bitmap !== bitmap) close(bitmap);
+  };
+  /** The size the editor paints at and the model sees, for a picture of `width` x `height`. */
+  const workSize = (size: { width: number; height: number }) =>
+    fitWithin(size.width, size.height, WORK_SIDE);
+
+  const forget = (id: string): void => {
+    if (onScreen?.id === id) {
+      close(onScreen.bitmap);
+      onScreen = null;
+    }
     const thumb = thumbs.get(id);
     if (thumb) URL.revokeObjectURL(thumb);
     thumbs.delete(id);
@@ -432,17 +449,24 @@ eread after a refresh elsewhere, never forcing the network. */
   ui.output.append(empty, workspace);
 
   let comparing = false;
+  /** The "before" picture while comparing; closed when comparing ends. */
+  let before: Decoded | null = null;
   const setCompare = (on: boolean): void => {
     const working = versions.working;
     const parent = working ? versions.parentOf(working.id) : null;
     comparing = on && parent !== null;
     compare.setAttribute('aria-pressed', String(comparing));
     if (comparing && parent) {
-      void bitmapOf(parent).then((bitmap) => {
-        if (comparing) editor.preview(bitmap, parent.width, parent.height);
+      void loadImage(parent.blob).then((bitmap) => {
+        close(before);
+        before = bitmap;
+        const size = workSize(parent);
+        if (comparing) editor.preview(bitmap, size.width, size.height);
       });
       announce(`Showing ${versionLabel(parent).toLowerCase()}, before this edit.`);
     } else {
+      close(before);
+      before = null;
       showModePreview();
       if (!on) announce('Showing the current version.');
     }
@@ -504,19 +528,35 @@ eread after a refresh elsewhere, never forcing the network. */
     if (compare.disabled && comparing) setCompare(false);
   };
 
-  /** Puts a version on the canvas; the mask stays when the size is the same. */
+  /**
+   * Puts a version on the canvas at the size the model sees; the mask stays when that size is the same. The
+   * picture that was on screen is closed (only Blobs are kept for the others).
+   */
   const showVersion = async (version: Version, keepMask: boolean): Promise<void> => {
-    const bitmap = await bitmapOf(version);
-    editor.setImage(bitmap, version.width, version.height, { keepMask });
+    const bitmap = await decode(version);
+    if (onScreen && onScreen.bitmap !== bitmap) close(onScreen.bitmap);
+    onScreen = { id: version.id, bitmap };
+    const size = workSize(version);
+    editor.setImage(bitmap, size.width, size.height, { keepMask });
     comparing = false;
+    close(before);
+    before = null;
     compare.setAttribute('aria-pressed', 'false');
     renderVersions();
     modeChanged();
   };
 
+  /** Says why the picture cannot change now (an edit is in flight), or returns false. */
+  const busyEditing = (action: string): boolean => {
+    if (!editing) return false;
+    ui.status(`An edit is running: wait for it, or press Stop, before ${action}.`);
+    return true;
+  };
+
   const selectVersion = async (id: string): Promise<void> => {
     const version = versions.get(id);
     if (!version || versions.working?.id === id) return;
+    if (busyEditing('switching versions')) return;
     versions.select(id);
     await showVersion(version, true);
     announce(`Editing from ${versionLabel(version).toLowerCase()}.`);
@@ -540,8 +580,55 @@ eread after a refresh elsewhere, never forcing the network. */
   const unsaved = (): number =>
     [...cards.values()].filter((card) => !card.handle.result.downloaded).length;
 
+  /**
+   * Decodes a picture and scales it down when it has more pixels than browsers can draw (the scaled copy, a
+   * PNG, becomes the original). Null with the reason shown when it cannot be opened.
+   */
+  const openPicture = async (
+    file: Blob,
+  ): Promise<{ blob: Blob; bitmap: Decoded; note: string | null } | null> => {
+    let bitmap: Decoded;
+    try {
+      bitmap = await loadImage(file);
+    } catch {
+      void presentError(
+        new InvalidInputError(
+          'This picture could not be opened: it may be damaged, or too large for the browser.',
+        ),
+      );
+      return null;
+    }
+    const { width, height } = imageSize(bitmap);
+    if (width * height <= MAX_PIXELS) return { blob: file, bitmap, note: null };
+    const scale = Math.sqrt(MAX_PIXELS / (width * height));
+    const target = {
+      width: Math.max(1, Math.floor(width * scale)),
+      height: Math.max(1, Math.floor(height * scale)),
+    };
+    try {
+      const blob = await toBlob(resizeCanvas(bitmap, target.width, target.height), {
+        type: 'image/png',
+      });
+      close(bitmap);
+      return {
+        blob,
+        bitmap: await loadImage(blob),
+        note: `Scaled down from ${width} × ${height} to ${target.width} × ${target.height}: larger pictures are more than browsers can draw.`,
+      };
+    } catch {
+      close(bitmap);
+      void presentError(
+        new InvalidInputError(
+          `This picture (${width} × ${height}) is too large for the browser to work with. Try a smaller one.`,
+        ),
+      );
+      return null;
+    }
+  };
+
   const loadFile = async (file: File | Blob | undefined, name?: string): Promise<void> => {
     if (!file) return;
+    if (busyEditing('loading another picture')) return;
     const fileName = name ?? (file instanceof File ? file.name : 'image.png');
     const pending = unsaved();
     if (
@@ -555,24 +642,19 @@ eread after a refresh elsewhere, never forcing the network. */
     ) {
       return;
     }
-    let bitmap: ImageBitmap | HTMLImageElement;
-    try {
-      bitmap = await loadImage(file);
-    } catch (error) {
-      void presentError(error);
-      return;
-    }
-    const { width, height } = imageSize(bitmap);
+    const opened = await openPicture(file);
+    if (!opened) return;
+    const { width, height } = imageSize(opened.bitmap);
     for (const card of cards.values()) card.remove();
     for (const version of versions.all()) forget(version.id);
     originalName = fileName;
-    const original = versions.reset({ blob: file, name: fileName, width, height });
-    bitmaps.set(original.id, bitmap);
+    const original = versions.reset({ blob: opened.blob, name: fileName, width, height });
+    onScreen = { id: original.id, bitmap: opened.bitmap };
     empty.hidden = true;
     workspace.hidden = false;
     renderSource();
     await showVersion(original, false);
-    ui.status(`Loaded ${fileName} (${width} × ${height}).`);
+    ui.status(opened.note ?? `Loaded ${fileName} (${width} × ${height}).`);
   };
 
   // --- mode-dependent parts --------------------------------------------------------------------------------
@@ -584,29 +666,40 @@ eread after a refresh elsewhere, never forcing the network. */
       : null;
   };
 
-  /** Shows the new canvas on the editor while Outpaint is chosen (grey new area, tinted like the mask). */
-  const showModePreview = (): void => {
+  /** One canvas for the outpaint preview, redrawn (never reallocated per keystroke). */
+  const previewCanvas = document.createElement('canvas');
+  /**
+   * Shows the new canvas on the editor while Outpaint is chosen (grey new area, tinted like the mask), at the
+   * size the model would see; a plan beyond MAX_CANVAS_SIDE shows the picture alone (the notes say why).
+   */
+  const drawModePreview = (): void => {
     const working = versions.working;
     const plan = settings.mode === 'outpaint' ? currentPlan() : null;
-    if (!working || !plan || comparing) {
-      if (!comparing) editor.preview(null);
+    if (comparing) return;
+    if (!working || !plan || planProblem(plan, working.width, working.height) || !onScreen) {
+      editor.preview(null);
       return;
     }
-    void bitmapOf(working).then((bitmap) => {
-      if (settings.mode !== 'outpaint' || comparing) return;
-      const canvas = document.createElement('canvas');
-      canvas.width = plan.width;
-      canvas.height = plan.height;
-      const context = canvas.getContext('2d');
-      if (!context) return;
-      context.fillStyle = `rgb(${OUTPAINT_FILL.join(',')})`;
-      context.fillRect(0, 0, plan.width, plan.height);
-      context.fillStyle = 'rgba(255, 0, 255, 0.5)';
-      context.fillRect(0, 0, plan.width, plan.height);
-      context.clearRect(plan.offsetX, plan.offsetY, working.width, working.height);
-      context.drawImage(bitmap, plan.offsetX, plan.offsetY, working.width, working.height);
-      editor.preview(canvas, plan.width, plan.height);
-    });
+    const size = workSize(plan);
+    const at = scaledPlan(plan, working.width, working.height, size);
+    previewCanvas.width = size.width;
+    previewCanvas.height = size.height;
+    const context = previewCanvas.getContext('2d');
+    if (!context) return;
+    context.fillStyle = `rgb(${OUTPAINT_FILL.join(',')})`;
+    context.fillRect(0, 0, size.width, size.height);
+    context.fillStyle = 'rgba(255, 0, 255, 0.5)';
+    context.fillRect(0, 0, size.width, size.height);
+    context.clearRect(at.offsetX, at.offsetY, at.imageWidth, at.imageHeight);
+    context.imageSmoothingQuality = 'high';
+    context.drawImage(onScreen.bitmap, at.offsetX, at.offsetY, at.imageWidth, at.imageHeight);
+    editor.preview(previewCanvas, size.width, size.height);
+  };
+  const debouncedPreview = debounce(drawModePreview, PREVIEW_DELAY_MS);
+  /** At once for a mode or version change; typing in the margins goes through `debouncedPreview`. */
+  const showModePreview = (): void => {
+    debouncedPreview.cancel();
+    drawModePreview();
   };
 
   const renderOutpaint = (): void => {
@@ -687,10 +780,12 @@ eread after a refresh elsewhere, never forcing the network. */
     instruction.placeholder = PLACEHOLDER[settings.mode];
     keepOutside.element.hidden = settings.mode === 'whole';
     editor.setPainting(
-      settings.mode === 'inpaint',
-      settings.mode === 'outpaint'
-        ? 'Outpaint marks the new area for you.'
-        : 'Whole-image edits use no mask.',
+      settings.mode === 'inpaint' && !editing,
+      editing
+        ? 'Painting waits until the edit is back.'
+        : settings.mode === 'outpaint'
+          ? 'Outpaint marks the new area for you.'
+          : 'Whole-image edits use no mask.',
     );
     renderOutpaint();
     showModePreview();
@@ -700,7 +795,7 @@ eread after a refresh elsewhere, never forcing the network. */
 
   function outpaintChanged(): void {
     renderOutpaint();
-    showModePreview();
+    debouncedPreview();
     renderNotes();
     void ui.refreshEstimate();
   }
@@ -712,63 +807,111 @@ eread after a refresh elsewhere, never forcing the network. */
   };
 
   // --- running ---------------------------------------------------------------------------------------------
-  /** What an edit of the working version sends, built before anything is paid for. */
-  const prepare = async (
-    model: string,
-    modelControls: ImageModelControls,
-  ): Promise<{
+  /** What one edit sends and needs afterwards, built before anything is paid for. */
+  interface Prepared {
     working: Version;
-    canvas: RasterImage;
+    mode: EditMode;
+    /** The canvas at full size: the picture, or the outpaint canvas (picture on grey). */
+    canvas: { width: number; height: number };
+    plan: ReturnType<typeof outpaintPlan> | null;
+    /** The size every reference was built at (what the model sees). */
+    refSize: { width: number; height: number };
+    /** The mask at `refSize` (inpaint) or null. */
     mask: Mask | null;
     body: ReturnType<typeof buildEditRequest>;
-  } | null> => {
-    const working = versions.working;
-    if (!working) return null;
+  }
+
+  /**
+   * The references for an edit of the working version, all at one size (the canvas fitted in WORK_SIDE) and
+   * from the decoded, upright pixels, so the marked picture, the plain one and the mask line up exactly.
+   */
+  const prepare = async (model: string, modelControls: ImageModelControls): Promise<Prepared> => {
+    const working = versions.working!;
     const mode = settings.mode;
-    const base = await rasterOf(working);
-    let canvas = base;
-    let mask: Mask | null = null;
-    if (mode === 'inpaint') {
-      const live = editor.mask();
-      mask = { width: live.width, height: live.height, data: new Uint8Array(live.data) };
-    } else if (mode === 'outpaint') {
-      const plan = currentPlan()!;
-      canvas = placeOnCanvas(base, plan);
-      mask = outpaintMask(plan, working.width, working.height);
-    }
-    const roles = referenceRoles(mode, modelControls.references?.max ?? 0);
-    const encode = async (raster: RasterImage, type: 'image/png' | 'image/jpeg'): Promise<string> =>
-      toDataUrl(await toBlob(raster, { type }), {
-        maxDimension: REFERENCE_MAX_SIDE,
-        maxBytes: REFERENCE_MAX_BYTES,
-        type,
+    const plan = mode === 'outpaint' ? currentPlan() : null;
+    const canvas = plan ?? { width: working.width, height: working.height };
+    const refSize = workSize(canvas);
+    const bitmap = await decode(working);
+    try {
+      let plain: RasterImage;
+      let mask: Mask | null = null;
+      if (plan) {
+        const at = scaledPlan(plan, working.width, working.height, refSize);
+        plain = drawToRaster(bitmap, refSize.width, refSize.height, {
+          box: { x: at.offsetX, y: at.offsetY, width: at.imageWidth, height: at.imageHeight },
+          fill: OUTPAINT_FILL,
+        });
+        mask = outpaintMask(at, at.imageWidth, at.imageHeight);
+      } else {
+        plain = drawToRaster(bitmap, refSize.width, refSize.height);
+        if (mode === 'inpaint') mask = scaleMask(editor.mask(), refSize.width, refSize.height);
+      }
+      const roles = referenceRoles(mode, modelControls.references?.max ?? 0);
+      const references = await Promise.all(
+        roles.map((role) =>
+          role === 'plain'
+            ? referenceUrl(plain, true)
+            : role === 'marked'
+              ? referenceUrl(maskOverlay(plain, mask!, MASK_COLOUR, MASK_ALPHA), true)
+              : referenceUrl(maskToRaster(mask!), false),
+        ),
+      );
+      const body = buildEditRequest({
+        model,
+        mode,
+        instruction: instruction.value,
+        roles,
+        references,
+        controls: modelControls,
+        width: refSize.width,
+        height: refSize.height,
       });
-    const references = await Promise.all(
-      roles.map((role) => {
-        if (role === 'plain') {
-          return mode === 'outpaint'
-            ? encode(canvas, 'image/png')
-            : toDataUrl(working.blob, {
-                maxDimension: REFERENCE_MAX_SIDE,
-                maxBytes: REFERENCE_MAX_BYTES,
-              });
-        }
-        if (role === 'marked')
-          return encode(maskOverlay(canvas, mask!, MASK_COLOUR, MASK_ALPHA), 'image/png');
-        return encode(maskToRaster(mask!), 'image/png');
-      }),
-    );
-    const body = buildEditRequest({
-      model,
-      mode,
-      instruction: instruction.value,
-      roles,
-      references,
-      controls: modelControls,
-      width: canvas.width,
-      height: canvas.height,
-    });
-    return { working, canvas, mask, body };
+      return {
+        working,
+        mode,
+        canvas,
+        plan,
+        refSize,
+        mask: mode === 'inpaint' ? mask : null,
+        body,
+      };
+    } finally {
+      release(bitmap);
+    }
+  };
+
+  /**
+   * "Keep outside the mask" at full size: the result fitted onto the canvas (filling it when the shapes agree,
+   * else fitted inside and centred, never stretched) and laid in through the mask. Inpaint softens the inside of
+   * the mask; outpaint keeps the new area all result and softens the picture's side of the seam, so the grey
+   * filler never shows. Returns the PNG and whether the result had to be fitted.
+   */
+  const compositeKeepingOutside = async (
+    prepared: Prepared,
+    result: Blob,
+  ): Promise<{ blob: Blob; fitted: boolean }> => {
+    const { working, canvas, plan, refSize } = prepared;
+    const bitmap = await decode(working);
+    const answer = await loadImage(result);
+    try {
+      const picture = imageDataFrom(bitmap, { width: working.width, height: working.height });
+      const base = plan ? placeOnCanvas(picture, plan) : picture;
+      const radius = Math.round((settings.feather * canvas.width) / refSize.width);
+      const alphaFull = plan
+        ? outpaintAlpha(plan, working.width, working.height, radius)
+        : featherInside(scaleMask(prepared.mask!, canvas.width, canvas.height), radius);
+      const { width, height } = imageSize(answer);
+      const fit = fitResult(width, height, canvas.width, canvas.height);
+      const laid = drawToRaster(answer, canvas.width, canvas.height, { box: fit.box });
+      const alpha = fit.fill ? alphaFull : clipMask(alphaFull, fit.box);
+      return {
+        blob: await toBlob(compositeMasked(base, laid, alpha), { type: 'image/png' }),
+        fitted: !fit.fill,
+      };
+    } finally {
+      release(bitmap);
+      close(answer);
+    }
   };
 
   const run = async (signal: AbortSignal): Promise<void> => {
@@ -808,17 +951,16 @@ eread after a refresh elsewhere, never forcing the network. */
       }
     }
     const keep = settings.keepOutside && mode !== 'whole';
-    const featherRadius = settings.feather;
 
     // Everything is encoded before the run starts: a picture that cannot be read costs nothing.
-    let prepared: Awaited<ReturnType<typeof prepare>>;
+    let prepared: Prepared;
     try {
       prepared = await prepare(model, modelControls);
     } catch (error) {
       throw new InvalidInputError(`The picture could not be prepared (${userMessage(error)}).`);
     }
-    if (!prepared) return;
-    const { canvas, mask, body } = prepared;
+    const { body } = prepared;
+    const maskRevision = editor.revision();
 
     // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
     const handle = await ctx.beginRun(
@@ -827,6 +969,9 @@ eread after a refresh elsewhere, never forcing the network. */
       },
       signal,
     );
+    // From here until the version is shown, the picture, the version and the mask stay as they were sent.
+    editing = true;
+    modeChanged();
     const started = Date.now();
     ui.status(`${MODE_LABEL[mode]}…`);
     const ticker = setInterval(() => {
@@ -836,23 +981,11 @@ eread after a refresh elsewhere, never forcing the network. */
       const result = await ctx.api.images(body, { run: handle });
       const image = result.images[0]!;
       let blob = image.blob;
-      let size = { width: canvas.width, height: canvas.height };
-      if (keep && mask) {
-        // The result is scaled to the canvas and laid in through the mask: outside it, the original pixels.
-        const decoded = await loadImage(image.blob);
-        try {
-          const raster = imageDataFrom(decoded, size);
-          blob = await toBlob(compositeMasked(canvas, raster, featherInside(mask, featherRadius)), {
-            type: 'image/png',
-          });
-        } finally {
-          if ('close' in decoded) decoded.close();
-        }
-      } else {
-        const decoded = await loadImage(image.blob);
-        size = imageSize(decoded);
-        if ('close' in decoded) decoded.close();
-      }
+      let fitted = false;
+      if (keep) ({ blob, fitted } = await compositeKeepingOutside(prepared, image.blob));
+      const decoded = await loadImage(blob);
+      const size = imageSize(decoded);
+      close(decoded);
       const extension =
         blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/webp' ? 'webp' : 'png';
       const version = versions.add({
@@ -866,6 +999,9 @@ eread after a refresh elsewhere, never forcing the network. */
         model,
       });
       version.name = `${stemOf(originalName)}-v${version.number}.${extension}`;
+      const fitNote = fitted
+        ? 'The model answered in another shape than the picture: its result was fitted inside and centred, not stretched; check the edges.'
+        : null;
       cards.set(
         version.id,
         imageResultCard({
@@ -882,19 +1018,37 @@ eread after a refresh elsewhere, never forcing the network. */
             formatBytes(blob.size),
           ],
           formats: ['png', 'jpg', 'webp'],
-          extra: version.instruction
-            ? h('p', { class: 'small mb-0 text-break' }, shorten(version.instruction, 200))
-            : null,
+          extra: h(
+            'div',
+            { class: 'vstack gap-1 empty-hidden' },
+            version.instruction
+              ? h('p', { class: 'small mb-0 text-break' }, shorten(version.instruction, 200))
+              : null,
+            fitNote
+              ? h(
+                  'p',
+                  {
+                    class: 'small mb-0 text-warning-emphasis',
+                    role: 'note',
+                    'data-testid': 'editor-version-fitted',
+                  },
+                  fitNote,
+                )
+              : null,
+          ),
+          beforeRemove: () => !busyEditing('removing a version'),
           onRemove: () => void removeVersion(version.id),
           testId: 'editor-version',
         }),
       );
       clearInterval(ticker);
-      // Same size (inpaint, whole): the mask stays, cleared as one undoable step. Outpaint starts a new mask.
+      // The mask the user painted for this edit is cleared (one undoable step) only if it is still that one.
+      const maskUntouched = editor.revision() === maskRevision;
+      editing = false;
       await showVersion(version, true);
-      if (mode === 'inpaint') editor.clearMask();
+      if (mode === 'inpaint' && maskUntouched) editor.clearMask();
       const summary = `${versionLabel(version)} ready: ${MODE_LABEL[mode].toLowerCase()}, ${size.width} × ${size.height}`;
-      ui.status(summary);
+      ui.status(fitNote ? `${summary}. ${fitNote}` : summary);
       await handle.finish({
         output: `${summary}${keep ? ', outside the mask kept' : ''}.\nInstruction sent:\n${body.prompt}`,
         meta: {
@@ -902,6 +1056,7 @@ eread after a refresh elsewhere, never forcing the network. */
           width: size.width,
           height: size.height,
           keepOutside: keep,
+          fitted,
           version: version.number,
         },
       });
@@ -912,9 +1067,12 @@ eread after a refresh elsewhere, never forcing the network. */
       throw error;
     } finally {
       clearInterval(ticker);
+      if (editing) {
+        editing = false;
+        modeChanged();
+      }
     }
   };
-
   ui.runner({ label: 'Edit', icon: 'brush', run });
 
   // --- state -----------------------------------------------------------------------------------------------
@@ -952,7 +1110,9 @@ eread after a refresh elsewhere, never forcing the network. */
       if (!modelControls) return null;
       const working = versions.working;
       const plan = settings.mode === 'outpaint' ? currentPlan() : null;
-      const size = plan ?? (working ? { width: working.width, height: working.height } : null);
+      const canvas = plan ?? (working ? { width: working.width, height: working.height } : null);
+      // Priced at the size the model is sent and asked for (at most WORK_SIDE a side), not the full picture.
+      const size = canvas ? workSize(canvas) : null;
       return ctx.models.estimate({
         kind: 'image',
         model,
