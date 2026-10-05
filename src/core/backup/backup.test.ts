@@ -682,6 +682,69 @@ describe('merge details', () => {
     expect((await db.get('jobs', 'j2'))?.progress).toBe(0.5);
   });
 
+  it('prompts: the copy used more recently wins, so an older backup never overwrites newer local prompts', async () => {
+    const db = await getDb();
+    const prompt = (id: string, kind: 'saved' | 'recent', usedAt: number, text: string) => ({
+      id,
+      tool: 'chat' as const,
+      kind,
+      name: null,
+      text,
+      settings: {},
+      createdAt: 1,
+      usedAt,
+    });
+    await db.put('prompts', prompt('s1', 'saved', 300, 'local, newer'));
+    await db.put('prompts', prompt('s2', 'saved', 100, 'local, older'));
+    await db.put('prompts', prompt('r1', 'recent', 300, 'local, newer'));
+    const blob = backupBlob({
+      savedPrompts: [
+        prompt('s1', 'saved', 200, 'backup, older'),
+        prompt('s2', 'saved', 200, 'backup, newer'),
+      ],
+      recentPrompts: [prompt('r1', 'recent', 200, 'backup, older')],
+    });
+    const preview = await core.backup.import(blob, { mode: 'merge' });
+    expect(preview.changes).toEqual(['Settings unchanged', 'Update 1 saved prompt']);
+    expect((await db.get('prompts', 's1'))?.text).toBe('local, newer');
+    expect((await db.get('prompts', 's2'))?.text).toBe('backup, newer');
+    expect((await db.get('prompts', 'r1'))?.text).toBe('local, newer');
+  });
+
+  it('tool state: the copy written later wins', async () => {
+    const db = await getDb();
+    await db.put('kv', { key: 'tool:chat:thread:a', value: { v: 'local, newer' }, updatedAt: 300 });
+    await db.put('kv', { key: 'tool:chat:thread:b', value: { v: 'local, older' }, updatedAt: 100 });
+    const changed: string[] = [];
+    core.bus.on('tool-state-changed', ({ key }) => changed.push(key));
+    const blob = backupBlob({
+      toolState: [
+        { key: 'tool:chat:thread:a', value: { v: 'backup, older' }, updatedAt: 200 },
+        { key: 'tool:chat:thread:b', value: { v: 'backup, newer' }, updatedAt: 200 },
+      ],
+    });
+    const preview = await core.backup.import(blob, { mode: 'merge' });
+    expect(preview.changes).toEqual(['Settings unchanged', 'Update 1 tool state entry']);
+    expect((await db.get('kv', 'tool:chat:thread:a'))?.value).toEqual({ v: 'local, newer' });
+    expect((await db.get('kv', 'tool:chat:thread:b'))?.value).toEqual({ v: 'backup, newer' });
+    expect(changed).toEqual(['thread:b']);
+  });
+
+  it('merges favorites written under the old British names', async () => {
+    core.settings.update((d) => {
+      d.favoriteTools = ['ocr'];
+      d.models.favorites = ['x/local'];
+    });
+    const blob = backupBlob({
+      scope: 'settings',
+      settings: { favouriteTools: ['chat'], models: { favourites: ['a/b'] } },
+    });
+    const preview = await core.backup.import(blob, { mode: 'merge' });
+    expect(preview.changes[0]).toBe('Change 2 settings: favoriteTools, models.favorites');
+    expect(core.settings.get().favoriteTools).toEqual(['chat']);
+    expect(core.settings.get().models.favorites).toEqual(['a/b']);
+  });
+
   it('drops key pins, per-key budgets and the default key for keys this browser lacks', async () => {
     localStorage.setItem(LS_KEYS.keys, JSON.stringify(keysFile([{ id: 'k1', secret: 's' }])));
     const blob = backupBlob({
@@ -755,6 +818,47 @@ describe('validation of imported files', () => {
         'Skip 1 recent prompt (invalid records)',
       ]),
     );
+  });
+
+  it('skips records whose times are outside the range a date can hold', async () => {
+    const prompt = (id: string, usedAt: number) => ({
+      id,
+      tool: 'chat',
+      kind: 'saved',
+      name: null,
+      text: 'x',
+      settings: {},
+      createdAt: 1,
+      usedAt,
+    });
+    const blob = backupBlob({
+      createdAt: 1e20,
+      runs: [
+        runRecord('ok'),
+        runRecord('huge', { startedAt: 1e20 }),
+        runRecord('late', { finishedAt: 8.64e15 + 1 }),
+        runRecord('negative', { startedAt: -1 }),
+      ],
+      jobs: [jobRecord('j'), jobRecord('j-huge', { updatedAt: 1e20 })],
+      toolState: [
+        { key: 'tool:chat:a', value: 1, updatedAt: 1 },
+        { key: 'tool:chat:b', value: 1, updatedAt: 1e20 },
+      ],
+      savedPrompts: [prompt('p', 1), prompt('p-huge', 1e20)],
+    });
+    const preview = await core.backup.import(blob, { mode: 'merge' });
+    expect(preview.createdAt).toBe(0);
+    expect(preview.counts).toMatchObject({ runs: 1, jobs: 1, toolState: 1, prompts: 1 });
+    expect(preview.changes).toEqual(
+      expect.arrayContaining([
+        'Skip 3 runs (invalid records)',
+        'Skip 1 job (invalid records)',
+        'Skip 1 tool state entry (invalid records)',
+        'Skip 1 saved prompt (invalid records)',
+      ]),
+    );
+    const runs = await (await getDb()).getAll('runs');
+    expect(runs.map((r) => r.id)).toEqual(['ok']);
   });
 
   it('fills fields that older backups did not have', async () => {

@@ -7,9 +7,11 @@
  *   recent prompts, jobs, tool state and stats rows.
  * - Keys are included only on request, always as a passphrase envelope (crypto.ts) around the keys file
  *   from `core.keys.exportFile()`. With the key lock on, the secrets inside are encrypted a second time.
- * - Every record is validated field by field; invalid ones are skipped and counted in the preview.
+ * - Every record is validated field by field; invalid ones are skipped and counted in the preview. Times must
+ *   be ones a `Date` can hold (0 to 8.64e15 ms), or every page that draws them would throw.
  * - Import `merge`: only the settings present in the file override current ones. Records are added when
- *   missing; existing ones are replaced only by a newer copy (runs by `finishedAt`, jobs by `updatedAt`),
+ *   missing; existing ones are replaced only by a newer copy (runs by `finishedAt`, jobs and tool state by
+ *   `updatedAt`, prompts by `usedAt`; on a tie the local copy stays),
  *   a final run or job never goes back to an earlier state, a run that is running here is never touched,
  *   and stats rows keep the larger value of each field (a backup of this same device must not double
  *   count). Keys are merged only when both sides use the same passphrase lock (or there is no lock and no
@@ -132,12 +134,16 @@ const isToolId = (value: unknown): value is ToolId =>
   isString(value) && (TOOL_IDS as readonly string[]).includes(value);
 const isId = (value: unknown): value is string => isString(value) && value !== '';
 const isCount = (value: unknown): value is number => isFiniteNumber(value) && value >= 0;
+/** The largest time a `Date` can hold; beyond it `toISOString()` throws. */
+const MAX_TIME_MS = 8.64e15;
+const isTime = (value: unknown): value is number => isCount(value) && value <= MAX_TIME_MS;
 const orNull =
   <T>(check: (value: unknown) => value is T) =>
   (value: unknown): value is T | null =>
     value === null || check(value);
 const stringOrNull = orNull(isString);
 const numberOrNull = orNull(isFiniteNumber);
+const timeOrNull = orNull(isTime);
 const isStringList = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every(isString);
 /** A JSON-ish plain object, copied without unsafe keys. */
@@ -178,8 +184,8 @@ function toPrompt(value: unknown, kind: PromptEntry['kind']): PromptEntry | null
     !stringOrNull(name) ||
     !isString(text) ||
     !settings ||
-    !isFiniteNumber(createdAt) ||
-    !isFiniteNumber(usedAt)
+    !isTime(createdAt) ||
+    !isTime(usedAt)
   ) {
     return null;
   }
@@ -202,8 +208,8 @@ function toRun(value: unknown): RunRecord | null {
     !isStringList(v['models']) ||
     !isString(v['keyId']) ||
     !isString(v['keyName']) ||
-    !isFiniteNumber(v['startedAt']) ||
-    !numberOrNull(v['finishedAt']) ||
+    !isTime(v['startedAt']) ||
+    !timeOrNull(v['finishedAt']) ||
     !numberOrNull(v['latencyMs']) ||
     !isString(v['title']) ||
     !stringOrNull(v['prompt']) ||
@@ -275,8 +281,8 @@ function toJob(value: unknown): JobRecord | null {
     !numberOrNull(v['progress']) ||
     !stringOrNull(v['remoteStatus']) ||
     !stringOrNull(v['error']) ||
-    !isFiniteNumber(v['createdAt']) ||
-    !isFiniteNumber(v['updatedAt']) ||
+    !isTime(v['createdAt']) ||
+    !isTime(v['updatedAt']) ||
     !isCount(v['attempts'])
   ) {
     return null;
@@ -307,7 +313,7 @@ function toToolState(value: unknown): KvEntry | null {
   if (!isPlainObject(value)) return null;
   const { key, updatedAt } = value;
   if (!isString(key) || !key.startsWith(TOOL_STATE_PREFIX) || !('value' in value)) return null;
-  if (!isFiniteNumber(updatedAt)) return null;
+  if (!isTime(updatedAt)) return null;
   return { key, value: stripUnsafeKeys(value['value']), updatedAt };
 }
 
@@ -428,7 +434,7 @@ async function parseBackup(blob: Blob): Promise<ParsedBackup> {
   const all = scope === 'all';
   const none = { items: [], skipped: 0 };
   return {
-    createdAt: isFiniteNumber(data['createdAt']) ? data['createdAt'] : 0,
+    createdAt: isTime(data['createdAt']) ? data['createdAt'] : 0,
     appVersion: isString(data['appVersion']) ? data['appVersion'] : 'unknown',
     scope,
     settings: migrateSettings(data['settings']),
@@ -670,14 +676,19 @@ export function createBackupService(core: CoreServices): BackupService {
 
     const promptsById = new Map(localPrompts.map((p) => [p.id, p]));
     const promptsOf = (kind: PromptEntry['kind']) => localPrompts.filter((p) => p.kind === kind);
-    const takeIncoming = <T>(incoming: T): T => incoming;
+    /** The incoming copy only when it is newer by `time`; on a tie the local copy stays. */
+    const newer =
+      <T>(time: (item: T) => number) =>
+      (incoming: T, local: T): T | null =>
+        time(incoming) > time(local) ? incoming : null;
+    const usedLater = newer<PromptEntry>((p) => p.usedAt);
 
     plan(
       N.saved,
       file.savedPrompts,
       promptsOf('saved').length,
       (p) => promptsById.get(p.id),
-      takeIncoming,
+      usedLater,
       puts.prompts,
     );
     if (all) {
@@ -698,7 +709,7 @@ export function createBackupService(core: CoreServices): BackupService {
         file.recentPrompts,
         promptsOf('recent').length,
         (p) => promptsById.get(p.id),
-        takeIncoming,
+        usedLater,
         puts.prompts,
       );
       plan(
@@ -718,7 +729,7 @@ export function createBackupService(core: CoreServices): BackupService {
         file.toolState,
         toolKeys.length,
         (e) => localTool.get(e.key),
-        takeIncoming,
+        newer<KvEntry>((e) => e.updatedAt),
         puts.kv,
       );
       plan(
