@@ -4,7 +4,7 @@
  */
 import { formatCount, formatMs, formatUsd, plural } from '../../ui/format';
 import type { StopReason, TurnUsage } from './conversation';
-import type { Limits } from './loop';
+import { capReached, type Limits } from './loop';
 
 /** `123 in · 456 out · $0.0012 · 1.4 s`; `free` on a free model, `≈` for estimated or unknown costs. */
 export function usageLine(usage: TurnUsage | undefined, free: boolean): string {
@@ -36,7 +36,7 @@ export function endText(
     case 'time':
       return `Time limit reached (${formatMs(limits.timeMs)}).`;
     case 'cost':
-      return spentUsd >= limits.costUsd
+      return capReached(spentUsd, limits.costUsd)
         ? `Cost cap reached: ${formatUsd(spentUsd)} spent of ${formatUsd(limits.costUsd)}.`
         : `Cost cap: the next turn could pass ${formatUsd(limits.costUsd)} (${formatUsd(spentUsd)} spent).`;
     case 'phrase':
@@ -65,15 +65,4 @@ export function initials(name: string): string {
   }
   const chars = letters(words[0]!);
   return (chars[0]!.toUpperCase() + (chars[1] ?? '').toLowerCase()).trim();
-}
-
-/** Elapsed time as a clock: `0:42`, `4:05`, `1:02:09`. */
-export function clock(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const seconds = String(total % 60).padStart(2, '0');
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}`
-    : `${minutes}:${seconds}`;
 }

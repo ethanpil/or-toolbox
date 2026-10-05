@@ -223,6 +223,7 @@ export function entrySignature(entry: Entry, ctx: EntryContext): string {
     streaming ? Boolean(entry.content) : entry.content,
     entry.status ?? '',
     entry.error ?? '',
+    entry.outcomeUnknown === true,
     entry.usage ?? null,
     entry.trimmed ?? 0,
     entry.edited === true,
@@ -232,6 +233,17 @@ export function entrySignature(entry: Entry, ctx: EntryContext): string {
     editing,
     editing ? ctx.after(entry.id) : 0,
   ]);
+}
+
+/**
+ * What a failed turn says. One that may have gone through (the connection dropped after sending) must not invite a
+ * plain retry: it may already be billed.
+ */
+export function failureNote(entry: Pick<Entry, 'error' | 'outcomeUnknown'>): string {
+  const error = entry.error ?? 'The turn failed.';
+  return entry.outcomeUnknown
+    ? `${error} It may have gone through and been billed: check your OpenRouter activity before resuming.`
+    : `${error} Resume to try again.`;
 }
 
 const STATUS_BADGES: Partial<
@@ -347,7 +359,7 @@ function botView(entry: Entry, ctx: EntryContext): EntryView {
               'data-testid': 'turn-error',
             },
             icon('exclamation-octagon'),
-            h('span', null, `${entry.error ?? 'The turn failed.'} Resume to try again.`),
+            h('span', null, failureNote(entry)),
           )
         : null,
       editing || streaming ? null : footer(entry, ctx, !failed),

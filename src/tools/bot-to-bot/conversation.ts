@@ -52,6 +52,8 @@ export interface Entry {
   model?: string;
   status?: TurnStatus;
   error?: string;
+  /** A failed turn whose request may have gone through and been billed (`isOutcomeUnknown`). */
+  outcomeUnknown?: boolean;
   usage?: TurnUsage;
   /** Bot turns: earlier entries left out of this turn's context to fit the model's window. */
   trimmed?: number;
@@ -71,6 +73,11 @@ export interface Conversation {
   version: number;
   id: string;
   rev: number;
+  /**
+   * New on every stored write: tabs tell versions apart by it (two tabs can write the same `rev`). A tab that is
+   * idle and has no write pending shows the stored version whenever its `writeId` differs.
+   */
+  writeId?: string;
   createdAt: number;
   updatedAt: number;
   first: Speaker;
@@ -246,6 +253,7 @@ function parseEntry(value: unknown): Entry | null {
   entry.model = model;
   entry.status = oneOf(status, TURN_STATUSES) ? status : 'done';
   if (isString(value['error'])) entry.error = value['error'];
+  if (value['outcomeUnknown'] === true) entry.outcomeUnknown = true;
   const usage = parseUsage(value['usage']);
   if (usage) entry.usage = usage;
   if (count(value['trimmed']) > 0) entry.trimmed = Math.floor(count(value['trimmed']));
@@ -289,6 +297,7 @@ export function parseConversation(value: unknown): Conversation | null {
     version: CONVERSATION_VERSION,
     id,
     rev: count(value['rev']),
+    ...(isString(value['writeId']) ? { writeId: value['writeId'] } : {}),
     createdAt: count(value['createdAt']),
     updatedAt: count(value['updatedAt']),
     first: oneOf(value['first'], SPEAKERS) ? value['first'] : 'a',

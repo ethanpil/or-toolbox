@@ -14,16 +14,23 @@
  * personas and models are fixed for a run; the limits are read live (a limit raised while paused applies on
  * Resume). The loop and the stop conditions are in loop.ts.
  *
- * **Persistence.** The conversation (text only) is the tool state `conversation`; every change bumps its `rev`. It
- * survives a reload, coming back paused (a turn cut off by the reload keeps its text as stopped). A tab that is not
- * running follows a newer stored version; the tab that runs a conversation holds the Web Lock
- * `ortoolbox:bot-to-bot:<id>`, so no second tab can run it at the same time. A run in progress is guarded by the
- * shell's leave guard (`runs.active()`).
+ * **Persistence.** The conversation (text only) is the tool state `conversation`; every write bumps its `rev` and
+ * gives it a new `writeId`. It survives a reload, coming back paused (a turn cut off by the reload keeps its text as
+ * stopped). One Web Lock for the whole tool (`ortoolbox:bot-to-bot`) is held by the tab that runs the conversation
+ * and, briefly, by a tab that changes it (a moderator message, an edit, New conversation, Undo): while another tab
+ * holds it, this one refuses to change or run the conversation and says so. After taking the lock a run reads the
+ * stored version again and adopts a newer one. A tab that is idle with no write pending shows whatever is stored
+ * (an announcement that arrives during its own write is caught up afterwards). A data reset drops the conversation
+ * and nothing written before it is written again. A run in progress is guarded by the leave guard.
+ *
+ * Loading a setup (History's Re-run, a saved prompt, the sample) never saves it as the user's options, and one
+ * with another opening prompt sets the current conversation aside (with Undo): the opener starts a conversation.
  *
  * The transcript is a labelled region, not a live region: turn starts, ends and stops go through `ui.status`.
  * Entries are redrawn only when their signature changes (view.ts); the run's state never rebuilds them.
  */
-import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
+import { toJsonBlob } from '../../core/export/table';
+import { InvalidInputError, isAbortError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import { webLocks } from '../../core/jobs/index';
 import { excerpt } from '../../core/runs/index';
 import type { ModelInfo, RunHandle, Usage } from '../../core/types';
@@ -38,7 +45,7 @@ import { announce } from '../../ui/feedback/announce';
 import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
 import { modalOpen } from '../../ui/feedback/modal';
 import { toast } from '../../ui/feedback/toast';
-import { formatMs, formatShortcut, formatUsd, plural } from '../../ui/format';
+import { formatDuration, formatMs, formatShortcut, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
@@ -62,11 +69,13 @@ import {
   turnCount,
   type TurnUsage,
   undoEdit,
+  type EditUndo,
 } from './conversation';
 import { toJson, toMarkdown } from './export';
-import { clock, END_TITLES, endText } from './format';
+import { END_TITLES, endText } from './format';
 import {
   blockedBy,
+  capReached,
   type Limits,
   type LoopEnd,
   type LoopMode,
@@ -82,6 +91,7 @@ import {
   entrySignature,
   entryView,
   type EntryView,
+  failureNote,
   prerender,
 } from './view';
 
@@ -204,7 +214,8 @@ export const SAMPLE = {
   models: ['qwen/qwen3.8-27b:free', 'nvidia/nemotron-3-super-120b-a12b:free'],
 } as const;
 
-type Action = 'start' | 'resume' | 'step';
+/** The runner's argument: Step runs one turn; no argument is Start or Resume. */
+type Action = 'step';
 
 /** A run handle that also tells `tap` about every usage the API client reports (a turn's own usage). */
 function tapUsage(run: RunHandle, tap: (usage: Usage) => void): RunHandle {
@@ -239,13 +250,17 @@ export function turnUsage(
   };
 }
 
-/** Holds the conversation's Web Lock until the returned release is called; null when another tab holds it. */
-function lockConversation(id: string): Promise<(() => void) | null> {
+/** One lock for the whole tool: there is one stored conversation, whatever its id. */
+const LOCK_NAME = 'ortoolbox:bot-to-bot';
+const OTHER_TAB = 'The conversation is running in another tab. Pause or stop it there first.';
+
+/** Holds the tool's Web Lock until the returned release is called; null when another tab holds it. */
+function lockConversation(): Promise<(() => void) | null> {
   const locks = webLocks();
   if (!locks) return Promise.resolve(() => undefined);
   return new Promise((resolve) => {
     locks
-      .request(`ortoolbox:bot-to-bot:${id}`, { ifAvailable: true }, (lock) => {
+      .request(LOCK_NAME, { ifAvailable: true }, (lock) => {
         if (!lock) {
           resolve(null);
           return undefined;
@@ -314,9 +329,14 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   });
   const transcript = (conv: Conversation): string => toMarkdown(conv, exportContext());
 
-  const saveParams = (): void => {
+  /**
+   * Saves what the user changed as the tool's options: only the given fields. A loaded setup (a sample, a link,
+   * History, a saved prompt) is never saved by itself: `applyState` changes the form for this visit only.
+   */
+  const saveParams = (...keys: (keyof BotsParams)[]): void => {
+    const all = settingsOf(params);
     try {
-      ctx.options.set(settingsOf(params));
+      ctx.options.set(Object.fromEntries(keys.map((key) => [key, all[key]])));
     } catch (error) {
       void presentError(error);
     }
@@ -324,46 +344,115 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
 
   // --- persistence --------------------------------------------------------------------------------------------
   let writes: Promise<void> = Promise.resolve();
-  /** Writes of this tab not stored yet: changes announced meanwhile are this tab's own. */
+  /** Writes of this tab not stored yet: an announcement meanwhile is caught up once they are (`followStale`). */
   let pendingWrites = 0;
+  /** A data reset bumps it: nothing queued or read before a reset is written or shown after it. */
+  let epoch = 0;
+  /** Another tab announced a change this tab could not look at yet (busy, or writing): look once it can. */
+  let followStale = false;
   const queueWrite = (write: () => Promise<void>): void => {
+    const mine = epoch;
     pendingWrites++;
     writes = writes
-      .then(write)
+      .then(() => (mine === epoch ? write() : undefined))
       .catch((error: unknown) => void presentError(error))
       .finally(() => {
         pendingWrites--;
+        if (pendingWrites === 0 && followStale) void followStore();
       });
   };
-  /** Stores the conversation as it is now (a copy: a streaming turn keeps changing). */
+  /** Stores the conversation as it is now (a copy: a streaming turn keeps changing), as a new version. */
   const persist = (): void => {
     const conv = conversation;
     if (!conv) return;
     conv.rev += 1;
+    conv.writeId = newId();
     const copy = structuredClone(conv);
     queueWrite(() => ctx.state.set(STATE_KEY, copy));
   };
 
-  // Another tab changed the stored conversation: follow it, unless this tab runs it (its writes win).
+  /** The same stored version: both absent, or the same conversation, rev and write. */
+  const sameVersion = (a: Conversation | null, b: Conversation | null): boolean =>
+    a === null || b === null
+      ? a === b
+      : a.id === b.id && a.rev === b.rev && a.writeId === b.writeId;
+
+  const readStored = async (): Promise<Conversation | null> =>
+    parseConversation(await ctx.state.get(STATE_KEY));
+
+  /** Shows a version another tab stored (the editor stays open while its entry is still there). */
+  const adopt = (stored: Conversation | null): void => {
+    conversation = stored;
+    renderAll();
+    void ui.refreshEstimate();
+  };
+
+  /** An idle tab with nothing pending shows what is stored; a busy or writing one looks again when it can. */
+  async function followStore(): Promise<void> {
+    if (runState.busy || pendingWrites > 0) {
+      followStale = true;
+      return;
+    }
+    followStale = false;
+    const mine = epoch;
+    const stored = await readStored();
+    if (mine !== epoch) return;
+    if (runState.busy || pendingWrites > 0) {
+      followStale = true;
+      return;
+    }
+    if (!sameVersion(stored, conversation)) adopt(stored);
+  }
+
   ctx.bus.on('tool-state-changed', (event) => {
     if (event.tool !== ctx.manifest.id || event.key !== STATE_KEY) return;
-    if (runState.busy || pendingWrites > 0) return;
-    void (async () => {
-      const stored = parseConversation(await ctx.state.get(STATE_KEY));
-      if (runState.busy || pendingWrites > 0) return;
-      if (!stored) {
-        if (!conversation) return;
-        conversation = null;
-      } else if (conversation && stored.id === conversation.id && stored.rev <= conversation.rev) {
-        return;
-      } else {
-        conversation = stored;
-      }
-      editing = null;
-      renderAll();
-      void ui.refreshEstimate();
-    })().catch(() => undefined);
+    followStore().catch(() => undefined);
   });
+
+  /**
+   * Changes the conversation (a moderator message, an edit, New conversation, an Undo) only while no other tab
+   * runs it: under the tool's lock, held until the change is stored. The tab that runs it already holds the lock.
+   * False (and said) when another tab holds it.
+   */
+  async function whileUnlocked(change: () => void): Promise<boolean> {
+    if (runState.busy) {
+      change();
+      return true;
+    }
+    const release = await lockConversation();
+    if (!release) {
+      toast({ variant: 'warning', message: OTHER_TAB, testId: 'bots-other-tab' });
+      return false;
+    }
+    try {
+      change();
+      await writes;
+    } finally {
+      release();
+    }
+    return true;
+  }
+
+  // A data reset (Settings → Data, any tab) wipes the stored conversation: drop this tab's copy, never write it
+  // back, and stop a run in progress (the core discards it too).
+  ctx.bus.on('data-reset', () => {
+    epoch++;
+    // A write already under way may land after the wipe: remove what it stored once it has.
+    if (pendingWrites > 0) queueWrite(() => ctx.state.delete(STATE_KEY));
+    conversation = null;
+    editing = null;
+    followStale = false;
+    params = paramsFrom(ctx.options.get());
+    runner.stop();
+    renderParams();
+    renderAll();
+  });
+
+  /** Fields whose change re-arms the time limit of a turn in flight. */
+  const limitListeners = new Set<() => void>();
+  const limitsChanged = (): void => {
+    for (const fn of [...limitListeners]) fn();
+  };
 
   // --- setup form (input zone) --------------------------------------------------------------------------------
   interface BotFields {
@@ -408,7 +497,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         params[key].name = name.value;
         setupChanged();
       },
-      onchange: () => saveParams(),
+      onchange: () => saveParams(key),
     });
     const persona = h('textarea', {
       id: ids.persona,
@@ -420,7 +509,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         params[key].persona = persona.value;
         setupChanged();
       },
-      onchange: () => saveParams(),
+      onchange: () => saveParams(key),
     });
     const modelButton = h('button', {
       type: 'button',
@@ -512,6 +601,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     'data-testid': 'tool-prompt',
     oninput: () => estimateSoon(),
   });
+  /** Says what the field does now: it starts a conversation; an open one keeps its own opener. */
+  const openerHintEl = h('div', {
+    id: openerHint,
+    class: 'form-text',
+    'data-testid': 'bots-opener-hint',
+  });
 
   const firstName = uid('first');
   const firstInputs = {} as Record<Speaker, HTMLInputElement>;
@@ -529,7 +624,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       onchange: () => {
         if (!input.checked) return;
         params.first = speaker;
-        saveParams();
+        saveParams('first');
         setupChanged();
       },
     });
@@ -583,67 +678,68 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       params.stopPhrase = phraseInput.value;
       setupChanged();
     },
-    onchange: () => saveParams(),
+    onchange: () => saveParams('stopPhrase'),
   });
 
-  /** Reads a number field, clamped (written back when it changed); null when empty or not a number. */
-  const readNumber = (
-    input: HTMLInputElement,
-    range: { min: number; max: number },
-    integer: boolean,
-  ): number | null => {
-    if (input.value.trim() === '') return null;
-    const value = Number(input.value);
-    if (!Number.isFinite(value)) return null;
-    const clamped = Math.min(range.max, Math.max(range.min, integer ? Math.round(value) : value));
-    if (clamped !== value) input.value = String(clamped);
-    return clamped;
+  /** A number field bound to one parameter (`null` allowed only where the parameter takes it: Max tokens). */
+  interface NumberBinding {
+    input: HTMLInputElement;
+    key: 'turnLimit' | 'timeLimitMinutes' | 'costCapUsd' | 'maxTokens';
+    range: { min: number; max: number };
+    integer: boolean;
+  }
+  /**
+   * Takes a number field's value into `params`, clamped and written back; an unusable one is replaced by the value
+   * in force. Done on `change` and again at the start of every run: Ctrl/Cmd+Enter starts one without a blur, so a
+   * value typed and not yet committed must still count. (Not on every keystroke: typing "25" over "20" would
+   * briefly set a running conversation's limit to 2.) True when the value changed.
+   */
+  const commitNumber = (binding: NumberBinding): boolean => {
+    const { input, key, range, integer } = binding;
+    const before = params[key];
+    const text = input.value.trim();
+    if (text === '' && key === 'maxTokens') {
+      params.maxTokens = null;
+    } else {
+      const value = Number(text);
+      if (text !== '' && Number.isFinite(value)) {
+        params[key] = Math.min(range.max, Math.max(range.min, integer ? Math.round(value) : value));
+      }
+      input.value = params[key] === null ? '' : String(params[key]);
+    }
+    if (params[key] === before) return false;
+    if (key === 'timeLimitMinutes') limitsChanged();
+    return true;
   };
-  const limitChanged =
-    (
-      input: HTMLInputElement,
-      range: { min: number; max: number },
-      integer: boolean,
-      apply: (value: number) => void,
-      current: () => number,
-    ) =>
-    (): void => {
-      const value = readNumber(input, range, integer);
-      if (value === null) input.value = String(current());
-      else apply(value);
-      saveParams();
+  const numberBindings: NumberBinding[] = [];
+  const bindNumber = (binding: NumberBinding): void => {
+    numberBindings.push(binding);
+    binding.input.addEventListener('change', () => {
+      commitNumber(binding);
+      saveParams(binding.key);
       setupChanged();
-    };
-  turnsField.input.addEventListener(
-    'change',
-    limitChanged(
-      turnsField.input,
-      RANGES.turnLimit,
-      true,
-      (v) => (params.turnLimit = v),
-      () => params.turnLimit,
-    ),
-  );
-  timeField.input.addEventListener(
-    'change',
-    limitChanged(
-      timeField.input,
-      RANGES.timeLimitMinutes,
-      false,
-      (v) => (params.timeLimitMinutes = v),
-      () => params.timeLimitMinutes,
-    ),
-  );
-  costField.input.addEventListener(
-    'change',
-    limitChanged(
-      costField.input,
-      RANGES.costCapUsd,
-      false,
-      (v) => (params.costCapUsd = v),
-      () => params.costCapUsd,
-    ),
-  );
+    });
+  };
+  /** Every number field as it reads now (before a run): what Ctrl/Cmd+Enter runs with. */
+  const commitNumbers = (): void => {
+    const changed = numberBindings.filter((binding) => commitNumber(binding));
+    if (changed.length === 0) return;
+    saveParams(...changed.map((binding) => binding.key));
+    setupChanged();
+  };
+  bindNumber({ input: turnsField.input, key: 'turnLimit', range: RANGES.turnLimit, integer: true });
+  bindNumber({
+    input: timeField.input,
+    key: 'timeLimitMinutes',
+    range: RANGES.timeLimitMinutes,
+    integer: false,
+  });
+  bindNumber({
+    input: costField.input,
+    key: 'costCapUsd',
+    range: RANGES.costCapUsd,
+    integer: false,
+  });
 
   const limitColumn = (
     field: { input: HTMLInputElement; id: string; label: string },
@@ -736,11 +832,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       { class: 'd-flex flex-column' },
       h('label', { class: 'form-label fw-semibold', htmlFor: openerId }, 'Opening prompt'),
       openerField,
-      h(
-        'div',
-        { id: openerHint, class: 'form-text' },
-        'Both bots see it as the moderator’s first message. It starts a new conversation.',
-      ),
+      openerHintEl,
     ),
     h(
       'fieldset',
@@ -787,12 +879,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     inputMode: 'numeric',
     'aria-describedby': `${maxTokensId}-hint`,
     'data-testid': 'bots-max-tokens',
-    onchange: () => {
-      params.maxTokens = readNumber(maxTokensInput, RANGES.maxTokens, true);
-      saveParams();
-      setupChanged();
-    },
   });
+  bindNumber({ input: maxTokensInput, key: 'maxTokens', range: RANGES.maxTokens, integer: true });
   ui.drawer.append(
     h(
       'div',
@@ -840,15 +928,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         label: 'JSON',
         extension: 'json',
         icon: 'filetype-json',
-        build: () =>
-          new Blob(
-            [
-              conversation
-                ? `${JSON.stringify(toJson(conversation, exportContext()), null, 2)}\n`
-                : '',
-            ],
-            { type: 'application/json' },
-          ),
+        build: () => toJsonBlob(conversation ? toJson(conversation, exportContext()) : null),
       },
     ],
   });
@@ -860,7 +940,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
       'data-testid': 'bots-new',
       onclick: () => {
-        if (clearButton.getAttribute('aria-disabled') !== 'true') clearConversation();
+        if (clearButton.getAttribute('aria-disabled') !== 'true') void clearConversation();
       },
     },
     icon('plus-lg'),
@@ -933,7 +1013,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       type: 'button',
       class: 'btn btn-outline-primary d-inline-flex align-items-center gap-2',
       'data-testid': 'moderator-send',
-      onclick: () => inject(),
+      onclick: () => void inject(),
     },
     icon('megaphone'),
     'Send',
@@ -943,7 +1023,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     // Enter (and Ctrl/Cmd+Enter, never the page's Run shortcut here) sends.
     event.preventDefault();
     event.stopPropagation();
-    inject();
+    void inject();
   });
 
   ui.output.append(
@@ -1179,7 +1259,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     );
     setTile(
       timeTile.tile,
-      `${clock(elapsed)} / ${clock(limits.timeMs)}`,
+      `${formatDuration(elapsed / 1000)} / ${formatDuration(limits.timeMs / 1000)}`,
       elapsed / limits.timeMs,
       `${formatMs(elapsed)} of ${formatMs(limits.timeMs)}`,
     );
@@ -1226,14 +1306,28 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           : ['Paused', 'warning'];
     stateBadge.textContent = text;
     stateBadge.className = `badge rounded-pill text-bg-${tone}`;
+    openerHintEl.textContent = conversation
+      ? 'Used by your next conversation: this one keeps its own (edit it in the transcript). New conversation starts with this one.'
+      : 'Both bots see it as the moderator’s first message.';
     fixBarFocus();
   };
 
-  /** Keeps the newest text in view while it arrives, unless the reader scrolled up. */
+  /**
+   * Whether the reader is at the end of the transcript, measured when they scroll (never after the content grew:
+   * a render adding a lot would otherwise look like scrolling up). Our own scrolls do not count.
+   */
+  let pinned = true;
+  let ownScrollTop = -1;
+  log.addEventListener('scroll', () => {
+    if (pinned && log.scrollTop === ownScrollTop) return;
+    pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  });
+  /** Keeps the newest text in view while it arrives, unless the reader scrolled up (`force`: the user acted). */
   const follow = (force = false): void => {
-    if (force || log.scrollHeight - log.scrollTop - log.clientHeight < 120) {
-      log.scrollTop = log.scrollHeight;
-    }
+    if (!force && !pinned) return;
+    log.scrollTop = log.scrollHeight;
+    ownScrollTop = log.scrollTop;
+    pinned = true;
   };
 
   const entryActions = {
@@ -1249,7 +1343,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       renderLog();
       focusKey(log, `edit-button:${entry.id}`);
     },
-    save: (entry: Entry, text: string) => saveEdit(entry, text),
+    save: (entry: Entry, text: string) => void saveEdit(entry, text),
   };
 
   const entryContext = (): EntryContext => ({
@@ -1364,14 +1458,14 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     const bot = params[BOT_KEY[speaker]];
     if (bot.model === model) return;
     bot.model = model;
-    saveParams();
+    saveParams(BOT_KEY[speaker]);
     setupChanged();
     if (model === null) fields[speaker].modelButton.focus();
     const shown = modelOf(speaker);
     announce(`${nameOf(speaker)} now uses ${shown ? modelName(shown) : 'no model'}.`);
   }
 
-  function inject(): void {
+  async function inject(): Promise<void> {
     if (!conversation) return;
     const text = modInput.value.trim();
     if (!text) {
@@ -1379,19 +1473,23 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       modInput.focus();
       return;
     }
-    conversation.entries.push({
-      id: newId(),
-      kind: 'moderator',
-      content: text,
-      createdAt: Date.now(),
+    const added = await whileUnlocked(() => {
+      if (!conversation) return;
+      conversation.entries.push({
+        id: newId(),
+        kind: 'moderator',
+        content: text,
+        createdAt: Date.now(),
+      });
+      touch(conversation);
+      persist();
+      modInput.value = '';
+      renderLog();
+      renderControls();
+      follow(true);
+      void ui.refreshEstimate();
     });
-    touch(conversation);
-    persist();
-    modInput.value = '';
-    renderLog();
-    renderControls();
-    follow(true);
-    void ui.refreshEstimate();
+    if (!added) return;
     announce(
       runState.busy
         ? 'Moderator message added. The next bot to speak sees it.'
@@ -1399,86 +1497,125 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     );
   }
 
-  function saveEdit(entry: Entry, text: string): void {
+  async function saveEdit(entry: Entry, text: string): Promise<void> {
     if (runState.busy || !conversation) return;
-    const conv = conversation;
     const written = text.trim();
     if (!written) {
       ui.status('A message cannot be empty.');
       return;
     }
-    const undo = editEntry(conv, entry.id, written);
-    editing = null;
-    if (!undo) {
-      renderLog();
-      return;
-    }
-    touch(conv);
-    persist();
-    renderAll();
-    focusKey(log, `edit-button:${entry.id}`);
-    void ui.refreshEstimate();
-    if (undo.removed.length === 0) {
+    let undo: EditUndo | null = null;
+    const conv = conversation;
+    // Refused (another tab runs it): the editor stays open with what was typed.
+    const saved = await whileUnlocked(() => {
+      if (conversation !== conv) return;
+      undo = editEntry(conv, entry.id, written);
+      editing = null;
+      if (!undo) {
+        renderLog();
+        return;
+      }
+      touch(conv);
+      persist();
+      renderAll();
+      focusKey(log, `edit-button:${entry.id}`);
+      void ui.refreshEstimate();
+    });
+    const done = undo as EditUndo | null;
+    if (!saved || !done) return;
+    if (done.removed.length === 0) {
       announce('Message edited. Resume carries on from here.');
       return;
     }
     toast({
-      message: `Message edited; ${plural(undo.removed.length, 'message')} after it removed.`,
+      message: `Message edited; ${plural(done.removed.length, 'message')} after it removed.`,
       testId: 'bots-edit-toast',
       action: {
         label: 'Undo',
         testId: 'toast-undo',
-        onClick: () => {
-          if (runState.busy || conversation !== conv || !undoEdit(conv, undo)) {
-            toast({
-              variant: 'warning',
-              message: 'The messages cannot come back: the conversation went on since.',
-              testId: 'undo-refused',
-            });
-            return;
-          }
-          touch(conv);
-          persist();
-          renderAll();
-          void ui.refreshEstimate();
-          announce('Edit undone.');
-        },
+        onClick: () => void undoEditPressed(conv, done),
       },
     });
   }
 
-  function clearConversation(): void {
-    if (runState.busy || !conversation) return;
-    const removed = conversation;
-    conversation = null;
-    editing = null;
-    queueWrite(() => ctx.state.delete(STATE_KEY));
-    renderAll();
-    void ui.refreshEstimate();
-    primaryButton.focus();
-    toast({
-      message: 'Conversation cleared. Start begins a new one.',
-      testId: 'bots-cleared-toast',
-      action: {
-        label: 'Undo',
-        testId: 'toast-undo',
-        onClick: () => {
-          if (conversation) {
-            toast({
-              variant: 'warning',
-              message: 'The conversation cannot come back: a new one was started since.',
-              testId: 'undo-refused',
-            });
-            return;
-          }
-          conversation = removed;
-          persist();
-          renderAll();
-          void ui.refreshEstimate();
-          announce('Conversation restored.');
-        },
-      },
+  async function undoEditPressed(conv: Conversation, undo: EditUndo): Promise<void> {
+    let undone = false;
+    const allowed = await whileUnlocked(() => {
+      if (runState.busy || conversation !== conv || !undoEdit(conv, undo)) return;
+      undone = true;
+      touch(conv);
+      persist();
+      renderAll();
+      // The toast's button goes away: focus goes back to the turn the edit was on.
+      if (!focusKey(log, `edit-button:${undo.id}`)) primaryButton.focus();
+      void ui.refreshEstimate();
     });
+    if (!allowed) return;
+    if (!undone) {
+      toast({
+        variant: 'warning',
+        message: 'The messages cannot come back: the conversation went on since.',
+        testId: 'undo-refused',
+      });
+      return;
+    }
+    announce('Edit undone.');
+  }
+
+  /**
+   * Clears the conversation (New conversation, or a loaded setup with another opener: `message` says which), with
+   * Undo while nothing new was started.
+   */
+  async function clearConversation(
+    message = 'Conversation cleared. Start begins a new one.',
+  ): Promise<void> {
+    if (runState.busy || !conversation) return;
+    let removed: Conversation | null = null;
+    const cleared = await whileUnlocked(() => {
+      if (runState.busy || !conversation) return;
+      removed = conversation;
+      conversation = null;
+      editing = null;
+      queueWrite(() => ctx.state.delete(STATE_KEY));
+      renderAll();
+      // New conversation turned itself off: Start is next.
+      const active = document.activeElement;
+      if (!active || active === document.body || clearButton.contains(active)) {
+        primaryButton.focus();
+      }
+      void ui.refreshEstimate();
+    });
+    const previous = removed as Conversation | null;
+    if (!cleared || !previous) return;
+    toast({
+      message,
+      testId: 'bots-cleared-toast',
+      action: { label: 'Undo', testId: 'toast-undo', onClick: () => void undoClear(previous) },
+    });
+  }
+
+  async function undoClear(previous: Conversation): Promise<void> {
+    let restored = false;
+    const allowed = await whileUnlocked(() => {
+      if (conversation) return;
+      conversation = previous;
+      restored = true;
+      persist();
+      renderAll();
+      // The toast's button goes away: focus goes to Resume.
+      primaryButton.focus();
+      void ui.refreshEstimate();
+    });
+    if (!allowed) return;
+    if (!restored) {
+      toast({
+        variant: 'warning',
+        message: 'The conversation cannot come back: a new one was started since.',
+        testId: 'undo-refused',
+      });
+      return;
+    }
+    announce('Conversation restored.');
   }
 
   // --- estimates ---------------------------------------------------------------------------------------------
@@ -1504,23 +1641,32 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
    * The cost of `speaker`'s next turn, assuming `ahead` turns to go: the prompt grows by up to one full reply per
    * turn, so the last of them is the dearest (within the context window). Null when the price is unknown.
    */
-  async function turnEstimate(
+  async function planTurn(
     conv: Pick<Conversation, 'entries'>,
     speaker: Speaker,
     model: string,
     bots: Record<Speaker, BotProfile>,
     ahead = 1,
-  ): Promise<number | null> {
+  ): Promise<{ built: BuiltTurn; cost: number | null }> {
     const info = await modelInfo(model);
     const built = buildTurn(conv, speaker, turnOptions(model, info, bots));
     const window = info?.contextLength && info.contextLength > 0 ? info.contextLength : Infinity;
     const grown = built.promptTokens + Math.max(0, ahead - 1) * built.completionTokens;
-    return costOf(
+    const cost = await costOf(
       model,
       Math.min(grown, Math.max(window, built.promptTokens)),
       built.completionTokens,
     );
+    return { built, cost };
   }
+  const turnEstimate = async (...args: Parameters<typeof planTurn>): Promise<number | null> =>
+    (await planTurn(...args)).cost;
+
+  /** Refused before sending: even with older messages left out, the next turn does not fit. */
+  const tooLong = (model: string): InvalidInputError =>
+    new InvalidInputError(
+      `This conversation is too long for ${modelName(model)}: even with older messages left out it does not fit the model's context window. Shorten the opening prompt or the last message, or choose a model with a larger window.`,
+    );
 
   /** What a Start/Resume (or a Step) may cost at most: min(cap left, per-turn estimate × turns left). */
   async function runEstimate(
@@ -1560,7 +1706,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       timeField.input.focus();
     } else {
       ui.status(
-        progress.spentUsd > 0 && progress.spentUsd >= limits.costUsd
+        capReached(progress.spentUsd, limits.costUsd)
           ? `The cost cap is reached (${formatUsd(progress.spentUsd)} of ${formatUsd(limits.costUsd)}). ${raise}`
           : `The next turn (≈ ${formatUsd(nextEstimate ?? 0)}) could pass the cost cap (${formatUsd(progress.spentUsd)} spent of ${formatUsd(limits.costUsd)}). ${raise}`,
       );
@@ -1570,8 +1716,21 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
 
   async function perform(requested: Action | undefined, signal: AbortSignal): Promise<void> {
     const mode: LoopMode = requested === 'step' ? 'step' : 'continue';
-    const creating = conversation === null;
-    if (creating && !openerField.value.trim()) {
+    // What the fields say now: Ctrl/Cmd+Enter starts a run without the blur that commits them.
+    commitNumbers();
+    // An open editor with changes is never thrown away by a run; an unchanged one just closes.
+    if (editing) {
+      const open = editing;
+      const entry = conversation?.entries.find((item) => item.id === open.id);
+      if (entry && open.text.trim() !== entry.content.trim()) {
+        ui.status('Save or cancel your edit first.');
+        focusKey(log, `edit:${open.id}`);
+        return;
+      }
+      editing = null;
+      renderLog();
+    }
+    if (!conversation && !openerField.value.trim()) {
       ui.status('Write an opening prompt first.');
       openerField.focus();
       return;
@@ -1589,26 +1748,34 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     }
     const models: Record<Speaker, string> = { a, b };
     const bots = botRecords(models);
-    const draft =
-      conversation ??
-      createConversation({ opener: openerField.value.trim(), first: params.first, bots });
-    // Who speaks first follows the form until somebody has spoken.
-    const first = turnCount(draft) === 0 ? params.first : draft.first;
-    const plan: Conversation = { ...draft, first };
-    const speaker = nextSpeaker(plan);
-    const nextEstimate = await turnEstimate(plan, speaker, models[speaker], bots);
-    const blocked = blockedBy(progressOf(draft), currentLimits(), nextEstimate);
-    if (blocked) {
-      refuse(blocked, draft, nextEstimate);
-      return;
-    }
-    const release = await lockConversation(draft.id);
-    if (!release) {
-      throw new InvalidInputError(
-        'This conversation is running in another tab. Pause or stop it there first.',
-      );
-    }
+    const release = await lockConversation();
+    if (!release) throw new InvalidInputError(OTHER_TAB);
     try {
+      // Another tab may have changed it since this one last looked: run only what is stored now.
+      await writes;
+      const stored = await readStored();
+      if (!sameVersion(stored, conversation)) {
+        adopt(stored);
+        ui.status(
+          'The conversation changed in another tab; this is its latest version. Press Resume or Step to go on.',
+        );
+        return;
+      }
+      const creating = conversation === null;
+      const draft =
+        conversation ??
+        createConversation({ opener: openerField.value.trim(), first: params.first, bots });
+      // Who speaks first follows the form until somebody has spoken.
+      const first = turnCount(draft) === 0 ? params.first : draft.first;
+      const plan: Conversation = { ...draft, first };
+      const speaker = nextSpeaker(plan);
+      const next = await planTurn(plan, speaker, models[speaker], bots);
+      if (next.built.tooLong) throw tooLong(models[speaker]);
+      const blocked = blockedBy(progressOf(draft), currentLimits(), next.cost);
+      if (blocked) {
+        refuse(blocked, draft, next.cost);
+        return;
+      }
       const estimateUsd = await runEstimate(plan, models, bots, mode);
       const openingText = opener(draft);
       const run = await ctx.beginRun(
@@ -1669,11 +1836,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       const bot = bots[speaker];
       const info = await modelInfo(model);
       const built: BuiltTurn = buildTurn(conv, speaker, turnOptions(model, info, bots));
-      if (built.tooLong) {
-        throw new InvalidInputError(
-          `The conversation no longer fits ${modelName(model)}'s context window, even with older messages left out. Shorten the last message or choose a model with a larger window.`,
-        );
-      }
+      // (Checked before the run too; a later turn of the loop may have grown past the window.)
+      if (built.tooLong) throw tooLong(model);
       const estimate = await costOf(model, built.promptTokens, built.completionTokens);
       const entry: Entry = {
         id: newId(),
@@ -1692,7 +1856,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       persist();
       renderLog();
       renderControls();
-      follow(true);
+      follow(); // never pulls down a reader who scrolled up
       ui.status(
         `${lastSpeaker ? `${lastSpeaker} finished. ` : ''}${bot.name} is speaking (turn ${turnCount(conv) + 1} of ${currentLimits().turns})…`,
       );
@@ -1713,6 +1877,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           },
         });
         entry.content = answer.text || entry.content;
+        // A reply without text is a failure, not a turn: asking again would send the same request (and pay).
+        if (!entry.content.trim()) {
+          throw new InvalidInputError(
+            `${bot.name} sent no text. It may have spent its token limit on reasoning: raise Max tokens per turn in Settings, or choose another model.`,
+          );
+        }
         entry.status = 'done';
         result = { status: 'done', content: entry.content };
       } catch (error) {
@@ -1725,6 +1895,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         } else {
           entry.status = 'error';
           entry.error = userMessage(error);
+          if (isOutcomeUnknown(error)) entry.outcomeUnknown = true;
           failedTurn = entry;
           throw error;
         }
@@ -1764,6 +1935,10 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           },
           takeTurn,
           pauseRequested: () => pauseRequested,
+          onLimitsChange: (fn) => {
+            limitListeners.add(fn);
+            return () => limitListeners.delete(fn);
+          },
         },
         mode,
         signal,
@@ -1782,11 +1957,13 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       failure !== null && isStop(failure.error) && signal.aborted
         ? 'stopped'
         : (end?.reason ?? null);
+    const lastSpoken = conv.entries.filter(isSpoken).at(-1);
     const ending = reason
       ? endText(reason, {
-          limits: currentLimits(),
+          // The limits that applied when it ended (a field may have changed since).
+          limits: end?.limits ?? currentLimits(),
           spentUsd: conv.spentUsd,
-          speakerName: conv.entries.filter(isSpoken).at(-1)?.name,
+          speakerName: lastSpoken?.speaker ? bots[lastSpoken.speaker].name : lastSpoken?.name,
         })
       : '';
     if (reason) {
@@ -1812,11 +1989,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         );
         markPresented(failure.error); // announced here; the runner adds nothing
       } else if (failedTurn) {
-        ui.status(
-          `${failedTurn.name ?? 'The bot'}'s turn failed: ${failedTurn.error ?? userMessage(failure.error)}`,
-        );
-        // Shown on the turn; errors that need a dialog (a locked key…) still go to the runner, whose Retry resumes.
-        if (!needsAction(failure.error)) markPresented(failure.error);
+        ui.status(`${failedTurn.name ?? 'The bot'}'s turn failed: ${failureNote(failedTurn)}`);
+        // Shown on the turn. Still left to the runner: errors that need a dialog (a locked key…, whose Retry
+        // resumes) and a request that may have gone through (presentError warns it may be billed, no Retry).
+        if (!needsAction(failure.error) && !isOutcomeUnknown(failure.error)) {
+          markPresented(failure.error);
+        }
       } else {
         ui.status(`The conversation is on hold: ${userMessage(failure.error)}`);
       }
@@ -1866,16 +2044,25 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     settings: settingsOf(params),
   });
 
+  /**
+   * Loads a setup (Prompts' Use, History's Reopen and Re-run, `?prompt=`, the sample) for this visit: nothing is
+   * saved as the user's options. With another opening prompt than the open conversation's it is a new
+   * conversation, so the open one is set aside (Undo brings it back); the same opener keeps it.
+   */
   function applyState({ prompt, settings }: ToolSnapshot): void {
     openerField.value = prompt;
     const next = paramsFrom({ ...settingsOf(params), ...settings });
     // A `?model=` visit (History's "Re-run with another model") gives Bot A the visit's model.
     if (ctx.modelOverride !== null) next.botA.model = null;
     params = next;
-    saveParams();
     renderParams();
     renderAll();
     void ui.refreshEstimate();
+    if (conversation && !runState.busy && prompt.trim() !== opener(conversation).trim()) {
+      void clearConversation(
+        'The loaded setup has another opening prompt, so the conversation was set aside. Start begins the new one.',
+      );
+    }
   }
 
   // A link that brings its own setup (a run, a prompt, a sample) fills the opener itself.
@@ -1893,6 +2080,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     if (!busy) pauseRequested = false;
     renderControls();
     applyBusy(log, busy);
+    // Another tab's change announced while this one ran: look now.
+    if (!busy && followStale) void followStore();
   });
 
   return {
