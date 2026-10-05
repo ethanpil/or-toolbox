@@ -3,9 +3,10 @@
  * with Retry, the metrics), the vote bar, the comparison table and the vote tally. arena.ts decides when.
  *
  * A panel is built once per round and updated in place (`update()`), so the answer that streams into it is never
- * rebuilt and a focused Retry or answer region keeps focus. Before names are shown (`round.revealed`), nothing
- * that tells the models apart is drawn: no name, no cost, no "Cheapest", and errors with the model's name
- * replaced (`anonymize`).
+ * rebuilt and a focused Retry or answer region keeps focus; the comparison and tally tables keep their scroll
+ * region and redraw only their rows. Before names are shown (`round.revealed`), nothing that tells the models
+ * apart is drawn: no name, no cost, no "Cheapest", errors with every form of the model's name replaced
+ * (`anonymize`), and one billing note for every failed panel instead of the paid-only "may have gone through".
  */
 import { type MarkdownStream, streamMarkdown } from '../../ui/components/stream-markdown';
 import { dataTable } from '../../ui/components/data-table';
@@ -16,8 +17,11 @@ import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { formatCost, formatRate } from './export';
 import {
+  allIn,
   anonymize,
+  blindTerms,
   canVote,
+  cutOff,
   entryAt,
   type Entry,
   hasAnswer,
@@ -26,7 +30,6 @@ import {
   panelLabel,
   panelLetter,
   type Round,
-  roundSettled,
   summary,
 } from './round';
 import { type Tally, tallyRows } from './tally';
@@ -48,6 +51,15 @@ const STATUS: Readonly<Record<Entry['status'], { text: string; tone: string }>> 
 /** A metric's value as the panels and the table show it. */
 const show = (value: number | null, format: (value: number) => string): string =>
   value === null ? '—' : format(value);
+
+/**
+ * What a failed panel adds about billing. The "may have gone through" warning exists only for paid requests, so
+ * while names are hidden every failed panel gets the same note instead (true for each of them).
+ */
+export const BLIND_BILLING_NOTE =
+  'Before retrying, you can check your OpenRouter activity to see whether this request was billed.';
+const OUTCOME_UNKNOWN_NOTE =
+  'It may have gone through and been billed: check your OpenRouter activity before retrying.';
 
 /** Cost, hidden before names are shown (a free model's $0 would give it away). */
 function costText(metrics: Metrics, entry: Entry, round: Round, naming: Naming): string {
@@ -103,6 +115,11 @@ export function panelView(options: PanelOptions): PanelView {
     'data-testid': 'panel-answer',
   });
   const problem = h('div', { class: 'empty-hidden' });
+  const cutNote = h(
+    'p',
+    { class: 'small text-warning-emphasis mb-0', hidden: true, 'data-testid': 'panel-cutoff' },
+    'Cut off at the length limit.',
+  );
   const metrics = h('dl', { class: 'or-arena-metrics mb-0', 'data-testid': 'panel-metrics' });
   const card = h(
     'section',
@@ -125,7 +142,7 @@ export function panelView(options: PanelOptions): PanelView {
       pick,
       status,
     ),
-    h('div', { class: 'card-body d-flex flex-column gap-2' }, answer, problem),
+    h('div', { class: 'card-body d-flex flex-column gap-2' }, answer, cutNote, problem),
     h('div', { class: 'card-footer' }, metrics),
   );
 
@@ -183,17 +200,19 @@ export function panelView(options: PanelOptions): PanelView {
       waiting = thinking;
     }
 
+    cutNote.hidden = !cutOff(entry);
+
     // The error block is rebuilt only when the error changes, so a focused Retry survives other updates.
+    const failure = entry.error ?? 'The request failed.';
     const message =
       entry.status !== 'error'
         ? ''
         : round.revealed
-          ? (entry.error ?? 'The request failed.')
-          : anonymize(entry.error ?? 'The request failed.', [entry.model, name]);
-    const shown = message ? `${message}|${entry.outcomeUnknown === true}` : '';
-    if (shown !== problemShown) {
-      problemShown = shown;
-      problem.replaceChildren(message ? errorBlock(message, entry, index) : '');
+          ? `${failure}${entry.outcomeUnknown ? ` ${OUTCOME_UNKNOWN_NOTE}` : ''}`
+          : `${anonymize(failure, blindTerms(entry.model, name))} ${BLIND_BILLING_NOTE}`;
+    if (message !== problemShown) {
+      problemShown = message;
+      problem.replaceChildren(message ? errorBlock(message, index) : '');
     }
 
     const values = metricsOf(entry);
@@ -206,7 +225,7 @@ export function panelView(options: PanelOptions): PanelView {
     );
   };
 
-  const errorBlock = (message: string, entry: Entry, index: number): HTMLElement =>
+  const errorBlock = (message: string, index: number): HTMLElement =>
     h(
       'div',
       {
@@ -217,14 +236,7 @@ export function panelView(options: PanelOptions): PanelView {
       h(
         'div',
         { class: 'd-flex flex-column align-items-start gap-2 min-w-0' },
-        h(
-          'span',
-          null,
-          message,
-          entry.outcomeUnknown
-            ? ' It may have gone through and been billed: check your OpenRouter activity before retrying.'
-            : '',
-        ),
+        h('span', null, message),
         options.retryButton(index),
       ),
     );
@@ -338,7 +350,7 @@ export function voteBar(round: Round, naming: Naming, actions: VoteActions): HTM
       h(
         'p',
         { class: 'small text-body-secondary mb-0', 'data-testid': 'vote-hint' },
-        !roundSettled(round)
+        !allIn(round)
           ? 'Voting opens when every answer is in.'
           : open
             ? round.settings.blind
@@ -381,8 +393,29 @@ export function voteBar(round: Round, naming: Naming, actions: VoteActions): HTM
 
 // --- comparison table --------------------------------------------------------------------------------------------
 
-export function comparisonTable(round: Round, naming: Naming): HTMLElement {
-  const rows = summary(round).map((row) => {
+export interface TableView<T> {
+  readonly element: HTMLElement;
+  /** Redraws the rows; the scroll region stays, so focus and scroll position do too. */
+  update(value: T): void;
+}
+
+export function comparisonTable(naming: Naming): TableView<Round> {
+  const body = h('tbody');
+  const element = dataTable({
+    scrollerLabel: 'Comparison of the answers',
+    caption:
+      'Time to first token, total time, output tokens, tokens per second and cost per answer',
+    head: ['Answer', 'First token', 'Total', 'Tokens', 'Tokens/s', 'Cost'],
+    numericFrom: 1,
+    body,
+    class: 'table table-sm align-middle mb-0',
+    testId: 'compare-table',
+  });
+  return { element, update: (round) => body.replaceChildren(...comparisonRows(round, naming)) };
+}
+
+function comparisonRows(round: Round, naming: Naming): HTMLElement[] {
+  return summary(round).map((row) => {
     const label = panelLabel(row.panel);
     return h(
       'tr',
@@ -422,44 +455,51 @@ export function comparisonTable(round: Round, naming: Naming): HTMLElement {
       ].map((value) => h('td', { class: 'text-end text-nowrap' }, value)),
     );
   });
-  return dataTable({
-    scrollerLabel: 'Comparison of the answers',
-    caption:
-      'Time to first token, total time, output tokens, tokens per second and cost per answer',
-    head: ['Answer', 'First token', 'Total', 'Tokens', 'Tokens/s', 'Cost'],
-    numericFrom: 1,
-    body: h('tbody', null, rows),
-    class: 'table table-sm align-middle mb-0',
-    testId: 'compare-table',
-  });
 }
 
 // --- tally ---------------------------------------------------------------------------------------------------
 
-export function tallyTable(tally: Tally, naming: Naming): HTMLElement {
-  const rows = tallyRows(tally);
-  if (rows.length === 0) {
-    return emptyState({
-      icon: 'bar-chart',
-      title: 'No votes yet',
-      text: 'Vote after a round: wins per model add up here, in this browser only.',
-      inline: true,
-      testId: 'tally-empty',
-    });
-  }
-  return dataTable({
+/** The tally table, or "No votes yet" while it is empty. */
+export function tallyView(naming: Naming): TableView<Tally> {
+  const body = h('tbody');
+  const table = dataTable({
     scrollerLabel: 'Your votes per model',
     caption: 'Wins, ties and rounds per model from your votes',
     head: ['Model', 'Wins', 'Ties', 'Rounds'],
     numericFrom: 1,
-    rows: rows.map((row) => [
-      h('span', { title: row.model }, naming.name(row.model)),
-      String(row.wins),
-      String(row.ties),
-      String(row.rounds),
-    ]),
+    body,
     class: 'table table-sm align-middle mb-0',
     testId: 'tally-table',
-    rowTestId: 'tally-row',
   });
+  const empty = emptyState({
+    icon: 'bar-chart',
+    title: 'No votes yet',
+    text: 'Vote after a round: wins per model add up here, in this browser only.',
+    inline: true,
+    testId: 'tally-empty',
+  });
+  return {
+    element: h('div', null, empty, table),
+    update(tally) {
+      const rows = tallyRows(tally);
+      empty.hidden = rows.length > 0;
+      table.hidden = rows.length === 0;
+      body.replaceChildren(
+        ...rows.map((row) =>
+          h(
+            'tr',
+            { 'data-testid': 'tally-row' },
+            h(
+              'th',
+              { scope: 'row', class: 'fw-normal' },
+              h('span', { title: row.model }, naming.name(row.model)),
+            ),
+            [row.wins, row.ties, row.rounds].map((value) =>
+              h('td', { class: 'text-end' }, String(value)),
+            ),
+          ),
+        ),
+      );
+    },
+  };
 }

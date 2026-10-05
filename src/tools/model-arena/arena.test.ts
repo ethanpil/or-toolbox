@@ -11,9 +11,17 @@ import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient, CallOptions } from '../../core/types';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import type { ToolInstance, ToolSnapshot } from '../../ui/tool/types';
+import type * as sharedRequest from '../../core/attachments/request';
+import { approxTokens } from '../../core/attachments/request';
 import { getTool } from '../registry';
 import { SAMPLE_PROMPT, setup } from './arena';
 import { parseTally } from './tally';
+
+// Counts token approximations (the shared input is counted once per refresh, not once per contender).
+vi.mock('../../core/attachments/request', async (importOriginal) => {
+  const actual = await importOriginal<typeof sharedRequest>();
+  return { ...actual, approxTokens: vi.fn(actual.approxTokens) };
+});
 
 const model = (id: string, price: string, input: string[], created: number): RawModel => ({
   id,
@@ -49,10 +57,18 @@ const result = (body: ChatRequest, text: string): ChatStreamResult => ({
 });
 
 /**
- * A chatStream that answers `Answer from <model>` and reports usage like the client. It records each body and
- * how many requests were in flight at once; `hold` keeps every request open until that many have arrived.
+ * A chatStream that answers `Answer from <model>` and reports usage like the client (the usage event, then the
+ * run's usage). It records each body and how many requests were in flight at once; `hold` keeps every request
+ * open until that many have arrived.
  */
-function fakeStream(options: { hold?: number; fail?: (body: ChatRequest) => Error | null } = {}) {
+function fakeStream(
+  options: {
+    hold?: number;
+    fail?: (body: ChatRequest) => Error | null;
+    finishReason?: string;
+    reasoningTokens?: number;
+  } = {},
+) {
   const bodies: ChatRequest[] = [];
   let inFlight = 0;
   let maxInFlight = 0;
@@ -71,6 +87,16 @@ function fakeStream(options: { hold?: number; fail?: (body: ChatRequest) => Erro
       if (failure) throw failure;
       const text = `Answer from ${body.model}`;
       opts.onEvent({ type: 'text', text });
+      opts.onEvent({
+        type: 'usage',
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 20,
+          ...(options.reasoningTokens
+            ? { completion_tokens_details: { reasoning_tokens: options.reasoningTokens } }
+            : {}),
+        },
+      });
       opts.run.addUsage({
         model: body.model,
         promptTokens: 10,
@@ -79,7 +105,7 @@ function fakeStream(options: { hold?: number; fail?: (body: ChatRequest) => Erro
         costEstimated: false,
         latencyMs: 100,
       });
-      return result(body, text);
+      return { ...result(body, text), finishReason: options.finishReason ?? 'stop' };
     } finally {
       inFlight--;
     }
@@ -87,17 +113,40 @@ function fakeStream(options: { hold?: number; fail?: (body: ChatRequest) => Erro
   return { bodies, chatStream, maxInFlight: () => maxInFlight };
 }
 
-/** A chatStream that sends a first chunk, then waits until the run is stopped. */
+/**
+ * A chatStream that sends a first chunk, then waits until the run is stopped. Like the client, a stream cut
+ * before its usage chunk still reports a request with zero tokens (`reportUnknown`).
+ */
 function heldStream() {
   return vi.fn(
     (body: ChatRequest, opts: StreamOptions) =>
       new Promise<ChatStreamResult>((_, reject) => {
         opts.onEvent({ type: 'text', text: `Partial from ${body.model}` });
-        opts.run.signal.addEventListener('abort', () =>
-          reject(new DOMException('Stopped.', 'AbortError')),
-        );
+        opts.run.signal.addEventListener('abort', () => {
+          opts.run.addUsage({
+            model: body.model,
+            promptTokens: 0,
+            completionTokens: 0,
+            costUsd: 0,
+            costEstimated: false,
+            latencyMs: 50,
+          });
+          reject(new DOMException('Stopped.', 'AbortError'));
+        });
       }),
   );
+}
+
+/** Holds `ctx.models.estimate` (the planning step of a round or a Retry) until `release()`. */
+function holdEstimates(context: ToolTestContext): { release: () => void } {
+  const original = context.core.models.estimate.bind(context.core.models);
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  vi.spyOn(context.core.models, 'estimate').mockImplementation(async (input) => {
+    await gate;
+    return original(input);
+  });
+  return { release };
 }
 
 let t: ToolTestContext | null = null;
@@ -170,6 +219,7 @@ describe('model arena', () => {
         models: ['delta/four', 'gamma/three:free', 'alpha/one:free'],
         system: 'You are terse.',
         temperature: 0.4,
+        maxTokens: 600,
         blind: false,
         pdfEngine: 'mistral-ocr',
       },
@@ -181,6 +231,7 @@ describe('model arena', () => {
     expect($$('contender')).toHaveLength(3);
     expect(($('arena-blind') as HTMLInputElement).checked).toBe(false);
     expect(($('arena-temperature') as HTMLInputElement).value).toBe('0.4');
+    expect(($('arena-max-tokens') as HTMLInputElement).value).toBe('600');
 
     // Unknown keys and invalid values leave the form as it is; the form is kept for the next visit.
     tool.applyState({ prompt: 'x', settings: { models: ['only/one'], temperature: 9, other: 1 } });
@@ -195,6 +246,9 @@ describe('model arena', () => {
     expect(one).toBeGreaterThan(0);
     form(tool, ['delta/four', 'delta/four', 'alpha/one:free']);
     expect(await t!.ctx.ui.refreshEstimate()).toBeCloseTo(one! * 2);
+    // Max tokens is what the estimate assumes for the answer.
+    form(tool, ['delta/four', 'alpha/one:free'], { maxTokens: 100 });
+    expect(await t!.ctx.ui.refreshEstimate()).toBeLessThan(one!);
 
     form(tool, ['alpha/one:free', 'gamma/three:free'], { pdfEngine: 'mistral-ocr' });
     expect(tool.addons?.()).toEqual([]);
@@ -232,6 +286,8 @@ describe('model arena', () => {
     for (const run of runs) {
       expect(run.output).toBe(`Answer from ${run.model}`);
       expect(run.settings).toEqual(tool.getState().settings);
+      // History must not map a blind panel to its model before the vote.
+      expect(run.meta).not.toHaveProperty('panel');
     }
 
     // Blind: panels are Model A–D, with no names and no costs until the vote.
@@ -351,6 +407,9 @@ describe('model arena', () => {
     await running;
     expect($$('panel-status').map((badge) => badge.textContent)).toEqual(['Stopped', 'Stopped']);
     expect(Object.values(answers()).every((text) => text?.startsWith('Partial from'))).toBe(true);
+    // No usage arrived: the token count is unknown, not 0.
+    expect($$('metric-tokens').map((cell) => cell.textContent)).toEqual(['—', '—']);
+    expect($$('metric-rate').map((cell) => cell.textContent)).toEqual(['—', '—']);
     expect($$('panel-error')).toHaveLength(0);
     expect(t!.status()).toBe('Stopped. Partial answers are kept.');
     const runs = await t!.core.history.query({ tool: 'model-arena' });
@@ -409,8 +468,9 @@ describe('model arena', () => {
     $('vote-tie').click();
     await vi.waitFor(() => expect($$('tally-row')).toHaveLength(2));
 
+    expect($('tally-empty').hidden).toBe(true);
     $('tally-reset').click();
-    await vi.waitFor(() => expect($$('tally-empty')).toHaveLength(1));
+    await vi.waitFor(() => expect($('tally-empty').hidden).toBe(false));
     expect(parseTally(await t!.ctx.state.get('tally')).models).toEqual({});
 
     await t!.runners[0]!.trigger();
@@ -428,6 +488,183 @@ describe('model arena', () => {
     const { tool } = await mount();
     await tool.sample?.();
     expect(prompt().value).toBe(SAMPLE_PROMPT);
+  });
+});
+
+describe('review fixes', () => {
+  it('blind errors read the same for every model: one neutral billing note, no partial names', async () => {
+    const unknown = new ApiError('Upstream error.', 502);
+    unknown.outcomeUnknown = true; // a paid request that may have gone through
+    const fake = fakeStream({
+      fail: (body) =>
+        body.model === 'delta/four'
+          ? unknown
+          : body.model === 'beta/two:free'
+            ? new ApiError('BETA/TWO is busy right now.', 400)
+            : null,
+    });
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'beta/two:free', 'delta/four']);
+    await t!.runners[0]!.trigger();
+
+    const errors = $$('panel-error').map((el) => el.textContent ?? '');
+    expect(errors).toHaveLength(2);
+    for (const text of errors) {
+      expect(text).not.toMatch(/beta|two/i);
+      expect(text).not.toContain('may have gone through');
+      expect(text).toContain('Before retrying, you can check your OpenRouter activity');
+    }
+    expect(errors.some((text) => text.includes('this model is busy right now.'))).toBe(true);
+
+    // Once the names show, the paid request's own warning appears, on that panel only.
+    $('vote-reveal').click();
+    const revealed = $$('panel-error').map((el) => el.textContent ?? '');
+    expect(revealed.filter((text) => text.includes('may have gone through'))).toHaveLength(1);
+    expect(revealed.some((text) => text.includes('BETA/TWO is busy right now.'))).toBe(true);
+  });
+
+  it('closes voting while a contender runs again, from Retry until it settles', async () => {
+    let failing = true;
+    const fake = fakeStream({
+      fail: (body) =>
+        failing && body.model === 'beta/two:free' ? new ApiError('Busy.', 400) : null,
+    });
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'beta/two:free'], { blind: false });
+    await t!.runners[0]!.trigger();
+    expect($('vote-tie').getAttribute('aria-disabled')).toBe('false');
+
+    failing = false;
+    const held = holdEstimates(t!); // the Retry is being planned
+    $('panel-retry').click();
+    await vi.waitFor(() => expect($('vote-tie').getAttribute('aria-disabled')).toBe('true'));
+    expect($('vote-hint').textContent).toBe('Voting opens when every answer is in.');
+    $('vote-tie').click();
+    expect($$('vote-result')).toHaveLength(0);
+    expect(($('arena-export') as HTMLButtonElement).disabled).toBe(true);
+
+    held.release();
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect($('vote-tie').getAttribute('aria-disabled')).toBe('false');
+    $('vote-tie').click();
+    expect($('vote-result').textContent).toBe('You called it a tie.');
+  });
+
+  it('marks no Cheapest (or Fastest) when every answer ties', async () => {
+    const fake = fakeStream();
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free'], { blind: false });
+    await t!.runners[0]!.trigger();
+    expect($$('metric-cost').map((cell) => cell.textContent)).toEqual(['Free', 'Free']);
+    expect($$('badge-cheapest')).toHaveLength(0);
+  });
+
+  it('marks an answer cut off at the length limit', async () => {
+    const fake = fakeStream({ finishReason: 'length' });
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free']);
+    await t!.runners[0]!.trigger();
+    expect($$('panel-cutoff').map((el) => el.textContent)).toEqual([
+      'Cut off at the length limit.',
+      'Cut off at the length limit.',
+    ]);
+  });
+
+  it('offers Export only once every answer is in, also with blind voting off', async () => {
+    const chatStream = heldStream();
+    const { tool } = await mount({ chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free'], { blind: false });
+    const running = t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect(chatStream).toHaveBeenCalledTimes(2));
+    expect(($('arena-export') as HTMLButtonElement).disabled).toBe(true);
+    t!.runners[0]!.stop();
+    await running;
+    expect(($('arena-export') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('sends Max tokens from Settings', async () => {
+    const fake = fakeStream();
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free']);
+    const field = $('arena-max-tokens') as HTMLInputElement;
+    field.value = '250';
+    field.dispatchEvent(new Event('change'));
+    expect(tool.getState().settings['maxTokens']).toBe(250);
+    await t!.runners[0]!.trigger();
+    expect(fake.bodies.map((body) => body.max_tokens)).toEqual([250, 250]);
+    field.value = '';
+    field.dispatchEvent(new Event('change'));
+    expect(tool.getState().settings['maxTokens']).toBeNull();
+  });
+
+  it('takes the round’s input when Compare is pressed, not after the planning and the budget dialog', async () => {
+    let failing = true;
+    const fake = fakeStream({
+      fail: (body) =>
+        failing && body.model === 'beta/two:free' ? new ApiError('Busy.', 400) : null,
+    });
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'beta/two:free'], { blind: false });
+    const held = holdEstimates(t!);
+    const running = t!.runners[0]!.trigger();
+    // While the round is planned: the system prompt changes and a file arrives.
+    const system = $('arena-system') as HTMLTextAreaElement;
+    system.value = 'Changed later';
+    system.dispatchEvent(new Event('input'));
+    tool.onFiles?.([new File(['late'], 'late.txt', { type: 'text/plain' })]);
+    await vi.waitFor(() => expect($$('arena-file-chip')).toHaveLength(1));
+    held.release();
+    await running;
+
+    const runs = await t!.core.history.query({ tool: 'model-arena' });
+    expect(runs.map((run) => run.settings?.['system'])).toEqual(['', '']);
+    // The Retry repeats the round as it was sent: no late system prompt, no late file.
+    failing = false;
+    $('panel-retry').click();
+    await vi.waitFor(() => expect($$('panel-error')).toHaveLength(0));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect(fake.bodies.at(-1)).toEqual({
+      model: 'beta/two:free',
+      messages: [{ role: 'user', content: 'Which is larger, 9.11 or 9.9?' }],
+    });
+  });
+
+  it('keeps focus on the comparison and tally tables while they update', async () => {
+    const fake = fakeStream();
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free'], { blind: false });
+    await t!.runners[0]!.trigger();
+    const compare = $('compare-table').closest<HTMLElement>('[role="region"]')!;
+    compare.focus();
+    $('vote-tie').click(); // redraws the round
+    expect(document.activeElement).toBe(compare);
+
+    await vi.waitFor(() => expect($$('tally-row')).toHaveLength(2));
+    const tallyRegion = $('tally-table').closest<HTMLElement>('[role="region"]')!;
+    tallyRegion.focus();
+    await t!.runners[0]!.trigger();
+    $$('vote-panel')[0]!.click();
+    await vi.waitFor(() => expect($('tally-row').textContent).toContain('1'));
+    await vi.waitFor(async () =>
+      expect(parseTally(await t!.ctx.state.get('tally')).models['alpha/one:free']?.rounds).toBe(2),
+    );
+    expect(document.activeElement).toBe(tallyRegion);
+  });
+
+  it('counts the shared input once per refresh, however many contenders there are', async () => {
+    const { tool } = await mount();
+    const calls = async (models: string[]): Promise<number> => {
+      vi.mocked(approxTokens).mockClear();
+      form(tool, models, { system: 'Be brief.' });
+      await t!.ctx.ui.refreshEstimate();
+      return vi.mocked(approxTokens).mock.calls.length;
+    };
+    expect(await calls(FOUR)).toBe(await calls(FOUR.slice(0, 2)));
+  });
+
+  it('keeps a ?model= contender for the next visit, as any other form change', async () => {
+    await mount({}, { modelOverride: 'delta/four' });
+    expect(t!.ctx.options.get()['models']).toEqual(['delta/four', 'beta/two:free']);
   });
 });
 

@@ -3,10 +3,12 @@ import type { ModelInfo } from '../../core/types';
 import {
   anonymize,
   type ArenaSettings,
+  blindTerms,
   canVote,
   castVote,
   defaultContenders,
   entryAt,
+  exportReady,
   metricsOf,
   newRound,
   panelLabel,
@@ -22,6 +24,7 @@ const settings = (patch: Partial<ArenaSettings> = {}): ArenaSettings => ({
   models: ['a/one', 'b/two', 'c/three', 'd/four'],
   system: '',
   temperature: null,
+  maxTokens: null,
   blind: true,
   pdfEngine: 'cloudflare-ai',
   ...patch,
@@ -57,6 +60,7 @@ describe('settings', () => {
           models: ['m/1', 'm/2', 'm/3'],
           system: 'Be brief.',
           temperature: 0.7,
+          maxTokens: 800,
           blind: false,
           pdfEngine: 'mistral-ocr',
           unknown: 1,
@@ -67,9 +71,14 @@ describe('settings', () => {
       models: ['m/1', 'm/2', 'm/3'],
       system: 'Be brief.',
       temperature: 0.7,
+      maxTokens: 800,
       blind: false,
       pdfEngine: 'mistral-ocr',
     });
+    for (const maxTokens of [0, 1.5, -3, 10_000_001, '800']) {
+      expect(settingsFrom({ maxTokens }, base).maxTokens).toBeNull();
+    }
+    expect(settingsFrom({ maxTokens: null }, settings({ maxTokens: 50 })).maxTokens).toBeNull();
     // Too few or too many contenders, blanks, an out-of-range temperature, an unknown engine: ignored.
     for (const models of [['m/1'], ['m/1', 'm/2', 'm/3', 'm/4', 'm/5'], ['m/1', ' '], 'm/1']) {
       expect(settingsFrom({ models }, base).models).toEqual(['x/a', 'x/b']);
@@ -158,6 +167,32 @@ describe('blind rounds', () => {
     expect(castVote(r, { kind: 'tie' })).toBe(false);
   });
 
+  it('takes no vote and offers no export while a contender is being run again', () => {
+    const r = round({ blind: false });
+    r.entries.forEach((_, i) => answer(r, i));
+    r.entries[3]!.status = 'error';
+    expect(canVote(r)).toBe(true);
+    expect(exportReady(r)).toBe(true);
+    r.retrying = 3; // Retry pressed: planning, booking or streaming
+    expect(canVote(r)).toBe(false);
+    expect(exportReady(r)).toBe(false);
+    expect(castVote(r, { kind: 'tie' })).toBe(false);
+    delete r.retrying;
+    expect(castVote(r, { kind: 'tie' })).toBe(true);
+  });
+
+  it('offers export once names show and every answer is in', () => {
+    const open = round({ blind: false });
+    expect(exportReady(open)).toBe(false); // names shown, answers still coming
+    open.entries.forEach((_, i) => answer(open, i));
+    expect(exportReady(open)).toBe(true);
+    const blind = round();
+    blind.entries.forEach((_, i) => answer(blind, i));
+    expect(exportReady(blind)).toBe(false);
+    reveal(blind);
+    expect(exportReady(blind)).toBe(true);
+  });
+
   it('closes voting when a blind round is revealed by hand, not an open one', () => {
     const blind = round();
     blind.entries.forEach((_, i) => answer(blind, i));
@@ -175,6 +210,25 @@ describe('blind rounds', () => {
     expect(
       anonymize('qwen/big:free is not available (Qwen Big)', ['qwen/big:free', 'Qwen Big', '']),
     ).toBe('this model is not available (this model)');
+  });
+
+  it('also strips the slug without its variant, its last segment and the bare name, in any case', () => {
+    const terms = blindTerms('qwen/qwen3.8-27b:free', 'Qwen: Qwen3.8 27B (free)');
+    const leaks = [
+      'QWEN/QWEN3.8-27B is overloaded',
+      'Model qwen3.8-27b:free returned nothing',
+      'qwen3.8-27b timed out',
+      'Qwen3.8 27B (free) is busy',
+      'qwen3.8 27b is busy',
+      'Qwen: Qwen3.8 27B failed',
+      'Provider Qwen refused the request',
+    ];
+    for (const text of leaks) expect(anonymize(text, terms).toLowerCase()).not.toContain('qwen');
+    expect(anonymize('qwen3.8-27b timed out', terms)).toBe('this model timed out');
+    // Only whole words: unrelated text stays as it was.
+    expect(anonymize('metadata is missing', blindTerms('meta/llama-5:free', 'Meta: Llama 5'))).toBe(
+      'metadata is missing',
+    );
   });
 });
 
@@ -231,6 +285,64 @@ describe('metrics', () => {
         usage: { ...usage, costUsd: 0, costUnknown: true },
       }),
     ).toMatchObject({ costUsd: null, costUnknown: true });
+  });
+
+  it('shows no token count for an answer without usage (stopped, cut off) instead of 0', () => {
+    const stopped = metricsOf({
+      model: 'a',
+      status: 'stopped',
+      text: 'Half an answer',
+      startedAt: 0,
+      firstTokenAt: 100,
+      endedAt: 2000,
+      usage: {
+        promptTokens: null,
+        completionTokens: null,
+        costUsd: 0,
+        costEstimated: false,
+        costUnknown: true,
+      },
+    });
+    expect(stopped).toMatchObject({
+      promptTokens: null,
+      completionTokens: null,
+      tokensPerSecond: null,
+    });
+  });
+
+  it('drops the rate when the count includes reasoning that never streamed', () => {
+    const base = {
+      model: 'a',
+      status: 'done' as const,
+      text: 'x',
+      startedAt: 0,
+      firstTokenAt: 1000,
+      endedAt: 2000,
+    };
+    const reasoning = { ...usage, costUsd: 0, reasoningTokens: 80 };
+    expect(metricsOf({ ...base, usage: reasoning }).tokensPerSecond).toBeNull();
+    // Reasoning that streamed was timed from its first token: the rate stands.
+    expect(metricsOf({ ...base, reasoned: true, usage: reasoning }).tokensPerSecond).toBe(100);
+    expect(
+      metricsOf({ ...base, usage: { ...usage, costUsd: 0, reasoningTokens: 0 } }).tokensPerSecond,
+    ).toBe(100);
+  });
+
+  it('marks nobody fastest or cheapest when all of them tie', () => {
+    const r = round({ models: ['a/one:free', 'b/two:free'] }, sequence(0.99));
+    for (const entry of r.entries) {
+      Object.assign(entry, {
+        status: 'done',
+        text: 'x',
+        startedAt: 0,
+        endedAt: 400,
+        usage: { ...usage, costUsd: 0 },
+      });
+    }
+    expect(summary(r).map((row) => [row.fastest, row.cheapest])).toEqual([
+      [false, false],
+      [false, false],
+    ]);
   });
 
   it('marks the fastest and the cheapest finished answers, in panel order', () => {

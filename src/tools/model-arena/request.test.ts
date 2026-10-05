@@ -7,6 +7,7 @@ const input = (patch: Partial<ArenaInput> = {}): ArenaInput => ({
   prompt: 'Which is larger, 9.11 or 9.9?',
   system: '',
   temperature: null,
+  maxTokens: null,
   pdfEngine: 'cloudflare-ai',
   attachments: [],
   data: () => undefined,
@@ -124,5 +125,29 @@ describe('contender requests', () => {
     const large = contenderRequest('a', info(64_000, null), long);
     expect(large.tooLong).toBe(false);
     expect(large.promptTokens + large.completionTokens).toBeLessThanOrEqual(64_000);
+  });
+
+  it('sends Max tokens when set, clamped to the model’s cap and the room left, and estimates with it', () => {
+    const set = contenderRequest('a', info(128_000, 8000), input({ maxTokens: 300 }));
+    expect(set.body.max_tokens).toBe(300);
+    expect(set.completionTokens).toBe(300);
+    const capped = contenderRequest('a', info(128_000, 8000), input({ maxTokens: 50_000 }));
+    expect(capped.body.max_tokens).toBe(8000);
+    expect(capped.completionTokens).toBe(8000);
+    const long = input({ prompt: 'x'.repeat(40_000), maxTokens: 30_000 }); // about 10,000 tokens
+    const room = contenderRequest('a', info(32_000, null), long);
+    expect(room.tooLong).toBe(false);
+    expect(room.promptTokens + room.body.max_tokens!).toBeLessThanOrEqual(32_000);
+    // Unset: nothing is sent, and the estimate assumes the default.
+    const unset = contenderRequest('a', info(128_000, 8000), input());
+    expect(unset.body).not.toHaveProperty('max_tokens');
+    expect(unset.completionTokens).toBe(DEFAULT_OUTPUT_TOKENS);
+  });
+
+  it('takes a prompt token count worked out once for every contender', () => {
+    const shared = input({ prompt: 'x'.repeat(4000) });
+    const counted = contenderRequest('a', info(128_000, null), shared);
+    expect(contenderRequest('a', info(128_000, null), shared, 12_345).promptTokens).toBe(12_345);
+    expect(counted.promptTokens).toBeGreaterThan(1000);
   });
 });

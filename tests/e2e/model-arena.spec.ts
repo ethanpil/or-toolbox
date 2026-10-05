@@ -284,6 +284,8 @@ test('Stop stops every contender and keeps the partial answers', async ({ page }
     'The first half from',
     'The first half from',
   ]);
+  // The client books a cut stream with zero tokens; the panels say the count is unknown instead of 0.
+  await expect(panels(page).getByTestId('metric-tokens')).toHaveText(['—', '—']);
   await expect(page.getByTestId('tool-status')).toHaveText('Stopped. Partial answers are kept.');
   await expect(page.getByTestId('stop-button')).toBeHidden();
   await expect(page.getByTestId('panel-error')).toHaveCount(0);
