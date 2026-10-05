@@ -4,7 +4,7 @@
  * their bytes are never exported. An answer stopped or cut off inside a code fence gets the fence closed, or it
  * would swallow the rest of the Markdown.
  */
-import { formatInt, formatMs, formatUsd } from '../../ui/format';
+import { formatInt, formatMs, formatRunCost } from '../../ui/format';
 import {
   cutOff,
   entryAt,
@@ -42,13 +42,6 @@ export function closeFences(markdown: string): string {
 export const formatRate = (perSecond: number): string =>
   perSecond < 100 ? perSecond.toFixed(1) : String(Math.round(perSecond));
 
-/** A cost as the panels show it: unknown, estimated (≈), or the billed amount. */
-export function formatCost(metrics: Metrics): string {
-  if (metrics.costUnknown) return 'Unknown';
-  if (metrics.costUsd === null) return '—';
-  return `${metrics.costEstimated ? '≈ ' : ''}${formatUsd(metrics.costUsd)}`;
-}
-
 const cell = (value: number | null, format: (value: number) => string): string =>
   value === null ? '—' : format(value);
 
@@ -63,7 +56,11 @@ export function voteLine(round: Round, name: (id: string) => string): string {
   return `${panelLabel(vote.panel)} (${name(entry.model)}) won.`;
 }
 
-export function roundMarkdown(round: Round, name: (id: string) => string): string {
+export function roundMarkdown(
+  round: Round,
+  name: (id: string) => string,
+  isFree: (id: string) => boolean = () => false,
+): string {
   const parts: string[] = ['# Model arena round', '## Prompt', round.prompt || '_(no text)_'];
   if (round.attachments.length > 0) {
     parts.push(`_Attachments: ${round.attachments.map((file) => file.name).join(', ')}_`);
@@ -84,12 +81,14 @@ export function roundMarkdown(round: Round, name: (id: string) => string): strin
     if (entry.text) parts.push(closeFences(entry.text));
     if (cutOff(entry)) parts.push('_(cut off at the length limit)_');
     if (entry.status === 'stopped') parts.push('_(stopped)_');
-    if (entry.status === 'error') parts.push(`_(failed: ${entry.error ?? 'error'})_`);
+    if (entry.status === 'error') {
+      parts.push(`_(failed: ${entry.failure?.shown.text ?? 'error'})_`);
+    }
     parts.push(
       [
         '| First token | Total | Output tokens | Tokens/s | Cost |',
         '| --- | --- | --- | --- | --- |',
-        `| ${cell(metrics.ttftMs, formatMs)} | ${cell(metrics.totalMs, formatMs)} | ${cell(metrics.completionTokens, formatInt)} | ${cell(metrics.tokensPerSecond, formatRate)} | ${formatCost(metrics)} |`,
+        `| ${cell(metrics.ttftMs, formatMs)} | ${cell(metrics.totalMs, formatMs)} | ${cell(metrics.completionTokens, formatInt)} | ${cell(metrics.tokensPerSecond, formatRate)} | ${formatRunCost(metrics, { free: isFree(entry.model) })} |`,
       ].join('\n'),
     );
   });
@@ -139,7 +138,7 @@ export function roundJson(round: Round): ExportedRound {
         status: entry.status,
         answer: entry.text,
         cutOff: cutOff(entry),
-        ...(entry.error ? { error: entry.error } : {}),
+        ...(entry.failure ? { error: entry.failure.shown.text } : {}),
         metrics: metricsOf(entry),
       };
     }),

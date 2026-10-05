@@ -10,6 +10,7 @@
 import { isPdfEngineId, type PdfEngineId } from '../../core/models/pdf-engines';
 import type { ModelInfo } from '../../core/types';
 import { isFiniteNumber, isString } from '../../core/util';
+import type { FailureText } from '../../ui/feedback/errors';
 
 export const MIN_CONTENDERS = 2;
 export const MAX_CONTENDERS = 4;
@@ -124,10 +125,12 @@ export interface Entry {
   thinking?: boolean;
   /** Some reasoning streamed (so the time after the first token includes it). */
   reasoned?: boolean;
-  /** A user-safe message (status `error`). */
-  error?: string;
-  /** The request may have gone through and been billed (`isOutcomeUnknown`). */
-  outcomeUnknown?: boolean;
+  /**
+   * Status `error`: what to show once names are shown (`failureText(error)`, with the unknown-outcome caution) and
+   * while they are hidden (`failureText(error, { blind: true })`: the same for every model).
+   */
+  failure?: { shown: FailureText; blind: FailureText };
+  /** Request sent (`onSend`), first token and end, on one monotonic clock. */
   startedAt?: number;
   firstTokenAt?: number;
   endedAt?: number;
@@ -249,50 +252,6 @@ export function castVote(round: Round, vote: Vote): boolean {
 /** "Reveal without voting": the names show and the round takes no vote any more. */
 export function reveal(round: Round): void {
   round.revealed = true;
-}
-
-/** Shorter terms are left alone: they would match too much of an ordinary message. */
-const MIN_TERM_LENGTH = 3;
-
-/**
- * Every way an error message may name a model: its id (`qwen/qwen3.8-27b:free`), the id without its variant, the
- * id's last segment with and without the variant, its provider segment; the display name
- * (`Qwen: Qwen3.8 27B (free)`) without the "(free)" suffix, without the provider prefix, and the prefix itself.
- */
-export function blindTerms(model: string, name: string): string[] {
-  const terms = new Set<string>();
-  const add = (term: string | undefined): void => {
-    const clean = term?.trim();
-    if (clean && clean.length >= MIN_TERM_LENGTH) terms.add(clean);
-  };
-  const bare = model.split(':')[0] ?? model;
-  const [provider, ...rest] = bare.split('/');
-  for (const id of [model, bare]) {
-    add(id);
-    add(id.slice(id.lastIndexOf('/') + 1));
-  }
-  if (rest.length > 0) add(provider);
-  const unsuffixed = name.replace(/\s*\(free\)\s*$/i, '');
-  const prefix = /^([^:]+):\s*(.+)$/.exec(unsuffixed);
-  for (const value of [name, unsuffixed, prefix?.[2], prefix?.[1]]) add(value);
-  if (prefix) add(name.slice(name.indexOf(':') + 1));
-  return [...terms];
-}
-
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-/**
- * `text` with every term replaced by "this model", ignoring case and only as whole words (longest first), for a
- * blind panel's error message: provider errors often name the model. Use `blindTerms()` for the terms.
- */
-export function anonymize(text: string, terms: readonly string[]): string {
-  let out = text;
-  const sorted = terms.filter((term) => term.trim()).sort((a, b) => b.length - a.length);
-  for (const term of sorted) {
-    const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(term)}(?![\\p{L}\\p{N}])`, 'giu');
-    out = out.replace(pattern, 'this model');
-  }
-  return out;
 }
 
 // --- metrics ----------------------------------------------------------------------------------------------------

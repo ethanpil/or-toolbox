@@ -1,9 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ModelInfo } from '../../core/types';
 import {
-  anonymize,
   type ArenaSettings,
-  blindTerms,
   canVote,
   castVote,
   defaultContenders,
@@ -204,31 +202,6 @@ describe('blind rounds', () => {
     open.entries.forEach((_, i) => answer(open, i));
     expect(canVote(open)).toBe(true);
     expect(castVote(open, { kind: 'bad' })).toBe(true);
-  });
-
-  it('keeps model names out of a blind error message', () => {
-    expect(
-      anonymize('qwen/big:free is not available (Qwen Big)', ['qwen/big:free', 'Qwen Big', '']),
-    ).toBe('this model is not available (this model)');
-  });
-
-  it('also strips the slug without its variant, its last segment and the bare name, in any case', () => {
-    const terms = blindTerms('qwen/qwen3.8-27b:free', 'Qwen: Qwen3.8 27B (free)');
-    const leaks = [
-      'QWEN/QWEN3.8-27B is overloaded',
-      'Model qwen3.8-27b:free returned nothing',
-      'qwen3.8-27b timed out',
-      'Qwen3.8 27B (free) is busy',
-      'qwen3.8 27b is busy',
-      'Qwen: Qwen3.8 27B failed',
-      'Provider Qwen refused the request',
-    ];
-    for (const text of leaks) expect(anonymize(text, terms).toLowerCase()).not.toContain('qwen');
-    expect(anonymize('qwen3.8-27b timed out', terms)).toBe('this model timed out');
-    // Only whole words: unrelated text stays as it was.
-    expect(anonymize('metadata is missing', blindTerms('meta/llama-5:free', 'Meta: Llama 5'))).toBe(
-      'metadata is missing',
-    );
   });
 });
 

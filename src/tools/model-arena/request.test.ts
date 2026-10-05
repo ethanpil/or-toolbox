@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { AttachmentRef } from '../../core/attachments/attachments';
+import { DEFAULT_OUTPUT_TOKENS } from '../../core/tokens';
 import type { ModelInfo } from '../../core/types';
-import { type ArenaInput, contenderRequest, DEFAULT_OUTPUT_TOKENS } from './request';
+import { type ArenaInput, contenderRequest } from './request';
 
 const input = (patch: Partial<ArenaInput> = {}): ArenaInput => ({
   prompt: 'Which is larger, 9.11 or 9.9?',

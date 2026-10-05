@@ -2,64 +2,68 @@
  * Model arena: one prompt (and files) to 2–4 models at once, answers side by side, blind voting and a local tally.
  *
  * Layout (the three-zone tool layout): prompt, files and contenders on the left; the round on the right (panels
- * in a two-column grid, the vote bar, the comparison table and the tally); blind voting, system prompt and
- * temperature in Settings, the PDF reader under Advanced. The header has no model chip (`modelChip: false`):
- * the contenders are the models.
+ * in a two-column grid, the vote bar, the comparison table and the tally); blind voting, system prompt,
+ * temperature and Max tokens in Settings, the PDF reader under Advanced. The manifest says `ownModels`, so the
+ * header has no model chip: the contenders are the models.
  *
- * A round is one run per contender, begun in parallel with the round's id as `groupId` (one budget dialog for
- * all) and each booking its own estimate and PDF parser add-on; the header's estimate is their sum. The round
- * starts only once every `beginRun` has answered, so a refused round changes nothing, and the requests then go
- * out together, which keeps time-to-first-token fair. One contender failing never stops the others: it shows its
- * error inline with its own Retry (the runner's argument `{ kind: 'retry', index }`, a new run in the same
- * group, with the round's own input). Stop aborts every run in flight.
+ * A round is one run per contender, all begun at once by `ctx.runs.beginAll` with the round's id as `groupId`:
+ * approved once for the round's total (one budget question naming the round), each booking its own estimate and
+ * PDF parser add-on, all or none (a refusal withdraws the ones begun: nothing is sent or booked). The header's
+ * estimate is their sum. The requests then go out together; first token and total are timed from `onSend`, when
+ * each request is actually sent. One contender failing never stops the others: it shows its error inline with
+ * its own Retry (the runner's argument `{ kind: 'retry', index }`, a single run in the same group that asks for
+ * itself, with the round's own input). Stop aborts every run in flight.
  *
- * Blind rounds shuffle the panels (Model A–D) and hide names and costs until a vote (or "Reveal without
- * voting", which takes no vote). Votes go to a small tally in the tool's state (`tally`), read-modify-write
- * under a Web Lock; Reset offers Undo, which adds back the old counts to whatever was voted since.
+ * Blind rounds shuffle the panels (Model A–D) and hide names, costs and anything else that differs between
+ * models (errors in `failureText(error, { blind: true })`'s words) until a vote (or "Reveal without voting", which
+ * takes no vote). Votes go to a small tally in the tool's state (`tally`, through `ctx.state.update`); Reset
+ * offers Undo, which adds back the old counts to whatever was voted since.
  *
- * `getState`/`applyState` carry the prompt and the whole form (contenders, system prompt, temperature, blind,
- * PDF reader), and the form is also kept in the tool's options for the next visit. Files are not part of it:
- * their bytes stay in memory (rule 3). A `?model=` visit (History's "Re-run with another model") puts that
- * model in place of the contender whose run was opened (contender 1 without a run).
+ * `getState`/`applyState` carry the prompt and the whole form (contenders, system prompt, temperature, Max
+ * tokens, blind, PDF reader), and the form is also kept in the tool's options for the next visit. Files are not
+ * part of it: their bytes stay in memory (rule 3); `attachmentIntake` takes them in. A `?model=` visit (History's
+ * "Re-run with another model") puts that model in place of the contender whose run was opened (contender 1
+ * without a run).
  */
 import type { WireUsage } from '../../core/api/types';
 import {
   ACCEPT_ATTRIBUTE,
   type AttachmentRef,
-  checkText,
   keepParsed,
-  MAX_ATTACHMENTS,
-  readAttachment,
-  SIZE_LIMITS,
-  textAttachment,
 } from '../../core/attachments/attachments';
 import { missingInput, needsParser, parserAddons } from '../../core/attachments/request';
-import { FreeOnlyError, InvalidInputError, isOutcomeUnknown, userMessage } from '../../core/errors';
-import { webLocks } from '../../core/jobs/index';
+import { FreeOnlyError, InvalidInputError } from '../../core/errors';
 import { isPdfEngineId, PDF_ENGINES, pdfEngine } from '../../core/models/pdf-engines';
 import { paidAddons } from '../../core/runs/addons';
 import type { ModelInfo, RunAddon, RunHandle, UsageTotals } from '../../core/types';
 import { debounce, isFiniteNumber } from '../../core/util';
 import { attachmentChip } from '../../ui/components/attachment-chip';
+import { attachmentIntake } from '../../ui/components/attachment-intake';
 import { emptyState } from '../../ui/components/empty-state';
 import { exportMenu } from '../../ui/components/export-menu';
 import { modelPicker } from '../../ui/components/model-picker';
 import { switchField } from '../../ui/components/switch-field';
 import { focusKey, h, replace, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
+import {
+  failureText,
+  isStop,
+  markPresented,
+  needsAction,
+  presentError,
+} from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
-import { formatBytes, formatModelPrice, plural } from '../../ui/format';
+import { formatModelPrice, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { retryGate } from '../../ui/tool/retry-gate';
-import type { SendItem, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
+import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
 import { roundJson, roundMarkdown } from './export';
 import {
   type ArenaInput,
   type ContenderRequest,
   contenderRequest,
-  fitOutput,
+  fitFor,
   inputTokens,
 } from './request';
 import {
@@ -98,7 +102,6 @@ export const SAMPLE_PROMPT =
   'Explain why the sky is blue to a curious ten-year-old in under 120 words, then give one everyday example.';
 
 const STATE_TALLY = 'tally';
-const TALLY_LOCK = 'ortoolbox:model-arena:tally';
 
 /** The runner's argument: a new round, or one failed contender of the current round again. */
 export type RunArg = { kind: 'round' } | { kind: 'retry'; index: number };
@@ -212,7 +215,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     tabIndex: -1,
     'data-testid': 'arena-file',
     onchange: () => {
-      void addFiles([...(fileInput.files ?? [])]);
+      void intake.addFiles([...(fileInput.files ?? [])]);
       fileInput.value = '';
     },
   });
@@ -443,7 +446,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         extension: 'md',
         icon: 'markdown',
         build: () =>
-          new Blob([live ? roundMarkdown(live.round, naming.name) : ''], { type: 'text/markdown' }),
+          new Blob([live ? roundMarkdown(live.round, naming.name, naming.isFree) : ''], {
+            type: 'text/markdown',
+          }),
       },
       {
         label: 'JSON',
@@ -553,7 +558,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         session.has(id),
       );
       if (missing) return `This model ${MISSING_INPUT[missing]}`;
-      if (fitOutput(promptTokens, info, form.maxTokens).tooLong) {
+      if (fitFor(promptTokens, info, form.maxTokens).tooLong) {
         return 'The prompt and files are too long for this model';
       }
     }
@@ -625,7 +630,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
                 'button',
                 {
                   type: 'button',
-                  class: 'btn btn-sm btn-link or-attachment-remove flex-shrink-0',
+                  class: 'btn btn-sm btn-link or-icon-action',
                   'aria-label': `Remove contender ${index + 1}, ${name}`,
                   title: 'Remove',
                   'data-focus-key': `remove:${index}`,
@@ -755,10 +760,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       panelGrid,
       panels.map((panel) => h('div', { class: 'col' }, panel.element)),
     );
-    // Contenders refused before the round (a budget block, say) show why, with Retry.
-    round.order.forEach((index, panel) => {
-      if (round.entries[index]!.status === 'error') void panels[panel]!.end();
-    });
     renderRound();
   }
 
@@ -848,21 +849,25 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       reasoned: false,
       runId: run.id,
     } satisfies Partial<Entry>);
-    delete entry.error;
-    delete entry.outcomeUnknown;
+    delete entry.failure;
     delete entry.firstTokenAt;
     delete entry.endedAt;
     delete entry.usage;
     delete entry.servedModel;
     delete entry.finishReason;
+    delete entry.startedAt;
     const md = panel?.begin();
     /** The stream's usage chunk, when one arrives. */
     const seen: { usage: WireUsage | null } = { usage: null };
-    entry.startedAt = now();
     panel?.update();
     try {
       const answer = await ctx.api.chatStream(planned.request.body, {
         run,
+        // The clocks start when the request is actually sent: after the free-model throttle's wait and any
+        // retry's backoff, which are not the model's time.
+        onSend: () => {
+          entry.startedAt = now();
+        },
         onEvent: (event) => {
           if (event.type === 'text' && event.text) {
             entry.firstTokenAt ??= now();
@@ -906,8 +911,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         entry.status = 'stopped';
       } else {
         entry.status = 'error';
-        entry.error = userMessage(error);
-        if (isOutcomeUnknown(error)) entry.outcomeUnknown = true;
+        // The real wording (with the caution of an unknown outcome) for after the reveal; the blind one, true for
+        // any model, while names are hidden.
+        entry.failure = { shown: failureText(error), blind: failureText(error, { blind: true }) };
         // A key, a lock or a budget: the dialog helps, and then this contender runs again.
         if (needsAction(error)) {
           void presentError(error, {
@@ -956,26 +962,27 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     const models = settings.models;
     const planned = await plan(models, source);
     const id = crypto.randomUUID();
-    // Every contender's run is begun before any request goes out: one budget dialog for the group, and a round
-    // refused as a whole changes nothing on the page.
-    const begun = await Promise.allSettled(
-      planned.map((p) =>
-        ctx.beginRun(
-          {
-            model: p.model,
-            estimateUsd: p.estimate,
-            addons: p.addons,
-            prompt: snapshot.prompt,
-            settings: snapshot.settings,
-            groupId: id,
-          },
-          signal,
-        ),
-      ),
-    );
-    const runs = begun.map((result) => (result.status === 'fulfilled' ? result.value : null));
-    if (runs.every((run) => run === null)) {
-      throw (begun[0] as PromiseRejectedResult).reason;
+    // The round is approved once for its total (one budget question naming it) and begun all or none: a refusal
+    // (Cancel, a block, Stop) withdraws the runs already begun, so nothing is sent or booked and the page stays.
+    let runs: RunHandle[];
+    try {
+      runs = await ctx.runs.beginAll(
+        planned.map((p) => ({
+          tool: ctx.manifest.id,
+          model: p.model,
+          estimateUsd: p.estimate,
+          addons: p.addons,
+          prompt: snapshot.prompt,
+          settings: snapshot.settings,
+          groupId: id,
+        })),
+        { label: `Model arena round: ${plural(planned.length, 'model')}`, signal },
+      );
+    } catch (error) {
+      ui.status('The round did not start: nothing was sent.');
+      // A declined confirmation or Stop is said here; a key, a lock or a block still goes to its dialog.
+      if (isStop(error)) markPresented(error);
+      throw error;
     }
 
     const round = newRound({
@@ -985,20 +992,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       attachments: roundFiles,
       startedAt: Date.now(),
     });
-    begun.forEach((result, index) => {
-      if (result.status === 'fulfilled') return;
-      const entry = round.entries[index]!;
-      entry.status = 'error';
-      entry.error = isStop(result.reason)
-        ? 'Not run: the budget confirmation was cancelled.'
-        : userMessage(result.reason);
-    });
     showRound(round, roundFiles);
-    const refused = begun.find(
-      (result): result is PromiseRejectedResult =>
-        result.status === 'rejected' && needsAction(result.reason),
-    );
-    if (refused) void presentError(refused.reason);
     ui.status(
       round.settings.blind
         ? `Comparing ${plural(models.length, 'model')}, shown as Model A to ${panelLetter(models.length - 1)}.`
@@ -1006,13 +1000,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     );
 
     let settled = 0;
-    const total = runs.filter(Boolean).length;
     await Promise.all(
       runs.map(async (run, index) => {
-        if (!run) return;
         await stream(round, index, run, planned[index]!);
         settled++;
-        if (settled < total) ui.progress(`${settled} of ${total} answers in`);
+        if (settled < runs.length) ui.progress(`${settled} of ${runs.length} answers in`);
       }),
     );
     ui.status(roundStatus(round, signal.aborted));
@@ -1097,16 +1089,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     );
 
   // --- votes and the tally ------------------------------------------------------------------------------
-  /** Read-modify-write of the stored tally, under a lock shared by every tab. */
-  async function changeTally(change: (stored: Tally) => Tally): Promise<Tally> {
-    const work = async (): Promise<Tally> => {
-      const next = change(parseTally(await ctx.state.get(STATE_TALLY)));
-      await ctx.state.set(STATE_TALLY, next);
-      return next;
-    };
-    const locks = webLocks();
-    return locks ? locks.request(TALLY_LOCK, work) : work();
-  }
+  /** Read-modify-write of the stored tally (`update` holds the key's lock across tabs); resolves with what is stored. */
+  const changeTally = async (change: (stored: Tally) => Tally): Promise<Tally> =>
+    parseTally(
+      await ctx.state.update<unknown>(STATE_TALLY, (stored) => change(parseTally(stored))),
+    );
 
   const loadTally = async (): Promise<void> => {
     try {
@@ -1215,37 +1202,20 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   }
 
   // --- files --------------------------------------------------------------------------------------------
-  function attach(ref: AttachmentRef, data?: string): void {
-    if (files.length >= MAX_ATTACHMENTS) {
-      throw new InvalidInputError(`At most ${MAX_ATTACHMENTS} files go with one prompt.`);
-    }
-    if (ref.kind === 'text') checkText(files, ref.name, ref.size);
-    if (data) session.set(ref.id, data);
-    files = [...files, ref];
-  }
-
-  async function addFiles(list: File[]): Promise<void> {
-    const problems: string[] = [];
-    let added = 0;
-    for (const file of list) {
-      try {
-        if (files.length >= MAX_ATTACHMENTS) {
-          throw new InvalidInputError(`At most ${MAX_ATTACHMENTS} files go with one prompt.`);
-        }
-        const { ref, data } = await readAttachment(file);
-        attach(ref, data);
-        added++;
-      } catch (error) {
-        problems.push(userMessage(error));
-      }
-    }
-    renderFiles();
-    renderContenders();
-    void ui.refreshEstimate();
-    if (problems.length > 0) {
-      toast({ variant: 'warning', message: problems.join(' '), testId: 'attach-error' });
-    } else if (added > 0) announce(`${plural(added, 'file')} attached.`);
-  }
+  const intake = attachmentIntake({
+    noun: 'prompt',
+    files: () => files,
+    setFiles: (next) => {
+      files = next;
+    },
+    keep: (id, data) => session.set(id, data),
+    field: promptInput,
+    changed: () => {
+      renderFiles();
+      renderContenders();
+      void ui.refreshEstimate();
+    },
+  });
 
   // --- live updates ---------------------------------------------------------------------------------------
   const loadCatalog = (): void => {
@@ -1315,7 +1285,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
               kind: 'tokens',
               model,
               promptTokens,
-              completionTokens: fitOutput(promptTokens, catalog.get(model), form.maxTokens)
+              completionTokens: fitFor(promptTokens, catalog.get(model), form.maxTokens)
                 .completionTokens,
             })
             .catch(() => null),
@@ -1331,36 +1301,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       const unread = files.filter((ref) => needsParser(ref, (id) => session.get(id)));
       return form.models.flatMap(() => parserAddons(form.pdfEngine, unread));
     },
-    onFiles: (list) => void addFiles(list),
-    onReceive: (items: SendItem[]) => {
-      const list: File[] = [];
-      const problems: string[] = [];
-      for (const item of items) {
-        if (item.kind === 'file') {
-          list.push(new File([item.blob], item.name, { type: item.blob.type }));
-          continue;
-        }
-        try {
-          if (item.name) attach(textAttachment(item.name, item.text, item.type));
-          else {
-            const size = new Blob([item.text]).size;
-            if (size > SIZE_LIMITS.text) {
-              throw new InvalidInputError(
-                `The text sent here is ${formatBytes(size)}. A prompt takes at most ${formatBytes(SIZE_LIMITS.text)} of typed text; send it as a file instead.`,
-              );
-            }
-            promptInput.value = [promptInput.value, item.text].filter(Boolean).join('\n\n');
-          }
-        } catch (error) {
-          problems.push(userMessage(error));
-        }
-      }
-      renderFiles();
-      if (problems.length > 0) {
-        toast({ variant: 'warning', message: problems.join(' '), testId: 'attach-error' });
-      }
-      void addFiles(list);
-    },
+    onFiles: (list) => void intake.addFiles(list),
+    onReceive: (items) => intake.receive(items),
     sample: () => {
       promptInput.value = SAMPLE_PROMPT;
       renderContenders();
