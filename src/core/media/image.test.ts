@@ -57,8 +57,8 @@ describe('parseColour', () => {
     expect(parseColour([1, 2, 3])).toEqual([1, 2, 3]);
   });
   it('rejects anything else', () => {
-    expect(() => parseColour('red')).toThrow(/hex colour/);
-    expect(() => parseColour('#12345')).toThrow(/hex colour/);
+    expect(() => parseColour('red')).toThrow(/hex color/);
+    expect(() => parseColour('#12345')).toThrow(/hex color/);
   });
 });
 

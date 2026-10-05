@@ -206,13 +206,13 @@ export function keysSection(core: CoreServices): SectionView {
       type: 'color',
       class: 'form-control form-control-color form-control-sm',
       value: key.colour ?? NO_COLOUR,
-      title: 'Colour',
-      'aria-label': `Colour of ${key.name}`,
+      title: 'Color',
+      'aria-label': `Color of ${key.name}`,
       'data-testid': 'key-colour',
       'data-focus-key': `key:${key.id}:colour`,
       onchange: () => {
         if (attempt(() => core.keys.update(key.id, { colour: colour.value })))
-          announce(`Colour of ${key.name} changed.`);
+          announce(`Color of ${key.name} changed.`);
       },
     });
     const freeOnly = core.settings.get().freeOnly;

@@ -75,6 +75,7 @@ All notable changes to this project are documented here. The format follows
 - US spelling "Favorites" everywhere (text, test ids, code and the settings fields `favoriteTools` and `models.favorites`); settings saved under the old field names are still read.
 - `trimOldest()` in `src/core/tokens.ts` replaces Chat's `trimToBudget` and Bot-to-bot's `trimCount` (94c14cf).
 - `RunHandle.reservedUsd`; Model arena says what an unknown cost counted; a group total with unknown members shows "+ N unknown" and budgets treat it as a floor; `beginAll` returns handles in spec order (4f88cad).
+- US spelling throughout the UI: color, canceled, centered, labeled, organization and harbor in labels, messages and samples; `tests/lint/us-spelling.test.ts` fails on a British spelling in UI strings, HTML titles and manifests (2fc023b).
 - Bot-to-bot chat uses the framework's run bar (Step and Pause as runner actions, Escape through `stopOnEscape`), the shared Markdown cache, cost wording ("cost unknown (≈ $x counted)"), `failureText`, core token counting and `holdLock`; it re-reads its state after a data reset (752fdfe, 41d107d).
 - Group budget approvals: `runs.approveGroup()`/`releaseGroup()`, `RunSpec.useGroupApproval` and all-or-none `runs.beginAll()`; the budget dialog names a group with its models and total; Video studio approves its sequences through them (e7660ec).
 - A run stopped before it sent anything books no stats row (e7660ec).

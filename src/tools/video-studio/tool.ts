@@ -1850,7 +1850,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     sample: () => {
       applySettings(
         { ...settings, tab: 'clip', mode: 'text', format: { ...settings.format, duration: 5 } },
-        'A fishing boat leaves a quiet harbour at dawn, gulls circling overhead, gentle waves catching the first light',
+        'A fishing boat leaves a quiet harbor at dawn, gulls circling overhead, gentle waves catching the first light',
       );
     },
   };

@@ -85,7 +85,7 @@ export function staticItems(core: Pick<CoreServices, 'settings' | 'keys'>): Pale
       id: `theme:${mode}`,
       group: 'Actions',
       label: `Switch to ${label.toLowerCase()} theme`,
-      keywords: 'appearance colour mode',
+      keywords: 'appearance color colour mode',
       icon: themeIcon,
       action: () => setTheme(core, mode),
     });

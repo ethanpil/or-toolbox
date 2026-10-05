@@ -100,7 +100,7 @@ export const PRESETS: readonly Preset[] = [
     fields: [
       text('full_name', 'Name of the person.', true),
       text('job_title', 'Role or title.'),
-      text('company', 'Company or organisation.'),
+      text('company', 'Company or organization.'),
       field('emails', 'list', 'Email addresses.'),
       field('phones', 'list', 'Phone numbers, as printed.'),
       text('website', 'Web address.'),

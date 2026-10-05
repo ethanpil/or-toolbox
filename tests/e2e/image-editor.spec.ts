@@ -402,9 +402,9 @@ test.describe('Image editor', () => {
       'Inpaint · 4579 × 3663 · outside kept',
       { timeout: 120_000 },
     );
-    // 3:2 into a 5:4 picture: fitted inside and centred, not stretched, and the version says so.
+    // 3:2 into a 5:4 picture: fitted inside and centered, not stretched, and the version says so.
     await expect(page.getByTestId('editor-version-fitted')).toContainText(
-      'fitted inside and centred',
+      'fitted inside and centered',
     );
 
     // Every reference was built at the same size: the picture fitted in 2048 px.

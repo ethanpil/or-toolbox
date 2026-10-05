@@ -170,7 +170,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       autocomplete: 'off',
       'data-testid': testId,
     });
-  const style = textInput(ids.style, 'Watercolour, soft light', 'imagegen-style');
+  const style = textInput(ids.style, 'Watercolor, soft light', 'imagegen-style');
   const negative = textInput(ids.negative, 'Text, watermarks', 'imagegen-negative');
   prompt.addEventListener('input', () => {
     form.prompt = prompt.value;
@@ -1270,7 +1270,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       applyForm({
         ...form,
         prompt: 'A lighthouse on a rocky coast at dusk, warm light in the windows, gentle waves',
-        style: 'Watercolour, soft light',
+        style: 'Watercolor, soft light',
         negative: 'Text, watermarks',
         aspectRatio: '16:9',
       });

@@ -174,7 +174,7 @@ export class BudgetBlockedError extends OrError {
 /** The user declined a budget confirmation. Not an error worth reporting; tools just stop quietly. */
 export class RunCancelledError extends OrError {
   override readonly name = 'RunCancelledError';
-  constructor(message = 'Run cancelled.') {
+  constructor(message = 'Run canceled.') {
     super('cancelled', message);
   }
 }

@@ -89,7 +89,7 @@ export function appearanceSection(core: CoreServices): SectionView {
         'data-testid': `accent-preset-${preset.name.toLowerCase()}`,
         dataset: { hex: preset.hex },
         onclick: () => {
-          if (setAccent(preset.hex)) announce(`Accent colour: ${preset.name}.`);
+          if (setAccent(preset.hex)) announce(`Accent color: ${preset.name}.`);
         },
       },
       icon('check-lg'),
@@ -102,7 +102,7 @@ export function appearanceSection(core: CoreServices): SectionView {
       class: 'btn btn-sm btn-outline-secondary',
       'data-testid': 'accent-reset',
       onclick: () => {
-        if (setAccent(null)) announce('Accent colour reset to the default indigo.');
+        if (setAccent(null)) announce('Accent color reset to the default indigo.');
       },
     },
     icon('arrow-counterclockwise', 'me-1'),
@@ -171,14 +171,14 @@ export function appearanceSection(core: CoreServices): SectionView {
       h(
         'div',
         null,
-        h('label', { class: 'form-label fw-semibold', htmlFor: accentId }, 'Accent colour'),
+        h('label', { class: 'form-label fw-semibold', htmlFor: accentId }, 'Accent color'),
         h(
           'div',
           { class: 'd-flex flex-wrap align-items-center gap-3' },
           accentInput,
           h(
             'div',
-            { class: 'd-flex flex-wrap gap-2', role: 'group', 'aria-label': 'Preset colours' },
+            { class: 'd-flex flex-wrap gap-2', role: 'group', 'aria-label': 'Preset colors' },
             presetButtons,
           ),
           resetAccent,
@@ -202,7 +202,7 @@ export function appearanceSection(core: CoreServices): SectionView {
         h(
           'div',
           { class: 'form-text' },
-          'Text on buttons and links switches between light and dark to stay readable on any colour.',
+          'Text on buttons and links switches between light and dark to stay readable on any color.',
         ),
       ),
       density.element,
