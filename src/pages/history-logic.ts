@@ -5,7 +5,7 @@
  */
 import type { HistoryQuery, RunRecord, RunStatus } from '../core/types';
 import { TOOL_IDS, type ToolId } from '../tools/types';
-import { formatCount, formatDate, formatMs, formatUsd } from '../ui/format';
+import { describeRunCost, formatCount, formatDate, formatMs } from '../ui/format';
 
 export interface HistoryFilters {
   text: string;
@@ -176,27 +176,30 @@ export interface CostInfo {
 /** What a run cost, with estimated and unknown costs marked rather than shown as exact or zero. */
 export function costInfo(run: RunRecord, isFree: (model: string) => boolean): CostInfo {
   if (run.status === 'running') return { text: 'Running', note: null, title: 'Still running.' };
-  const { costUsd, costUnknown, costEstimated } = run.usage;
-  if (costUnknown) {
-    return {
-      text: 'Unknown',
-      note: 'unknown',
-      title: 'OpenRouter did not report a cost for this run. Budgets counted the pre-run estimate.',
-    };
+  const cost = describeRunCost(run.usage, { free: isFree(run.model), booked: run.reservedUsd });
+  switch (cost.kind) {
+    case 'unknown':
+      return {
+        text: cost.text,
+        note: 'unknown',
+        title: `OpenRouter did not report a cost for this run. Budgets counted ${cost.counted ?? 'the pre-run estimate'}.`,
+      };
+    case 'estimated':
+      return {
+        text: cost.text,
+        note: 'estimated',
+        title: 'Estimated from catalog prices; OpenRouter did not report the cost.',
+      };
+    case 'free':
+      return { text: cost.text, note: null, title: 'A free model.' };
+    default:
+      return {
+        text: cost.text,
+        note: null,
+        title:
+          run.usage.costUsd === 0 ? 'OpenRouter reported no charge.' : 'Reported by OpenRouter.',
+      };
   }
-  if (costEstimated && costUsd > 0) {
-    return {
-      text: `≈ ${formatUsd(costUsd)}`,
-      note: 'estimated',
-      title: 'Estimated from catalog prices; OpenRouter did not report the cost.',
-    };
-  }
-  if (costUsd === 0) {
-    return isFree(run.model)
-      ? { text: 'Free', note: null, title: 'A free model.' }
-      : { text: '$0.00', note: null, title: 'OpenRouter reported no charge.' };
-  }
-  return { text: formatUsd(costUsd), note: null, title: 'Reported by OpenRouter.' };
 }
 
 /** `1.2K in · 340 out`, or null when the run used no tokens (images, speech, video). */

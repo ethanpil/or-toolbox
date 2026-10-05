@@ -37,6 +37,89 @@ export function formatEstimate(usd: number | null): string {
   return `≈ ${formatUsd(usd)}`;
 }
 
+/** What a finished request or run says about its cost (`Usage`, `UsageTotals`, a run's or a turn's totals). */
+export interface RunCostFields {
+  /** null: no number to show (a panel that has not answered yet). */
+  costUsd: number | null;
+  /** `costUsd` is the client's estimate from catalog prices, not what OpenRouter reported. */
+  costEstimated?: boolean;
+  /** Some request's cost could not be determined at all: the number is not the cost. */
+  costUnknown?: boolean;
+}
+
+export interface RunCostOptions {
+  /** The model is free: a zero cost reads `Free`, not `$0.00`. Never applies to an unknown cost. */
+  free?: boolean;
+  /** USD counted against budgets in place of an unknown cost (the run's reservation); said with it. */
+  booked?: number | null;
+}
+
+export type RunCostKind = 'free' | 'known' | 'estimated' | 'unknown' | 'none';
+
+export interface RunCost {
+  kind: RunCostKind;
+  /** Short, for a cell or a labelled value: `Free`, `$0.012`, `≈ $0.012`, `Unknown`, `—`. */
+  text: string;
+  /** For `unknown`: what was counted instead (`≈ $0.0034`), or null when nothing is known about it. */
+  counted: string | null;
+}
+
+/**
+ * The one rule for what a run cost: unknown first (never free, never zero, never `≈`: the amount counted for it is
+ * said separately), then free (a zero cost on a free model), then an estimate (`≈ $0.012`), else the amount
+ * OpenRouter reported. History, Chat, Bot-to-bot and Model arena all word costs through this.
+ */
+export function describeRunCost(cost: RunCostFields, options: RunCostOptions = {}): RunCost {
+  if (cost.costUnknown) {
+    const booked = options.booked ?? 0;
+    return {
+      kind: 'unknown',
+      text: 'Unknown',
+      counted: booked > 0 ? `≈ ${formatUsd(booked)}` : null,
+    };
+  }
+  if (cost.costUsd === null) return { kind: 'none', text: '—', counted: null };
+  if (cost.costUsd === 0 && options.free) return { kind: 'free', text: 'Free', counted: null };
+  return cost.costEstimated
+    ? { kind: 'estimated', text: `≈ ${formatUsd(cost.costUsd)}`, counted: null }
+    : { kind: 'known', text: formatUsd(cost.costUsd), counted: null };
+}
+
+/** `describeRunCost` as one string: `Unknown (≈ $0.0034 counted)` when something was counted for an unknown cost. */
+export function formatRunCost(cost: RunCostFields, options: RunCostOptions = {}): string {
+  const { text, counted } = describeRunCost(cost, options);
+  return counted ? `${text} (${counted} counted)` : text;
+}
+
+/** Tokens, cost and latency of one answer or turn. */
+export interface UsageFields extends RunCostFields {
+  promptTokens: number;
+  completionTokens: number;
+  latencyMs: number;
+}
+
+/**
+ * `1.2K in · 340 out · $0.0012 · 1.4 s`: the line under a reply. The cost follows `describeRunCost`, in lower case
+ * because nothing labels it (`free`, `cost unknown (≈ $0.0034 counted)`); no latency when it is 0.
+ */
+export function usageLine(usage: UsageFields | undefined, options: RunCostOptions = {}): string {
+  if (!usage) return '';
+  const cost = describeRunCost(usage, options);
+  const text =
+    cost.kind === 'unknown'
+      ? `cost unknown${cost.counted ? ` (${cost.counted} counted)` : ''}`
+      : cost.kind === 'free'
+        ? 'free'
+        : cost.text;
+  return [
+    `${formatCount(usage.promptTokens)} in · ${formatCount(usage.completionTokens)} out`,
+    cost.kind === 'none' ? null : text,
+    usage.latencyMs > 0 ? formatMs(usage.latencyMs) : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
 /** Compact counts: `950`, `1.2K`, `34K`, `1.5M`. */
 export function formatCount(n: number): string {
   if (!Number.isFinite(n)) return '—';
