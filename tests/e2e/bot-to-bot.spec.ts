@@ -91,6 +91,96 @@ async function holdStreams(context: BrowserContext): Promise<void> {
   });
 }
 
+/**
+ * Chat streams the test finishes when it chooses: each sends "<speaker> says <n> " at once, then waits for
+ * `release()` (or finishes by itself after `auto()`) to send "is done." with its usage and `[DONE]`. Nothing
+ * depends on timing, and no request leaves the page.
+ */
+async function controlledStreams(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    const original = window.fetch.bind(window);
+    const waiting: (() => void)[] = [];
+    const control = {
+      auto: false,
+      waiting: () => waiting.length,
+      release: () => waiting.shift()?.(),
+    };
+    (window as unknown as { botStreams: typeof control }).botStreams = control;
+    let n = 0;
+    window.fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!url.endsWith('/api/v1/chat/completions')) return original(input, init);
+      const body = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as {
+        messages?: { content?: string }[];
+      };
+      const speaker =
+        /You are (.+?), in a conversation/.exec(body.messages?.[0]?.content ?? '')?.[1] ?? '?';
+      n += 1;
+      const encoder = new TextEncoder();
+      const base = {
+        id: 'gen-c',
+        object: 'chat.completion.chunk',
+        created: 1,
+        model: 'test/text-model',
+      };
+      const event = (data: unknown): Uint8Array =>
+        encoder.encode(`data: ${JSON.stringify(data)}\n\n`);
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            event({
+              ...base,
+              choices: [
+                { index: 0, delta: { content: `${speaker} says ${n} ` }, finish_reason: null },
+              ],
+            }),
+          );
+          const finish = (): void => {
+            controller.enqueue(
+              event({
+                ...base,
+                choices: [{ index: 0, delta: { content: 'is done.' }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 40, completion_tokens: 8, total_tokens: 48, cost: 0.0001 },
+              }),
+            );
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          };
+          init?.signal?.addEventListener('abort', () =>
+            controller.error(new DOMException('The operation was aborted.', 'AbortError')),
+          );
+          if (control.auto) finish();
+          else waiting.push(finish);
+        },
+      });
+      return Promise.resolve(
+        new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+      );
+    };
+  });
+}
+type StreamControl = { auto: boolean; waiting: () => number; release: () => void };
+const streams = (page: Page) => ({
+  /** Finishes the stream that is waiting (waits for one to be). */
+  release: async (): Promise<void> => {
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (window as unknown as { botStreams: StreamControl }).botStreams.waiting(),
+        ),
+      )
+      .toBe(1);
+    await page.evaluate(() =>
+      (window as unknown as { botStreams: StreamControl }).botStreams.release(),
+    );
+  },
+  /** From now on every stream finishes by itself. */
+  auto: (): Promise<void> =>
+    page.evaluate(() => {
+      (window as unknown as { botStreams: StreamControl }).botStreams.auto = true;
+    }),
+});
+
 const turns = (page: Page) => page.getByTestId('bot-turn');
 const turnText = (page: Page, index: number) => turns(page).nth(index).getByTestId('turn-content');
 const end = (page: Page) => page.getByTestId('conversation-end');
@@ -183,10 +273,12 @@ test('the time limit cuts the turn in flight and keeps its text', async ({ page,
   // The time limit aborts the stream on purpose.
   const problems = await watchForProblems(page, { allowAborted: [CHAT] });
   await open(page);
-  await setLimits(page, { turns: 3, minutes: 0.1 }); // 6 s
+  await setLimits(page, { turns: 3 }); // 5 minutes on the clock
   await start(page);
   await expect(turnText(page, 0)).toHaveText('The first half of a thought');
   await expect(page.getByTestId('bots-state')).toHaveText('Running');
+  // Lowered while the turn streams: the turn's timer follows the new limit.
+  await setLimits(page, { minutes: 0.1 }); // 6 s
 
   await expect(end(page)).toHaveAttribute('data-reason', 'time', { timeout: 20_000 });
   await expect(turns(page).first()).toHaveAttribute('data-status', 'cut');
@@ -225,10 +317,18 @@ test('the cost cap ends the conversation once spending reaches it', async ({ pag
   expect(problems).toEqual([]);
 });
 
-test('the stop phrase, said by either bot, ends it', async ({ page, mock }) => {
+test('the stop phrase ends it when a bot ends its message with it, not when it is mentioned', async ({
+  page,
+  mock,
+}) => {
   const problems = await watchForProblems(page, { allowAborted: [CHAT] });
   answerTurns(mock, {
-    text: (speaker, n) => (n === 2 ? 'We agree: zero is even. [END]' : `${speaker} says ${n}`),
+    text: (speaker, n) =>
+      n === 1
+        ? 'Let us settle it; say [END] once we agree.'
+        : n === 3
+          ? 'Agreed: zero is even. **[end]**'
+          : `${speaker} says ${n}`,
   });
   await open(page);
   await start(page);
@@ -238,8 +338,8 @@ test('the stop phrase, said by either bot, ends it', async ({ page, mock }) => {
   await expect(page.getByTestId('budget-estimate')).toContainText('$0.25');
   await confirm.getByTestId('budget-confirm').click();
   await expect(end(page)).toHaveAttribute('data-reason', 'phrase');
-  await expect(end(page)).toContainText('Bot B said [END].');
-  await expect(turns(page)).toHaveCount(2);
+  await expect(end(page)).toContainText('Bot A said [END].');
+  await expect(turns(page)).toHaveCount(3);
   // The framing asks for the phrase, and the page shows the framing.
   expect(messagesOf(mock.calls(CHAT, 'POST')[0])[0]?.content).toContain(
     'end your message with [END]',
@@ -275,23 +375,30 @@ test('Stop keeps the partial turn and ends it, silently', async ({ page, context
 
 test('Pause holds after the turn in flight; Step runs one turn; Resume goes on', async ({
   page,
-  mock,
+  context,
 }) => {
-  const problems = await watchForProblems(page, { allowAborted: [CHAT] });
-  answerTurns(mock, { delayMs: 1500 });
+  test.slow();
+  // The turn in flight finishes only when the test says so: Pause is pressed while it streams, every time.
+  await controlledStreams(context);
+  const problems = await watchForProblems(page);
+  const stream = streams(page);
   await open(page);
   await setLimits(page, { turns: 4 });
   await start(page);
-  await expect(page.getByTestId('bots-pause')).toBeVisible();
+  await expect(turnText(page, 0)).toContainText('Bot A says 1');
   await expect(page.getByTestId('bots-pause')).toBeFocused();
   await page.getByTestId('bots-pause').click();
   await expect(page.getByTestId('bots-pause')).toContainText('Pausing…');
+  await expect(page.getByTestId('bots-state')).toHaveText('Running');
+  await stream.release();
 
   await expect(page.getByTestId('bots-state')).toHaveText('Paused');
   await expect(turns(page)).toHaveCount(1);
+  await expect(turnText(page, 0)).toHaveText('Bot A says 1 is done.');
   await expect(status(page)).toHaveText('Paused after Bot A’s turn.');
   await expect(end(page)).toHaveCount(0);
 
+  await stream.auto();
   await page.getByTestId('bots-step').click();
   await expect(turns(page)).toHaveCount(2);
   await expect(page.getByTestId('bots-state')).toHaveText('Paused');
@@ -345,6 +452,18 @@ test('a moderator message reaches both bots; edit a turn and resume from there',
   await expect(page.getByTestId('bots-edit-toast')).toContainText('2 messages after it removed');
   await expect(turns(page).first().getByTestId('turn-edit')).toBeFocused();
 
+  // Undo brings the rest back, and focus with it (the toast's button is gone).
+  await page.getByTestId('bots-edit-toast').getByTestId('toast-undo').click();
+  await expect(turns(page)).toHaveCount(2);
+  await expect(page.getByTestId('moderator-message')).toHaveCount(2);
+  await expect(turnText(page, 0)).toHaveText('Bot A says 1');
+  await expect(turns(page).first().getByTestId('turn-edit')).toBeFocused();
+
+  // Edit again, and go on from there.
+  await turns(page).first().getByTestId('turn-edit').click();
+  await page.getByTestId('edit-input').fill('Zero is even, because 0 = 2 × 0.');
+  await page.getByTestId('edit-save').click();
+  await expect(turns(page)).toHaveCount(1);
   await page.getByTestId('bots-step').click();
   await expect(turns(page)).toHaveCount(2);
   await expect(turns(page).nth(1)).toHaveAttribute('data-speaker', 'b');
@@ -415,8 +534,8 @@ test('exports the transcript as Markdown and JSON, with per-turn stats', async (
   expect(markdown).toContain(
     '## Bot A · Turn 1\n\nBot A says 1\n\n_test/text-model · 40 in · 8 out · $0.00042',
   );
-  expect(markdown).toContain('**Ended (Turn limit).** Turn limit reached (2 turns).');
-  expect(markdown).toContain('_2 of 2 turns · ');
+  expect(markdown).toContain('## Ended · Turn limit\n\nTurn limit reached (2 turns).');
+  expect(markdown).toContain('## Totals\n\n2 of 2 turns · ');
 
   await page.getByTestId('bots-export').click();
   download = page.waitForEvent('download');
@@ -477,7 +596,52 @@ test('works at 320 px with the keyboard only', async ({ page, mock }) => {
   await page.setViewportSize({ width: 320, height: 720 });
   answerTurns(mock);
   await open(page);
-  await setLimits(page, { turns: 2 });
+  await setLimits(page, { turns: 2, minutes: 120 });
+  // Long totals stay inside their tile: a stored conversation that used over an hour of a 2-hour limit
+  // (`1:02:09 / 2:00:00`), at 320 px and where tiles share a row (two at 375 px, three at 480 px).
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('ortoolbox');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error ?? new Error('open failed'));
+    });
+    const bots = { name: 'Bot A', model: 'test/text-model', persona: '' };
+    const value = {
+      version: 1,
+      id: 'long',
+      rev: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      first: 'a',
+      bots: { a: bots, b: { ...bots, name: 'Bot B' } },
+      entries: [{ id: 'o', kind: 'opener', content: 'Say hello.', createdAt: 1 }],
+      elapsedMs: 3_729_000,
+      spentUsd: 0.0123,
+      spentApprox: true,
+    };
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put({ key: 'tool:bot-to-bot:conversation', value, updatedAt: 1 });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error('write failed'));
+    });
+    db.close();
+  });
+  await page.reload();
+  await expect(page.getByTestId('bots-time')).toHaveText('1:02:09 / 2:00:00');
+  for (const width of [320, 375, 480]) {
+    await page.setViewportSize({ width, height: 720 });
+    for (const testId of ['bots-turns', 'bots-time', 'bots-cost']) {
+      const fits = await page
+        .getByTestId(testId)
+        .evaluate((element) => element.scrollWidth <= element.clientWidth);
+      expect(fits, `${testId} fits its tile at ${width} px`).toBe(true);
+    }
+  }
+  await page.setViewportSize({ width: 320, height: 720 });
+  await page.getByTestId('bots-new').click();
+  await expect(page.getByTestId('bots-empty')).toBeVisible();
+  await page.getByTestId('tool-prompt').fill('');
   await page.getByTestId('tool-prompt').focus();
   await page.keyboard.type('Say hello.');
   await tabTo(page, 'bots-primary');
