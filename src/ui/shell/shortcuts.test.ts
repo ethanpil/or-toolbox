@@ -3,7 +3,7 @@ import type { CoreServices } from '../../core/types';
 import { h } from '../dom';
 import { openModal } from '../feedback/modal';
 import { installPaletteShortcut } from './palette';
-import { isTypingTarget, plainShortcutAllowed } from './shortcuts';
+import { composing, isTypingTarget, plainShortcutAllowed } from './shortcuts';
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -53,12 +53,39 @@ describe('plainShortcutAllowed', () => {
     expect(key(document.body, { altKey: true })).toBe(false);
   });
 
+  it('lets a key through in the fields it is meant for', () => {
+    const composer = h('textarea');
+    const search = h('input');
+    document.body.append(composer, search);
+    const allowIn = (target: EventTarget): boolean => {
+      let allowed = false;
+      const listener = (event: KeyboardEvent): void => {
+        allowed = plainShortcutAllowed(event, { allowIn: [composer] });
+      };
+      document.addEventListener('keydown', listener, { once: true });
+      press(target, { key: 'Escape' });
+      return allowed;
+    };
+    expect(allowIn(composer)).toBe(true);
+    expect(allowIn(search)).toBe(false);
+  });
+
   it('stays out of the way of a dialog', async () => {
     const modal = openModal({ title: 'Open', body: h('p', null, 'x'), testId: 'dlg' });
     expect(key(document.body)).toBe(false);
     modal.hide();
     await modal.closed;
     expect(key(document.body)).toBe(true);
+  });
+});
+
+describe('composing', () => {
+  it('is true while an input method composes, including the 229 key code some browsers send', () => {
+    expect(composing(new KeyboardEvent('keydown', { key: 'Enter' }))).toBe(false);
+    expect(composing(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true }))).toBe(true);
+    const legacy = new KeyboardEvent('keydown', { key: 'Enter' });
+    Object.defineProperty(legacy, 'keyCode', { value: 229 });
+    expect(composing(legacy)).toBe(true);
   });
 });
 

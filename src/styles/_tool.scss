@@ -35,6 +35,7 @@
   background-color: var(--or-surface);
 }
 
-.or-run-button[aria-disabled='true'] {
+.or-run-button[aria-disabled='true'],
+.or-run-action[aria-disabled='true'] {
   cursor: not-allowed;
 }

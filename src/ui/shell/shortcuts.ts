@@ -15,13 +15,25 @@ export function isTypingTarget(target: EventTarget | null): boolean {
   );
 }
 
-/** A plain-key shortcut may fire only without modifiers, with no dialog open and nothing being typed into. */
-export function plainShortcutAllowed(event: KeyboardEvent): boolean {
+/** True while an input method is composing text: Enter and Escape belong to it, not to the page. */
+export const composing = (event: KeyboardEvent): boolean =>
+  event.isComposing || event.keyCode === 229;
+
+/**
+ * A plain-key shortcut may fire only without modifiers, with no dialog open and nothing being typed into.
+ * `allowIn` lists fields where the key still counts, because the shortcut is meant for them (Escape stops a reply
+ * from the message field, which has no use for it).
+ */
+export function plainShortcutAllowed(
+  event: KeyboardEvent,
+  options: { allowIn?: readonly EventTarget[] } = {},
+): boolean {
   return (
     !event.ctrlKey &&
     !event.metaKey &&
     !event.altKey &&
     !modalOpen() &&
-    !isTypingTarget(event.target)
+    (!isTypingTarget(event.target) ||
+      (event.target !== null && options.allowIn?.includes(event.target) === true))
   );
 }
