@@ -7,9 +7,14 @@
  * reload) the document came straight from the network, so:
  *
  * - Pages that need isolation (multi-threaded ffmpeg: Diagnostics and Video
- *   studio) reload once as soon as the worker is active. This happens at page
- *   start, before the user has done anything, and at most once per tab
- *   session (sessionStorage guard), so it can never loop.
+ *   studio) reload once when the worker is active, but only if the user has
+ *   not started using the page yet: no key press, click, input, paste or drop,
+ *   and no results or held work in the page. Otherwise the reload is left out
+ *   and the next page the user opens is isolated. The reload restores the
+ *   page's original address first, so parameters the page already consumed
+ *   and removed (`?run=`, `?prompt=`, `?sample=`) apply again. A page opened
+ *   by Send to (`?receive=`) never reloads: the hand-over cannot be repeated.
+ *   At most once per tab session (sessionStorage guard), so it never loops.
  * - Every other page only registers the worker. It must never reload: the
  *   OAuth callback, for one, carries a single-use code. The next page the
  *   user opens is served by the worker and isolated anyway.
@@ -19,11 +24,16 @@
  * browsing, registration failure and the dev server (which isolates pages
  * with real headers instead) are all normal.
  */
+import { getCore } from './index';
 import { url } from './paths';
+import { installStaleBuildOffer } from './stale-build';
 import { SS_KEYS } from './storage/local';
 
 /** sessionStorage key set just before the isolation reload. */
 const RELOAD_GUARD_KEY = SS_KEYS.isolationReload;
+
+/** Events that mean the user has started using the page. */
+const INTERACTIONS = ['keydown', 'pointerdown', 'input', 'paste', 'drop'] as const;
 
 export interface RegisterOptions {
   /** Reload once, at page start, if the page is not yet cross-origin isolated. */
@@ -36,45 +46,82 @@ export interface RegisterOptions {
  */
 export function registerServiceWorker(options: RegisterOptions = {}): void {
   if (!import.meta.env.PROD) return;
+  installStaleBuildOffer();
   if (!('serviceWorker' in navigator)) return;
 
-  const reloadForIsolation = options.isolation === 'required' && claimReload();
+  const isolation = options.isolation === 'required' ? prepareIsolationReload() : null;
 
   navigator.serviceWorker
     .register(url('sw.js'), { scope: url() })
     // Typed as possibly undefined on purpose: Playwright's `serviceWorkers:
     // 'block'` replaces register() with a stub that resolves to nothing.
     .then(async (registration: ServiceWorkerRegistration | undefined) => {
-      if (!registration || !reloadForIsolation) return;
+      if (!registration || !isolation) return;
       // Once a worker is active, a reload goes through it and comes back isolated.
       await navigator.serviceWorker.ready;
-      window.location.reload();
+      isolation.reloadIfUnused();
     })
     .catch(() => {
       // Registration refused (private browsing, storage disabled, offline
       // first visit, ...): the app runs without the worker.
-    });
+    })
+    .finally(() => isolation?.stopWatching());
 }
 
 /**
- * Decides whether this page load may reload for isolation, and if so records
- * that it did. Returns false when the page is already isolated, cannot be,
- * already reloaded once in this tab, or sessionStorage is unusable (without a
- * working guard a reload could repeat forever).
+ * Returns null when this page load may not reload for isolation: it is
+ * already isolated, cannot be (old browser, framed), already reloaded once in
+ * this tab, cannot keep the guard (without it a reload could repeat forever),
+ * or was opened by Send to. Otherwise starts watching for the user and
+ * remembers the address as it is now, before the page consumes its parameters.
  */
-function claimReload(): boolean {
+function prepareIsolationReload(): { reloadIfUnused(): void; stopWatching(): void } | null {
   try {
     if (window.crossOriginIsolated) {
       sessionStorage.removeItem(RELOAD_GUARD_KEY);
-      return false;
+      return null;
     }
-    // No isolation concept (old browser) or a framed page: a reload cannot help.
-    if (!('crossOriginIsolated' in window) || window.top !== window.self) return false;
-    if (sessionStorage.getItem(RELOAD_GUARD_KEY)) return false;
-    sessionStorage.setItem(RELOAD_GUARD_KEY, '1');
-    return sessionStorage.getItem(RELOAD_GUARD_KEY) === '1';
+    if (!('crossOriginIsolated' in window) || window.top !== window.self) return null;
+    if (sessionStorage.getItem(RELOAD_GUARD_KEY)) return null;
+    if (new URL(window.location.href).searchParams.has('receive')) return null;
   } catch {
-    return false;
+    return null;
+  }
+
+  const address = window.location.href;
+  let used = false;
+  const onUse = (): void => {
+    used = true;
+  };
+  for (const type of INTERACTIONS) window.addEventListener(type, onUse, { capture: true });
+  const stopWatching = (): void => {
+    for (const type of INTERACTIONS) window.removeEventListener(type, onUse, { capture: true });
+  };
+
+  return {
+    stopWatching,
+    reloadIfUnused() {
+      stopWatching();
+      if (used || holdsWork()) return;
+      try {
+        sessionStorage.setItem(RELOAD_GUARD_KEY, '1');
+        if (sessionStorage.getItem(RELOAD_GUARD_KEY) !== '1') return;
+      } catch {
+        return;
+      }
+      window.history.replaceState(window.history.state, '', address);
+      window.location.reload();
+    },
+  };
+}
+
+/** True if the page has results not downloaded or work a tool holds. */
+function holdsWork(): boolean {
+  try {
+    const { results } = getCore();
+    return results.pending().length > 0 || results.holds().length > 0;
+  } catch {
+    return true; // cannot tell: do not risk it
   }
 }
 

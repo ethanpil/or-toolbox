@@ -67,6 +67,66 @@ test('the OAuth callback never reloads, even on a first visit', async ({ page })
   expect(navigation).toBe('navigate');
 });
 
+test('a page the user has started using does not reload for isolation', async ({
+  page,
+  context,
+}) => {
+  // A key press before the worker is ready: the page module listens from its start, and on a first visit the
+  // worker is still installing the shell when the document has been parsed.
+  await context.addInitScript(() => {
+    document.addEventListener('DOMContentLoaded', () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' }));
+    });
+  });
+  const documents = countDocuments(page);
+  await page.goto('diagnostics/');
+  await waitUntilControlled(page);
+  await page.waitForTimeout(2000);
+
+  expect(documents()).toBe(1);
+  expect(await isolated(page)).toBe(false);
+  // Left for the next navigation, which the worker serves isolated.
+  await page.goto('settings/');
+  expect(await isolated(page)).toBe(true);
+});
+
+test('the isolation reload restores the parameters the tool already consumed', async ({
+  page,
+  browserName,
+}) => {
+  test.skip(
+    browserName === 'webkit',
+    'Tool pages call OpenRouter; WebKit lets those escape the mock.',
+  );
+  const navigations: string[] = [];
+  page.on('request', (request) => {
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+      navigations.push(request.url());
+    }
+  });
+  await page.goto('tools/video-studio/?sample=1');
+  await waitUntilIsolated(page);
+
+  expect(navigations).toHaveLength(2);
+  expect(new URL(navigations[1] ?? '').searchParams.get('sample')).toBe('1');
+});
+
+test('a page opened by Send to never reloads: the hand-over cannot be repeated', async ({
+  page,
+  browserName,
+}) => {
+  test.skip(
+    browserName === 'webkit',
+    'Tool pages call OpenRouter; WebKit lets those escape the mock.',
+  );
+  const documents = countDocuments(page);
+  await page.goto('tools/video-studio/?receive=hand-over-1');
+  await waitUntilControlled(page);
+  await page.waitForTimeout(2000);
+
+  expect(documents()).toBe(1);
+});
+
 test('the isolation reload happens at most once per tab', async ({ page, context }) => {
   // As if this tab had already reloaded once without becoming isolated.
   await context.addInitScript(() => {
