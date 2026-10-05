@@ -25,12 +25,53 @@ interface Libraries {
 
 let libraries: Promise<Libraries> | undefined;
 
+/**
+ * The only attributes model output may carry. Everything the page itself uses
+ * to look or behave like UI is refused: `class` (Bootstrap could draw a
+ * full-screen fake dialog or hide text that Copy code copies), `data-*`
+ * (Bootstrap's data API), `role`/`aria-*`, `tabindex`, `hidden`, `inert`,
+ * `for` and `popovertarget` (which forward clicks to the page's real
+ * controls, whose ids are predictable), `id`/`name` (DOM clobbering) and
+ * `style`. `target`/`rel` on links are added afterwards by a hook.
+ */
+const ALLOWED_ATTR = new Set([
+  'href',
+  'src',
+  'alt',
+  'title',
+  'align',
+  'colspan',
+  'rowspan',
+  'start',
+  'type',
+  'checked',
+  'disabled',
+  'class',
+]);
+
+/** Allowed attributes that are only allowed on some elements, or with some values. */
+const ATTRIBUTE_RULES: Record<string, (element: string, value: string) => boolean> = {
+  // Fenced code blocks: `language-js` and the like, nothing else.
+  class: (element, value) => element === 'code' && /^language-[\w+#.-]+$/.test(value),
+  // GFM task lists (see keepOnlyTaskCheckboxes).
+  type: (element) => element === 'input',
+  checked: (element) => element === 'input',
+  disabled: (element) => element === 'input',
+};
+
 /** Loads both libraries once. A failed load is not remembered, so the next call retries. */
 function loadLibraries(): Promise<Libraries> {
   libraries ??= Promise.all([import('marked'), import('dompurify')]).then(
     ([marked, { default: createPurify }]) => {
       // A private instance: hooks added here cannot leak into other users of DOMPurify.
       const purify = createPurify(window);
+      // The allowlist is enforced here: with USE_PROFILES, DOMPurify ignores ALLOWED_ATTR.
+      purify.addHook('uponSanitizeAttribute', (node, data) => {
+        const rule = ATTRIBUTE_RULES[data.attrName];
+        if (!ALLOWED_ATTR.has(data.attrName) || (rule && !rule(node.localName, data.attrValue))) {
+          data.keepAttr = false;
+        }
+      });
       purify.addHook('afterSanitizeAttributes', (node) => {
         if (node instanceof Element && node.localName === 'a' && node.hasAttribute('href')) {
           // In-page links stay in the page; everything else opens in a new tab
@@ -59,8 +100,8 @@ function loadLibraries(): Promise<Libraries> {
  *
  * Removed: scripts, event handlers, `javascript:` URLs, styles, forms and
  * form controls (except GFM task-list checkboxes, which are disabled),
- * frames, embedded objects and media, `id`/`name` (which could clobber page
- * globals), and anything that would load a remote resource.
+ * frames, embedded objects and media, anything that would load a remote
+ * resource, and every attribute outside ALLOWED_ATTR.
  */
 export async function renderMarkdown(markdown: string): Promise<DocumentFragment> {
   const { marked, purify } = await loadLibraries();
@@ -85,7 +126,8 @@ export async function renderMarkdown(markdown: string): Promise<DocumentFragment
       'map',
       'area',
     ],
-    FORBID_ATTR: ['style', 'id', 'name', 'background', 'poster', 'srcset', 'ping'],
+    ALLOW_DATA_ATTR: false,
+    ALLOW_ARIA_ATTR: false,
     // DOMPurify's default URL allow-list plus `blob:` (object URLs this page made).
     ALLOWED_URI_REGEXP:
       /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|blob):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
