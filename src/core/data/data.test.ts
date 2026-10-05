@@ -26,6 +26,8 @@ async function populate(): Promise<void> {
   });
 }
 
+const wiped = { runs: 0, prompts: 0, jobs: 0, stats: 0 };
+
 async function counts() {
   const db = await getDb();
   return {
@@ -106,7 +108,9 @@ describe('deletion', () => {
     await core.data.resetEverything();
 
     expect(clearKeys).toHaveBeenCalledOnce();
-    expect(await counts()).toEqual({ runs: 0, prompts: 0, jobs: 0, stats: 0, kv: [] });
+    // Only the reset generation stays in kv, one higher (each reset bumps it).
+    expect(await counts()).toEqual({ ...wiped, kv: ['meta:reset-generation'] });
+    expect((await (await getDb()).get('kv', 'meta:reset-generation'))?.value).toBe(1);
     for (const key of Object.values(LS_KEYS)) expect(localStorage.getItem(key)).toBeNull();
     expect(sessionStorage.getItem(SS_KEYS.unlocked)).toBeNull();
     expect(sessionStorage.getItem(SS_KEYS.oauth)).toBeNull();
@@ -114,6 +118,8 @@ describe('deletion', () => {
     expect(localStorage.getItem('unrelated-site-key')).toBe('kept');
     expect(core.settings.get()).toEqual(defaultSettings());
     expect(events).toEqual(['keys-changed', 'settings-changed', 'jobs-changed', 'data-reset']);
+    await core.data.resetEverything();
+    expect((await (await getDb()).get('kv', 'meta:reset-generation'))?.value).toBe(2);
   });
 
   it('tells open pages which tool state was removed (after the reset itself), so they show it', async () => {
@@ -159,7 +165,7 @@ describe('deletion', () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
 
     expect(poll.mock.calls.length).toBe(calls);
-    expect(await counts()).toEqual({ runs: 0, prompts: 0, jobs: 0, stats: 0, kv: [] });
+    expect(await counts()).toEqual({ ...wiped, kv: ['meta:reset-generation'] });
     expect(core.runs.active()).toEqual([]);
     await until(() => seen.some((j) => j.removed));
     expect(seen.filter((j) => j.removed)).toEqual([

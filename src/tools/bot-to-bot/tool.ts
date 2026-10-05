@@ -438,13 +438,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   }
 
   // A data reset (Settings → Data, any tab) wipes the stored conversation: drop this tab's copy and stop a run in
-  // progress (the core discards it too). Writes queued before it are dropped (`epoch`); the store refuses one that
-  // starts its check after the reset (StateResetError). A write whose check ran before the reset but whose `put`
-  // is queued behind the wipe still lands, so a delete follows it. Reading the key again re-arms it, so the next
-  // conversation is stored without a "reload the page".
+  // progress (the core discards it too). Writes queued before it are dropped (`epoch`); the store refuses any
+  // write of the old conversation that reaches storage after the wipe (StateResetError, checked in the write's
+  // own transaction). Reading the key again re-arms it, so the next conversation is stored without a "reload the
+  // page".
   ctx.bus.on('data-reset', () => {
     epoch++;
-    if (pendingWrites > 0) queueWrite(() => ctx.state.delete(STATE_KEY));
     conversation = null;
     editing = null;
     followStale = false;

@@ -7,7 +7,7 @@
 import type { CoreServices, DataService } from '../types';
 import { getDb } from '../storage/db';
 import { LS_KEYS, SS_KEYS, local, removeItem, session } from '../storage/local';
-import { TOOL_STATE_PREFIX, announceToolState, prefixRange } from '../tool-state';
+import { TOOL_STATE_PREFIX, announceToolState, prefixRange, wipeKv } from '../tool-state';
 
 export function createDataService(core: CoreServices): DataService {
   return {
@@ -55,7 +55,8 @@ export function createDataService(core: CoreServices): DataService {
         tx.objectStore('prompts').clear(),
         tx.objectStore('jobs').clear(),
         tx.objectStore('stats').clear(),
-        tx.objectStore('kv').clear(),
+        // Clears kv and bumps the reset generation in this transaction: no tool state write lands behind it.
+        wipeKv(tx.objectStore('kv')),
         tx.done,
       ]);
       core.keys.clear(); // keys, lock and this tab's unlocked session; emits keys-changed
@@ -66,8 +67,8 @@ export function createDataService(core: CoreServices): DataService {
       }
       core.bus.emit({ type: 'settings-changed' });
       for (const id of jobIds) core.bus.emit({ type: 'jobs-changed', id });
-      // Every service (here and in other tabs) drops its live work: runs abort without booking, polling stops, and
-      // tool state stores refuse what their pages held from before.
+      // Every service (here and in other tabs) drops its live work: runs abort without booking, polling stops. (Tool
+      // state stores refuse what their pages held from before already: the wipe bumped the reset generation.)
       core.bus.emit({ type: 'data-reset' });
       // Then open tools read their state again (after the reset, so that read counts as a fresh one).
       announceToolState(core.bus, stateKeys);
