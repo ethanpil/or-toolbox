@@ -8,7 +8,8 @@
  * card's own player reads once the browser has the video's header (no second element, no ffmpeg). The download is
  * the file as it is; `covers` names other results that downloading it counts as saved (the clips of a join).
  *
- * Remove asks `beforeRemove`, by default a confirmation while the video is not downloaded, then drops the result
+ * Remove (shared with the image and audio cards: `resultRemoval()`, result-removal.ts) asks `beforeRemove`, by
+ * default a confirmation while the video is not downloaded, then drops the result
  * (`handle.remove()`), disposes the player, detaches the card, announces it and calls `onRemove`. Then, unless
  * `onRemove` moved focus itself, focus goes to the Remove button of the next video card on the page (else the
  * previous one), else to `focusFallback()`, asked only now so it can return what `onRemove` showed. `remove()`
@@ -29,15 +30,13 @@
  * ```
  */
 import { extensionForMime } from '../../core/files';
-import { disposeBootstrap } from '../bootstrap';
-import { type Child, focusKey, h } from '../dom';
-import { announce } from '../feedback/announce';
-import { confirmDialog } from '../feedback/dialogs';
+import { type Child, h } from '../dom';
 import { formatDuration } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
 import type { ResultHandle, ToolUi } from '../tool/types';
 import { exportMenu } from './export-menu';
+import { resultRemoval } from './result-removal';
 import { type VideoPlayer, videoPlayer } from './video-player';
 
 export interface VideoResultCardOptions {
@@ -85,21 +84,6 @@ export interface VideoResultCard {
 
 /** Marks video cards on the page, so a card that goes can hand focus to a neighbour. */
 const CARD_CLASS = 'or-video-result';
-/** Each live card's Remove button key. */
-const removeKeys = new WeakMap<Element, string>();
-
-/** The other video cards on the page: the following ones nearest first, then the preceding ones nearest first. */
-function neighbours(card: Element): Element[] {
-  const cards = [...document.querySelectorAll(`.${CARD_CLASS}`)];
-  const at = cards.indexOf(card);
-  return at < 0 ? [] : [...cards.slice(at + 1), ...cards.slice(0, at).reverse()];
-}
-
-/** Focus fell to the page (its element was removed, or nothing has it). */
-function focusLost(): boolean {
-  const active = document.activeElement;
-  return !active || active === document.body || !active.isConnected;
-}
 
 export function videoResultCard(options: VideoResultCardOptions): VideoResultCard {
   const { ui, blob, name } = options;
@@ -199,58 +183,20 @@ export function videoResultCard(options: VideoResultCardOptions): VideoResultCar
       ),
     ),
   );
-  removeKeys.set(element, removeKey);
+  const removal = resultRemoval({
+    element,
+    cardClass: CARD_CLASS,
+    removeKey,
+    handle,
+    title,
+    noun: 'video',
+    testId,
+    beforeRemove: options.beforeRemove,
+    onRemove: options.onRemove,
+    focusFallback: options.focusFallback,
+    dispose: () => player.dispose(),
+  });
+  const removeByUser = (): Promise<void> => removal.removeByUser();
 
-  let removed = false;
-  /** Drops the card; returns the Remove keys of the cards that may take focus next, nearest first. */
-  const detach = (): string[] => {
-    removed = true;
-    const next = neighbours(element).flatMap((card) => removeKeys.get(card) ?? []);
-    handle.remove();
-    player.dispose();
-    disposeBootstrap(element);
-    removeKeys.delete(element);
-    element.remove();
-    return next;
-  };
-  const moveFocus = (next: readonly string[]): void => {
-    for (const key of next) if (focusKey(document, key)) return;
-    options.focusFallback?.()?.focus();
-  };
-
-  const confirmRemove = (): boolean | Promise<boolean> =>
-    handle.result.downloaded ||
-    confirmDialog({
-      title: 'Remove the video?',
-      message: `${title} was not downloaded. Once removed, it is gone from this page.`,
-      confirmLabel: 'Remove',
-      tone: 'danger',
-      testId: `${testId}-remove-confirm`,
-    });
-
-  let asking = false;
-  const removeByUser = async (): Promise<void> => {
-    if (asking || removed) return;
-    asking = true;
-    try {
-      if (!(await (options.beforeRemove ?? confirmRemove)())) return;
-    } finally {
-      asking = false;
-    }
-    if (removed) return;
-    const next = detach();
-    announce(`Removed ${title}.`);
-    options.onRemove();
-    // After onRemove, so the fallback can be what it showed; a place onRemove focused itself is kept.
-    if (focusLost()) moveFocus(next);
-  };
-
-  const remove = (): void => {
-    if (removed) return;
-    const hadFocus = element.contains(document.activeElement);
-    const next = detach();
-    if (hadFocus) moveFocus(next);
-  };
-
-  return { element, handle, player, remove };
+  return { element, handle, player, remove: () => removal.remove() };
 }

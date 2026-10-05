@@ -12,7 +12,7 @@ import type { FailureText } from '../feedback/errors';
 import { externalLink } from './external-link';
 
 export interface FailureLineOptions {
-  /** Classes of the wrapper; default a small danger-coloured line. */
+  /** Classes of the wrapper; default a small danger-colored line. */
   className?: string;
   testId?: string;
   /** Test id of the activity link; default `<testId>-activity` (or none without `testId`). */

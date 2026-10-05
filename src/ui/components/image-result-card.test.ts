@@ -9,6 +9,7 @@ const hoisted = vi.hoisted(() => {
   const writes = new Map<string, string>();
   return {
     close: vi.fn(),
+    confirm: vi.fn(() => Promise.resolve(true)),
     writes,
     toBlob: vi.fn((_source: unknown, options: { type?: string; quality?: number }) =>
       Promise.resolve(
@@ -23,6 +24,7 @@ vi.mock('../../core/media/image', () => ({
   loadImage: () => Promise.resolve({ close: hoisted.close }),
   toBlob: hoisted.toBlob,
 }));
+vi.mock('../feedback/dialogs', () => ({ confirmDialog: hoisted.confirm }));
 
 const $ = <T extends HTMLElement = HTMLElement>(root: ParentNode, id: string): T | null =>
   root.querySelector<T>(`[data-testid="${id}"]`);
@@ -64,6 +66,8 @@ afterEach(() => {
   hoisted.toBlob.mockClear();
   hoisted.close.mockClear();
   hoisted.writes.clear();
+  hoisted.confirm.mockReset();
+  hoisted.confirm.mockImplementation(() => Promise.resolve(true));
   document.body.replaceChildren();
 });
 
@@ -130,20 +134,38 @@ describe('imageResultCard', () => {
     expect(hoisted.close).toHaveBeenCalledOnce();
   });
 
-  it('offers an SVG as it is only, never converted', () => {
+  it('offers an SVG as PNG first, and as an SVG only once sanitized (no script, no external links)', async () => {
+    const hostile =
+      '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10">' +
+      '<script>alert(1)</script><rect id="a" width="10" height="10" fill="red" onload="alert(2)"/>' +
+      '<foreignObject><div>hi</div></foreignObject>' +
+      '<image href="https://evil.example/x.png"/><use xlink:href="#a"/>' +
+      '<style>@import url(https://evil.example/a.css);</style></svg>';
     const svg = card({
-      blob: new Blob(['<svg/>'], { type: 'image/svg+xml' }),
+      blob: new Blob([hostile], { type: 'image/svg+xml' }),
       name: 'logo.svg',
       formats: ['png', 'jpg', 'webp'],
     });
-    expect(svg.element.querySelectorAll('.dropdown-item')).toHaveLength(0);
-    expect($(svg.element, 'gen-download')?.textContent).toBe('Download .svg');
-    const unnamed = card({
-      blob: new Blob(['<svg/>'], { type: 'image/svg+xml' }),
-      name: 'logo',
-      formats: ['png'],
-    });
-    expect($(unnamed.element, 'gen-download')?.textContent).toBe('Download .svg');
+    document.body.append(svg.element);
+    expect(labels(svg.element)).toEqual(['PNG.png', 'SVG.svg']);
+
+    $<HTMLButtonElement>(svg.element, 'export-svg')!.click();
+    await vi.waitFor(() => expect(saved).toHaveLength(1));
+    const text = await saved[0]!.blob.text();
+    expect(saved[0]?.name).toBe('logo.svg');
+    expect(text).toContain('<rect');
+    expect(text).toContain('http://www.w3.org/2000/svg');
+    expect(text).toContain('id="a"');
+    // DOMPurify drops <use> outright (it can pull in another document).
+    for (const bad of ['<script', 'onload', 'foreignObject', 'evil.example', '@import', '<use']) {
+      expect(text).not.toContain(bad);
+    }
+    // "Download all" in the leave guard saves the registered blob: the clean one too.
+    expect(await svg.handle.result.blob.text()).toBe(text);
+
+    $<HTMLButtonElement>(svg.element, 'export-png')!.click();
+    await vi.waitFor(() => expect(saved).toHaveLength(2));
+    expect(saved[1]?.name).toBe('logo.png');
   });
 
   it('always offers the image itself next to the conversions; JPEG counts as jpg', () => {
@@ -213,6 +235,23 @@ describe('imageResultCard', () => {
     $<HTMLButtonElement>(item.element, 'gen-remove')!.click();
     await vi.waitFor(() => expect(item.element.isConnected).toBe(false));
     expect(document.activeElement).toBe(empty);
+  });
+
+  it('asks before removing an image that was not downloaded, by default', async () => {
+    hoisted.confirm.mockImplementation(() => Promise.resolve(false));
+    const item = card();
+    document.body.append(item.element);
+    $<HTMLButtonElement>(item.element, 'gen-remove')!.click();
+    await vi.waitFor(() => expect(hoisted.confirm).toHaveBeenCalledOnce());
+    expect(hoisted.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Remove the image?', testId: 'gen-remove-confirm' }),
+    );
+    await Promise.resolve();
+    expect(item.element.isConnected).toBe(true);
+    item.handle.download();
+    $<HTMLButtonElement>(item.element, 'gen-remove')!.click();
+    await vi.waitFor(() => expect(item.onRemove).toHaveBeenCalledOnce());
+    expect(hoisted.confirm).toHaveBeenCalledOnce();
   });
 
   it('leaves focus where onRemove put it', async () => {
