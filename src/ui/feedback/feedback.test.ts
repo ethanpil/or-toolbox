@@ -11,7 +11,7 @@ import {
 } from '../../core/errors';
 import { h } from '../dom';
 import { confirmDialog, promptDialog, typedConfirm } from './dialogs';
-import { failureText, presentError } from './errors';
+import { BLIND_ACTIVITY_NOTE, failureText, presentError } from './errors';
 import { setFieldError } from './field-error';
 import { modalOpen, openModal } from './modal';
 import { toast } from './toast';
@@ -353,6 +353,7 @@ describe('failureText', () => {
       text: 'The model is overloaded.',
       outcomeUnknown: false,
       activityUrl: null,
+      note: null,
     });
     expect(failureText(new TypeError('boom')).text).toContain('Something went wrong');
   });
@@ -371,13 +372,50 @@ describe('failureText', () => {
     expect(failureText(unknownOutcome(new NetworkError())).text).toContain('connection dropped');
   });
 
-  it('does not tell a blind voter that the model is paid', () => {
-    const failure = failureText(unknownOutcome(new NetworkError()), { blind: true });
-    expect(failure.outcomeUnknown).toBe(true);
-    expect(failure.activityUrl).not.toBeNull();
-    expect(failure.text).toContain('may still have done the work');
-    expect(failure.text).toContain('check your OpenRouter activity before sending it again');
-    expect(failure.text).not.toMatch(/billed|paid|cost/i);
+  describe('blind', () => {
+    const blind = (error: unknown) => failureText(error, { blind: true });
+
+    it('shows every failure the same way, so nothing tells a free model from a paid one', () => {
+      const failures = [
+        blind(unknownOutcome(new ApiError('Gateway timeout', 524))),
+        blind(unknownOutcome(new NetworkError())),
+        blind(new ApiError('Not enough credits', 402)),
+        blind(new RateLimitError('free-models-per-min exceeded', 429)),
+        blind(new ApiError('The model is overloaded.', 503)),
+        blind(new TypeError('boom')),
+      ];
+      for (const failure of failures) {
+        expect(failure.note).toBe(BLIND_ACTIVITY_NOTE);
+        expect(failure.activityUrl).toBe('https://openrouter.ai/activity');
+        // The Retry decision must not depend on the outcome either: a missing Retry would give a paid model away.
+        expect(failure.outcomeUnknown).toBe(false);
+      }
+    });
+
+    it('keeps the arena’s sentence about checking the activity as the note', () => {
+      expect(BLIND_ACTIVITY_NOTE).toBe(
+        'Before retrying, you can check your OpenRouter activity to see whether this request was billed.',
+      );
+    });
+
+    it('words the message so that it is true for any model: no credits, free or paid, no names', () => {
+      const texts = [
+        blind(new ApiError('Not enough credits', 402)).text,
+        blind(new RateLimitError('Rate limited. Free models allow 20 requests a minute.', 429))
+          .text,
+        blind(new ApiError('openai/gpt-6-luna via Azure is down', 502)).text,
+        blind(new ApiError('Provider openai/gpt-6-luna returned an error', 400)).text,
+        blind(new FreeOnlyError(['openai/gpt-6-luna'])).text,
+        blind(unknownOutcome(new ApiError('qwen/qwen3.8-27b:free timed out', 524))).text,
+      ];
+      for (const text of texts) {
+        expect(text).not.toMatch(/credit|free|paid|\bpay|cost|billed|openai|azure|qwen|gpt/i);
+        expect(text.length).toBeGreaterThan(10);
+      }
+      // What is the same for every model stays informative.
+      expect(blind(new ApiError('x', 401)).text).toContain('rejected the key');
+      expect(blind(new NetworkError()).text).toContain('Network error');
+    });
   });
 
   it('marks nothing as presented, so the caller decides', async () => {
