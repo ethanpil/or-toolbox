@@ -278,6 +278,11 @@ test('a Score scale is reordered by dragging, by buttons and by keyboard', async
     targetPosition: { x: 40, y: 2 },
   });
   await expect.poll(order).toEqual(['High', 'Low', 'Medium']);
+  // Focus is on the level that moved (now first), not the one it was dropped on.
+  await expect(texts.nth(0)).toBeFocused();
+  // Nothing was left on the drag that a text field would take in.
+  await texts.nth(1).dispatchEvent('drop');
+  expect(await order()).toEqual(['High', 'Low', 'Medium']);
 
   // A button: Move level 2 up swaps the last two.
   await page.getByRole('button', { name: /^Move level 2 of .* up$/ }).click();
@@ -482,6 +487,9 @@ test('History keeps the answers as pretty JSON, and Reopen restores the whole fo
     'Decide: Is it a bug?, Owning team, Urgency',
   );
   await page.getByTestId('run-open').click();
+  // A fields-mode run's prompt says what was sent, as name: value lines.
+  await expect(page.getByTestId('run-prompt')).toContainText('customer_tier: enterprise');
+  await expect(page.getByTestId('run-prompt')).toContainText(`ticket: ${TICKET}`);
   const output = page.getByTestId('run-output');
   await expect(output).toContainText('"is_bug"');
   await expect(output).toContainText('"probabilities"');
@@ -532,6 +540,76 @@ test('the Prompts panel saves the whole form and Use restores it', async ({ page
   await expect(page.getByTestId('dec-mode-text')).toBeChecked();
   await expect(page.getByTestId('tool-prompt')).toHaveValue(TICKET);
   await expect(page.getByTestId('dec-threshold').nth(0)).toHaveValue('72');
+  expect(problems).toEqual([]);
+});
+
+test('loading a decider that brings a situation asks before it replaces text you typed', async ({
+  page,
+}) => {
+  test.slow();
+  const problems = await watchForProblems(page);
+  await open(page);
+  await loadTemplate(page, 'ticket-triage');
+  await page.getByTestId('tool-prompt').fill(TICKET);
+  await page.getByTestId('dec-save').click();
+  await page.getByTestId('dec-save-name').fill('With situation');
+  await page.getByTestId('dec-save-with-state').check();
+  await page.getByTestId('dialog-confirm').click();
+  await expect(
+    page.getByTestId('dec-library').locator('option', { hasText: 'With situation' }),
+  ).toHaveCount(1);
+
+  // The questions are as saved, but the text in the box is something else: loading would lose it.
+  await page.getByTestId('tool-prompt').fill('Something I am in the middle of writing');
+  await page.getByTestId('dec-load').click();
+  const confirm = page.getByTestId('confirm-dialog');
+  await expect(confirm).toContainText('Replace your situation?');
+  await confirm.getByTestId('dialog-cancel').click();
+  await expect(confirm).toHaveCount(0);
+  await expect(page.getByTestId('tool-prompt')).toHaveValue(
+    'Something I am in the middle of writing',
+  );
+
+  await page.getByTestId('dec-load').click();
+  await confirm.getByTestId('dialog-confirm').click();
+  await expect(page.getByTestId('tool-prompt')).toHaveValue(TICKET);
+
+  // Same situation as saved: nothing to lose, nothing to ask.
+  await page.getByTestId('dec-load').click();
+  await expect(page.getByTestId('confirm-dialog')).toHaveCount(0);
+  expect(problems).toEqual([]);
+});
+
+test('in key-value mode the Prompts panel saves the fields as name: value lines and Use brings them back', async ({
+  page,
+}) => {
+  test.slow();
+  const problems = await watchForProblems(page);
+  await open(page);
+  await page.locator('label', { hasText: 'Key-value fields' }).click();
+  await page.getByTestId('dec-field-key').nth(0).fill('customer_tier');
+  await page.getByTestId('dec-field-value').nth(0).fill('enterprise');
+  await loadTemplate(page, 'ticket-triage');
+
+  // The text box is empty and hidden; Save current must still have something to save.
+  await page.getByTestId('prompts-button').click();
+  await page.getByTestId('prompts-tab-saved').click();
+  await page.getByTestId('prompts-save-current').click();
+  await page.getByTestId('prompt-input').fill('Fields form');
+  await page.getByTestId('prompt-dialog').getByTestId('dialog-confirm').click();
+  const entry = page.getByTestId('prompts-saved').getByTestId('prompt-entry');
+  await expect(entry).toHaveCount(1);
+  await expect(entry).toContainText('customer_tier: enterprise');
+  await page.keyboard.press('Escape');
+
+  await page.getByTestId('dec-field-value').nth(0).fill('free');
+  await page.locator('label', { hasText: /^Text$/ }).click();
+  await page.getByTestId('prompts-button').click();
+  await page.getByTestId('prompts-tab-saved').click();
+  await page.getByTestId('prompts-saved').getByTestId('prompt-use').click();
+  await expect(page.getByTestId('dec-mode-fields')).toBeChecked();
+  await expect(page.getByTestId('dec-field-value').nth(0)).toHaveValue('enterprise');
+  await expect(page.getByTestId('dec-question')).toHaveCount(3);
   expect(problems).toEqual([]);
 });
 
