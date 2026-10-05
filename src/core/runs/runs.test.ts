@@ -552,6 +552,16 @@ describe('cost booking', () => {
     expect(await core.stats.monthSpend()).toBeCloseTo(0.01);
   });
 
+  it('exposes its reservation on the handle, also after a reattach', async () => {
+    const parser = { id: 'pdf-engine:mistral-ocr', label: 'Mistral OCR', estimateUsd: 0.02 };
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.08, addons: [parser] });
+    expect(run.reservedUsd).toBeCloseTo(0.1); // models plus add-ons, what an unknown cost books
+    expect((await core.runs.begin(spec)).reservedUsd).toBe(0); // no estimate: nothing reserved
+    run.handOff('job-1');
+    await until(async () => (await stored(run.id))?.jobId === 'job-1');
+    expect((await createTestCore().core.runs.reattach(run.id))?.reservedUsd).toBeCloseTo(0.1);
+  });
+
   it('books max(actual, reservation) when the cost is unknown', async () => {
     const run = await core.runs.begin({ ...spec, estimateUsd: 0.08 });
     run.addUsage(usage({ costUsd: 0, costUnknown: true }));

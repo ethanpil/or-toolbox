@@ -55,7 +55,7 @@ const show = (value: number | null, format: (value: number) => string): string =
 /** Cost, hidden before names are shown (a free model's $0 would give it away); else the shared wording. */
 function costText(metrics: Metrics, entry: Entry, round: Round, naming: Naming): string {
   if (!round.revealed) return 'Hidden';
-  return formatRunCost(metrics, { free: naming.isFree(entry.model) });
+  return formatRunCost(metrics, { free: naming.isFree(entry.model), booked: metrics.bookedUsd });
 }
 
 export interface PanelView {

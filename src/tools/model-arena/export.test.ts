@@ -89,6 +89,9 @@ describe('round export', () => {
     expect(free).toContain('| 250 ms | 1.3 s | 50 | 50.0 | Free |');
     round.entries[0]!.usage = usage({ costUnknown: true });
     expect(roundMarkdown(round, name)).toContain('| 50.0 | Unknown |');
+    // What budgets counted for it (the run's reservation) is said with it.
+    round.entries[0]!.usage = usage({ costUnknown: true, bookedUsd: 0.05 });
+    expect(roundMarkdown(round, name)).toContain('| 50.0 | Unknown (≈ $0.05 counted) |');
     round.entries[0]!.usage = usage({ costUsd: 0.0012, costEstimated: true });
     expect(roundMarkdown(round, name)).toContain('| 50.0 | ≈ $0.0012 |');
   });

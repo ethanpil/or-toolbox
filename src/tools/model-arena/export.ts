@@ -88,7 +88,7 @@ export function roundMarkdown(
       [
         '| First token | Total | Output tokens | Tokens/s | Cost |',
         '| --- | --- | --- | --- | --- |',
-        `| ${cell(metrics.ttftMs, formatMs)} | ${cell(metrics.totalMs, formatMs)} | ${cell(metrics.completionTokens, formatInt)} | ${cell(metrics.tokensPerSecond, formatRate)} | ${formatRunCost(metrics, { free: isFree(entry.model) })} |`,
+        `| ${cell(metrics.ttftMs, formatMs)} | ${cell(metrics.totalMs, formatMs)} | ${cell(metrics.completionTokens, formatInt)} | ${cell(metrics.tokensPerSecond, formatRate)} | ${formatRunCost(metrics, { free: isFree(entry.model), booked: metrics.bookedUsd })} |`,
       ].join('\n'),
     );
   });

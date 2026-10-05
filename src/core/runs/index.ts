@@ -65,7 +65,7 @@ import {
   webLocks,
   lockRunner,
 } from '../util';
-import { paidAddons, withAddons } from './addons';
+import { paidAddons, unknownAddons, withAddons } from './addons';
 import { getTool } from '../../tools/registry';
 
 export const OUTPUT_CAP = 500_000;
@@ -539,6 +539,7 @@ export function createRunsService(core: CoreServices): RunsService {
       tool,
       model,
       keyId,
+      reservedUsd: initial.reservedUsd,
       signal: controller.signal,
       abort,
       addUsage(usage) {
@@ -811,7 +812,14 @@ export function createRunsService(core: CoreServices): RunsService {
     const estimate = withAddons(group.estimateUsd, addons);
     if (costsNothing(models, addons, estimate)) return; // its runs never ask
 
-    const check = await core.budgets.check({ keyId: key.id, estimateUsd: estimate, group: true });
+    // Unknown runs' estimates and unknown add-on prices make the total a floor (when any part of it is known).
+    const unknownParts = (group.unknownEstimates ?? 0) + unknownAddons(addons);
+    const check = await core.budgets.check({
+      keyId: key.id,
+      estimateUsd: estimate,
+      group: true,
+      unknownParts,
+    });
     if (check.verdict === 'block') throw new BudgetBlockedError(check);
     if (
       check.verdict === 'confirm' &&
@@ -863,6 +871,7 @@ export function createRunsService(core: CoreServices): RunsService {
           models: members.flatMap((spec) => [spec.model, ...(spec.models ?? [])]),
           runs: members.length,
           estimateUsd: sumKnown(members.map((spec) => spec.estimateUsd)),
+          unknownEstimates: members.filter((spec) => !isFiniteNumber(spec.estimateUsd)).length,
           addons: members.flatMap((spec) => spec.addons ?? []),
           ...(first.keyId ? { keyId: first.keyId } : {}),
         });

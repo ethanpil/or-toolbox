@@ -119,7 +119,7 @@ A run stopped before it sent anything (Stop during the free-model wait, a step p
 
 Several runs that the user starts with one action are checked and confirmed once, for their **total**: the key and the lock once, free-only across all their models and paid add-ons, the budgets against the total estimate (add-ons included), and one dialog that names the group (your label, its models, the total, an optional note). Each run still reserves its own estimate when it begins, and a hard (monthly) block still refuses it.
 
-**Runs that start together** (Model arena's contenders): `ctx.runs.beginAll(specs, { label, signal })` approves them as one group and begins them all, or none. When one is refused (Cancel, a block, the signal), the ones already begun are withdrawn: no record, no reservation, nothing sent or booked, and the refusal is thrown as `beginRun` would. Fill each spec as `ctx.beginRun` would (`tool`, `model`, `estimateUsd`, `addons`, `prompt` and `settings` from `getState()`); they share `specs[0].groupId`.
+**Runs that start together** (Model arena's contenders): `ctx.runs.beginAll(specs, { label, signal })` approves them as one group and begins them all, or none. When one is refused (Cancel, a block, the signal), the ones already begun are withdrawn: no record, no reservation, nothing sent or booked, and the refusal is thrown as `beginRun` would. Fill each spec as `ctx.beginRun` would (`tool`, `model`, `estimateUsd`, `addons`, `prompt` and `settings` from `getState()`); they share `specs[0].groupId`, and the handles come back in the order of `specs`. A member whose estimate is unknown is left out of the total and counted (the dialog says "≈ $0.27 + 1 unknown"; budgets treat the total as a floor).
 
 ```ts
 const snapshot = getState();
@@ -156,7 +156,9 @@ await ctx.beginRun({ estimateUsd: step, groupId: sequence.id, useGroupApproval: 
 await ctx.runs.releaseGroup(sequence.id); // when the group is done with (New sequence)
 ```
 
-The approval is stored (IndexedDB `kv`), so it holds in every tab and after a reload until `releaseGroup`, a new approval of the same group id or a data reset. It covers at most `runs` runs, together within the approved total when that is known, on the approved key and models; a run beyond that asks for itself. A run that ends having sent nothing gives its share back. Groups on free models only need no approval and store none.
+The approval is stored (IndexedDB `kv`), so it holds in every tab and after a reload until `releaseGroup`, a new approval of the same group id or a data reset. It covers at most `runs` runs, together within the approved total when that is known, on the approved key and models; a run beyond that asks for itself. A run that ends having sent nothing gives its share back. Groups on free models only need no approval and store none. When some runs' estimates are unknown, pass the sum of the known ones as `estimateUsd` and how many are unknown as `unknownEstimates`.
+
+A run's reservation is on its handle, `run.reservedUsd` (its estimate plus add-ons). When its cost turns out unknown, budgets and Stats book `max(cost, reservedUsd)`: show it as `formatRunCost(cost, { booked: Math.max(totals.costUsd, run.reservedUsd) })`, which reads "Unknown (≈ $x counted)".
 
 ### Refused runs change nothing
 

@@ -82,6 +82,34 @@ describe('budgetConfirm', () => {
     await gone();
   });
 
+  it('says how much of a group total is unknown', async () => {
+    const group = {
+      tool: 'model-arena',
+      groupId: 'round-2',
+      label: 'Model arena round: 3 models',
+      models: ['a/one', 'b/two', 'c/three'],
+      runs: 3,
+    } as const;
+    const partly = budgetConfirm(check, {
+      kind: 'group',
+      group: { ...group, estimateUsd: 0.27, unknownEstimates: 1 },
+    });
+    await shown();
+    expect($('budget-estimate')?.textContent).toBe('≈ $0.27 + 1 unknown');
+    $('budget-cancel')!.click();
+    await partly;
+    await gone();
+
+    const none = budgetConfirm(check, {
+      kind: 'group',
+      group: { ...group, estimateUsd: null, unknownEstimates: 3 },
+    });
+    await shown();
+    expect($('budget-estimate')?.textContent).toBe('Unknown');
+    $('budget-cancel')!.click();
+    await none;
+  });
+
   it('shows the estimate with paid add-ons included', async () => {
     const answer = budgetConfirm(
       check,

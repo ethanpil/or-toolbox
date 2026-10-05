@@ -451,8 +451,17 @@ export interface RunGroupSpec {
   models: readonly string[];
   /** How many runs the approval covers. */
   runs: number;
-  /** The models' estimate for the whole group; null = unknown. Add-on estimates are added, as for a run. */
+  /**
+   * The models' estimate for the whole group: the sum of the runs' estimates that are known; null when none is.
+   * Add-on estimates are added, as for a run.
+   */
   estimateUsd: number | null;
+  /**
+   * How many runs' estimates are unknown and left out of `estimateUsd` (default 0). The dialog says so ("≈ $0.27 +
+   * 1 unknown"), and budgets treat the total as at least `estimateUsd`, as they treat an unknown estimate: a monthly
+   * limit that the known part reaches counts as passed.
+   */
+  unknownEstimates?: number;
   /** Paid extras of the whole group (see `RunAddon`). */
   addons?: readonly RunAddon[];
   /** One more sentence for the dialog, e.g. the sequence's spend cap. */
@@ -479,6 +488,11 @@ export interface RunHandle {
   readonly tool: ToolId;
   readonly model: string;
   readonly keyId: string;
+  /**
+   * What the run holds against budgets (`RunRecord.reservedUsd`: its estimate plus add-ons, 0 when unknown). When its
+   * cost turns out unknown, stats book `max(cost, reservedUsd)`: pass it as `booked` to `formatRunCost`.
+   */
+  readonly reservedUsd: number;
   /** Aborted by `abort()`, by the shell's Stop button, or on page unload. Pass to every call. */
   readonly signal: AbortSignal;
   abort(reason?: string): void;
@@ -550,8 +564,9 @@ export interface RunsService {
   releaseGroup(groupId: string): Promise<void>;
   /**
    * Begins runs that start together (arena contenders), all or none. With `label`, they are approved first as one
-   * group (`approveGroup` over their models, add-ons and summed estimates: one check, one confirmation) and the
-   * approval is released once they have begun. When any member is refused (or `signal` aborts), the members already
+   * group (`approveGroup` over their models, add-ons and summed estimates, unknown ones counted in
+   * `unknownEstimates`: one check, one confirmation) and the approval is released once they have begun. Resolves
+   * with the handles in the order of `specs` (they begin one after another). When any member is refused (or `signal` aborts), the members already
    * begun are withdrawn: their records and reservations are removed, nothing was sent and nothing is booked; then
    * the refusal is thrown. The members share `specs[0].groupId` (one is made when it has none) and must be of one
    * tool. After they have begun, `signal` aborting aborts them, as `ctx.beginRun` does.
@@ -657,11 +672,15 @@ export interface BudgetsService {
    * disabled → ok. warn → confirm when any rule is exceeded. hard → block when a monthly rule is exceeded,
    * confirm when only the per-run threshold is exceeded. Spend comes from local stats (current UTC month).
    * `group`: the estimate is a group's total (`runs.approveGroup`); the reasons then speak of "these runs".
+   * `unknownParts`: that many parts of the cost are unknown and left out of `estimateUsd`, so it is a floor: like an
+   * unknown estimate (where the limit counts as passed once spend reaches it), a monthly limit that spend plus the
+   * known part reaches counts as passed.
    */
   check(input: {
     keyId: string;
     estimateUsd: number | null;
     group?: boolean;
+    unknownParts?: number;
   }): Promise<BudgetCheck>;
 }
 

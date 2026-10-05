@@ -112,6 +112,8 @@ export interface EntryUsage {
   costUsd: number;
   costEstimated: boolean;
   costUnknown: boolean;
+  /** With an unknown cost: what budgets counted for it (the run's reservation, or more if it spent more). */
+  bookedUsd?: number;
 }
 
 /** One contender's answer in a round. Times are on one monotonic clock (`performance.now()`), in ms. */
@@ -268,6 +270,8 @@ export interface Metrics {
   costUsd: number | null;
   costEstimated: boolean;
   costUnknown: boolean;
+  /** With an unknown cost: what budgets counted for it, said with it; null otherwise. */
+  bookedUsd: number | null;
 }
 
 /** Shorter than this after the first token, a rate is noise (a reply that arrived in one piece). */
@@ -301,6 +305,7 @@ export function metricsOf(entry: Entry): Metrics {
     costUsd: usage && !usage.costUnknown ? usage.costUsd : null,
     costEstimated: usage?.costEstimated ?? false,
     costUnknown: usage?.costUnknown ?? false,
+    bookedUsd: usage?.costUnknown ? (usage.bookedUsd ?? null) : null,
   };
 }
 
