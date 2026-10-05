@@ -9,7 +9,7 @@
 import type { Bus, ToolId, ToolStateStore } from '../types';
 import { NotJsonSafeError } from '../errors';
 import { getDb } from '../storage/db';
-import { isPlainObject } from '../util';
+import { isPlainObject, withLock } from '../util';
 
 export { NotJsonSafeError };
 
@@ -52,23 +52,37 @@ export function assertJsonSafe(value: unknown, path = 'value'): void {
 export function createToolStateStore(tool: ToolId, bus?: Pick<Bus, 'emit'>): ToolStateStore {
   const prefix = `${TOOL_STATE_PREFIX}${tool}:`;
   const changed = (key: string): void => bus?.emit({ type: 'tool-state-changed', tool, key });
+
+  const get = async <T>(key: string): Promise<T | undefined> =>
+    (await (await getDb()).get('kv', prefix + key))?.value as T | undefined;
+  const set = async <T>(key: string, value: T): Promise<void> => {
+    assertJsonSafe(value);
+    const stored = JSON.parse(JSON.stringify(value)) as unknown;
+    await (await getDb()).put('kv', { key: prefix + key, value: stored, updatedAt: Date.now() });
+    changed(key);
+  };
+  const remove = async (key: string): Promise<void> => {
+    await (await getDb()).delete('kv', prefix + key);
+    changed(key);
+  };
+
   return {
-    async get<T>(key: string) {
-      return (await (await getDb()).get('kv', prefix + key))?.value as T | undefined;
-    },
-    async set<T>(key: string, value: T) {
-      assertJsonSafe(value);
-      const stored = JSON.parse(JSON.stringify(value)) as unknown;
-      await (await getDb()).put('kv', { key: prefix + key, value: stored, updatedAt: Date.now() });
-      changed(key);
-    },
-    async delete(key) {
-      await (await getDb()).delete('kv', prefix + key);
-      changed(key);
-    },
+    get,
+    set,
+    delete: remove,
     async keys() {
       const keys = await (await getDb()).getAllKeys('kv', prefixRange(prefix));
       return keys.map((key) => key.slice(prefix.length));
+    },
+    update<T>(key: string, fn: (current: T | undefined) => T | undefined | Promise<T | undefined>) {
+      return withLock(`ortoolbox:tool-state:${tool}:${key}`, async () => {
+        const current = await get<T>(key);
+        const next = await fn(current);
+        if (next === current) return current;
+        if (next === undefined) await remove(key);
+        else await set(key, next);
+        return next;
+      });
     },
   };
 }

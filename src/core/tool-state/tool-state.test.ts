@@ -45,6 +45,44 @@ describe('tool state store', () => {
     ]);
   });
 
+  it('update: reads, changes and writes one key, and loses no update of parallel callers', async () => {
+    const events: unknown[] = [];
+    const store = createToolStateStore('model-arena', { emit: (event) => events.push(event) });
+    await Promise.all(
+      Array.from({ length: 10 }, () =>
+        store.update<number>('tally', async (current) => {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          return (current ?? 0) + 1;
+        }),
+      ),
+    );
+    expect(await store.get('tally')).toBe(10);
+    expect(events).toHaveLength(10);
+  });
+
+  it('update: returning the current value writes nothing; undefined deletes the key', async () => {
+    const events: unknown[] = [];
+    const store = createToolStateStore('chat', { emit: (event) => events.push(event) });
+    await store.set('k', { n: 1 });
+    events.length = 0;
+    await expect(store.update('k', (current) => current)).resolves.toEqual({ n: 1 });
+    expect(events).toEqual([]);
+    await expect(store.update('k', () => undefined)).resolves.toBeUndefined();
+    expect(await store.keys()).toEqual([]);
+    expect(events).toEqual([{ type: 'tool-state-changed', tool: 'chat', key: 'k' }]);
+  });
+
+  it('update: a failing change writes nothing and does not block the next one', async () => {
+    const store = createToolStateStore('chat');
+    await store.set('k', 1);
+    await expect(
+      store.update('k', () => {
+        throw new Error('no');
+      }),
+    ).rejects.toThrow('no');
+    await expect(store.update<number>('k', (n) => (n ?? 0) + 1)).resolves.toBe(2);
+  });
+
   it('stores a detached copy', async () => {
     const store = createToolStateStore('chat');
     const value = { list: [1] };

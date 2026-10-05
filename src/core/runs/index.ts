@@ -44,8 +44,8 @@ import { getDb } from '../storage/db';
 import { jsonCopy } from '../settings/merge';
 import { RECENT_MODELS_CAP } from '../settings/schema';
 import { addRunToStats } from '../stats';
-import { isFinalState, webLocks } from '../jobs';
-import { MINUTE_MS, abortError, isFiniteNumber } from '../util';
+import { isFinalState } from '../jobs';
+import { MINUTE_MS, abortError, holdLock, isFiniteNumber, webLocks, withLock } from '../util';
 import { paidAddons, withAddons } from './addons';
 import { getTool } from '../../tools/registry';
 
@@ -107,25 +107,9 @@ function copyMeta(meta: Record<string, unknown>): Record<string, unknown> | null
   }
 }
 
-/**
- * Holds `ortoolbox:run:<id>` until the returned function is called. Resolves once the lock is held, with
- * null when another page holds it or Web Locks are unavailable.
- */
-function holdRunLock(id: string): Promise<(() => void) | null> {
-  const locks = webLocks();
-  if (!locks) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    let release!: () => void;
-    const held = new Promise<void>((done) => (release = done));
-    locks
-      .request(runLockName(id), { ifAvailable: true }, async (lock) => {
-        if (!lock) return resolve(null);
-        resolve(release);
-        await held;
-      })
-      .catch(() => resolve(null));
-  });
-}
+/** Holds `ortoolbox:run:<id>` until the returned function is called; null when another page holds it. */
+const holdRunLock = (id: string): Promise<(() => void) | null> =>
+  holdLock(runLockName(id), { ifAvailable: true });
 
 interface InternalHandle extends RunHandle {
   /** pagehide: abort unless handed off. No storage work. */
@@ -152,26 +136,7 @@ export function createRunsService(core: CoreServices): RunsService {
   };
 
   // Check-and-reserve runs one at a time per page, and across tabs under a Web Lock.
-  let budgetQueue: Promise<unknown> = Promise.resolve();
-  const withBudgetLock = <T>(fn: () => Promise<T>): Promise<T> => {
-    const run = async (): Promise<T> => {
-      const locks = webLocks();
-      if (!locks) return fn();
-      let started = false;
-      try {
-        return await locks.request(BUDGET_LOCK, () => {
-          started = true;
-          return fn();
-        });
-      } catch (error) {
-        if (started) throw error;
-        return fn(); // the Locks API refused: the in-page queue still serialises this page
-      }
-    };
-    const result = budgetQueue.then(run, run);
-    budgetQueue = result.catch(() => undefined);
-    return result;
-  };
+  const withBudgetLock = <T>(fn: () => Promise<T>): Promise<T> => withLock(BUDGET_LOCK, fn);
 
   /** Bumped by every data reset; handles from an earlier generation never write again. */
   let generation = 0;

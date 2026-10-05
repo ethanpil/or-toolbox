@@ -4,8 +4,8 @@
  * one queue in the page), so two tabs never start the same sequence step or lose each other's clips; the store
  * announces each write as `tool-state-changed`, and the tool reads it again.
  */
-import { webLocks } from '../../core/jobs';
 import type { ToolStateStore } from '../../core/types';
+import { withLock } from '../../core/util';
 import { parseRun, type SequenceRun } from './sequence';
 import { parseTimeline, type TimelineClip, timelineJson } from './timeline';
 
@@ -35,26 +35,7 @@ export interface StudioStore {
 }
 
 export function createStore(state: ToolStateStore): StudioStore {
-  let queue: Promise<unknown> = Promise.resolve();
-  const locked = <T>(fn: () => Promise<T>): Promise<T> => {
-    const run = async (): Promise<T> => {
-      const locks = webLocks();
-      if (!locks) return fn();
-      let started = false;
-      try {
-        return await locks.request(LOCK, () => {
-          started = true;
-          return fn();
-        });
-      } catch (error) {
-        if (started) throw error;
-        return fn(); // the Locks API refused: the page queue still serialises this page
-      }
-    };
-    const result = queue.then(run, run);
-    queue = result.catch(() => undefined);
-    return result;
-  };
+  const locked = <T>(fn: () => Promise<T>): Promise<T> => withLock(LOCK, fn);
 
   const tx: StoreTransaction = {
     timeline: async () => parseTimeline(await state.get(TIMELINE_KEY)),

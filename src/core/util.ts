@@ -62,6 +62,76 @@ export function debounce<A extends unknown[]>(fn: (...args: A) => void, ms: numb
   return debounced;
 }
 
+// --- Web Locks -------------------------------------------------------------------------------------
+
+/** The Web Locks API, or null where it is missing or refused. */
+export function webLocks(): LockManager | null {
+  try {
+    return typeof navigator !== 'undefined' && navigator.locks ? navigator.locks : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The tail of each lock name's in-page queue (see `withLock`). */
+const lockQueues = new Map<string, Promise<unknown>>();
+
+/**
+ * Runs `fn` holding the Web Lock `name`: one at a time across tabs, and in this page through an in-page queue,
+ * which is all there is where Web Locks are missing or refused. Never nest two calls with the same name (it
+ * waits for itself, as a Web Lock would).
+ */
+export function withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const run = async (): Promise<T> => {
+    const locks = webLocks();
+    if (!locks) return fn();
+    let started = false;
+    try {
+      return await locks.request(name, () => {
+        started = true;
+        return fn();
+      });
+    } catch (error) {
+      if (started) throw error;
+      return fn(); // the Locks API refused: the in-page queue still serialises this page
+    }
+  };
+  const result = (lockQueues.get(name) ?? Promise.resolve()).then(run, run);
+  const tail = result.catch(() => undefined);
+  lockQueues.set(name, tail);
+  void tail.then(() => {
+    if (lockQueues.get(name) === tail) lockQueues.delete(name);
+  });
+  return result;
+}
+
+const noop = (): void => undefined;
+
+/**
+ * Holds the Web Lock `name` until the returned release is called: for locks held as long as something lives (a
+ * run, a conversation being run). Resolves once the lock is held; with `ifAvailable`, with null when another tab
+ * or page holds it. Where Web Locks are missing or refused, it resolves with a release that does nothing (nothing
+ * can be held, and nothing stops the caller).
+ */
+export function holdLock(
+  name: string,
+  opts: { ifAvailable?: boolean } = {},
+): Promise<(() => void) | null> {
+  const locks = webLocks();
+  if (!locks) return Promise.resolve(noop);
+  return new Promise((resolve) => {
+    let release!: () => void;
+    const held = new Promise<void>((done) => (release = done));
+    locks
+      .request(name, { ifAvailable: opts.ifAvailable === true }, async (lock) => {
+        if (!lock) return resolve(null);
+        resolve(release);
+        await held;
+      })
+      .catch(() => resolve(noop));
+  });
+}
+
 // --- time ------------------------------------------------------------------------------------------
 
 export const MINUTE_MS = 60_000;

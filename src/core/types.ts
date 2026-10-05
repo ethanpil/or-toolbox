@@ -913,6 +913,17 @@ export interface ToolStateStore {
   set<T>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<void>;
   keys(): Promise<string[]>;
+  /**
+   * Read-modify-write of one key under the Web Lock `ortoolbox:tool-state:<tool>:<key>` (one at a time across
+   * tabs; an in-page queue where Web Locks are missing): `fn` gets the stored value and returns the next one.
+   * Returning `current` itself writes nothing, returning undefined deletes the key. Resolves with the value now
+   * stored. Only other `update`s of the key wait for each other: change a key that several tabs write through
+   * `update` alone. Never call `update` of the same key inside `fn`.
+   */
+  update<T>(
+    key: string,
+    fn: (current: T | undefined) => T | undefined | Promise<T | undefined>,
+  ): Promise<T | undefined>;
 }
 
 // ---------------------------------------------------------------------------------------------
