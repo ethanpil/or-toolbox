@@ -287,6 +287,18 @@ describe('createRunner', () => {
       expect(runner.button.hidden).toBe(false);
     });
 
+    it('leaves alone a Run button the tool hid itself (a bar built by hand before addAction)', async () => {
+      const { run, finish } = manual();
+      const runner = createRunner({ run }, true);
+      document.body.append(runner.element);
+      runner.button.hidden = true;
+      const running = runner.trigger();
+      expect(runner.button.hidden).toBe(true);
+      finish();
+      await running;
+      expect(runner.button.hidden).toBe(true);
+    });
+
     it('adds buttons that start a run with their argument, off exactly when Run is, with the reason', async () => {
       const seen: (string | undefined)[] = [];
       const runner = createRunner<string>(

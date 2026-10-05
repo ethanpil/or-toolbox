@@ -142,7 +142,8 @@ export function createRunner<A = unknown>(
 
   const render = (): void => {
     const blocked = reason();
-    button.hidden = busy && options.hideWhileBusy === true;
+    // Only touched when asked to: a tool that hides Run by hand (Bot-to-bot before it uses addAction) keeps it so.
+    if (options.hideWhileBusy) button.hidden = busy;
     button.setAttribute('aria-disabled', String(busy || blocked !== null));
     button.classList.toggle('disabled', blocked !== null);
     spinner.hidden = !busy;
