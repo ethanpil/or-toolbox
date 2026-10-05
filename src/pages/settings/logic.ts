@@ -175,34 +175,38 @@ export interface PassphraseStrength {
 
 const WEAK_PARTS = ['password', 'passphrase', 'qwerty', 'letmein', '123456', 'abc123', 'ortoolbox'];
 
+/** Length a passphrase needs before the hint stops asking for more. */
+const GOOD_PASSPHRASE_LENGTH = 16;
+
 /**
- * A rough strength hint, not a guarantee: length matters most, then variety. Nothing here is sent anywhere.
+ * A rough strength hint, not a guarantee. The threat is offline guessing (Privacy page, "A note on github.io"),
+ * so length is what counts: under 12 characters is weak and under 16 fair whatever the variety; 16 or more is
+ * good, and strong from 20 with several words or kinds of character. Nothing here is sent anywhere.
  */
 export function passphraseStrength(text: string): PassphraseStrength {
   if (text.length < MIN_PASSPHRASE_LENGTH) {
     return {
       score: 0,
       label: 'Too short',
-      hint: `Use at least ${MIN_PASSPHRASE_LENGTH} characters. A few unrelated words are easy to remember and hard to guess.`,
+      hint: `Use at least ${MIN_PASSPHRASE_LENGTH} characters; ${GOOD_PASSPHRASE_LENGTH} or more is much safer. Four or more unrelated words are easy to remember and hard to guess.`,
     };
   }
   const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((re) => re.test(text)).length;
   const words = text.trim().split(/\s+/).length;
-  let score = 1;
-  if (text.length >= 12) score++;
-  if (text.length >= 16 || words >= 4) score++;
-  if (classes >= 3) score++;
+  let score: PassphraseStrength['score'] = 1;
+  if (text.length >= 12) score = 2;
+  if (text.length >= GOOD_PASSPHRASE_LENGTH) score = 3;
+  if (text.length >= 20 && (words >= 4 || classes >= 3)) score = 4;
   const lower = text.toLowerCase();
   if (/^(.)\1+$/.test(text) || WEAK_PARTS.some((part) => lower.includes(part))) score = 1;
-  const capped = Math.min(score, 4) as PassphraseStrength['score'];
   const labels = ['Too short', 'Weak', 'Fair', 'Good', 'Strong'] as const;
   return {
-    score: capped,
-    label: labels[capped],
+    score,
+    label: labels[score],
     hint:
-      capped >= 3
+      score >= 3
         ? 'Remember it: a forgotten passphrase cannot be recovered.'
-        : 'Longer is stronger: try four or more unrelated words.',
+        : `A page that copies your encrypted keys can try passphrases offline as fast as its computer allows. Use ${GOOD_PASSPHRASE_LENGTH} or more characters: four or more unrelated words are easy to remember and hard to guess.`,
   };
 }
 

@@ -29,7 +29,8 @@ export function fromBase64(base64: string): Uint8Array<ArrayBuffer> {
 
 /**
  * Derive an AES-GCM key from a passphrase. `extractable` is needed only when the raw key must be kept in
- * sessionStorage for the rest of the tab session (the key lock).
+ * sessionStorage for the rest of the tab session (the key lock). The passphrase is normalized to NFC first, so
+ * `é` typed as one character or as `e` plus an accent (another keyboard, OS or browser) opens the same lock.
  */
 export async function deriveKey(
   passphrase: string,
@@ -39,7 +40,7 @@ export async function deriveKey(
 ): Promise<CryptoKey> {
   const material = await crypto.subtle.importKey(
     'raw',
-    new TextEncoder().encode(passphrase),
+    new TextEncoder().encode(passphrase.normalize('NFC')),
     'PBKDF2',
     false,
     ['deriveKey'],
