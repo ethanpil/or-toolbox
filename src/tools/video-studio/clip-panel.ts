@@ -230,8 +230,8 @@ export function clipPanel(host: ClipPanelHost): ClipPanel {
       const continuing = view.mode === 'continue' || view.mode === 'extend';
       promptLabel.textContent = continuing ? 'What happens next (optional)' : 'Describe the video';
       prompt.placeholder = continuing
-        ? 'For example: the camera keeps rising above the harbour as the sun comes up'
-        : 'For example: a fishing boat leaves a quiet harbour at dawn, gulls overhead';
+        ? 'For example: the camera keeps rising above the harbor as the sun comes up'
+        : 'For example: a fishing boat leaves a quiet harbor at dawn, gulls overhead';
       sourceSection.hidden = !continuing;
       urlSection.hidden = view.mode !== 'extend';
       firstSlot.hidden = view.mode !== 'first' && view.mode !== 'first-last';

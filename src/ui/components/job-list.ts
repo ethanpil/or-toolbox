@@ -34,7 +34,7 @@ const STATE_BADGES: Record<JobState, [label: string, className: string]> = {
   running: ['Running', 'text-bg-primary'],
   succeeded: ['Done', 'text-bg-success'],
   failed: ['Failed', 'text-bg-danger'],
-  cancelled: ['Cancelled', 'text-bg-secondary'],
+  cancelled: ['Canceled', 'text-bg-secondary'],
 };
 
 const isFinal = (state: JobState): boolean =>

@@ -1046,7 +1046,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       });
       version.name = `${stemOf(originalName)}-v${version.number}.${extension}`;
       const fitNote = fitted
-        ? 'The model answered in another shape than the picture: its result was fitted inside and centred, not stretched; check the edges.'
+        ? 'The model answered in another shape than the picture: its result was fitted inside and centered, not stretched; check the edges.'
         : keepFailed;
       cards.set(
         version.id,

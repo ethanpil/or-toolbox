@@ -114,7 +114,7 @@ export function createOAuthService(
       removeItem(session(), SS_KEYS.oauth);
 
       const denied = params.get('error');
-      if (denied) throw new OAuthError('The sign-in was cancelled or refused on OpenRouter.');
+      if (denied) throw new OAuthError('The sign-in was canceled or refused on OpenRouter.');
       const code = params.get('code');
       if (!code) throw new OAuthError('This page has no sign-in code. Start the connection again.');
       if (!pending) {

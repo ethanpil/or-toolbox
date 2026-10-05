@@ -675,7 +675,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       : 'This model returns text without timestamps, so there are no subtitle files.';
     diarize.show(support.diarization);
     diarize.note.textContent = support.diarization
-      ? 'Names who speaks when. The model numbers speakers per request, so a long recording is labelled per part.'
+      ? 'Names who speaks when. The model numbers speakers per request, so a long recording is labeled per part.'
       : 'Speaker labels can be requested from Deepgram and MAI-Transcribe models only. Choose one of those to turn them on.';
     vocabularyNote.textContent = support.keyterms
       ? 'Sent to the model as key terms, so they are spelled as you write them here.'

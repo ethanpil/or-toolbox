@@ -170,7 +170,7 @@ describe('complete', () => {
     const s = setup();
     await expect(s.oauth.complete(new URLSearchParams())).rejects.toThrow(/no sign-in code/);
     await expect(s.oauth.complete(new URLSearchParams({ error: 'access_denied' }))).rejects.toThrow(
-      /cancelled/,
+      /canceled/,
     );
     let clock = 0;
     const late = setup(() => clock);

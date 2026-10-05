@@ -27,7 +27,7 @@ const LEADS: Record<SettingsSection, string> = {
   models: 'The model each kind of task uses, and free-only mode.',
   tools: 'Pin a key or a model to a single tool.',
   budgets: 'Limits that ask first, or stop a run, before it spends too much.',
-  appearance: 'Theme, accent colour, density and motion.',
+  appearance: 'Theme, accent color, density and motion.',
   security: 'Encrypt your keys in this browser with a passphrase.',
   data: 'What ORtoolbox keeps in this browser, and deleting it.',
   backup: 'Save everything to a file, or restore from one.',

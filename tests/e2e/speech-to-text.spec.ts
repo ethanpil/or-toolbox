@@ -640,7 +640,7 @@ test('speaker labels go through the Deepgram provider option; names apply everyw
   await page.getByTestId('drawer-button').click();
   await expect(page.getByTestId('stt-diarize')).toBeChecked();
   await expect(page.getByTestId('stt-diarize')).toBeEnabled();
-  await expect(page.getByTestId('stt-diarize-note')).toContainText('labelled per part');
+  await expect(page.getByTestId('stt-diarize-note')).toContainText('labeled per part');
   expect(problems).toEqual([]);
 });
 

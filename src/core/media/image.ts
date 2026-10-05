@@ -53,7 +53,7 @@ const WHITE: Rgb = [255, 255, 255];
 export function parseColour(colour: string | Rgb): Rgb {
   if (typeof colour !== 'string') return colour;
   const match = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(colour.trim());
-  if (!match?.[1]) throw new RangeError(`Not a hex colour: ${colour}`);
+  if (!match?.[1]) throw new RangeError(`Not a hex color: ${colour}`);
   const hex =
     match[1].length === 3 ? [...match[1]].map((digit) => digit + digit).join('') : match[1];
   return [
