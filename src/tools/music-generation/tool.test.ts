@@ -130,8 +130,8 @@ beforeEach(async () => {
   HTMLMediaElement.prototype.pause = pause;
   HTMLCanvasElement.prototype.getContext = () => null;
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 

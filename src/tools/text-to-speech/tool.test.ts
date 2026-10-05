@@ -157,8 +157,8 @@ beforeEach(async () => {
   HTMLMediaElement.prototype.pause = vi.fn();
   HTMLCanvasElement.prototype.getContext = () => null;
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 

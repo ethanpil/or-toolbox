@@ -130,22 +130,8 @@ beforeEach(async () => {
   localStorage.clear();
 });
 
-/** Waits until no run is going and the tool's queued writes have landed. */
-async function settle(): Promise<void> {
-  if (!t) return;
-  await vi.waitFor(() => expect(t!.runners[0]?.busy ?? false).toBe(false), { timeout: 5000 });
-  let last = '';
-  for (let stable = 0; stable < 3;) {
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    const now = JSON.stringify(await (await getDb()).getAll('kv'));
-    stable = now === last ? stable + 1 : 0;
-    last = now;
-  }
-}
-
 afterEach(async () => {
-  await settle();
-  t?.cleanup();
+  await t?.cleanup();
   t = null;
   document.body.replaceChildren();
 });
@@ -544,8 +530,7 @@ describe('persistence', () => {
     setField('bots-turn-limit', '6', 'change');
     await t!.runners[0]!.trigger('step');
     await t!.runners[0]!.trigger('step');
-    await settle();
-    t!.cleanup();
+    await t!.cleanup();
     document.body.replaceChildren();
 
     await mount({ chatStream });
@@ -736,7 +721,7 @@ describe('review fixes: other tabs (B3)', () => {
     const tool = await mount({ chatStream });
     configure(tool, {});
     await t!.runners[0]!.trigger('step');
-    await settle();
+    await t!.settle();
     held.add(LOCK); // another tab started running it
 
     sendModerator('From here');
@@ -754,7 +739,7 @@ describe('review fixes: other tabs (B3)', () => {
     await vi.waitFor(() =>
       expect($('error-toast')?.textContent).toContain('running in another tab'),
     );
-    await settle();
+    await t!.settle();
     expect(moderatorTexts()).toEqual(['Is zero even?']);
     expect(turnTexts()).toEqual(['Bot A says 1']);
     expect((await stored())?.entries).toHaveLength(2);
@@ -772,7 +757,7 @@ describe('review fixes: other tabs (B3)', () => {
     const tool = await mount({ chatStream });
     configure(tool, {});
     await t!.runners[0]!.trigger('step');
-    await settle();
+    await t!.settle();
     // Another tab wrote, and this tab never heard of it.
     const newer = (await stored())!;
     newer.entries.push({ id: 'm', kind: 'moderator', content: 'From the other tab', createdAt: 5 });
@@ -796,7 +781,7 @@ describe('review fixes: other tabs (B3)', () => {
     const tool = await mount({ chatStream });
     configure(tool, {});
     await t!.runners[0]!.trigger('step');
-    await settle();
+    await t!.settle();
     const tie = (await stored())!;
     tie.entries[1]!.content = 'Rewritten elsewhere';
     tie.writeId = 'other-tab';
@@ -809,7 +794,7 @@ describe('review fixes: other tabs (B3)', () => {
     const tool = await mount({ chatStream });
     configure(tool, {});
     await t!.runners[0]!.trigger('step');
-    await settle();
+    await t!.settle();
     const store = t!.ctx.state;
     const realSet = store.set.bind(store);
     let open!: () => void;
@@ -975,7 +960,7 @@ describe('review fixes: data reset (sweep #1)', () => {
     await wipe.done;
     t!.core.bus.emit({ type: 'data-reset' });
     await done;
-    await settle();
+    await t!.settle();
     expect(await stored()).toBeNull();
     expect($('bots-empty')).not.toBeNull();
     // Nothing from before the reset was offered for saving again, so the store refused nothing aloud.
@@ -986,7 +971,7 @@ describe('review fixes: data reset (sweep #1)', () => {
     const next = t!.runners[0]!.trigger('step');
     await release();
     await next;
-    await settle();
+    await t!.settle();
     expect((await stored())?.entries[0]?.content).toBe('After the reset');
     expect($$('error-toast')).toHaveLength(0);
   });

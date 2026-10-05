@@ -119,8 +119,8 @@ beforeEach(async () => {
   await resetDb();
   localStorage.clear();
 });
-afterEach(() => {
-  t.cleanup();
+afterEach(async () => {
+  await t.cleanup();
   for (const result of t.core.results.pending()) t.core.results.remove(result.id);
 });
 

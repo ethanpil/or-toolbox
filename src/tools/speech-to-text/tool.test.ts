@@ -56,8 +56,8 @@ beforeEach(async () => {
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null);
   vi.spyOn(HTMLMediaElement.prototype, 'pause').mockReturnValue(undefined);
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 

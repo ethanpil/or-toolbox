@@ -79,30 +79,9 @@ beforeEach(async () => {
   await resetDb();
   localStorage.clear();
 });
-/**
- * Waits until no run is going and the tool's queued thread writes have landed, so nothing of this test is
- * written into the next test's fresh database.
- */
-async function settle(context: ToolTestContext | null = t): Promise<void> {
-  if (!context) return;
-  const runner = context.runners[0];
-  await vi.waitFor(() => expect(runner?.busy ?? false).toBe(false), { timeout: 5000 });
-  let last = '';
-  for (let stable = 0; stable < 3;) {
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    const now = JSON.stringify(await (await getDb()).getAll('kv'));
-    stable = now === last ? stable + 1 : 0;
-    last = now;
-  }
-}
-
 afterEach(async () => {
-  for (const tab of tabs.splice(0)) {
-    await settle(tab);
-    tab.cleanup();
-  }
-  await settle();
-  t?.cleanup();
+  for (const tab of tabs.splice(0)) await tab.cleanup();
+  await t?.cleanup();
   t = null;
   document.body.replaceChildren();
 });
@@ -429,8 +408,7 @@ describe('chat tool', () => {
     });
 
     // A new page over the same storage.
-    await settle();
-    t!.cleanup();
+    await t!.cleanup();
     document.body.replaceChildren();
     await mount({ chatStream });
     await vi.waitFor(() => expect(contents()[0]).toBe('What is this?'));
@@ -599,15 +577,15 @@ describe('review fixes', () => {
     const { chatStream } = fakeStream((body) => `re ${body.messages.length}`);
     await mount({ chatStream });
     await send('From A');
-    await settle();
+    await t!.settle();
     const b = await mountTab({ chatStream });
     await vi.waitFor(() => expect(contents(b.zones.output)).toEqual(['From A', 're 1']));
     b.zones.input.querySelector<HTMLTextAreaElement>('textarea')!.value = 'From B';
     await b.runners[0]!.trigger();
     // A takes B's messages in, without a reload.
     await vi.waitFor(() => expect(contents()).toEqual(['From A', 're 1', 'From B', 're 3']));
-    await settle(b);
-    await settle();
+    await b.settle();
+    await t!.settle();
 
     // A version stored past the store (no bus event, as if it was missed): A merges when it writes.
     const [stored] = await storedThreads();
@@ -634,12 +612,12 @@ describe('review fixes', () => {
     await send('Question');
     $$('message-regenerate')[0]!.click();
     await vi.waitFor(() => expect(count).toBe(2));
-    await settle();
+    await t!.settle();
     const set = vi.spyOn(t!.ctx.state, 'set');
     $$('sibling-prev')[0]!.click();
     await vi.waitFor(() => expect(contents()).toEqual(['Question', 'answer 1']));
     tool.applyState(tool.getState());
-    await settle();
+    await t!.settle();
     expect(set).not.toHaveBeenCalled();
   });
 

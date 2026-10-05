@@ -57,8 +57,8 @@ beforeEach(async () => {
   await resetDb();
   localStorage.clear();
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 

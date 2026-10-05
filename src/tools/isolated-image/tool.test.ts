@@ -167,8 +167,8 @@ beforeEach(async () => {
   URL.createObjectURL = vi.fn(() => `blob:test-${++urls}`);
   URL.revokeObjectURL = vi.fn();
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 
