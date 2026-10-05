@@ -20,6 +20,7 @@ import {
   uniqueId,
   validateQuestions,
   validateState,
+  wireId,
   wireQuestion,
 } from './schema';
 import { templateQuestions } from './templates';
@@ -94,6 +95,30 @@ describe('reading what storage returns', () => {
     expect(read.options).toHaveLength(2);
     expect(read.levels).toHaveLength(2);
     expect(readQuestion({ name: 'Is it a bug?' })!.id).toBe('is_it_a_bug');
+  });
+
+  it('keeps a list the user emptied empty, and only fills in one that is missing', () => {
+    const emptied = readQuestion({
+      ...question({ type: 'choice' }),
+      options: [],
+      levels: [],
+    })!;
+    expect(emptied.options).toEqual([]);
+    expect(emptied.levels).toEqual([]);
+    const missing = readQuestion({ name: 'Q', id: 'q' })!;
+    expect(missing.options).toHaveLength(2);
+    expect(missing.levels).toHaveLength(2);
+    // And an emptied list is flagged by validation rather than silently refilled.
+    expect(validateQuestions([choice({ options: [] })])).toEqual([
+      expect.objectContaining({ field: 'options' }),
+    ]);
+    expect(validateQuestions([score({ levels: [] })])).toEqual([
+      expect.objectContaining({ field: 'levels' }),
+    ]);
+  });
+
+  it('trims the id of a stored question', () => {
+    expect(readQuestion({ ...question(), id: '  bug ' })!.id).toBe('bug');
   });
 
   it('clamps thresholds to 0 to 100', () => {
@@ -290,6 +315,12 @@ describe('validating the situation', () => {
 });
 
 describe('the request', () => {
+  it('names a question by its id without surrounding spaces, in the request and in the lookup', () => {
+    expect(wireId({ id: ' bug ' })).toBe('bug');
+    const request = buildRequest('m', { ...blankState(), text: 'x' }, [question({ id: ' bug ' })]);
+    expect(Object.keys(request.questions)).toEqual(['bug']);
+  });
+
   it('sends the text block as a string and the fields as an object', () => {
     expect(stateValue({ mode: 'text', text: '  A ticket \n', fields: [] })).toBe('A ticket');
     expect(

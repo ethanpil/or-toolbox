@@ -12,7 +12,7 @@
  */
 import type { DecisionRequest, DecisionResponse } from '../../core/api/types';
 import { isFiniteNumber, isRecord, isString } from '../../core/util';
-import type { QuestionDef } from './schema';
+import { type QuestionDef, wireId } from './schema';
 
 export type Verdict = 'clear' | 'review';
 
@@ -94,7 +94,7 @@ function confidenceOf(
 
 const unreadable = (question: QuestionDef): QuestionResult => ({
   kind: 'none',
-  id: question.id,
+  id: wireId(question),
   name: question.name,
   reason: 'The answer for this question could not be read.',
 });
@@ -127,7 +127,7 @@ function readChoice(question: QuestionDef, answer: Record<string, unknown>): Que
   }
   return {
     kind: 'choice',
-    id: question.id,
+    id: wireId(question),
     name: question.name,
     choice,
     bars,
@@ -151,7 +151,7 @@ function readScore(question: QuestionDef, answer: Record<string, unknown>): Ques
   const scale = entries?.filter(([key]) => /^\d+$/.test(key) && Number(key) < count) ?? null;
   return {
     kind: 'score',
-    id: question.id,
+    id: wireId(question),
     name: question.name,
     score,
     position,
@@ -166,7 +166,7 @@ function readNoul(question: QuestionDef, answer: Record<string, unknown>): Quest
   if (yes === null) return unreadable(question);
   return {
     kind: 'noul',
-    id: question.id,
+    id: wireId(question),
     name: question.name,
     yes,
     confidence: Math.max(yes, 1 - yes),
@@ -193,11 +193,11 @@ export function parseDecision(
   const inputTokens = usage['input_tokens'];
   return {
     results: questions.map((question) =>
-      Object.hasOwn(answers, question.id)
-        ? readAnswer(question, answers[question.id])
+      Object.hasOwn(answers, wireId(question))
+        ? readAnswer(question, answers[wireId(question)])
         : ({
             kind: 'none',
-            id: question.id,
+            id: wireId(question),
             name: question.name,
             reason: 'The model sent no answer for this question.',
           } satisfies QuestionResult),
@@ -212,12 +212,26 @@ export function parseDecision(
 // --- thresholds ------------------------------------------------------------------------------------------
 
 /**
+ * Float noise in `p * 1000` (0.57 * 1000 is 569.9999999999999, 1 - 0.07 is 0.9299999999999999) is about 1e-13; a
+ * product within this of a whole number is that number.
+ */
+const NOISE = 1e-9;
+
+/** A probability in whole tenths of a percent, cut not rounded: 0.8390 is 839, 0.9999999995 is 999. */
+function tenthsOf(p: number): number {
+  return Math.floor(p * 1000 + NOISE);
+}
+
+/**
  * Clear when the confidence reaches the threshold (a percentage), else it needs review. No confidence at all is
  * never clear: nothing says the answer can be trusted.
+ *
+ * It is compared in the tenths of a percent `formatPercent` shows, so the number on a card and its badge cannot
+ * disagree (an exact comparison missed 93% with a Yes/No confidence of `1 - 0.07`, which is 0.9299999999999999).
  */
 export function verdictOf(confidence: number | null, thresholdPercent: number): Verdict {
-  // Compared as a fraction: 57 / 100 is the same number as the literal 0.57, 0.57 * 100 is not 57.
-  return confidence !== null && confidence >= thresholdPercent / 100 ? 'clear' : 'review';
+  if (confidence === null) return 'review';
+  return tenthsOf(confidence) >= Math.ceil(thresholdPercent * 10 - NOISE) ? 'clear' : 'review';
 }
 
 export function resultVerdict(result: QuestionResult, thresholdPercent: number): Verdict {
@@ -231,8 +245,7 @@ export function resultVerdict(result: QuestionResult, thresholdPercent: number):
  */
 export function formatPercent(p: number): string {
   if (!Number.isFinite(p)) return '—';
-  // 1e-6 absorbs float noise (0.57 * 1000 is 569.9999999999999).
-  const tenths = Math.floor(p * 1000 + 1e-6);
+  const tenths = tenthsOf(p);
   if (tenths <= 0) return p > 0 ? '<0.1%' : '0%';
   const value = tenths / 10;
   return `${Number.isInteger(value) ? value : value.toFixed(1)}%`;

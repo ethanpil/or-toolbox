@@ -5,6 +5,7 @@ import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import {
   findByName,
   loadDeciders,
+  lossOnLoad,
   newDeciderId,
   readDecider,
   removeDecider,
@@ -12,6 +13,7 @@ import {
   saveDecider,
   sortDeciders,
 } from './saved';
+import { blankState, type StateDef } from './schema';
 import { templateQuestions } from './templates';
 
 const decider = (patch: Partial<SavedDecider> = {}): SavedDecider => ({
@@ -136,5 +138,47 @@ describe('saved deciders', () => {
 
   it('gives every decider its own id', () => {
     expect(newDeciderId()).not.toBe(newDeciderId());
+  });
+});
+
+describe('what loading a decider would lose', () => {
+  const typed: StateDef = { mode: 'text', text: 'A ticket I typed', fields: [] };
+  const saved: StateDef = { mode: 'text', text: 'The saved situation', fields: [] };
+  const blank: StateDef = blankState();
+
+  it('is the questions when they were edited', () => {
+    expect(lossOnLoad({ questionsEdited: true, current: blank, incoming: null })).toEqual({
+      questions: true,
+      situation: false,
+    });
+  });
+
+  it('is the situation when the decider brings one that replaces text in the form', () => {
+    expect(lossOnLoad({ questionsEdited: false, current: typed, incoming: saved })).toEqual({
+      questions: false,
+      situation: true,
+    });
+    const fields: StateDef = { mode: 'fields', text: '', fields: [{ key: 'a', value: 'b' }] };
+    expect(lossOnLoad({ questionsEdited: false, current: fields, incoming: saved }).situation).toBe(
+      true,
+    );
+    // Text kept hidden behind the other mode counts too.
+    const hidden: StateDef = { mode: 'fields', text: 'hidden words', fields: [] };
+    expect(lossOnLoad({ questionsEdited: false, current: hidden, incoming: saved }).situation).toBe(
+      true,
+    );
+  });
+
+  it('is nothing when the form has no situation, or the decider has none, or they are the same', () => {
+    expect(lossOnLoad({ questionsEdited: false, current: blank, incoming: saved })).toEqual({
+      questions: false,
+      situation: false,
+    });
+    expect(lossOnLoad({ questionsEdited: false, current: typed, incoming: null }).situation).toBe(
+      false,
+    );
+    expect(lossOnLoad({ questionsEdited: false, current: typed, incoming: typed }).situation).toBe(
+      false,
+    );
   });
 });

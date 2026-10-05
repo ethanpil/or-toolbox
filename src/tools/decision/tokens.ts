@@ -1,15 +1,18 @@
 /**
- * How many input tokens a decision request will be, roughly, so the form can refuse one that cannot fit the
- * model's context before anything is sent, and the header can estimate the (input-only) price.
+ * How many input tokens a decision request will be, roughly. Two numbers, for two jobs:
  *
- * `approxTokens` is the same approximation Chat uses (a tool folder may not import another's): Latin text about
- * four characters per token, other alphabets two, CJK, kana, Hangul, Indic and Thai one. It is multiplied by
- * `JSON_FACTOR`, because a decision request is JSON and the models count more tokens than that for it: Jev billed
- * 476 input tokens for the 830 characters of the tutorial request (about 0.57 per character; four characters per
- * token would give 208), Mercury 253 (docs/openrouter-api.md §8.2). The factor puts the estimate above both, the
- * way every estimate in this app errs high.
+ * - `estimateInputTokens` is for the **price**. It is deliberately high, the way every estimate in this app errs,
+ *   because a decision request is JSON and the models count more tokens than prose for it: Jev billed 476 input
+ *   tokens for the 830 characters of the tutorial request (about 0.57 per character; four characters per token
+ *   would give 208), Mercury 253 (docs/openrouter-api.md §8.2). The whole body is inflated by `JSON_FACTOR`.
+ * - `contextInputTokens` is for **refusing** a request that cannot fit the model's context before anything is
+ *   sent. A refusal must not lean one way: it counts the situation's prose as prose (`approxTokens`,
+ *   src/core/tokens.ts) and inflates only the structure around it (the questions, the field names), so a long
+ *   text of about 120,000 characters is not turned away at a 32,000 token context.
  */
 import type { DecisionRequest } from '../../core/api/types';
+import { approxTokens } from '../../core/tokens';
+import { isRecord, isString } from '../../core/util';
 import { formatInt } from '../../ui/format';
 
 /** Jev's context window, the one the docs state (§8.1); used when the catalog does not say. */
@@ -19,39 +22,35 @@ const JSON_FACTOR = 2.5;
 /** The framing the service adds around state and questions. */
 const OVERHEAD_TOKENS = 32;
 
-/** Scripts where one character is about one token (or more). */
-function isWide(code: number): boolean {
-  return (
-    (code >= 0x0900 && code <= 0x0dff) || // Devanagari … Sinhala
-    (code >= 0x0e00 && code <= 0x0eff) || // Thai, Lao
-    (code >= 0x1000 && code <= 0x109f) || // Myanmar
-    (code >= 0x1100 && code <= 0x11ff) || // Hangul Jamo
-    (code >= 0x1780 && code <= 0x17ff) || // Khmer
-    (code >= 0x2e80 && code <= 0x9fff) || // CJK radicals, kana, CJK ideographs
-    (code >= 0xa960 && code <= 0xa97f) ||
-    (code >= 0xac00 && code <= 0xd7ff) || // Hangul syllables
-    (code >= 0xf900 && code <= 0xfaff) || // CJK compatibility
-    (code >= 0xff00 && code <= 0xffef) // full-width forms
-  );
-}
+type Body = Pick<DecisionRequest, 'state' | 'questions'>;
 
-export function approxTokens(value: string): number {
-  let latin = 0;
-  let other = 0;
-  let wide = 0;
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code < 0x0250) latin++;
-    else if (isWide(code)) wide++;
-    else other++;
-  }
-  return Math.ceil(latin / 4 + other / 2 + wide);
-}
-
-/** Input tokens of the request: its state and questions (the model id is not part of what is read). */
-export function estimateInputTokens(request: Pick<DecisionRequest, 'state' | 'questions'>): number {
+/** Input tokens of the request for the price: the whole body at the heavier JSON rate. */
+export function estimateInputTokens(request: Body): number {
   const body = JSON.stringify({ state: request.state, questions: request.questions });
   return Math.ceil(approxTokens(body) * JSON_FACTOR) + OVERHEAD_TOKENS;
+}
+
+/** The situation's prose, and everything else the request says (field names, questions) as JSON. */
+function split(request: Body): { prose: string; structure: string } {
+  const { state, questions } = request;
+  if (isString(state)) return { prose: state, structure: JSON.stringify({ questions }) };
+  if (isRecord(state)) {
+    const entries = Object.entries(state);
+    return {
+      prose: entries.flatMap(([, value]) => (isString(value) ? [value] : [])).join('\n'),
+      structure: JSON.stringify({
+        state: entries.map(([key, value]) => (isString(value) ? key : [key, value])),
+        questions,
+      }),
+    };
+  }
+  return { prose: '', structure: JSON.stringify({ state, questions }) };
+}
+
+/** Input tokens of the request as the context sees them, for deciding whether it fits. */
+export function contextInputTokens(request: Body): number {
+  const { prose, structure } = split(request);
+  return approxTokens(prose) + Math.ceil(approxTokens(structure) * JSON_FACTOR) + OVERHEAD_TOKENS;
 }
 
 /** A refusal message when the request cannot fit `limit` tokens, else null. */

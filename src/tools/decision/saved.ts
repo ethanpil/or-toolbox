@@ -8,7 +8,7 @@
  */
 import type { ToolStateStore } from '../../core/types';
 import { isFiniteNumber, isRecord, isString } from '../../core/util';
-import { type QuestionDef, readQuestions, readState, type StateDef } from './schema';
+import { hasSituation, type QuestionDef, readQuestions, readState, type StateDef } from './schema';
 
 export interface SavedDecider {
   id: string;
@@ -68,4 +68,27 @@ export function findByName(list: readonly SavedDecider[], name: string): SavedDe
 
 export function newDeciderId(): string {
   return crypto.randomUUID();
+}
+
+export interface LoadLoss {
+  /** The questions in the form were edited since they were loaded or saved. */
+  questions: boolean;
+  /** The decider brings a situation that would replace a different one in the form. */
+  situation: boolean;
+}
+
+/** What loading a decider into the form would throw away, so the person is asked before it happens. */
+export function lossOnLoad(input: {
+  questionsEdited: boolean;
+  current: StateDef;
+  incoming: StateDef | null;
+}): LoadLoss {
+  const { current, incoming } = input;
+  return {
+    questions: input.questionsEdited,
+    situation:
+      incoming !== null &&
+      hasSituation(current) &&
+      JSON.stringify(current) !== JSON.stringify(incoming),
+  };
 }
