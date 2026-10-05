@@ -69,6 +69,7 @@ All notable changes to this project are documented here. The format follows
 - Shared `approxTokens()` in `src/core/tokens.ts` (0575155).
 - Stage 7 review, shared UI: `runner.setLabel()`, `runner.addAction()` and `RunnerOptions.hideWhileBusy` for multi-action run bars, `stopOnEscape()` and `composing()` (4a7cacb); `createMarkdownCache()`, `attachmentIntake()` and the `.or-icon-action` button class (cdb6f5f); `describeRunCost()`, `formatRunCost()` and `usageLine()` (6c3967a); `failureText()` with a blind mode for the arena whose failures all read alike (276d460, 2fe9023); manifest field `ownModels` (7200c1b).
 - v1 README and user guide (`docs/user-guide.md`: first steps, every tool, platform pages, troubleshooting), with screenshots in `docs/images/` (e29928a).
+- Stage 8 framework: `retryGate().retryFailed(error, keys)` (asks before resending a request that may have been billed), `failureLine()`, `ItemOutcome.failure`, `pendingOnly(isDone, allKeys)` for plain-run replays (13f0060); `resultRemoval()`/`confirmUndownloaded()` and `sanitizeSvg()` (fd0aca4); `ui.confirmDiscard()`, `RunnerOptions.stopOnEscape`, Alt+Shift+N to reach a toast's action (b60be68); `ToolTestContext.settle()` (1457b54).
 
 ### Changed
 
@@ -88,6 +89,9 @@ All notable changes to this project are documented here. The format follows
 - Video estimates take an `images` count and add per-image input prices (`cents_per_image_input`) (e7aaee5).
 - Video studio uses the framework's job cost (`usage`), `run.cancel()` for "Stop waiting" (History shows it stopped at once), opt-in job notifications (one per sequence), `outcomeUnknown` (no Retry toast) and `videoResultCard`; a sequence step the provider failed no longer counts against the spend cap (9fb1171).
 - Image pipeline: opt-in `adaptThreshold` (threshold kept below the picture's own background and noise) and `despeckle` (background filled on the picture and small light specks removed before the product box); `IsolateResult.threshold` (fdb6368).
+- The primary runner stops on Escape by default; image and audio result cards ask before removing a result not downloaded, like video (13f0060, fd0aca4).
+- `createToolTestContext().cleanup()` is async: it stops runs, waits for tool-state writes and leaves the bus (1457b54).
+- The palette lists every tool and page while the search is empty (b4cd175).
 
 - Stage 0 review fixes: COEP `require-corp` only, isolation reload limited to pages that need threads, manifest-based offline shell, hardened `h()` and Markdown sanitising, dev-server CSP and isolation, TypeScript 6, single gated CI pipeline (cb1cc69).
 - Errors share one `OrError` base with codes; shared helpers moved to `util.ts` (6b469ef).
@@ -108,6 +112,17 @@ All notable changes to this project are documented here. The format follows
 - Stage 7 review, shared UI: Chat uses the shared Markdown cache, attachment intake, `stopOnEscape()`, `usageLine()` and `.or-icon-action` (5252825); `checkText()` takes the noun ("message" or "prompt"); Settings → Tools shows "Chosen inside the tool" for Model arena and Bot-to-bot instead of a model picker, and `mountTool(…, { modelChip: false })` is the manifest's `ownModels` (7200c1b); History words costs through `describeRunCost()` and names what budgets counted for an unknown cost (6c3967a); the runner hands focus on when the focused bar control hides (4a7cacb).
 
 ### Fixed
+
+- A batch where every item failed and one may have been billed now shows the runner's caution instead of staying quiet; inline failures and the output panel keep that caution (13f0060).
+- The error toast's Retry after a failure part-way can skip finished items of a plain run, and says why when it cannot start (13f0060).
+- OpenRouter's specific 402 and 429 messages are no longer replaced by generic ones; the rate-limit toast no longer talks only about free models (13f0060).
+- Reloading or closing a tab during a run asks first (13f0060).
+- The same status line is announced once, not three times (13f0060).
+- Removing the last audio take no longer loses focus (fd0aca4).
+- SVG results are saved sanitized (no scripts, no external links) or as PNG (fd0aca4).
+- Tool pages no longer shift while the tool sets itself up; the Run bar no longer scrolls controls beside it or in dialogs; Shift+Tab never leaves focus under the navbar; toasts no longer cover Run and Stop on phones; `.tsx`, `.vue` and `.kt` files dropped on Chat are no longer skipped (b60be68).
+- History stops filtering by a key that was removed; Home words estimated costs with ≈; the Budgets help explains group totals; Enter that confirms an IME composition no longer acts in the palette or Home's search; revealing a document page respects reduced motion (b4cd175).
+- Tool unit tests no longer write into the next test's database (1457b54).
 
 - The sticky Run bar no longer covers a control focused by Tab when the page scrolls smoothly to it: the framework checks again once the scroll ends (d8e6d0c).
 - Reset everything can no longer be undone by a tool-state write already on its way: the guard runs inside each write's transaction against a reset generation that Reset bumps while it wipes; Bot-to-bot's extra delete is gone (2271fcd).
