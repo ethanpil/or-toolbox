@@ -71,6 +71,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `trimOldest()` in `src/core/tokens.ts` replaces Chat's `trimToBudget` and Bot-to-bot's `trimCount` (94c14cf).
+- `RunHandle.reservedUsd`; Model arena says what an unknown cost counted; a group total with unknown members shows "+ N unknown" and budgets treat it as a floor; `beginAll` returns handles in spec order (4f88cad).
 - Bot-to-bot chat uses the framework's run bar (Step and Pause as runner actions, Escape through `stopOnEscape`), the shared Markdown cache, cost wording ("cost unknown (≈ $x counted)"), `failureText`, core token counting and `holdLock`; it re-reads its state after a data reset (752fdfe, 41d107d).
 - Group budget approvals: `runs.approveGroup()`/`releaseGroup()`, `RunSpec.useGroupApproval` and all-or-none `runs.beginAll()`; the budget dialog names a group with its models and total; Video studio approves its sequences through them (e7660ec).
 - A run stopped before it sent anything books no stats row (e7660ec).
@@ -103,6 +105,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Reset everything can no longer be undone by a tool-state write already on its way: the guard runs inside each write's transaction against a reset generation that Reset bumps while it wipes; Bot-to-bot's extra delete is gone (2271fcd).
 - Model arena: a round asks one budget question for its total and starts all or none (`beginAll`; a declined dialog sends nothing); first token and total are timed from `onSend`; blind errors use `failureText` (no 402/429 or name differences); costs through `formatRunCost`; files through `attachmentIntake`; context fit from `src/core/tokens.ts`; the tally through `ctx.state.update` (3bbe92e).
 - Decision: a badge now agrees with the number beside it (Yes/No confidence float noise; no "100%" for 0.9999999995), an id typed with a trailing space finds its answer, a list you emptied stays empty, and the context check no longer refuses long prose that fits (2bdff81).
 - Decision: dropping a scale level clears the drag, focuses the level that moved and no longer carries `text/plain`; renamed questions and thresholds edited during a request keep their cards; key-value runs record what was sent as their prompt; Load asks before replacing a different situation; empty drops change nothing; Markdown, CSV, JSON, logs and YAML are accepted (e344b35).
