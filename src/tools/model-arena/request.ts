@@ -1,25 +1,18 @@
 /**
  * The request each contender gets: the same system prompt, prompt and files for every model (the files as
  * content parts, PDFs through the `file-parser` plugin), the temperature and Max tokens when set. Only the model
- * differs, and with it the limits (`fitOutput`): `max_tokens` is clamped to the model's output cap and to the room
- * its context window leaves, the estimate assumes Max tokens (else the model's cap, at most
- * DEFAULT_OUTPUT_TOKENS), and a prompt that does not fit a model's context window is refused before the round.
+ * differs, and with it the limits (`fitFor`, core's `fitContext`): `max_tokens` is clamped to the model's output
+ * cap and to the room its context window leaves, the estimate assumes Max tokens (else the model's cap, at most
+ * `DEFAULT_OUTPUT_TOKENS`), and a prompt that does not fit a model's context window is refused before the round.
  *
  * The prompt's token count is the same for every contender: callers count it once (`inputTokens`) and pass it.
  */
 import type { ChatMessage, ChatRequest, ContentPart } from '../../core/api/types';
 import { type AttachmentRef, toContentPart } from '../../core/attachments/attachments';
-import {
-  approxTokens,
-  attachmentTokens,
-  MESSAGE_OVERHEAD,
-  needsParser,
-} from '../../core/attachments/request';
+import { attachmentTokens, needsParser } from '../../core/attachments/request';
 import type { PdfEngineId } from '../../core/models/pdf-engines';
+import { approxTokens, type ContextFit, fitContext, MESSAGE_OVERHEAD } from '../../core/tokens';
 import type { ModelInfo } from '../../core/types';
-
-/** Output an estimate assumes, and keeps free in the context window, when Max tokens is not set. */
-export const DEFAULT_OUTPUT_TOKENS = 4096;
 
 export interface ArenaInput {
   prompt: string;
@@ -65,39 +58,18 @@ export function inputTokens(input: Pick<ArenaInput, 'prompt' | 'system' | 'attac
   );
 }
 
-export interface OutputFit {
-  /** What to send as `max_tokens`, or null to send none (Max tokens not set). */
-  maxTokens: number | null;
-  /** The output tokens an estimate assumes. */
-  completionTokens: number;
-  /** The prompt alone does not fit the model's context window. */
-  tooLong: boolean;
-}
-
-/** How the answer fits `info`'s limits after a prompt of `promptTokens` (as Chat's request does). */
-export function fitOutput(
+/** How a prompt of `promptTokens` and the answer fit `info`'s limits (nothing is trimmed: one message). */
+export const fitFor = (
   promptTokens: number,
   info: ModelInfo | undefined,
   maxTokens: number | null,
-): OutputFit {
-  const cap =
-    info?.maxCompletionTokens && info.maxCompletionTokens > 0
-      ? info.maxCompletionTokens
-      : Number.POSITIVE_INFINITY;
-  let sent = maxTokens === null ? null : Math.min(maxTokens, cap);
-  const wanted = sent ?? Math.min(cap, DEFAULT_OUTPUT_TOKENS);
-  let completionTokens = wanted;
-  let tooLong = false;
-  const context = info?.contextLength;
-  if (context && context > 0) {
-    // Room for an answer and a margin for the approximation.
-    tooLong = promptTokens > Math.floor(context * 0.95) - Math.min(wanted, Math.floor(context / 2));
-    const room = Math.max(1, context - promptTokens);
-    if (sent !== null) sent = Math.min(sent, room);
-    completionTokens = Math.min(wanted, room);
-  }
-  return { maxTokens: sent, completionTokens, tooLong };
-}
+): ContextFit =>
+  fitContext({
+    context: info?.contextLength,
+    maxTokens,
+    maxCompletionTokens: info?.maxCompletionTokens ?? null,
+    prompt: promptTokens,
+  });
 
 export function contenderRequest(
   model: string,
@@ -106,7 +78,7 @@ export function contenderRequest(
   promptTokens: number = inputTokens(input),
 ): ContenderRequest {
   const system = input.system.trim();
-  const fit = fitOutput(promptTokens, info, input.maxTokens);
+  const fit = fitFor(promptTokens, info, input.maxTokens);
   const messages: ChatMessage[] = [
     ...(system ? [{ role: 'system' as const, content: system }] : []),
     { role: 'user', content: userContent(input) },

@@ -204,6 +204,58 @@ test('four contenders stream at once; a blind vote reveals the names and counts'
   expect(problems).toEqual([]);
 });
 
+test('a round asks one budget question for its total; Cancel sends nothing', async ({
+  page,
+  mock,
+  context,
+}) => {
+  const problems = await watchForProblems(page, { allowAborted: [CHAT] });
+  // About $0.09 each (4,096 output tokens): under the default $0.10 per-run threshold alone, over it together.
+  const pricey = [1, 2, 3, 4].map((n) =>
+    catalogModel(`test/pricey-${n}`, `Test: Pricey ${n}`, ['text'], '0.000022'),
+  );
+  mock.json('GET', '/api/v1/models', { data: [...Object.values(MODELS), ...pricey] });
+  answerEach(mock);
+  await context.addInitScript(
+    (models: string[]) => {
+      const raw = localStorage.getItem('ortoolbox:settings');
+      const settings = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      localStorage.setItem(
+        'ortoolbox:settings',
+        JSON.stringify({ ...settings, tools: { 'model-arena': { options: { models } } } }),
+      );
+    },
+    pricey.map((model) => model.id),
+  );
+  await page.goto('tools/model-arena/');
+  await expect(contenders(page).getByTestId('contender-name')).toHaveText(
+    pricey.map((model) => model.name),
+  );
+  await page.getByTestId('tool-prompt').fill('Which is larger, 9.11 or 9.9?');
+  await page.getByTestId('run-button').click();
+
+  const dialog = page.getByTestId('budget-dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByTestId('budget-group')).toContainText('Model arena round: 4 models');
+  await expect(dialog.getByTestId('budget-estimate')).toHaveText('≈ $0.36');
+  await expect(dialog.getByTestId('budget-models')).toContainText('test/pricey-4');
+  await dialog.getByTestId('budget-cancel').click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByTestId('tool-status')).toHaveText(
+    'The round did not start: nothing was sent.',
+  );
+  // One question for the round, not one per contender; nothing was sent or recorded.
+  await expect(page.getByTestId('budget-dialog')).toHaveCount(0);
+  expect(mock.calls(CHAT)).toHaveLength(0);
+  await expect(panels(page)).toHaveCount(0);
+
+  await page.getByTestId('run-button').click();
+  await page.getByTestId('budget-dialog').getByTestId('budget-confirm').click();
+  await expect(panels(page).getByTestId('panel-status')).toHaveText(Array(4).fill('Done'));
+  expect(mock.calls(CHAT, 'POST')).toHaveLength(4);
+  expect(problems).toEqual([]);
+});
+
 test('one contender failing leaves the others; its Retry runs it alone', async ({ page, mock }) => {
   const problems = await watchForProblems(page, { allowAborted: [CHAT] });
   mock.respond('POST', CHAT, (call) =>
@@ -220,9 +272,9 @@ test('one contender failing leaves the others; its Retry runs it alone', async (
 
   const failed = panels(page).filter({ has: page.getByTestId('panel-error') });
   await expect(failed).toHaveCount(1);
-  // Blind: the provider's message does not give the model away.
+  // Blind: OpenRouter's message (which names the model) gives way to wording true for any model.
   await expect(failed.getByTestId('panel-error')).toContainText(
-    'this model is not available right now.',
+    'OpenRouter could not process this request. Before retrying, you can check your OpenRouter activity',
   );
   await expect(failed.getByTestId('panel-error')).not.toContainText('beta');
   await expect(panels(page).getByTestId('panel-status')).toContainText(['Failed']);

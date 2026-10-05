@@ -195,10 +195,8 @@
 // A small icon-only button (Remove, Copy, Edit, Retry…) in messages, chips and lists: `btn btn-sm btn-link
 // or-icon-action`. At least 2rem (32 px) square, above the 24 × 24 px of WCAG 2.2 target size (2.5.8), in a muted
 // colour that strengthens on hover and keyboard focus. (`.or-icon-button` in _pages.scss is the Models page's
-// compact copy button.) `.or-attachment-remove` is the old name, still used by Model arena's Remove contender
-// until it moves to `.or-icon-action`.
-.or-icon-action,
-.or-attachment-remove {
+// compact copy button.)
+.or-icon-action {
   flex-shrink: 0;
   min-width: 2rem;
   min-height: 2rem;

@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
+import { ApiError } from '../../core/errors';
+import { failureText } from '../../ui/feedback/errors';
 import { roundJson, roundMarkdown, voteLine } from './export';
 import { newRound, type Round } from './round';
+
+/** What a failed panel stores: the wording after the reveal, and the blind one. */
+const failure = (error: unknown) => ({
+  shown: failureText(error),
+  blind: failureText(error, { blind: true }),
+});
 
 function sampleRound(): Round {
   const round = newRound({
@@ -34,7 +42,7 @@ function sampleRound(): Round {
   });
   Object.assign(round.entries[1]!, {
     status: 'error',
-    error: 'Rate limited.',
+    failure: failure(new ApiError('Rate limited.', 400)),
     startedAt: 0,
     endedAt: 300,
   });
@@ -64,6 +72,25 @@ describe('round export', () => {
     const fences = markdown.split('\n').filter((line) => /^(`{3,}|~{3,})/.test(line));
     expect(fences).toHaveLength(5); // ```` ``` ```` (one closed by us), ~~~ ~~~
     expect(markdown.endsWith('## Vote\n\nModel B (One) won.\n')).toBe(true);
+  });
+
+  it('words costs as everywhere else: Free on a free model, Unknown, an estimate with ≈', () => {
+    const round = sampleRound();
+    const usage = (patch: Record<string, unknown>) => ({
+      promptTokens: 10,
+      completionTokens: 50,
+      costUsd: 0,
+      costEstimated: false,
+      costUnknown: false,
+      ...patch,
+    });
+    round.entries[0]!.usage = usage({});
+    const free = roundMarkdown(round, name, (id) => id === 'a/one');
+    expect(free).toContain('| 250 ms | 1.3 s | 50 | 50.0 | Free |');
+    round.entries[0]!.usage = usage({ costUnknown: true });
+    expect(roundMarkdown(round, name)).toContain('| 50.0 | Unknown |');
+    round.entries[0]!.usage = usage({ costUsd: 0.0012, costEstimated: true });
+    expect(roundMarkdown(round, name)).toContain('| 50.0 | ≈ $0.0012 |');
   });
 
   it('marks an answer cut off at the length limit in JSON', () => {

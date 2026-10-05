@@ -11,15 +11,16 @@ import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient, CallOptions } from '../../core/types';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import type { ToolInstance, ToolSnapshot } from '../../ui/tool/types';
-import type * as sharedRequest from '../../core/attachments/request';
-import { approxTokens } from '../../core/attachments/request';
+import type * as tokens from '../../core/tokens';
+import { approxTokens } from '../../core/tokens';
+import type { BudgetQuestion } from '../../core/types';
 import { getTool } from '../registry';
 import { SAMPLE_PROMPT, setup } from './arena';
 import { parseTally } from './tally';
 
 // Counts token approximations (the shared input is counted once per refresh, not once per contender).
-vi.mock('../../core/attachments/request', async (importOriginal) => {
-  const actual = await importOriginal<typeof sharedRequest>();
+vi.mock('../../core/tokens', async (importOriginal) => {
+  const actual = await importOriginal<typeof tokens>();
   return { ...actual, approxTokens: vi.fn(actual.approxTokens) };
 });
 
@@ -39,6 +40,8 @@ const CATALOG = [
   model('beta/two:free', '0', ['text'], 4),
   model('gamma/three:free', '0', ['text', 'image'], 3),
   model('delta/four', '0.000001', ['text', 'image'], 2),
+  // About $0.09 a round (4,000 output tokens): under the $0.10 per-run threshold alone, over it four at once.
+  model('eps/pricey', '0.0000225', ['text'], 1),
 ];
 const FOUR = ['alpha/one:free', 'beta/two:free', 'gamma/three:free', 'delta/four'];
 
@@ -56,14 +59,18 @@ const result = (body: ChatRequest, text: string): ChatStreamResult => ({
   usage: null,
 });
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * A chatStream that answers `Answer from <model>` and reports usage like the client (the usage event, then the
- * run's usage). It records each body and how many requests were in flight at once; `hold` keeps every request
- * open until that many have arrived.
+ * run's usage). Like the client, it calls `onSend` right before the request goes out: after `waitMs` (the free-model
+ * throttle or a retry's backoff). It records each body and how many requests were in flight at once; `hold` keeps
+ * every request open until that many have arrived.
  */
 function fakeStream(
   options: {
     hold?: number;
+    waitMs?: number;
     fail?: (body: ChatRequest) => Error | null;
     finishReason?: string;
     reasoningTokens?: number;
@@ -82,6 +89,8 @@ function fakeStream(
       if (bodies.length >= options.hold) release();
       await gate;
     }
+    if (options.waitMs) await sleep(options.waitMs);
+    opts.onSend?.(1);
     try {
       const failure = options.fail?.(body);
       if (failure) throw failure;
@@ -121,6 +130,7 @@ function heldStream() {
   return vi.fn(
     (body: ChatRequest, opts: StreamOptions) =>
       new Promise<ChatStreamResult>((_, reject) => {
+        opts.onSend?.(1);
         opts.onEvent({ type: 'text', text: `Partial from ${body.model}` });
         opts.run.signal.addEventListener('abort', () => {
           opts.run.addUsage({
@@ -369,8 +379,8 @@ describe('model arena', () => {
 
     const errors = $$('panel-error');
     expect(errors).toHaveLength(1);
-    // Blind: the error does not name the model.
-    expect(errors[0]!.textContent).toContain('this model is overloaded.');
+    // Blind: the error says nothing OpenRouter's message said about the model.
+    expect(errors[0]!.textContent).toContain('OpenRouter could not process this request.');
     expect(errors[0]!.textContent).not.toContain('beta/two');
     expect(Object.values(answers()).filter((text) => text?.startsWith('Answer from'))).toHaveLength(
       2,
@@ -492,35 +502,105 @@ describe('model arena', () => {
 });
 
 describe('review fixes', () => {
-  it('blind errors read the same for every model: one neutral billing note, no partial names', async () => {
-    const unknown = new ApiError('Upstream error.', 502);
+  it('blind errors read the same for every model; the real wording shows after the reveal', async () => {
+    const unknown = new ApiError('Upstream error from eps/pricey.', 502);
     unknown.outcomeUnknown = true; // a paid request that may have gone through
     const fake = fakeStream({
       fail: (body) =>
-        body.model === 'delta/four'
+        body.model === 'eps/pricey'
           ? unknown
-          : body.model === 'beta/two:free'
-            ? new ApiError('BETA/TWO is busy right now.', 400)
-            : null,
+          : body.model === 'delta/four'
+            ? new ApiError('Insufficient credits for delta/four.', 402) // a paid model's failure
+            : body.model === 'beta/two:free'
+              ? new ApiError('BETA/TWO free tier is busy.', 429) // a free model's failure
+              : null,
     });
     const { tool } = await mount({ chatStream: fake.chatStream });
-    form(tool, ['alpha/one:free', 'beta/two:free', 'delta/four']);
+    form(tool, ['alpha/one:free', 'beta/two:free', 'delta/four', 'eps/pricey']);
     await t!.runners[0]!.trigger();
 
-    const errors = $$('panel-error').map((el) => el.textContent ?? '');
-    expect(errors).toHaveLength(2);
-    for (const text of errors) {
-      expect(text).not.toMatch(/beta|two/i);
-      expect(text).not.toContain('may have gone through');
-      expect(text).toContain('Before retrying, you can check your OpenRouter activity');
+    const failed = panels().filter((panel) => $$('panel-error', panel).length > 0);
+    expect(failed).toHaveLength(3);
+    const texts = failed.map((panel) => $('panel-error', panel).textContent ?? '');
+    expect(texts.sort()).toEqual(
+      [
+        'OpenRouter did not accept this request.',
+        'Rate limited. Wait a moment, then try again.',
+        'The request did not finish.',
+      ]
+        .map(
+          (text) =>
+            `${text} Before retrying, you can check your OpenRouter activity to see whether this request was billed.OpenRouter activity (opens in a new tab)Retry`,
+        )
+        .sort(),
+    );
+    for (const panel of failed) {
+      expect(panel.querySelector('a[href="https://openrouter.ai/activity"]')).not.toBeNull();
+      expect($$('panel-retry', panel)).toHaveLength(1); // a Retry that went missing would give it away
     }
-    expect(errors.some((text) => text.includes('this model is busy right now.'))).toBe(true);
 
-    // Once the names show, the paid request's own warning appears, on that panel only.
+    // Once the names show: the real messages; the request that may have gone through gets no plain Retry.
     $('vote-reveal').click();
-    const revealed = $$('panel-error').map((el) => el.textContent ?? '');
-    expect(revealed.filter((text) => text.includes('may have gone through'))).toHaveLength(1);
-    expect(revealed.some((text) => text.includes('BETA/TWO is busy right now.'))).toBe(true);
+    const revealed = panels().filter((panel) => $$('panel-error', panel).length > 0);
+    const byText = (part: string) =>
+      revealed.find((panel) => $('panel-error', panel).textContent?.includes(part));
+    const maybeBilled = byText('may still have done the work')!;
+    expect(maybeBilled.querySelector('a[href="https://openrouter.ai/activity"]')).not.toBeNull();
+    expect($$('panel-retry', maybeBilled)).toHaveLength(0);
+    const credits = byText('Not enough credits')!;
+    expect(credits.querySelector('a[href="https://openrouter.ai/activity"]')).toBeNull();
+    expect($$('panel-retry', credits)).toHaveLength(1);
+  });
+
+  it('asks one budget question for the round’s total, and sends nothing when it is declined', async () => {
+    const fake = fakeStream();
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    const questions: BudgetQuestion[] = [];
+    let answer = false;
+    t!.core.runs.setConfirmHandler((_check, question) => {
+      questions.push(question);
+      return Promise.resolve(answer);
+    });
+    // Four contenders of about $0.09 each: each under the $0.10 per-run threshold, the round well over it.
+    form(tool, ['eps/pricey', 'eps/pricey', 'eps/pricey', 'eps/pricey']);
+    const each = await t!.ctx.models.estimate({
+      kind: 'tokens',
+      model: 'eps/pricey',
+      promptTokens: 20,
+      completionTokens: 4000,
+    });
+    expect(each).toBeLessThan(0.1);
+
+    await t!.runners[0]!.trigger();
+    expect(questions).toHaveLength(1);
+    const question = questions[0]!;
+    expect(question.kind).toBe('group');
+    if (question.kind !== 'group') return;
+    expect(question.group.label).toBe('Model arena round: 4 models');
+    expect(question.group.runs).toBe(4);
+    expect(question.group.estimateUsd).toBeGreaterThan(0.3); // the total, not one contender's share
+    // Declined: nothing was sent or recorded for any contender, and the page says so.
+    expect(fake.chatStream).not.toHaveBeenCalled();
+    expect(await t!.core.history.query({ tool: 'model-arena' })).toEqual([]);
+    expect(panels()).toHaveLength(0);
+    expect(t!.status()).toBe('The round did not start: nothing was sent.');
+
+    answer = true;
+    await t!.runners[0]!.trigger();
+    expect(questions).toHaveLength(2);
+    expect(fake.chatStream).toHaveBeenCalledTimes(4);
+    expect(await t!.core.history.query({ tool: 'model-arena' })).toHaveLength(4);
+  });
+
+  it('times first token and total from when the request is sent, not from the free-model wait', async () => {
+    const fake = fakeStream({ waitMs: 300 });
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free'], { blind: false });
+    await t!.runners[0]!.trigger();
+    const ms = (text: string | null): number => Number(/(\d+) ms/.exec(text ?? '')?.[1] ?? NaN);
+    for (const cell of [...$$('metric-ttft'), ...$$('metric-total')]) {
+      expect(ms(cell.textContent)).toBeLessThan(250);
+    }
   });
 
   it('closes voting while a contender runs again, from Retry until it settles', async () => {

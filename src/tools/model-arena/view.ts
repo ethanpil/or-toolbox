@@ -5,21 +5,21 @@
  * A panel is built once per round and updated in place (`update()`), so the answer that streams into it is never
  * rebuilt and a focused Retry or answer region keeps focus; the comparison and tally tables keep their scroll
  * region and redraw only their rows. Before names are shown (`round.revealed`), nothing that tells the models
- * apart is drawn: no name, no cost, no "Cheapest", errors with every form of the model's name replaced
- * (`anonymize`), and one billing note for every failed panel instead of the paid-only "may have gone through".
+ * apart is drawn: no name, no cost, no "Cheapest", and errors in `failureText(error, { blind: true })`'s words
+ * (true for any model, the same note, link and Retry on every failed panel); the real wording after the reveal.
  */
-import { type MarkdownStream, streamMarkdown } from '../../ui/components/stream-markdown';
 import { dataTable } from '../../ui/components/data-table';
 import { emptyState } from '../../ui/components/empty-state';
+import { externalLink } from '../../ui/components/external-link';
+import { type MarkdownStream, streamMarkdown } from '../../ui/components/stream-markdown';
 import { h } from '../../ui/dom';
-import { formatInt, formatMs } from '../../ui/format';
+import type { FailureText } from '../../ui/feedback/errors';
+import { formatInt, formatMs, formatRunCost } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import { formatCost, formatRate } from './export';
+import { formatRate } from './export';
 import {
   allIn,
-  anonymize,
-  blindTerms,
   canVote,
   cutOff,
   entryAt,
@@ -52,20 +52,10 @@ const STATUS: Readonly<Record<Entry['status'], { text: string; tone: string }>> 
 const show = (value: number | null, format: (value: number) => string): string =>
   value === null ? '—' : format(value);
 
-/**
- * What a failed panel adds about billing. The "may have gone through" warning exists only for paid requests, so
- * while names are hidden every failed panel gets the same note instead (true for each of them).
- */
-export const BLIND_BILLING_NOTE =
-  'Before retrying, you can check your OpenRouter activity to see whether this request was billed.';
-const OUTCOME_UNKNOWN_NOTE =
-  'It may have gone through and been billed: check your OpenRouter activity before retrying.';
-
-/** Cost, hidden before names are shown (a free model's $0 would give it away). */
+/** Cost, hidden before names are shown (a free model's $0 would give it away); else the shared wording. */
 function costText(metrics: Metrics, entry: Entry, round: Round, naming: Naming): string {
   if (!round.revealed) return 'Hidden';
-  if (metrics.costUsd === 0 && !metrics.costUnknown && naming.isFree(entry.model)) return 'Free';
-  return formatCost(metrics);
+  return formatRunCost(metrics, { free: naming.isFree(entry.model) });
 }
 
 export interface PanelView {
@@ -202,17 +192,17 @@ export function panelView(options: PanelOptions): PanelView {
 
     cutNote.hidden = !cutOff(entry);
 
-    // The error block is rebuilt only when the error changes, so a focused Retry survives other updates.
-    const failure = entry.error ?? 'The request failed.';
-    const message =
-      entry.status !== 'error'
-        ? ''
-        : round.revealed
-          ? `${failure}${entry.outcomeUnknown ? ` ${OUTCOME_UNKNOWN_NOTE}` : ''}`
-          : `${anonymize(failure, blindTerms(entry.model, name))} ${BLIND_BILLING_NOTE}`;
-    if (message !== problemShown) {
-      problemShown = message;
-      problem.replaceChildren(message ? errorBlock(message, index) : '');
+    // The error block is rebuilt only when what it says changes, so a focused Retry survives other updates.
+    const failure =
+      entry.status === 'error' && entry.failure
+        ? round.revealed
+          ? entry.failure.shown
+          : entry.failure.blind
+        : null;
+    const shown = failure ? JSON.stringify(failure) : '';
+    if (shown !== problemShown) {
+      problemShown = shown;
+      problem.replaceChildren(failure ? errorBlock(failure, index) : '');
     }
 
     const values = metricsOf(entry);
@@ -225,7 +215,12 @@ export function panelView(options: PanelOptions): PanelView {
     );
   };
 
-  const errorBlock = (message: string, index: number): HTMLElement =>
+  /**
+   * `text`, then `note` (blind: the same sentence on every failed panel), then the activity link when there is one.
+   * Retry unless a paid request may have gone through (never the case while blind, so a missing Retry gives
+   * nothing away).
+   */
+  const errorBlock = (failure: FailureText, index: number): HTMLElement =>
     h(
       'div',
       {
@@ -236,8 +231,15 @@ export function panelView(options: PanelOptions): PanelView {
       h(
         'div',
         { class: 'd-flex flex-column align-items-start gap-2 min-w-0' },
-        h('span', null, message),
-        options.retryButton(index),
+        h('span', null, failure.note ? `${failure.text} ${failure.note}` : failure.text),
+        h(
+          'div',
+          { class: 'd-flex flex-wrap align-items-center gap-2' },
+          failure.activityUrl
+            ? externalLink(failure.activityUrl, 'OpenRouter activity', 'alert-link')
+            : null,
+          failure.outcomeUnknown ? null : options.retryButton(index),
+        ),
       ),
     );
 
