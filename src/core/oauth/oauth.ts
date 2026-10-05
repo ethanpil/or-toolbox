@@ -19,7 +19,8 @@
 import { KeyLockedError, OAuthError, userMessage } from '../errors';
 import { maskKey } from '../keys/format';
 import { url } from '../paths';
-import { SS_KEYS, readJson, removeItem, session, writeJson } from '../storage/local';
+import { StorageUnavailableError } from '../errors';
+import { SS_KEYS, local, readJson, removeItem, session, writeJson } from '../storage/local';
 import type { CoreServices, KeyInfo, OAuthService } from '../types';
 import { isFiniteNumber, isRecord, isString } from '../util';
 import { challengeS256, createState, createVerifier } from './pkce';
@@ -136,8 +137,9 @@ export function createOAuthService(
     },
 
     async complete(params) {
-      // Before anything is consumed: a locked tab could not store the key.
+      // Before anything is consumed: a locked tab, or a browser that blocks storage, could not store the key.
       if (!core.keys.lock.unlocked()) throw new KeyLockedError();
+      if (!local()) throw new StorageUnavailableError();
       const pending = readPending();
       // Single use: gone before the exchange starts, whatever happens next.
       removeItem(session(), SS_KEYS.oauth);

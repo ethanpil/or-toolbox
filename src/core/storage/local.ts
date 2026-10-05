@@ -3,7 +3,7 @@
  * page; sessionStorage holds per-tab secrets (unlocked key material, the OAuth verifier).
  */
 
-import { StorageFullError } from '../errors';
+import { StorageFullError, StorageUnavailableError } from '../errors';
 import { parseJsonSafe } from '../util';
 
 export const LS_KEYS = {
@@ -49,17 +49,32 @@ export function readJson<T>(storage: Storage | undefined, key: string): T | null
   }
 }
 
-/** Write JSON. Throws `StorageFullError` when the quota is exceeded so callers can tell the user. */
+/**
+ * True for the error a browser raises when a store is over its quota (Web Storage or IndexedDB; Firefox's older
+ * name too). By name, since a DOMException may come from another realm.
+ */
+export function isQuotaError(error: unknown): boolean {
+  const name =
+    typeof error === 'object' && error !== null ? (error as { name?: unknown }).name : '';
+  return (
+    name === 'QuotaExceededError' ||
+    name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    (error instanceof DOMException && error.code === 22)
+  );
+}
+
+/**
+ * Write JSON. Throws `StorageFullError` when the quota is exceeded and `StorageUnavailableError` when the browser
+ * blocks storage (absent, or a SecurityError), so callers can tell the user; it never pretends to have saved.
+ */
 export function writeJson(storage: Storage | undefined, key: string, value: unknown): void {
-  if (!storage) return;
+  if (!storage) throw new StorageUnavailableError();
   try {
     storage.setItem(key, JSON.stringify(value));
   } catch (error) {
-    if (
-      error instanceof DOMException &&
-      (error.name === 'QuotaExceededError' || error.code === 22)
-    ) {
-      throw new StorageFullError();
+    if (isQuotaError(error)) throw new StorageFullError();
+    if ((error as { name?: unknown } | null)?.name === 'SecurityError') {
+      throw new StorageUnavailableError();
     }
     throw error;
   }
@@ -91,4 +106,4 @@ export function session(): Storage | undefined {
   }
 }
 
-export { StorageFullError };
+export { StorageFullError, StorageUnavailableError };

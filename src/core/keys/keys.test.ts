@@ -253,6 +253,17 @@ describe('keys', () => {
     expect(localStorage.getItem(LS_KEYS.keys)).toBe('{"version":1,"keys":[');
   });
 
+  it('never reports a key as added when the browser blocks storage', async () => {
+    const { keys } = harness();
+    vi.spyOn(globalThis, 'localStorage', 'get').mockImplementation(() => {
+      throw new DOMException('denied', 'SecurityError');
+    });
+    const error: unknown = await keys.add({ name: 'A', secret: KEY_A }).catch((e: unknown) => e);
+    expect(errorCode(error)).toBe('storage-unavailable');
+    vi.restoreAllMocks();
+    expect(keys.list()).toEqual([]);
+  });
+
   it('maps GET /key to KeyStatus and caches it for 60 s', async () => {
     vi.useFakeTimers();
     try {

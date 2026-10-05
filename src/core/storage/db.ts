@@ -1,10 +1,15 @@
 /**
  * The single IndexedDB database. Every store is declared here so that all modules agree on names, keys and
  * indexes; bump DB_VERSION and add an upgrade step for any change. Text and JSON only — never binaries.
+ *
+ * Quota errors of every request and transaction, in every store, reject as `StorageFullError` (`guard` below
+ * wraps the connection), so the user gets the storage-full help instead of a raw DOMException.
  */
 
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { StorageFullError } from '../errors';
 import type { JobRecord, PromptEntry, RunRecord, StatsRow } from '../types';
+import { isQuotaError } from './local';
 
 export const DB_NAME = 'ortoolbox';
 export const DB_VERSION = 1;
@@ -55,6 +60,58 @@ export interface OrDb extends DBSchema {
   };
 }
 
+/** The mapped copy of each idb promise, so `tx.done` stays one promise however often it is read. */
+const mapped = new WeakMap<Promise<unknown>, Promise<unknown>>();
+
+function mapQuota<T>(promise: Promise<T>): Promise<T> {
+  let out = mapped.get(promise);
+  if (!out) {
+    out = promise.catch((error: unknown) => {
+      throw isQuotaError(error) ? new StorageFullError() : error;
+    });
+    mapped.set(promise, out);
+  }
+  return out as Promise<T>;
+}
+
+/** Transactions, stores and indexes (idb's wrappers of them): the objects whose promises can hit the quota. */
+function isIdbObject(value: unknown): value is object {
+  return (
+    typeof IDBTransaction !== 'undefined' &&
+    (value instanceof IDBTransaction ||
+      value instanceof IDBObjectStore ||
+      value instanceof IDBIndex)
+  );
+}
+
+const guarded = new WeakMap<object, object>();
+
+/**
+ * Wraps idb's connection (and every transaction, store and index reached from it) so each promise it hands out,
+ * `tx.done` and request results alike (the `db.put`-style shortcuts too), rejects with `StorageFullError` on a
+ * quota error. Records are never wrapped: only promises and these objects are touched.
+ */
+function guard<T extends object>(target: T): T {
+  const cached = guarded.get(target);
+  if (cached) return cached as T;
+  const proxy = new Proxy(target, {
+    get(object, prop) {
+      const value: unknown = Reflect.get(object, prop, object);
+      if (value instanceof Promise) return mapQuota(value);
+      if (isIdbObject(value)) return guard(value);
+      if (typeof value !== 'function') return value;
+      const fn = value as (...args: unknown[]) => unknown;
+      return (...args: unknown[]): unknown => {
+        const result = fn.apply(object, args);
+        if (result instanceof Promise) return mapQuota(result);
+        return isIdbObject(result) ? guard(result) : result;
+      };
+    },
+  });
+  guarded.set(target, proxy);
+  return proxy;
+}
+
 let dbPromise: Promise<IDBPDatabase<OrDb>> | null = null;
 
 /**
@@ -66,7 +123,7 @@ export function getDb(): Promise<IDBPDatabase<OrDb>> {
   if (dbPromise) return dbPromise;
   let opening: Promise<IDBPDatabase<OrDb>>;
   try {
-    opening = openDatabase();
+    opening = openDatabase().then(guard);
   } catch (error) {
     return Promise.reject(error instanceof Error ? error : new Error(String(error)));
   }
