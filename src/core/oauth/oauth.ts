@@ -9,9 +9,15 @@
  * Both refuse with KeyLockedError while the passphrase lock is on and this tab is locked: the new key could not
  * be stored (it must be encrypted), and a consumed code cannot be exchanged again. `complete()` checks before it
  * touches anything, so after unlocking the caller retries with the same params.
+ *
+ * Once the code is exchanged, the key exists on OpenRouter and the code is spent. If storing it still fails (the
+ * tab auto-locked during the exchange, storage is full, keys changed in another tab), `complete()` throws
+ * KeyNotSavedError, which holds the key in memory: its `save()` tries again (after unlocking, for example).
+ * Leaving the page loses it; the key then stays on the OpenRouter account.
  */
 
-import { KeyLockedError, OAuthError } from '../errors';
+import { KeyLockedError, OAuthError, userMessage } from '../errors';
+import { maskKey } from '../keys/format';
 import { url } from '../paths';
 import { SS_KEYS, readJson, removeItem, session, writeJson } from '../storage/local';
 import type { CoreServices, KeyInfo, OAuthService } from '../types';
@@ -20,6 +26,29 @@ import { challengeS256, createState, createVerifier } from './pkce';
 
 // Historical import path (the class lives in errors.ts).
 export { OAuthError } from '../errors';
+
+type Completed = Awaited<ReturnType<OAuthService['complete']>>;
+
+/**
+ * The key was made on OpenRouter but could not be stored here. Only this error holds it: `save()` stores it
+ * (rejecting with the reason when it still cannot); nothing is exchanged again.
+ */
+export class KeyNotSavedError extends OAuthError {
+  /** Why storing failed (KeyLockedError, StorageFullError, KeysChangedError…). */
+  readonly reason: unknown;
+  readonly save: () => Promise<Completed>;
+
+  constructor(reason: unknown, save: () => Promise<Completed>) {
+    super(
+      `Your new key was created on OpenRouter but could not be saved here. ${userMessage(reason)}`,
+      {
+        cause: reason,
+      },
+    );
+    this.reason = reason;
+    this.save = save;
+  }
+}
 
 export const OPENROUTER_AUTH_URL = 'https://openrouter.ai/auth';
 /** Pending sign-ins older than this are refused (OpenRouter's codes expire after 10 minutes). */
@@ -136,12 +165,30 @@ export function createOAuthService(
         codeVerifier: pending.verifier,
         codeChallengeMethod: 'S256',
       });
-      const key: KeyInfo = await core.keys.add({
-        name: pending.keyLabel ?? 'OpenRouter',
-        secret,
-        source: 'oauth',
-      });
-      return { key, returnTo: safeReturnTo(pending.returnTo) };
+      const returnTo = safeReturnTo(pending.returnTo);
+      const save = async (): Promise<Completed> => {
+        const before = new Set(core.keys.list().map((k) => k.id));
+        try {
+          const key: KeyInfo = await core.keys.add({
+            name: pending.keyLabel ?? 'OpenRouter',
+            secret,
+            source: 'oauth',
+          });
+          return { key, returnTo };
+        } catch (error) {
+          // Stored before a later step failed (the default-key setting): saving again would add it twice.
+          const landed = core.keys
+            .list()
+            .find((k) => !before.has(k.id) && k.source === 'oauth' && k.masked === maskKey(secret));
+          if (landed) return { key: landed, returnTo };
+          throw error;
+        }
+      };
+      try {
+        return await save();
+      } catch (error) {
+        throw new KeyNotSavedError(error, save);
+      }
     },
   };
 }

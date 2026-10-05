@@ -6,8 +6,13 @@
  *
  * With the passphrase lock on and this tab locked, nothing is consumed: the page asks for the passphrase,
  * unlocks, and then connects with the same code (the query stays until then, so a reload still works).
+ *
+ * If the key is made but cannot be stored (the tab locked during the exchange, storage full), the code is spent and
+ * the page holds the key in memory (KeyNotSavedError): it asks for the passphrase or offers "Save again", and says
+ * that leaving keeps the key only on the OpenRouter account.
  */
 import { errorCode, userMessage } from '../core/errors';
+import { KeyNotSavedError } from '../core/oauth/oauth';
 import { url } from '../core/paths';
 import type { KeyLock, OAuthService } from '../core/types';
 import { h } from '../ui/dom';
@@ -73,8 +78,91 @@ function showError(status: HTMLElement, env: AuthCallbackEnv, error: unknown): v
   );
 }
 
-/** Asks for the passphrase; on success connects with the same params. */
-function showUnlock(status: HTMLElement, env: AuthCallbackEnv, params: URLSearchParams): void {
+type Completed = Awaited<ReturnType<OAuthService['complete']>>;
+
+const LOCKED_TEXT = 'Your keys are locked. Enter your passphrase to save the new key.';
+const LOCKED_AFTER_TEXT =
+  'Your new key was created on OpenRouter, but your keys locked before it was saved. Enter your passphrase to save it.';
+const KEEP_OPEN_TEXT =
+  'Keep this page open and try again. If you leave, the key stays on your OpenRouter account, where you can delete it.';
+
+function showSuccess(
+  status: HTMLElement,
+  env: AuthCallbackEnv,
+  { key, returnTo }: Completed,
+): void {
+  status.replaceChildren(
+    h(
+      'div',
+      { class: 'alert alert-success d-flex gap-3 mb-0', 'data-testid': 'auth-success' },
+      icon('check-circle-fill', 'fs-4 lh-1'),
+      h('div', null, `Connected. The key “${key.name}” (${key.masked}) is saved. Taking you back…`),
+    ),
+  );
+  env.redirect(returnTo ?? url('settings/'));
+}
+
+/** The key exists only in this page: unlock to save it, or save again. */
+function showNotSaved(status: HTMLElement, env: AuthCallbackEnv, error: KeyNotSavedError): void {
+  if (errorCode(error.reason) === 'locked') {
+    showUnlock(status, env, LOCKED_AFTER_TEXT, () => saveAgain(status, env, error));
+    return;
+  }
+  const save = h(
+    'button',
+    {
+      class: 'btn btn-primary',
+      type: 'button',
+      'data-testid': 'auth-save-again',
+      onclick: () => {
+        save.disabled = true;
+        void saveAgain(status, env, error);
+      },
+    },
+    'Save again',
+  );
+  status.replaceChildren(
+    h(
+      'div',
+      { class: 'alert alert-danger d-flex gap-3', 'data-testid': 'auth-error' },
+      icon('x-octagon-fill', 'fs-4 lh-1'),
+      h(
+        'div',
+        null,
+        h('p', { class: 'fw-semibold mb-1' }, 'Your new key is not saved yet.'),
+        h('p', { class: 'mb-1' }, userMessage(error)),
+        h('p', { class: 'mb-0' }, KEEP_OPEN_TEXT),
+      ),
+    ),
+    h(
+      'div',
+      { class: 'd-flex flex-wrap gap-2' },
+      save,
+      h('a', { class: 'btn btn-outline-secondary', href: url('settings/') }, 'Back to Settings'),
+    ),
+  );
+}
+
+async function saveAgain(
+  status: HTMLElement,
+  env: AuthCallbackEnv,
+  notSaved: KeyNotSavedError,
+): Promise<void> {
+  status.replaceChildren(progress('Saving your new key…'));
+  try {
+    showSuccess(status, env, await notSaved.save());
+  } catch (reason) {
+    showNotSaved(status, env, new KeyNotSavedError(reason, notSaved.save));
+  }
+}
+
+/** Asks for the passphrase; on success runs `then` (connect with the same params, or save the key held here). */
+function showUnlock(
+  status: HTMLElement,
+  env: AuthCallbackEnv,
+  text: string,
+  then: () => Promise<void>,
+): void {
   const input = h('input', {
     id: 'auth-passphrase',
     type: 'password',
@@ -99,7 +187,7 @@ function showUnlock(status: HTMLElement, env: AuthCallbackEnv, params: URLSearch
       input.select();
       return;
     }
-    await connect(status, env, params);
+    await then();
   };
   status.replaceChildren(
     h(
@@ -112,7 +200,7 @@ function showUnlock(status: HTMLElement, env: AuthCallbackEnv, params: URLSearch
           void unlock();
         },
       },
-      h('p', { class: 'mb-0' }, 'Your keys are locked. Enter your passphrase to save the new key.'),
+      h('p', { class: 'mb-0' }, text),
       h('label', { class: 'form-label mb-0', htmlFor: 'auth-passphrase' }, 'Passphrase'),
       input,
       feedback,
@@ -129,24 +217,13 @@ async function connect(
   env.clearQuery();
   status.replaceChildren(progress('Connecting your OpenRouter account…'));
   try {
-    const { key, returnTo } = await env.oauth.complete(params);
-    status.replaceChildren(
-      h(
-        'div',
-        { class: 'alert alert-success d-flex gap-3 mb-0', 'data-testid': 'auth-success' },
-        icon('check-circle-fill', 'fs-4 lh-1'),
-        h(
-          'div',
-          null,
-          `Connected. The key “${key.name}” (${key.masked}) is saved. Taking you back…`,
-        ),
-      ),
-    );
-    env.redirect(returnTo ?? url('settings/'));
+    showSuccess(status, env, await env.oauth.complete(params));
   } catch (error) {
-    // Locked meanwhile (auto-lock): nothing was consumed, so unlock and try the same code again.
-    if (errorCode(error) === 'locked') showUnlock(status, env, params);
-    else showError(status, env, error);
+    if (error instanceof KeyNotSavedError) showNotSaved(status, env, error);
+    // Locked before the exchange: nothing was consumed, so unlock and try the same code again.
+    else if (errorCode(error) === 'locked') {
+      showUnlock(status, env, LOCKED_TEXT, () => connect(status, env, params));
+    } else showError(status, env, error);
   }
 }
 
@@ -154,7 +231,7 @@ async function connect(
 export async function mountAuthCallback(status: HTMLElement, env: AuthCallbackEnv): Promise<void> {
   const params = new URLSearchParams(env.search);
   if (!env.lock.unlocked()) {
-    showUnlock(status, env, params);
+    showUnlock(status, env, LOCKED_TEXT, () => connect(status, env, params));
     return;
   }
   await connect(status, env, params);
