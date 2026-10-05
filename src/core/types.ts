@@ -758,13 +758,17 @@ export interface HistoryService {
    * comes back `aborted` (with `finishedAt`), never running. Stats are never touched.
    */
   restore(runs: RunRecord[]): Promise<void>;
-  /** Removes all runs, or all runs of one tool; returns how many were removed. */
-  clear(scope?: { tool?: ToolId }): Promise<number>;
+  /**
+   * Removes all runs, or all runs of one tool, except runs still `running` (a live or handed-off run must still book
+   * its spend); returns how many were removed and how many running ones were kept.
+   */
+  clear(scope?: { tool?: ToolId }): Promise<{ removed: number; kept: number }>;
   count(scope?: { tool?: ToolId }): Promise<number>;
   exportJson(ids?: string[]): Promise<Blob>;
-  /** Applies the retention setting (starred runs are kept). Called at page start, at most daily. */
+  /** Applies the retention setting (starred and running runs are kept). Called at page start, at most daily. */
   prune(): Promise<number>;
-  subscribe(fn: () => void): () => void;
+  /** `ids`: the runs that changed, when known (a run begun or finished); undefined for bulk changes and resets. */
+  subscribe(fn: (ids?: readonly string[]) => void): () => void;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1075,12 +1079,26 @@ export interface BackupService {
   ): Promise<BackupPreview>;
 }
 
+/**
+ * What a deletion kept: work in progress is never deleted (a running run, an open job, or a finished job whose run
+ * is still running must still book its spend), and a tool with such work keeps its saved state.
+ */
+export interface DataDeletion {
+  /** Runs still `running` that were kept. */
+  keptRuns: number;
+  /** Tools whose saved state was kept because they have work in progress. */
+  keptTools: ToolId[];
+}
+
 export interface DataService {
   storage(): Promise<{ usedBytes: number | null; quotaBytes: number | null }>;
-  /** History + prompts for one tool. */
-  deleteToolData(tool: ToolId): Promise<void>;
-  /** All prompts, history, jobs and tool state; keys, settings and stats (the budget ledger) untouched. */
-  deleteAllPromptsAndHistory(): Promise<void>;
+  /** History, prompts, finished jobs and saved state (`tool:<id>:*`) of one tool, except work in progress. */
+  deleteToolData(tool: ToolId): Promise<DataDeletion>;
+  /**
+   * All prompts, history, jobs and tool state, except work in progress; keys, settings and stats (the budget
+   * ledger) untouched.
+   */
+  deleteAllPromptsAndHistory(): Promise<DataDeletion>;
   /** Everything, including keys and settings. */
   resetEverything(): Promise<void>;
 }

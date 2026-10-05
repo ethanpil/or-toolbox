@@ -9,6 +9,8 @@ import { createTestCore, isolateChannels, resetDb, until } from '../testing/stat
 let core: CoreServices;
 let events: BusEvent['type'][];
 
+const videoJob = { tool: 'video-studio', type: 'video', payload: {}, keyId: 'k1' } as const;
+
 async function populate(): Promise<void> {
   localStorage.setItem(LS_KEYS.keys, '{"version":1,"keys":[],"lock":null}');
   for (const tool of ['chat', 'ocr'] as const) {
@@ -16,7 +18,7 @@ async function populate(): Promise<void> {
     await run.finish({ output: 'out' });
     await core.prompts.save({ tool, text: `${tool} saved`, settings: {} });
   }
-  await core.jobs.add({ tool: 'video-studio', type: 'video', payload: {}, keyId: 'k1' });
+  await core.jobs.add(videoJob);
   await core.toolState('chat').set('thread', { messages: [] });
   const db = await getDb();
   await db.put('kv', { key: 'models:catalog', value: [], updatedAt: 1 });
@@ -77,15 +79,73 @@ describe('storage estimate', () => {
   });
 });
 
+/** Ends the job `populate` added (it is open, and deletions keep open jobs). */
+async function finishPopulatedJob(): Promise<void> {
+  const [job] = await core.jobs.list();
+  await core.jobs.update(job!.id, { state: 'succeeded' });
+  events.length = 0;
+}
+
 describe('deletion', () => {
-  it('deletes one tool’s history and prompts only', async () => {
-    await core.data.deleteToolData('chat');
+  it('deletes one tool’s history, prompts and saved state only', async () => {
+    await core.toolState('ocr').set('draft', { text: 'kept' });
+    expect(await core.data.deleteToolData('chat')).toEqual({ keptRuns: 0, keptTools: [] });
     expect((await core.history.query()).map((r) => r.tool)).toEqual(['ocr']);
     expect(await core.prompts.counts()).toEqual({ ocr: { recent: 1, saved: 1 } });
     expect((await counts()).stats).toBe(2); // stats rows survive
+    expect(await core.toolState('chat').get('thread')).toBeUndefined(); // e.g. Chat's threads
+    expect(await core.toolState('ocr').get('draft')).toEqual({ text: 'kept' });
+  });
+
+  it('keeps work in progress: running runs, open jobs and their tool’s saved state', async () => {
+    core.settings.update((d) => {
+      d.freeOnly = false;
+    });
+    // A video clip: its run handed off to a finished job whose clip is not delivered yet.
+    const clip = await core.runs.begin({ tool: 'video-studio', model: 'v/x', estimateUsd: 0.4 });
+    const done = await core.jobs.add({ ...videoJob, runId: clip.id, state: 'succeeded' });
+    clip.handOff(done.id);
+    await core.toolState('video-studio').set('timeline', { clips: [] });
+    const reply = await core.runs.begin({ tool: 'chat', model: 'm/x', prompt: 'streaming' });
+
+    expect(await core.data.deleteToolData('video-studio')).toEqual({
+      keptRuns: 1,
+      keptTools: ['video-studio'],
+    });
+    expect(await core.toolState('video-studio').get('timeline')).toEqual({ clips: [] });
+    expect((await core.jobs.list()).map((job) => job.id)).toContain(done.id);
+
+    const all = await core.data.deleteAllPromptsAndHistory();
+    expect(all.keptRuns).toBe(2);
+    expect(all.keptTools.sort()).toEqual(['chat', 'video-studio']);
+    expect((await core.history.query()).map((r) => r.id).sort()).toEqual(
+      [clip.id, reply.id].sort(),
+    );
+    expect((await core.jobs.list()).map((job) => job.state).sort()).toEqual([
+      'queued',
+      'succeeded',
+    ]);
+    expect(await core.toolState('chat').get('thread')).toEqual({ messages: [] });
+
+    // Once they end, they book their spend (the clip's, as its job reported it), and the next deletion takes them.
+    clip.addUsage({
+      model: 'v/x',
+      promptTokens: 0,
+      completionTokens: 0,
+      costUsd: 0.4,
+      costEstimated: false,
+      latencyMs: 1,
+    });
+    await clip.finish();
+    await reply.fail(new Error('x'));
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.4);
+    await finishPopulatedJob();
+    expect(await core.data.deleteAllPromptsAndHistory()).toEqual({ keptRuns: 0, keptTools: [] });
+    expect((await counts()).runs).toBe(0);
   });
 
   it('deletes all prompts, history, jobs and tool state, keeping keys, settings and stats', async () => {
+    await finishPopulatedJob();
     await core.data.deleteAllPromptsAndHistory();
     expect(await counts()).toEqual({
       runs: 0,
@@ -123,6 +183,7 @@ describe('deletion', () => {
   });
 
   it('tells open pages which tool state was removed (after the reset itself), so they show it', async () => {
+    await finishPopulatedJob();
     await core.toolState('video-studio').set('sequence', { id: 's1' });
     const seen: string[] = [];
     core.bus.on('data-reset', () => seen.push('data-reset'));

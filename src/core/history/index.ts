@@ -1,6 +1,7 @@
 /**
  * History: text-only run records in IndexedDB `runs`. Queries walk the `startedAt` / `tool-startedAt` indexes
- * newest first; `before` is the pagination cursor (pass the last row's `startedAt`).
+ * newest first; `before` is the pagination cursor (pass the last row's `startedAt`). `clear` and `prune` never
+ * delete a `running` run: it must still book its spend when it ends (a handed-off video run may outlive both).
  */
 
 import type { CoreServices, HistoryQuery, HistoryService, RunRecord } from '../types';
@@ -10,16 +11,33 @@ import { DAY_MS } from '../util';
 const PRUNE_KEY = 'meta:lastPrune';
 const DEFAULT_LIMIT = 50;
 
-function matches(run: RunRecord, q: HistoryQuery, needle: string | null): boolean {
+/**
+ * A case-insensitive matcher for the search text. It tests each field in place (a regular expression with the `i`
+ * flag) instead of lowercasing a copy of it, so a run's output (up to 500 KB) is scanned once and never copied, and
+ * the short fields are tried before the output.
+ */
+function textMatcher(text: string | undefined): ((run: RunRecord) => boolean) | null {
+  const needle = text?.trim();
+  if (!needle) return null;
+  const pattern = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'iu');
+  return (run) =>
+    pattern.test(run.title) ||
+    pattern.test(run.model) ||
+    run.models.some((model) => pattern.test(model)) ||
+    (run.prompt !== null && pattern.test(run.prompt)) ||
+    (run.output !== null && pattern.test(run.output));
+}
+
+function matches(
+  run: RunRecord,
+  q: HistoryQuery,
+  text: ((run: RunRecord) => boolean) | null,
+): boolean {
   if (q.status !== undefined && run.status !== q.status) return false;
   if (q.starred !== undefined && run.starred !== q.starred) return false;
   if (q.model !== undefined && run.model !== q.model && !run.models.includes(q.model)) return false;
   if (q.keyId !== undefined && run.keyId !== q.keyId) return false;
-  if (needle) {
-    const haystack = [run.title, run.prompt ?? '', run.output ?? '', run.model, ...run.models];
-    if (!haystack.some((text) => text.toLowerCase().includes(needle))) return false;
-  }
-  return true;
+  return text === null || text(run);
 }
 
 /** The `startedAt` bounds of a query, or null when the range is empty. */
@@ -46,7 +64,7 @@ export function createHistoryService(core: CoreServices): HistoryService {
       const range = bounds(q);
       if (!range || limit <= 0) return [];
       const { lower, upper, upperOpen } = range;
-      const needle = q.text?.trim().toLowerCase() || null;
+      const text = textMatcher(q.text);
 
       const db = await getDb();
       const tx = db.transaction('runs');
@@ -71,7 +89,7 @@ export function createHistoryService(core: CoreServices): HistoryService {
 
       const out: RunRecord[] = [];
       for await (const cursor of iterator) {
-        if (matches(cursor.value, q, needle)) out.push(cursor.value);
+        if (matches(cursor.value, q, text)) out.push(cursor.value);
         if (out.length >= limit) break;
       }
       return out;
@@ -123,18 +141,16 @@ export function createHistoryService(core: CoreServices): HistoryService {
     async clear(scope = {}) {
       const db = await getDb();
       const tx = db.transaction('runs', 'readwrite');
-      let removed: number;
-      if (scope.tool) {
-        const keys = await tx.store.index('tool').getAllKeys(scope.tool);
-        await Promise.all(keys.map((key) => tx.store.delete(key)));
-        removed = keys.length;
-      } else {
-        removed = await tx.store.count();
-        await tx.store.clear();
-      }
-      await tx.done;
+      const keys = scope.tool
+        ? await tx.store.index('tool').getAllKeys(scope.tool)
+        : await tx.store.getAllKeys();
+      // Running runs stay: a live or handed-off run must still book its spend when it ends.
+      const running = new Set(await tx.store.index('status').getAllKeys('running'));
+      const doomed = keys.filter((key) => !running.has(key));
+      await Promise.all([...doomed.map((key) => tx.store.delete(key)), tx.done]);
+      const removed = doomed.length;
       if (removed > 0) changed();
-      return removed;
+      return { removed, kept: keys.length - removed };
     },
 
     async count(scope = {}) {
@@ -174,7 +190,8 @@ export function createHistoryService(core: CoreServices): HistoryService {
         .objectStore('runs')
         .index('startedAt')
         .iterate(IDBKeyRange.upperBound(cutoff, true))) {
-        if (!cursor.value.starred) {
+        // Running runs stay (a long video job outlives a short retention): they must still book their spend.
+        if (!cursor.value.starred && cursor.value.status !== 'running') {
           await cursor.delete();
           runsRemoved++;
         }
@@ -199,7 +216,10 @@ export function createHistoryService(core: CoreServices): HistoryService {
     },
 
     subscribe(fn) {
-      const offs = [core.bus.on('history-changed', fn), core.bus.on('data-reset', fn)];
+      const offs = [
+        core.bus.on('history-changed', (event) => fn(event.ids)),
+        core.bus.on('data-reset', () => fn()),
+      ];
       return () => offs.forEach((off) => off());
     },
   };
