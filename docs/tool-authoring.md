@@ -5,13 +5,13 @@ How to build one of the 14 tools on the Stage 2 shell. Read [CLAUDE.md](../CLAUD
 ## The contract in one screen
 
 ```text
-src/tools/<id>/manifest.json   static half: name, icon, category, capabilities (first = primary), accepts, produces, lazyLibs, defaults
+src/tools/<id>/manifest.json   static half: name, icon, category, capabilities (first = primary), accepts, produces, lazyLibs, defaults, ownModels?
 src/tools/<id>/main.ts         mountTool(getTool('<id>'), setup)          ← the only line that must stay
 src/tools/<id>/*.ts            your pipeline, UI pieces and *.test.ts (never import another tool's folder)
 ```
 
 ```ts
-mountTool(manifest: ToolManifest, setup: ToolSetup, options?: { isolation?: 'required'; modelChip?: false }): void
+mountTool(manifest: ToolManifest, setup: ToolSetup, options?: { isolation?: 'required' }): void
 type ToolSetup = (ctx: ToolContext) => ToolInstance | Promise<ToolInstance>;
 
 interface ToolInstance {
@@ -35,7 +35,12 @@ All types live in `src/ui/tool/types.ts` and are re-exported from `src/ui/tool/i
 4. computes the first estimate (`estimate`, if you provide it);
 5. applies the URL: `?run=<id>` (History → `applyState`), `?prompt=<id>` (a saved or recent prompt), `?sample=1` (`sample()`), `?receive=<id>` (Send to… hand-over → `onReceive`); these are removed from the address bar afterwards. `?model=<id>` stays and overrides the primary model for this visit ("re-run with another model").
 
-Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No other tool does. Model arena passes `{ modelChip: false }`: a tool that picks its models itself (its contenders) has no model chip in the header; `?model=` still arrives as `ctx.modelOverride`, and the tool decides what it means.
+Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No other tool does.
+
+**Tools that choose their own models** (Model arena's contenders, Bot-to-bot's two bots) set `"ownModels": true` in the manifest. One flag, read by both places that would otherwise name a single model:
+
+- the tool header shows no model chip and no free-only substitution note (the note would name a model the tool does not use). The key chip and the estimate stay, `?model=` still arrives as `ctx.modelOverride` (the tool decides what it means), and Run is still disabled, with the free-only notice, when free-only mode leaves the primary capability no model at all;
+- Settings → Tools shows "Chosen inside the tool" instead of a model picker. The primary capability's model (a binding saved earlier, else Settings → Models' default) is only where a new setup starts: the arena's first contenders, a bot that has no model of its own. Reset still clears an old binding.
 
 ## The context
 
@@ -62,7 +67,7 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `input`, `output` | The two zone bodies (`.card-body`). Input is left on wide screens, output right; they stack on narrow ones. |
 | `drawer` | Body of the Settings offcanvas. Put everyday options here. |
 | `advanced(title)` | Adds a collapsed accordion section at the end of the drawer and returns its body. |
-| `runner<A>({ label, icon, run(signal, arg?), hint, container })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter. Returns `Runner<A>`: `trigger(arg?)` (see Runner arguments), `stop()`, `setDisabled(reason)`, `busy`, `disabledReason`, `subscribe(fn)`. |
+| `runner<A>({ label, icon, run(signal, arg?), hint, container, hideWhileBusy })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter (Run, no argument). Returns `Runner<A>`: `trigger(arg?)` (see Runner arguments), `stop()`, `setDisabled(reason)`, `setLabel(text)`, `addAction(options)` (see A Run bar with more than Run), `busy`, `disabledReason`, `subscribe(fn)`. |
 | `refreshEstimate()` | Recomputes the estimate through `ToolInstance.estimate` and shows it; resolves with the value. Call it when the input changes. |
 | `setEstimate(usd \| null, note?)` | Sets the badge directly (`≈ $0.0012`, `Free` for 0, `Unknown` for null), for tools without `estimate`. |
 | `status(text)` | A state change in the output header ("Reading 3 pages…", "Done"), announced politely. |
@@ -99,6 +104,10 @@ try {
 - **Unknown outcome:** a paid request that may have gone through (`isOutcomeUnknown(error)`: connection lost after sending, 408, or a 5xx other than 503) never gets a plain Retry. Give the runner a `safeAction` (e.g. `{ label: 'Check status', onClick }`); without one the toast links to OpenRouter's activity page. Set `retryUnknownOutcome` only when sending again cannot pay twice.
 
 Outside the runner (reading a dropped file, an export, a button of your own), catch and call `presentError(error)` yourself; never show the same error twice and never `console.error` it away.
+
+**Showing an error inline** (on a reply, a panel, a row) is `failureText(error, { blind? })` from `src/ui/feedback/errors.ts`, never bare `userMessage(error)`, which drops the caution an unknown outcome needs. It returns `{ text, outcomeUnknown, activityUrl, note }`: show `text`; when `outcomeUnknown`, offer no plain Retry (a resend could pay twice) and link `activityUrl` (`externalLink(OPENROUTER_ACTIVITY_URL, 'OpenRouter activity')`); keep the flag with the message if the message is stored. Then `markPresented(error)`, so the runner stays quiet: the inline text is the presentation. Errors that `needsAction(error)` still go to `presentError`.
+
+`blind: true` is for Model arena while names are hidden, where anything that differs between a free and a paid model gives it away: a 402's "not enough credits", the 429 text about free models, provider and model names in OpenRouter's messages, a caution that shows only after an unknown outcome, a Retry that goes missing. So every failure reads alike: a generic `text` that is true for any model, `note` (`BLIND_ACTIVITY_NOTE`, "Before retrying, you can check your OpenRouter activity to see whether this request was billed.") for every failed panel, `activityUrl` always set, `outcomeUnknown` always false. Keep the real wording for the reveal: store `failureText(error)` as well and show it once names are shown.
 
 `beginRun` (via `runs.begin`) refuses before anything is sent: no key (`no-key`), locked keys (`locked`), free-only with a paid model (`free-only`), a hard budget (`budget-blocked`). In Warn mode, or above the per-run threshold, the shell's **budget confirmation** opens by itself (one dialog for parallel runs of one `groupId`); Cancel throws `RunCancelledError`. You never handle any of this yourself: throw, and the rule above applies.
 
@@ -143,6 +152,35 @@ const retryButton = (keys: string[]) =>
 `bind(button)` keeps the button in step with Run (shown unavailable while Run is busy or disabled, with the reason as its title, but still focusable); `retry(arg, fallbackMessage?)` triggers the runner and announces why when it cannot start; `blocked()` is the current reason or null. When a focused Retry button disappears (its item re-rendered as running) and nothing else took focus, focus goes to `fallback()` (default: Run).
 
 A replay must not pay for finished items again: give the runner `replayArg: pendingOnly((key) => hasResult(key))` (from `src/ui/tool/runner.ts`) and the error toast's Retry sends only the items still without a result (none left: it says so and does nothing).
+
+### A Run bar with more than Run
+
+A tool whose bar is more than one button (Bot-to-bot's Start/Resume, Step and Pause) builds it on the runner, not beside it, so busy, blocked, focus and the sticky bar's height stay the runner's job:
+
+```ts
+const runner = ui.runner<'step' | undefined>({
+  label: 'Start',
+  icon: 'play-fill',
+  hideWhileBusy: true, // while a run is going, Pause and Stop take its place
+  run: (signal, action) => perform(action, signal),
+});
+runner.addAction({
+  label: 'Step',
+  icon: 'skip-end-fill',
+  run: 'step',
+  title: 'Run exactly one turn, then hold',
+});
+const pause = runner.addAction({ label: 'Pause', icon: 'pause-fill', when: 'busy', onClick: requestPause });
+
+runner.setLabel('Resume'); // Run's text while idle (Start → Resume)
+pause.setLabel('Pausing…');
+pause.setDisabled('Pausing after this turn'); // a visible reason in the title; null turns it back on
+```
+
+- `runner.addAction(options)` adds a button after Run and before Stop, in call order. `run: arg` makes it start a run like `trigger(arg)`: it is off exactly when Run is, with Run's reason as its title, and the error toast's Retry replays that argument. `onClick` is for anything else. `when: 'idle'` (default) shows it while no run is going, `'busy'` only while one is. `tone: 'primary'` outlines it in the accent colour. It returns `{ button, setLabel, setDisabled(reason) }`.
+- An action that is off keeps focus (`aria-disabled`, like Run). When the control that has focus hides (Run → Pause, Stop → Run), focus moves to the first visible control in the bar, for every runner.
+- Ctrl/Cmd+Enter always presses the first runner's Run with no argument, so make that the primary action ("Start or Resume"). The bar is one sticky element: its height (`--or-runner-height`) follows whatever it holds, so extra buttons need nothing more.
+- **Escape to stop:** `stopOnEscape(runner, { allowIn?: [field] })` (`src/ui/tool/stop-on-escape.ts`) installs the one handler. Escape stops the run that is going, but not with Ctrl/Cmd/Alt, while a dialog, drawer or dropdown is open, while an input method composes, or in a field or select (they use Escape themselves) unless the field is listed in `allowIn` (Chat's composer). It is built on `plainShortcutAllowed` (`src/ui/shell/shortcuts.ts`), as any plain-key shortcut should be, and `composing(event)` lives there too. Do not copy the handler.
 
 ### Batches: `runItems`
 
@@ -327,6 +365,8 @@ A tool that works on files and settings only, with no main text field, sets `pro
 | --- | --- |
 | `dropZone(options)` | File input target (drag, keyboard, accept filter); its Choose files button keeps focus across rebuilds (`focusKey`, default `drop-zone`). |
 | `attachmentChip({ ref, data?, missing?, remove? })` | One file sent with a chat request (thumbnail or kind icon, name, size, optional Remove). The files themselves: `src/core/attachments/` (`readAttachment`, `toContentPart`, `missingInput`, `parserAddons`, `keepParsed`), as Chat and Model arena use them. |
+| `attachmentIntake({ noun, files, setFiles, keep, field, changed })` | How a request takes files in: `addFiles(files)` for `onFiles`, `receive(items)` for `onReceive` (named text and files become attachments, other text goes into `field`), `attach(ref, data?)`. The count and size limits, one warning for everything refused and the wording (one `noun`: "message", "prompt") are shared; `changed()` is where the tool redraws its chips and refreshes its estimate. Chat's composer uses it. |
+| `createMarkdownCache({ size?, decorate? })` | Rendered, sanitised Markdown of finished messages, so a redraw parses nothing again: `fill(target, key, text)` (the cached render at once, else plain text until it is ready; a slow render never overwrites a newer text), `prerender(key, text)` when a message finishes, `render`, `cached`. `decorate(fragment)` runs once per fresh render (Chat adds code Copy buttons). One cache per tool; a message still arriving streams through `streamMarkdown`. |
 | `referencePicker({ ui, min?, max, accepts?, label?, ... })` | Reference images for a request: drop zone, small thumbnails (`imageThumbnail`), remove with focus management, a limits note (`setLimits` when the model changes, `problem()`), `add(items)` for Send to, paste and "use as reference". `dataUrls({ maxSide, maxBytes })` encodes each reference once and caches it until the limits change. |
 | `compareSlider(...)` | A before/after wipe (keyboard and pointer). |
 | `documentInput(options)` | Images and PDFs with thumbnails and page choice (`1-3, 7`, tile toggles); `selection()` lists pages, `loadPage(ref)` renders one for upload (`{ fileName, pageNumber, imageDataUrl, text? }`), `pageImage`/`reveal` show the source. Pair with `runItems()` for per-page requests. |
@@ -347,7 +387,11 @@ A tool that works on files and settings only, with no main text field, sets `pro
 | `emptyState({ icon, title, text, action, compact, inline })` | Every "nothing yet" place. |
 | `connectKey(options)` | Connect with OpenRouter / paste a key (onboarding, the no-key dialog). |
 
-Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` (a toast with an action stays until dismissed), `confirmDialog`, `typedConfirm({ phrase })` (destructive data actions), `promptDialog`, `unlockDialog()`, `presentError(error, { retry })`, `announce(text)`, `setFieldError(input, feedback, message | null)` (field validation: `is-invalid`, `aria-invalid`, `aria-describedby`, announced), and `openModal(options)` for anything custom (one modal at a time, later ones queue; await `closed`). Formatting: `src/ui/format.ts` (`formatUsd`, `formatEstimate`, `formatTokens`, `formatMs`, `formatBytes`, `formatDuration`, `formatRelativeTime`, `formatModelPrice`, `plural`). Links: `src/ui/shell/links.ts` (`toolUrl`, `settingsUrl(section)`, `historyUrl`, `modelsUrl`).
+Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` (a toast with an action stays until dismissed), `confirmDialog`, `typedConfirm({ phrase })` (destructive data actions), `promptDialog`, `unlockDialog()`, `presentError(error, { retry })`, `announce(text)`, `setFieldError(input, feedback, message | null)` (field validation: `is-invalid`, `aria-invalid`, `aria-describedby`, announced), and `openModal(options)` for anything custom (one modal at a time, later ones queue; await `closed`). Formatting: `src/ui/format.ts` (`formatUsd`, `formatEstimate`, `formatTokens`, `formatMs`, `formatBytes`, `formatDuration`, `formatRelativeTime`, `formatModelPrice`, `plural`, and the cost wording below). Links: `src/ui/shell/links.ts` (`toolUrl`, `settingsUrl(section)`, `historyUrl`, `modelsUrl`).
+
+**What a run cost** has one rule, `describeRunCost(cost, { free?, booked? })` in `src/ui/format.ts`: unknown first (never free, never zero, never `≈`; `{ kind: 'unknown', text: 'Unknown', counted: '≈ $0.0034' }` says what budgets counted for it, `booked` being the run's reservation), then free (a zero cost on a free model), then estimated (`≈ $0.012`), else the reported amount. `formatRunCost` is the same as one string (`Unknown (≈ $0.0034 counted)`), and `usageLine(usage, { free?, booked? })` is the line under a reply (`1.2K in · 340 out · cost unknown · 1.4 s`). Take `free` from `ctx.models.isFree(model)`; do not word costs yourself.
+
+**Small icon-only buttons** (Remove, Copy, Edit) are `btn btn-sm btn-link or-icon-action` with an `aria-label`: 2 rem square, muted, stronger on hover and focus.
 
 **Re-rendering a list** (results, saved items, chips): give each focusable control a stable `data-focus-key` (for example `` `remove:${item.id}` ``) and swap the children with `replace(container, ...children)` from `src/ui/dom.ts`. Focus moves to the new element with the same key; when that one is gone or disabled (a Retry button while busy), to the nearest keyed control that can take focus, else to the first focusable element in the container. Bootstrap dropdowns, collapses and toasts inside the old children are disposed. For a single node you swap yourself: `const key = focusedKey(card); card.replaceWith(next); if (key) focusKey(next, key);`. Never key focus on `data-testid`, and better still, update a control in place (attributes, text) when only its state changes.
 

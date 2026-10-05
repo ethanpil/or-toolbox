@@ -26,12 +26,7 @@
 import {
   ACCEPT_ATTRIBUTE,
   type AttachmentRef,
-  checkText,
   keepParsed,
-  MAX_ATTACHMENTS,
-  readAttachment,
-  SIZE_LIMITS,
-  textAttachment,
 } from '../../core/attachments/attachments';
 import { missingInput, parserAddons as parserAddonsFor } from '../../core/attachments/request';
 import { isFreeModelId } from '../../core/models/free';
@@ -42,10 +37,11 @@ import {
   type PdfEngineId,
 } from '../../core/models/pdf-engines';
 import type { ModelInfo, RunAddon, RunHandle, UsageTotals } from '../../core/types';
-import { InvalidInputError, userMessage } from '../../core/errors';
+import { InvalidInputError } from '../../core/errors';
 import { debounce, isFiniteNumber, isString } from '../../core/util';
 import { copyWithToast } from '../../ui/clipboard';
 import { attachmentChip } from '../../ui/components/attachment-chip';
+import { attachmentIntake } from '../../ui/components/attachment-intake';
 import { emptyState } from '../../ui/components/empty-state';
 import { exportMenu } from '../../ui/components/export-menu';
 import { modelPicker } from '../../ui/components/model-picker';
@@ -54,11 +50,15 @@ import { switchField } from '../../ui/components/switch-field';
 import { focusedKey, focusKey, h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog, promptDialog } from '../../ui/feedback/dialogs';
-import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
-import { modalOpen } from '../../ui/feedback/modal';
+import {
+  failureText,
+  isStop,
+  markPresented,
+  needsAction,
+  presentError,
+} from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
 import {
-  formatBytes,
   formatCount,
   formatRelativeTime,
   formatShortcut,
@@ -68,9 +68,11 @@ import {
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { queryWords } from '../../ui/shell/palette-search';
+import { composing } from '../../ui/shell/shortcuts';
+import { stopOnEscape } from '../../ui/tool/stop-on-escape';
 import type { SendItem, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
 import { toJson, toMarkdown } from './export';
-import { addCodeCopyButtons, codeOf, renderReply } from './markdown-view';
+import { addCodeCopyButtons, codeOf, replies } from './markdown-view';
 import { type BuiltRequest, buildRequest, type RequestOptions, unparsedPdfs } from './request';
 import {
   activePath,
@@ -96,7 +98,6 @@ import {
 } from './thread';
 import {
   applyRunState,
-  composing,
   type MessageActions,
   type MessageContext,
   messageSignature,
@@ -419,7 +420,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     'button',
     {
       type: 'button',
-      class: 'btn btn-sm btn-link or-chat-action',
+      class: 'btn btn-sm btn-link or-icon-action',
       'aria-label': 'Use the default model',
       title: 'Use the default model',
       'data-testid': 'composer-model-reset',
@@ -446,7 +447,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     tabIndex: -1,
     'data-testid': 'composer-file',
     onchange: () => {
-      void addFiles([...(fileInput.files ?? [])]);
+      void intake.addFiles([...(fileInput.files ?? [])]);
       fileInput.value = '';
     },
   });
@@ -523,7 +524,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   };
   const threadsToggle = h('button', {
     type: 'button',
-    class: 'btn btn-sm btn-link or-chat-action',
+    class: 'btn btn-sm btn-link or-icon-action',
     'aria-controls': ids.threads,
     'data-testid': 'threads-toggle',
     onclick: () => {
@@ -585,7 +586,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     'button',
     {
       type: 'button',
-      class: 'btn btn-sm btn-link or-chat-action',
+      class: 'btn btn-sm btn-link or-icon-action',
       'aria-label': 'Rename this thread',
       title: 'Rename this thread',
       'data-testid': 'chat-rename',
@@ -939,7 +940,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
                 'button',
                 {
                   type: 'button',
-                  class: 'btn btn-sm btn-link or-chat-action',
+                  class: 'btn btn-sm btn-link or-icon-action',
                   'aria-label': `Remove fallback ${modelName(id)}`,
                   'data-focus-key': `fallback:${id}`,
                   onclick: () => {
@@ -1351,7 +1352,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
                 'button',
                 {
                   type: 'button',
-                  class: 'btn btn-sm btn-link or-chat-action',
+                  class: 'btn btn-sm btn-link or-icon-action',
                   'aria-label': `Rename “${thread.title}”`,
                   title: 'Rename',
                   'data-focus-key': `rename:${thread.id}`,
@@ -1364,7 +1365,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
                 'button',
                 {
                   type: 'button',
-                  class: 'btn btn-sm btn-link or-chat-action me-1',
+                  class: 'btn btn-sm btn-link or-icon-action me-1',
                   'aria-label': `Delete “${thread.title}”`,
                   title: 'Delete',
                   'data-focus-key': `delete-thread:${thread.id}`,
@@ -1425,37 +1426,19 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     void ui.refreshEstimate();
   }
 
-  /** Adds an attachment to the composer, within the count and the per-message text limit. */
-  function attach(ref: AttachmentRef, data?: string): void {
-    if (pending.length >= MAX_ATTACHMENTS) {
-      throw new InvalidInputError(`At most ${MAX_ATTACHMENTS} files go with one message.`);
-    }
-    if (ref.kind === 'text') checkText(pending, ref.name, ref.size);
-    if (data) session.set(ref.id, data);
-    pending = [...pending, ref];
-  }
-
-  async function addFiles(files: File[]): Promise<void> {
-    const problems: string[] = [];
-    let added = 0;
-    for (const file of files) {
-      try {
-        if (pending.length >= MAX_ATTACHMENTS) {
-          throw new InvalidInputError(`At most ${MAX_ATTACHMENTS} files go with one message.`);
-        }
-        const { ref, data } = await readAttachment(file);
-        attach(ref, data);
-        added++;
-      } catch (error) {
-        problems.push(userMessage(error));
-      }
-    }
-    renderComposer();
-    void ui.refreshEstimate();
-    if (problems.length > 0)
-      toast({ variant: 'warning', message: problems.join(' '), testId: 'attach-error' });
-    else if (added > 0) announce(`${plural(added, 'file')} attached.`);
-  }
+  const intake = attachmentIntake({
+    noun: 'message',
+    files: () => pending,
+    setFiles: (next) => {
+      pending = next;
+    },
+    keep: (id, data) => session.set(id, data),
+    field: composer,
+    changed: () => {
+      renderComposer();
+      void ui.refreshEstimate();
+    },
+  });
 
   function openThread(id: string): void {
     const thread = threads.get(id);
@@ -1840,7 +1823,10 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           markPresented(error); // announced here; the runner adds nothing
         } else {
           reply.status = 'error';
-          reply.error = userMessage(error);
+          const failure = failureText(error);
+          reply.error = failure.text;
+          // A request that may have gone through gets no Retry on the reply, only the caution and a way to check.
+          if (failure.outcomeUnknown) reply.outcomeUnknown = true;
           ui.status(`The reply failed: ${reply.error}`);
           if (needsAction(error)) {
             // A dialog or a setting helps here; once it has, try this reply again.
@@ -1860,7 +1846,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         persist(thread);
         releaseUnused();
         // Render the final Markdown before the redraw, so the reply never flashes as plain text.
-        if (reply.content) await renderReply(reply.id, reply.content).catch(() => undefined);
+        if (reply.content) await replies.prerender(reply.id, reply.content).catch(() => undefined);
       }
     } finally {
       if (current === thread) {
@@ -1917,23 +1903,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     'input',
     debounce(() => void ui.refreshEstimate(), 300),
   );
-  document.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape' || composing(event) || !runner.busy || event.defaultPrevented) {
-      return;
-    }
-    if (modalOpen() || document.querySelector('.offcanvas.show, .dropdown-menu.show')) return;
-    // Fields other than the composer use Escape themselves (search clears, a select closes).
-    const target = event.target;
-    if (
-      target instanceof HTMLElement &&
-      target !== composer &&
-      (target.isContentEditable || target.matches('input, select, textarea'))
-    ) {
-      return;
-    }
-    event.preventDefault();
-    runner.stop();
-  });
+  // Escape stops the reply, from the composer too (it has no use for the key).
+  stopOnEscape(runner, { allowIn: [composer] });
 
   // --- live updates -------------------------------------------------------------------------------------
   ctx.settings.subscribe((next, prev) => {
@@ -2032,35 +2003,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       );
       return estimateFor(built);
     },
-    onFiles: (files) => void addFiles(files),
+    onFiles: (files) => void intake.addFiles(files),
     onReceive: (items: SendItem[]) => {
-      const files: File[] = [];
-      const problems: string[] = [];
-      for (const item of items) {
-        if (item.kind === 'file') {
-          files.push(new File([item.blob], item.name, { type: item.blob.type }));
-          continue;
-        }
-        try {
-          if (item.name) attach(textAttachment(item.name, item.text, item.type));
-          else {
-            const size = new Blob([item.text]).size;
-            if (size > SIZE_LIMITS.text) {
-              throw new InvalidInputError(
-                `The text sent here is ${formatBytes(size)}. A message takes at most ${formatBytes(SIZE_LIMITS.text)} of typed text; send it as a file instead.`,
-              );
-            }
-            composer.value = [composer.value, item.text].filter(Boolean).join('\n\n');
-          }
-        } catch (error) {
-          problems.push(userMessage(error));
-        }
-      }
-      renderComposer();
-      if (problems.length > 0) {
-        toast({ variant: 'warning', message: problems.join(' '), testId: 'attach-error' });
-      }
-      void addFiles(files);
+      intake.receive(items);
       composer.focus();
     },
     sample: () => {

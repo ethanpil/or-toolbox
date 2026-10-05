@@ -11,11 +11,14 @@
  */
 import type { AttachmentRef } from '../../core/attachments/attachments';
 import { attachmentChip } from '../../ui/components/attachment-chip';
+import { externalLink } from '../../ui/components/external-link';
 import { h } from '../../ui/dom';
-import { formatCount, formatMs, formatUsd } from '../../ui/format';
+import { OPENROUTER_ACTIVITY_URL } from '../../ui/feedback/errors';
+import { usageLine } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import { fillReply } from './markdown-view';
+import { composing } from '../../ui/shell/shortcuts';
+import { replies } from './markdown-view';
 import { siblingInfo, type ChatNode, type Thread } from './thread';
 
 export interface MessageActions {
@@ -57,24 +60,6 @@ export interface MessageView {
   body: HTMLElement;
   /** The reasoning text element, when shown. */
   reasoning: HTMLElement | null;
-}
-
-/** Token, cost and latency line of a reply. */
-export function usageLine(node: ChatNode, free: boolean): string {
-  const usage = node.usage;
-  if (!usage) return '';
-  const cost = usage.costUnknown
-    ? 'cost unknown'
-    : free && usage.costUsd === 0
-      ? 'free'
-      : `${usage.costEstimated ? '≈ ' : ''}${formatUsd(usage.costUsd)}`;
-  return [
-    `${formatCount(usage.promptTokens)} in · ${formatCount(usage.completionTokens)} out`,
-    cost,
-    usage.latencyMs > 0 ? formatMs(usage.latencyMs) : null,
-  ]
-    .filter(Boolean)
-    .join(' · ');
 }
 
 /** "via …" when another model than the one asked for answered (a fallback, a router, a dated snapshot). */
@@ -140,7 +125,7 @@ const actionButton = (
 ): HTMLButtonElement =>
   guardedButton(
     {
-      class: 'btn btn-sm btn-link or-chat-action',
+      class: 'btn btn-sm btn-link or-icon-action',
       'aria-label': label,
       title: label,
       'data-focus-key': focusKey,
@@ -206,10 +191,6 @@ function siblingNav(node: ChatNode, ctx: MessageContext): HTMLElement | null {
     ),
   );
 }
-
-/** True while an input method is composing: Enter and Escape belong to it. */
-export const composing = (event: KeyboardEvent): boolean =>
-  event.isComposing || event.keyCode === 229;
 
 function editor(node: ChatNode, ctx: MessageContext): HTMLElement {
   const id = uid('edit');
@@ -287,6 +268,7 @@ export function messageSignature(node: ChatNode, ctx: MessageContext): string {
     ctx.showReasoning ? (streaming ? Boolean(node.reasoning) : (node.reasoning ?? '')) : '',
     node.status ?? '',
     node.error ?? '',
+    node.outcomeUnknown ?? false,
     node.usage ?? null,
     node.trimmed ?? 0,
     node.model ? ctx.modelName(node.model) : '',
@@ -304,6 +286,47 @@ export function messageSignature(node: ChatNode, ctx: MessageContext): string {
   ]);
 }
 
+/**
+ * A failed reply: the message and Retry buttons. When the request may have gone through and been billed
+ * (`outcomeUnknown`) there is no plain Retry, which could pay twice; a link to OpenRouter's activity takes its
+ * place, and Regenerate stays for a user who has checked.
+ */
+function errorBlock(node: ChatNode, ctx: MessageContext, at: string): HTMLElement {
+  return h(
+    'div',
+    {
+      class: 'alert alert-danger d-flex flex-wrap align-items-center gap-2 mt-2 mb-0 py-2',
+      'data-testid': 'message-error',
+    },
+    icon('exclamation-octagon'),
+    h('span', { class: 'flex-grow-1' }, node.error ?? 'The reply failed.'),
+    node.outcomeUnknown
+      ? externalLink(OPENROUTER_ACTIVITY_URL, 'OpenRouter activity', 'alert-link')
+      : [
+          guardedButton(
+            {
+              class: 'btn btn-sm btn-outline-danger',
+              'data-focus-key': `retry:${at}`,
+              'data-testid': 'message-retry',
+            },
+            () => ctx.actions.regenerate(node),
+            { needs: 'run' },
+            'Retry',
+          ),
+          guardedButton(
+            {
+              class: 'btn btn-sm btn-outline-danger',
+              'data-focus-key': `retry-with:${at}`,
+              'data-testid': 'message-retry-with',
+            },
+            () => ctx.actions.retryWith(node),
+            { needs: 'run' },
+            'Retry with another model',
+          ),
+        ],
+  );
+}
+
 export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
   const user = node.role === 'user';
   const streaming = ctx.streamingId === node.id;
@@ -318,7 +341,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
     'data-testid': 'message-content',
   });
   if (user) body.textContent = node.content;
-  else if (!streaming && node.content) fillReply(body, node.id, node.content);
+  else if (!streaming && node.content) replies.fill(body, node.id, node.content);
   else if (!streaming && node.status === 'stopped') {
     body.append(
       h('span', { class: 'text-body-secondary fst-italic' }, 'Stopped before any text arrived.'),
@@ -410,37 +433,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
           `The ${node.trimmed === 1 ? 'earliest message was' : `${node.trimmed} earliest messages were`} left out to fit the model's context window.`,
         )
       : null,
-    node.status === 'error'
-      ? h(
-          'div',
-          {
-            class: 'alert alert-danger d-flex flex-wrap align-items-center gap-2 mt-2 mb-0 py-2',
-            'data-testid': 'message-error',
-          },
-          icon('exclamation-octagon'),
-          h('span', { class: 'flex-grow-1' }, node.error ?? 'The reply failed.'),
-          guardedButton(
-            {
-              class: 'btn btn-sm btn-outline-danger',
-              'data-focus-key': `retry:${at}`,
-              'data-testid': 'message-retry',
-            },
-            () => ctx.actions.regenerate(node),
-            { needs: 'run' },
-            'Retry',
-          ),
-          guardedButton(
-            {
-              class: 'btn btn-sm btn-outline-danger',
-              'data-focus-key': `retry-with:${at}`,
-              'data-testid': 'message-retry-with',
-            },
-            () => ctx.actions.retryWith(node),
-            { needs: 'run' },
-            'Retry with another model',
-          ),
-        )
-      : null,
+    node.status === 'error' ? errorBlock(node, ctx, at) : null,
     editing
       ? null
       : h(
@@ -450,7 +443,7 @@ export function messageView(node: ChatNode, ctx: MessageContext): MessageView {
             ? h(
                 'span',
                 { class: 'small text-body-secondary me-auto', 'data-testid': 'message-usage' },
-                usageLine(node, ctx.isFree(node.servedModel ?? modelId)),
+                usageLine(node.usage, { free: ctx.isFree(node.servedModel ?? modelId) }),
               )
             : h('span', { class: 'me-auto' }),
           !user && node.status === 'stopped'

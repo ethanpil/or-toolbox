@@ -248,4 +248,167 @@ describe('createRunner', () => {
     document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
     await vi.waitFor(() => expect(seen).toEqual([['a', 'b'], ['b']]));
   });
+
+  describe('a bar with more than Run', () => {
+    /** A run the test finishes by hand. */
+    function manual() {
+      let finish!: () => void;
+      const run = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      return { run, finish: () => finish() };
+    }
+
+    it('changes the Run text while idle, and shows Running while busy', async () => {
+      const { run, finish } = manual();
+      const runner = createRunner({ run, label: 'Start' }, true);
+      expect(runner.button.textContent).toContain('Start');
+      runner.setLabel('Resume');
+      expect(runner.button.textContent).toContain('Resume');
+      const running = runner.trigger();
+      expect(runner.button.textContent).toContain('Running…');
+      finish();
+      await running;
+      expect(runner.button.textContent).toContain('Resume');
+    });
+
+    it('can hide Run while busy', async () => {
+      const { run, finish } = manual();
+      const runner = createRunner({ run, hideWhileBusy: true }, true);
+      document.body.append(runner.element);
+      expect(runner.button.hidden).toBe(false);
+      const running = runner.trigger();
+      expect(runner.button.hidden).toBe(true);
+      finish();
+      await running;
+      expect(runner.button.hidden).toBe(false);
+    });
+
+    it('leaves alone a Run button the tool hid itself (a bar built by hand before addAction)', async () => {
+      const { run, finish } = manual();
+      const runner = createRunner({ run }, true);
+      document.body.append(runner.element);
+      runner.button.hidden = true;
+      const running = runner.trigger();
+      expect(runner.button.hidden).toBe(true);
+      finish();
+      await running;
+      expect(runner.button.hidden).toBe(true);
+    });
+
+    it('adds buttons that start a run with their argument, off exactly when Run is, with the reason', async () => {
+      const seen: (string | undefined)[] = [];
+      const runner = createRunner<string>(
+        {
+          run: (_signal, arg) => {
+            seen.push(arg);
+            return Promise.resolve();
+          },
+        },
+        true,
+      );
+      document.body.append(runner.element);
+      const step = runner.addAction({
+        label: 'Step',
+        icon: 'skip-end-fill',
+        run: 'step',
+        title: 'One turn',
+      });
+      expect(step.button.textContent).toContain('Step');
+      expect(step.button.title).toBe('One turn');
+      expect(step.button.getAttribute('aria-disabled')).toBe('false');
+
+      step.button.click();
+      await vi.waitFor(() => expect(seen).toEqual(['step']));
+
+      runner.setDisabled('Add a topic first');
+      expect(step.button.getAttribute('aria-disabled')).toBe('true');
+      expect(step.button.title).toBe('Add a topic first');
+      step.button.click();
+      expect(seen).toEqual(['step']);
+
+      runner.setDisabled(null);
+      expect(step.button.title).toBe('One turn');
+    });
+
+    it('shows idle buttons only while idle and busy buttons only while a run is going', async () => {
+      const { run, finish } = manual();
+      const runner = createRunner({ run }, true);
+      document.body.append(runner.element);
+      const step = runner.addAction({ label: 'Step', run: undefined });
+      const pause = runner.addAction({ label: 'Pause', when: 'busy', onClick: () => undefined });
+      expect(step.button.hidden).toBe(false);
+      expect(pause.button.hidden).toBe(true);
+
+      const running = runner.trigger();
+      expect(step.button.hidden).toBe(true);
+      expect(pause.button.hidden).toBe(false);
+      finish();
+      await running;
+      expect(step.button.hidden).toBe(false);
+      expect(pause.button.hidden).toBe(true);
+      // The bar reads: Run, the actions in call order, Stop, then the hint.
+      const order = [...runner.element.children].map((child) => child.getAttribute('data-testid'));
+      expect(order).toEqual(['run-button', null, null, 'stop-button', 'run-hint']);
+    });
+
+    it('lets the tool turn an action off with a reason and relabel it; an off action does nothing', () => {
+      const onClick = vi.fn();
+      const runner = createRunner({ run: () => Promise.resolve() }, true);
+      const pause = runner.addAction({
+        label: 'Pause',
+        when: 'busy',
+        onClick,
+        title: 'Pause after this turn',
+      });
+      pause.button.hidden = false;
+      pause.button.click();
+      expect(onClick).toHaveBeenCalledOnce();
+
+      pause.setLabel('Pausing…');
+      pause.setDisabled('Pausing after this turn');
+      expect(pause.button.textContent).toContain('Pausing…');
+      expect(pause.button.getAttribute('aria-disabled')).toBe('true');
+      expect(pause.button.title).toBe('Pausing after this turn');
+      pause.button.click();
+      expect(onClick).toHaveBeenCalledOnce();
+
+      pause.setDisabled(null);
+      expect(pause.button.getAttribute('aria-disabled')).toBe('false');
+      expect(pause.button.title).toBe('Pause after this turn');
+    });
+
+    it('hands focus to the first visible control when the focused one hides, and back', async () => {
+      const { run, finish } = manual();
+      const runner = createRunner({ run, hideWhileBusy: true }, true);
+      document.body.append(runner.element);
+      const pause = runner.addAction({ label: 'Pause', when: 'busy', onClick: () => undefined });
+
+      runner.button.focus();
+      const running = runner.trigger();
+      expect(document.activeElement).toBe(pause.button); // Run hid; Pause took its place
+
+      runner.stopButton.focus();
+      finish();
+      await running;
+      expect(document.activeElement).toBe(runner.button); // Stop hid; Run is back
+    });
+
+    it('leaves focus alone when it is outside the bar', async () => {
+      const { run, finish } = manual();
+      const outside = document.createElement('button');
+      const runner = createRunner({ run, hideWhileBusy: true }, true);
+      document.body.append(outside, runner.element);
+      runner.addAction({ label: 'Pause', when: 'busy', onClick: () => undefined });
+      outside.focus();
+      const running = runner.trigger();
+      expect(document.activeElement).toBe(outside);
+      finish();
+      await running;
+      expect(document.activeElement).toBe(outside);
+    });
+  });
 });

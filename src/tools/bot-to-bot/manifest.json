@@ -8,6 +8,7 @@
   "accepts": [],
   "produces": ["text/markdown", "application/json"],
   "usesJobs": false,
+  "ownModels": true,
   "lazyLibs": ["marked", "dompurify"],
   "defaults": {
     "turnLimit": 20,

@@ -195,6 +195,15 @@ describe('cost', () => {
     expect(costInfo(unknown, isFree)).toMatchObject({ text: 'Unknown', note: 'unknown' });
   });
 
+  it('never shows an unknown cost as free, and says what the budgets counted for it', () => {
+    const usage = { ...run('a', 1).usage, costUnknown: true, costUsd: 0 };
+    const free = run('a', 1, { model: 'x/y:free', usage });
+    expect(costInfo(free, isFree)).toMatchObject({ text: 'Unknown', note: 'unknown' });
+    const booked = run('a', 1, { usage, reservedUsd: 0.0034 });
+    expect(costInfo(booked, isFree).title).toContain('≈ $0.0034');
+    expect(costInfo(run('a', 1, { usage }), isFree).title).not.toContain('$');
+  });
+
   it('says Running while running', () => {
     expect(costInfo(run('a', 1, { status: 'running' }), isFree).text).toBe('Running');
   });

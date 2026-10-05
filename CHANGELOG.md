@@ -60,13 +60,14 @@ All notable changes to this project are documented here. The format follows
 - Stage 6 e2e gate: a 5-step chained sequence survives a reload, joins into an MP4 that plays; a spend cap stops a sequence (0ec6971).
 - Model arena: one prompt and files to 2–4 models in parallel (one run each, one `groupId`), streamed side by side with time to first token, total time, tokens, tokens/s and cost, a comparison table marking the fastest and cheapest, per-contender Retry, Stop for all; blind voting (shuffled Model A–D, names and costs hidden until a vote or a reveal) with a local tally (Reset with Undo); Markdown/JSON export of a round (56a80b1).
 - Stage 7 e2e gate: the arena runs 4 models at once (c5e28e2).
-- `mountTool(…, { modelChip: false })` for tools that choose their models themselves (3978bbf).
+- `mountTool(…, { modelChip: false })` for tools that choose their models themselves (3978bbf; now the manifest field `ownModels`, 7200c1b).
 - Decision: text or key-value situation, question builder for Yes/No, Choice and Score (slug ids, criteria, options and a scale reordered by drag or Move buttons, thresholds), answer cards with meter, bars and scale, Clear / Needs review that re-labels without a new run, starter templates, saved deciders with Undo, JSON download and copy, free-only on Mercury Decide (099f5dd, eefc703).
 - Model picker help text per capability (`CAPABILITY_INFO.help`), used to say which decision models are verified (95ee388).
 - Stage 7 e2e gate for Decision: each question type with Jev, Mercury and thin responses, key-value state as the tutorial request, saved deciders, 429 and Stop, History reopen, 320 px by keyboard (44e6570).
 - Bot-to-bot chat: two bots with names, models and personas, framing shown read-only; streamed turns as alternating bubbles with avatars and per-turn tokens, cost and latency; turn, time, cost-cap and stop-phrase limits plus Stop; Pause, Step, Resume, moderator messages, edit and resume with Undo; one run per press with History replay; survives a reload; Markdown and JSON export (ae264ed, 484b833).
 - Stage 7 e2e for Bot-to-bot chat: every stop condition, moderation, a failed turn, exports and the prompts round trip (7d15e9f).
 - Shared `approxTokens()` in `src/core/tokens.ts` (0575155).
+- Stage 7 review, shared UI: `runner.setLabel()`, `runner.addAction()` and `RunnerOptions.hideWhileBusy` for multi-action run bars, `stopOnEscape()` and `composing()` (4a7cacb); `createMarkdownCache()`, `attachmentIntake()` and the `.or-icon-action` button class (cdb6f5f); `describeRunCost()`, `formatRunCost()` and `usageLine()` (6c3967a); `failureText()` with a blind mode for the arena whose failures all read alike (276d460, 2fe9023); manifest field `ownModels` (7200c1b).
 
 ### Changed
 
@@ -92,6 +93,7 @@ All notable changes to this project are documented here. The format follows
 - CSV/TSV keep phone-like values (`+44 20 7946 0958`) as written (c6d74d2).
 - File types: untyped source files (`.py`, `.yaml`, `.js`…) get `text/x-*` types, so `text/*` tools take them (5afda1e).
 - Chat's attachment logic moved to `src/core/attachments/` (kinds, limits, reading, content parts, parser text, token approximation, missing-input checks, parser add-on) and the chip to `attachmentChip()`, shared with Model arena (41e1cbb).
+- Stage 7 review, shared UI: Chat uses the shared Markdown cache, attachment intake, `stopOnEscape()`, `usageLine()` and `.or-icon-action` (5252825); `checkText()` takes the noun ("message" or "prompt"); Settings → Tools shows "Chosen inside the tool" for Model arena and Bot-to-bot instead of a model picker, and `mountTool(…, { modelChip: false })` is the manifest's `ownModels` (7200c1b); History words costs through `describeRunCost()` and names what budgets counted for an unknown cost (6c3967a); the runner hands focus on when the focused bar control hides (4a7cacb).
 
 ### Fixed
 
@@ -107,6 +109,7 @@ All notable changes to this project are documented here. The format follows
 - History: runs in progress are never deleted (and Undo cannot bring one back); the model filter comes from the runs (routed ids included); JSON output keeps big numbers and every value as stored; "Show more" appends rows.
 - Models: one price model (`src/ui/model-price.ts`) for the picker, tool chip, Settings and the page, in each model's real billing unit; sorting and the price limit compare like with like; usage from one ledger read.
 - Small targets are at least 24 × 24 px and page classes no longer collide with Settings.
+- Stage 7 review, shared UI: Ctrl, Cmd and Alt+Escape no longer stop a Chat reply (4a7cacb); a Chat reply whose request may have gone through and been billed shows that caution and a link to OpenRouter's activity instead of a Retry that could pay twice, and keeps it across reloads (5252825); the model picker's help text is linked to its search field (8287a8b).
 
 - Stage 1 review: orphaned runs, double-booked and lost spend, retried paid POSTs, OAuth while locked, stale unlock sessions, non-atomic backup import, CSV formula injection, invalid XLSX/DOCX output, WAV/MP3/video edge cases.
 - Stage 2 review, shared parts: orphans that sent nothing no longer book their reservation, Undo never restores a running run (5072110); duplicate budget and add-key dialogs, offcanvas focus trap lost under a dialog (1db3bfd); accent contrast on cards and canvas, weak dark-mode focus border (9f3d343); stalled streaming, leaking result buttons, waveform memory, stray drops leaving the page (9760b10); inaccurate privacy copy, stale Home state (9f0ce68).

@@ -228,9 +228,15 @@ export function textAttachment(name: string, text: string, type = 'text/plain'):
 
 /**
  * Throws InvalidInputError when `size` bytes of text named `name` are over the per-file limit, or would take the
- * text files of the message (`pending`) over TEXT_TOTAL_LIMIT.
+ * text files of the message (`pending`) over TEXT_TOTAL_LIMIT. `noun` is what the files go with in the wording:
+ * "message" (Chat) or "prompt" (Model arena).
  */
-export function checkText(pending: readonly AttachmentRef[], name: string, size: number): void {
+export function checkText(
+  pending: readonly AttachmentRef[],
+  name: string,
+  size: number,
+  noun = 'message',
+): void {
   if (size > SIZE_LIMITS.text) {
     throw new InvalidInputError(
       `${name} is ${formatBytes(size)}. Text can be at most ${formatBytes(SIZE_LIMITS.text)}.`,
@@ -239,7 +245,7 @@ export function checkText(pending: readonly AttachmentRef[], name: string, size:
   const total = pending.reduce((sum, ref) => sum + (ref.kind === 'text' ? ref.size : 0), 0);
   if (total + size > TEXT_TOTAL_LIMIT) {
     throw new InvalidInputError(
-      `${name} doesn't fit: one message takes at most ${formatBytes(TEXT_TOTAL_LIMIT)} of text files.`,
+      `${name} doesn't fit: one ${noun} takes at most ${formatBytes(TEXT_TOTAL_LIMIT)} of text files.`,
     );
   }
 }

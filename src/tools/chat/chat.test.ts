@@ -6,7 +6,7 @@ import type {
   ChatStreamResult,
   RawModel,
 } from '../../core/api/types';
-import { ApiError } from '../../core/errors';
+import { ApiError, NetworkError } from '../../core/errors';
 import { getDb } from '../../core/storage/db';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient, CallOptions } from '../../core/types';
@@ -381,6 +381,31 @@ describe('chat tool', () => {
     await vi.waitFor(() => expect(contents()).toEqual(['Hello?', 'Recovered']));
     // The failed, empty reply was replaced, not kept as a branch.
     expect($$('sibling-nav')).toHaveLength(0);
+  });
+
+  it('says so inline when a paid request may have gone through, with no Retry that could pay twice', async () => {
+    const lost = new NetworkError();
+    lost.outcomeUnknown = true;
+    const chatStream = vi.fn(() => Promise.reject(lost));
+    await mount({ chatStream });
+    await send('Hello?');
+
+    const error = $('message-error');
+    expect(error.textContent).toContain('may still have done the work and billed it');
+    expect(error.textContent).toContain('check your OpenRouter activity');
+    expect(error.querySelector('a')?.getAttribute('href')).toBe('https://openrouter.ai/activity');
+    expect($$('message-retry')).toHaveLength(0);
+    expect($$('message-retry-with')).toHaveLength(0);
+    // Shown once, inline: the runner adds no toast of its own.
+    expect($$('error-toast')).toHaveLength(0);
+    // Regenerate stays for a user who has checked.
+    expect($('message-regenerate')).not.toBeNull();
+
+    await eventually(async () => {
+      const [stored] = await storedThreads();
+      const reply = Object.values(stored!.nodes).find((node) => node.role === 'assistant');
+      expect(reply).toMatchObject({ status: 'error', outcomeUnknown: true });
+    });
   });
 
   it('keeps threads across a reload; attachments are marked as not kept', async () => {
@@ -817,6 +842,10 @@ describe('review fixes', () => {
     };
     escape(composer(), { isComposing: true });
     escape($('thread-search'));
+    // Ctrl, Cmd and Alt+Escape belong to the browser and the system.
+    escape(composer(), { ctrlKey: true });
+    escape(document.body, { metaKey: true });
+    escape(composer(), { altKey: true });
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(t!.runners[0]!.busy).toBe(true);
     escape(composer());

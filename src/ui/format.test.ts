@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { KeyStatus } from '../core/types';
 import {
+  describeRunCost,
   formatContext,
   formatCount,
   formatDate,
@@ -9,10 +10,12 @@ import {
   formatModelPrice,
   formatMs,
   formatRelativeTime,
+  formatRunCost,
   formatTokens,
   formatUsd,
   keyBalance,
   plural,
+  usageLine,
 } from './format';
 
 const pricing = (
@@ -53,6 +56,94 @@ describe('formatEstimate', () => {
     expect(formatEstimate(null)).toBe('Unknown');
     expect(formatEstimate(0)).toBe('Free');
     expect(formatEstimate(0.0012)).toBe('≈ $0.0012');
+  });
+});
+
+describe('run cost wording', () => {
+  const cost = (
+    costUsd: number | null,
+    extra: { costEstimated?: boolean; costUnknown?: boolean } = {},
+  ) => ({
+    costUsd,
+    ...extra,
+  });
+
+  it('has one rule: free, known, estimated with ≈, unknown', () => {
+    expect(describeRunCost(cost(0.0123))).toEqual({ kind: 'known', text: '$0.012', counted: null });
+    expect(describeRunCost(cost(0.0123, { costEstimated: true }))).toEqual({
+      kind: 'estimated',
+      text: '≈ $0.012',
+      counted: null,
+    });
+    expect(describeRunCost(cost(0, { costUnknown: true }))).toEqual({
+      kind: 'unknown',
+      text: 'Unknown',
+      counted: null,
+    });
+    expect(describeRunCost(cost(null))).toEqual({ kind: 'none', text: '—', counted: null });
+  });
+
+  it('calls a zero cost free only on a free model; a paid model reports $0.00', () => {
+    expect(describeRunCost(cost(0), { free: true })).toMatchObject({ kind: 'free', text: 'Free' });
+    expect(describeRunCost(cost(0), { free: false })).toMatchObject({
+      kind: 'known',
+      text: '$0.00',
+    });
+    expect(describeRunCost(cost(0))).toMatchObject({ text: '$0.00' });
+  });
+
+  it('never calls an unknown cost free or zero, and says what was counted for it', () => {
+    const unknown = cost(0, { costUnknown: true });
+    expect(describeRunCost(unknown, { free: true })).toMatchObject({ kind: 'unknown' });
+    expect(describeRunCost(unknown, { booked: 0.0034 })).toEqual({
+      kind: 'unknown',
+      text: 'Unknown',
+      counted: '≈ $0.0034',
+    });
+    expect(describeRunCost(unknown, { booked: 0 }).counted).toBeNull();
+    // A known part (other requests of the run) does not turn unknown into a number.
+    expect(describeRunCost(cost(0.5, { costUnknown: true })).text).toBe('Unknown');
+  });
+
+  it('formats the cost as one string, with what was counted for an unknown one', () => {
+    expect(formatRunCost(cost(0.0123))).toBe('$0.012');
+    expect(formatRunCost(cost(0, { costUnknown: true }))).toBe('Unknown');
+    expect(formatRunCost(cost(0, { costUnknown: true }), { booked: 0.0034 })).toBe(
+      'Unknown (≈ $0.0034 counted)',
+    );
+    expect(formatRunCost(cost(0), { free: true })).toBe('Free');
+  });
+
+  describe('usageLine', () => {
+    const usage = (
+      costUsd: number,
+      extra: { costEstimated?: boolean; costUnknown?: boolean } = {},
+    ) => ({
+      promptTokens: 1200,
+      completionTokens: 340,
+      costUsd,
+      latencyMs: 1400,
+      ...extra,
+    });
+
+    it('reads tokens, cost and latency', () => {
+      expect(usageLine(usage(0.0012))).toBe('1.2K in · 340 out · $0.0012 · 1.4 s');
+      expect(usageLine(usage(0.0012, { costEstimated: true }))).toBe(
+        '1.2K in · 340 out · ≈ $0.0012 · 1.4 s',
+      );
+      expect(usageLine({ ...usage(0.0012), latencyMs: 0 })).toBe('1.2K in · 340 out · $0.0012');
+      expect(usageLine(undefined)).toBe('');
+    });
+
+    it('says free for a free model and cost unknown for an unknown one, never ≈ on an unknown cost', () => {
+      expect(usageLine(usage(0), { free: true })).toBe('1.2K in · 340 out · free · 1.4 s');
+      expect(usageLine(usage(0, { costUnknown: true }), { free: true })).toBe(
+        '1.2K in · 340 out · cost unknown · 1.4 s',
+      );
+      expect(usageLine(usage(0.004, { costUnknown: true }), { booked: 0.004 })).toBe(
+        '1.2K in · 340 out · cost unknown (≈ $0.004 counted) · 1.4 s',
+      );
+    });
   });
 });
 

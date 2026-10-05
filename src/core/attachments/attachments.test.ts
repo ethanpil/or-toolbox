@@ -200,4 +200,10 @@ describe('text limits per message', () => {
     );
     expect(() => checkText([], 'big.txt', SIZE_LIMITS.text + 1)).toThrow(/big\.txt is/);
   });
+
+  it('names what the files go with: a message unless told otherwise', () => {
+    const full = [text(TEXT_TOTAL_LIMIT - 10)];
+    expect(() => checkText(full, 'b.txt', 11)).toThrow(/one message takes at most/);
+    expect(() => checkText(full, 'b.txt', 11, 'prompt')).toThrow(/one prompt takes at most/);
+  });
 });

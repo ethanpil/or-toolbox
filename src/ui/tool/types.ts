@@ -103,6 +103,11 @@ export interface RunnerOptions<A = unknown> {
    * cannot pay twice, e.g. `run` first looks for the earlier request's result.
    */
   retryUnknownOutcome?: boolean;
+  /**
+   * Hide the Run button while a run is going (it shows "Running…" otherwise), for a bar whose busy state is made of
+   * `addAction` buttons with `when: 'busy'` (Pause) and Stop.
+   */
+  hideWhileBusy?: boolean;
   /** Text after the button (e.g. a reason it is disabled); also its description. */
   hint?: string;
   /** Where the bar goes; default the end of `ui.input`. */
@@ -114,6 +119,32 @@ export interface RunnerOptions<A = unknown> {
  * and says at once whether it started at all (false: busy or disabled, nothing happened).
  */
 export type Triggered = Promise<void> & { readonly started: boolean };
+
+/**
+ * One more button in the Run bar (`Runner.addAction`), next to Run: Bot-to-bot's Step and Pause. Pressing it either
+ * starts a run with `run` as the argument (like `trigger(run)`: it is off exactly when Run is, with the same visible
+ * reason, and the error toast's Retry replays that argument) or calls `onClick`.
+ */
+export type RunnerActionOptions<A = unknown> = {
+  label: string;
+  /** Bootstrap Icons name. */
+  icon?: string;
+  /** Tooltip while the button is available (its reason replaces it when it is off). */
+  title?: string;
+  /** `'idle'` (default): shown while no run is going. `'busy'`: shown only while one is going (Pause). */
+  when?: 'idle' | 'busy';
+  /** `'primary'` outlines it in the accent colour (Step beside Start); `'secondary'` (default) is neutral. */
+  tone?: 'primary' | 'secondary';
+  testId?: string;
+} & ({ run: A } | { onClick: () => void });
+
+/** What `Runner.addAction` hands back. */
+export interface RunnerAction {
+  readonly button: HTMLButtonElement;
+  setLabel(text: string): void;
+  /** Turns the button off with a visible reason (its title); it keeps focus. null turns it back on. */
+  setDisabled(reason: string | null): void;
+}
 
 /** What a runner's subscribers are told on every change. */
 export interface RunnerState {
@@ -135,6 +166,14 @@ export interface Runner<A = unknown> {
    */
   trigger(arg?: A): Triggered;
   stop(): void;
+  /** Changes the Run button's text while no run is going (Start → Resume). */
+  setLabel(text: string): void;
+  /**
+   * Adds a button to the bar, after Run and before Stop, in call order. Shown by `when`, and kept in step with the
+   * runner: no extra busy or blocked logic in the tool. Focus on a bar button that hides (Start while Pause takes
+   * its place) moves to the first visible one.
+   */
+  addAction(options: RunnerActionOptions<A>): RunnerAction;
   /** Disables Run with a visible reason; null re-enables it (the framework also disables it when no model resolves). */
   setDisabled(reason: string | null): void;
   /**
