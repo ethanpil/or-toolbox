@@ -537,7 +537,7 @@ The navbar on every page has the **Tools** menu (grouped as Documents, Audio, Im
 
 Search first: type in the box (press `/` to jump to it) and Enter opens the best match. Below it:
 
-- **Favorites**: tools you starred, with their star on the card. Star or unstar any tool anywhere.
+- **Favorites**: tools you starred. Press the star on a tool's card to add or remove it.
 - **Recent runs**: your five latest runs with their cost ("Free" for free models), each opening the run in its tool, and a link to all of History.
 - **Every tool by category**. A tool card shows a "Free" badge when its main model is currently free.
 
