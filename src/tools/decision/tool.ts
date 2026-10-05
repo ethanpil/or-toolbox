@@ -27,6 +27,8 @@ import { resultsView } from './results-view';
 import {
   blankQuestion,
   buildRequest,
+  hasSituation,
+  promptOf,
   readFieldRows,
   readQuestions,
   readState,
@@ -35,7 +37,12 @@ import {
 } from './schema';
 import { statePanel } from './state-panel';
 import { TEMPLATES, templateQuestions } from './templates';
-import { contextProblem, DEFAULT_CONTEXT_TOKENS, estimateInputTokens } from './tokens';
+import {
+  contextInputTokens,
+  contextProblem,
+  DEFAULT_CONTEXT_TOKENS,
+  estimateInputTokens,
+} from './tokens';
 
 /** A dropped text file longer than this is not read: the model's context could not hold it anyway. */
 const MAX_TEXT_BYTES = 1_000_000;
@@ -85,9 +92,6 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   // --- the form -----------------------------------------------------------------------------------------
   const panel = statePanel({ onChange: refresh });
-  const thresholds = (): Map<string, number> =>
-    new Map(builder.questions().map((question) => [question.id, question.threshold]));
-
   /** The questions as last loaded, saved or restored; a different set is "edited". */
   let baseline = '';
   const snapshot = (): string => JSON.stringify(builder.questions());
@@ -97,7 +101,7 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   const builder = questionBuilder({
     onChange: () => {
-      results.relabel(thresholds());
+      results.relabel(builder.thresholds());
       refresh();
     },
     defaultThreshold,
@@ -111,18 +115,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     tool: ctx.manifest.id,
     questions: () => builder.questions(),
     state: () => panel.state(),
-    hasState: () => {
-      const state = panel.state();
-      return (
-        state.text.trim() !== '' || state.fields.some((row) => row.key.trim() || row.value.trim())
-      );
-    },
+    hasState: () => hasSituation(panel.state()),
     dirty: () => snapshot() !== baseline,
     load: (entry) => {
       builder.setQuestions(entry.questions);
       if (entry.state) panel.setState(entry.state);
       markBaseline();
-      results.relabel(thresholds());
+      results.relabel(builder.thresholds());
       refresh();
     },
     saved: markBaseline,
@@ -225,12 +224,13 @@ export function setup(ctx: ToolContext): ToolInstance {
       return;
     }
     const questions = builder.questions();
+    const keys = builder.keys();
     const state = panel.state();
     const model = ctx.model().model;
     if (!model) return;
     const info = await ctx.models.get(model).catch(() => undefined);
     const limit = info?.contextLength ?? DEFAULT_CONTEXT_TOKENS;
-    const tokens = estimateInputTokens(buildRequest(model, state, questions));
+    const tokens = contextInputTokens(buildRequest(model, state, questions));
     showTokens(tokens, limit);
     const tooLong = contextProblem(tokens, limit);
     if (tooLong) {
@@ -247,11 +247,18 @@ export function setup(ctx: ToolContext): ToolInstance {
       const response = await ctx.api.decide(request, { run: handle });
       const decision = parseDecision(response, questions);
       last = { request, response };
-      results.show(decision, questions);
+      results.show(decision, questions, keys);
+      // A threshold edited while the request was out applies to the cards drawn now.
+      const current = builder.thresholds();
+      results.relabel(current);
       menu.update({ disabled: false });
       copyButton.disabled = false;
       const review = decision.results.filter(
-        (entry, index) => resultVerdict(entry, questions[index]?.threshold ?? 0) === 'review',
+        (entry, index) =>
+          resultVerdict(
+            entry,
+            current.get(keys[index] ?? '') ?? questions[index]?.threshold ?? 0,
+          ) === 'review',
       ).length;
       ui.status(
         `Done · ${plural(questions.length, 'question')}, ${review === 0 ? 'all clear' : `${review} to review`}`,
@@ -278,26 +285,39 @@ export function setup(ctx: ToolContext): ToolInstance {
   const getState = (): ToolSnapshot => {
     const state = panel.state();
     return {
-      prompt: state.text,
-      settings: { stateMode: state.mode, fields: state.fields, questions: builder.questions() },
+      // What is sent: the text block, or the `name: value` lines of the fields.
+      prompt: promptOf(state),
+      settings: {
+        stateMode: state.mode,
+        fields: state.fields,
+        // The text block kept behind the fields is never sent, so it is not the prompt; it travels here.
+        ...(state.mode === 'fields' ? { text: state.text } : {}),
+        questions: builder.questions(),
+      },
     };
   };
 
-  const addText = (parts: readonly string[], replaceText: boolean): void => {
+  /** Adds the texts to the situation (or replaces it) and switches to the text block; false when they hold nothing. */
+  const addText = (parts: readonly string[], replaceText: boolean): boolean => {
+    const added = parts.filter((part) => part.trim() !== '');
+    if (added.length === 0) return false;
     const current = panel.state();
-    const text = [replaceText ? '' : current.text.trim(), ...parts].filter(Boolean).join('\n\n');
+    const text = [replaceText ? '' : current.text.trim(), ...added].filter(Boolean).join('\n\n');
     panel.setState({ ...current, mode: 'text', text });
     refresh();
+    return true;
   };
 
   return {
     getState,
     applyState({ prompt, settings }) {
       const questions = readQuestions(settings['questions']);
+      const mode = settings['stateMode'] === 'fields' ? 'fields' : 'text';
       panel.setState(
         readState({
-          mode: settings['stateMode'],
-          text: prompt,
+          mode,
+          // In fields mode the prompt only describes the fields; the text block behind them is in the settings.
+          text: mode === 'fields' ? settings['text'] : prompt,
           fields: readFieldRows(settings['fields']) ?? panel.state().fields,
         }),
       );
@@ -305,14 +325,19 @@ export function setup(ctx: ToolContext): ToolInstance {
         builder.setQuestions(questions);
         markBaseline();
       }
-      results.relabel(thresholds());
+      results.relabel(builder.thresholds());
       void ui.refreshEstimate();
     },
     async estimate(model) {
-      const tokens = estimateInputTokens(buildRequest(model, panel.state(), builder.questions()));
+      const request = buildRequest(model, panel.state(), builder.questions());
       const info = await ctx.models.get(model).catch(() => undefined);
-      showTokens(tokens, info?.contextLength ?? DEFAULT_CONTEXT_TOKENS);
-      return ctx.models.estimate({ kind: 'decision', model, inputTokens: tokens });
+      showTokens(contextInputTokens(request), info?.contextLength ?? DEFAULT_CONTEXT_TOKENS);
+      // The price is estimated high (JSON counts more than prose); the context check above is not.
+      return ctx.models.estimate({
+        kind: 'decision',
+        model,
+        inputTokens: estimateInputTokens(request),
+      });
     },
     onFiles(files) {
       const readable = files.filter((file) => file.size <= MAX_TEXT_BYTES);
@@ -321,20 +346,23 @@ export function setup(ctx: ToolContext): ToolInstance {
           `${plural(files.length - readable.length, 'file')} skipped: over ${formatBytes(MAX_TEXT_BYTES)}.`,
         );
       }
+      if (readable.length === 0) return;
       Promise.all(readable.map((file) => readAsText(file)))
-        .then((parts) => addText(parts, false))
+        .then((parts) => {
+          if (!addText(parts, false)) ui.status('The files had nothing to add.');
+        })
         .catch((error: unknown) => void presentError(error));
     },
     onReceive(items) {
       const texts = items.flatMap((item) => (item.kind === 'text' ? [item.text] : []));
-      if (texts.length > 0) addText(texts, true);
+      if (!addText(texts, true)) ui.status('What was sent had nothing to add.');
     },
     sample() {
       const template = TEMPLATES[0]!;
       builder.setQuestions(templateQuestions(template.id) ?? []);
       markBaseline();
       panel.setState({ ...panel.state(), mode: 'text', text: template.sample });
-      results.relabel(thresholds());
+      results.relabel(builder.thresholds());
       refresh();
     },
   };

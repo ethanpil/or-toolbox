@@ -36,8 +36,15 @@ import {
 
 export interface QuestionBuilder {
   readonly element: HTMLElement;
-  /** A clean copy of the questions as the form holds them (thresholds read, ids as shown). */
+  /** A clean copy of the questions as the form holds them (thresholds read, ids without surrounding spaces). */
   questions(): QuestionDef[];
+  /**
+   * One key per question, in the order of `questions()`, that stays with its card through renames (the id
+   * changes with the name; the key never does). Answers drawn for a run are matched to thresholds by it.
+   */
+  keys(): string[];
+  /** The threshold now set for each question, by key. */
+  thresholds(): Map<string, number>;
   setQuestions(questions: readonly QuestionDef[]): void;
   /** Shows every problem at its field and focuses the first; false when the questions cannot be sent. */
   validate(): boolean;
@@ -75,6 +82,9 @@ interface Entry {
   feedback: HTMLElement;
 }
 
+/** The drag's own data type (never text/plain, which a text field would take in). */
+const DRAG_TYPE = 'application/x-ortoolbox-level';
+
 const parseThreshold = (text: string): number => (text.trim() === '' ? NaN : Number(text));
 
 export function questionBuilder(options: {
@@ -111,7 +121,8 @@ export function questionBuilder(options: {
   // --- model --------------------------------------------------------------------------------------------
   const toDef = (row: QuestionRow): QuestionDef => ({
     name: row.name,
-    id: row.id,
+    // As the request will name it: the field may still hold a trailing space the user has not left yet.
+    id: row.id.trim(),
     instructions: row.instructions,
     type: row.type,
     threshold: thresholdOf(parseThreshold(row.threshold)),
@@ -126,8 +137,8 @@ export function questionBuilder(options: {
     return {
       rid: uid('dec-q'),
       name: def.name,
-      id: def.id || (named ? uniqueId(slugify(def.name), taken) : ''),
-      idEdited: def.id !== '' && !isDerivedId(def.id, def.name),
+      id: def.id.trim() || (named ? uniqueId(slugify(def.name), taken) : ''),
+      idEdited: def.id.trim() !== '' && !isDerivedId(def.id.trim(), def.name),
       instructions: def.instructions,
       type: def.type,
       threshold: String(def.threshold),
@@ -139,7 +150,7 @@ export function questionBuilder(options: {
   };
 
   const idsExcept = (row: QuestionRow): string[] =>
-    rows.filter((other) => other !== row).map((other) => other.id);
+    rows.filter((other) => other !== row).map((other) => other.id.trim());
 
   // --- problems -----------------------------------------------------------------------------------------
   /** The problem key of a field: `<question>:<field>`, with the option or level for those. */
@@ -514,7 +525,8 @@ export function questionBuilder(options: {
           dragging = { question: row.rid, level: level.rid };
           if (event.dataTransfer) {
             event.dataTransfer.effectAllowed = 'move';
-            event.dataTransfer.setData('text/plain', level.rid);
+            // A type of its own: with text/plain, dropping the handle on a text field would type the row's id.
+            event.dataTransfer.setData(DRAG_TYPE, level.rid);
             event.dataTransfer.setDragImage(item, 16, 16);
           }
           item.classList.add('or-dec-dragging');
@@ -549,7 +561,10 @@ export function questionBuilder(options: {
         ondrop: (event: DragEvent) => {
           if (dragging?.question !== row.rid) return;
           event.preventDefault();
-          const from = row.levels.findIndex((other) => other.rid === dragging?.level);
+          // The drag is over. The redraw below replaces the dragged node, so its dragend may never come.
+          const draggedRid = dragging.level;
+          dragging = null;
+          const from = row.levels.findIndex((other) => other.rid === draggedRid);
           const after = item.classList.contains('or-dec-drop-after');
           clearDrop();
           if (from < 0) return;
@@ -558,7 +573,7 @@ export function questionBuilder(options: {
           if (from < to) to -= 1;
           if (to === from) return;
           row.levels = moveTo(row.levels, from, to);
-          moved([`${level.rid}:text`], `Level moved to position ${to}.`);
+          moved([`${draggedRid}:text`], `Level moved to position ${to}.`);
         },
       },
       h(
@@ -857,6 +872,8 @@ export function questionBuilder(options: {
   return {
     element,
     questions: () => rows.map(toDef),
+    keys: () => rows.map((row) => row.rid),
+    thresholds: () => new Map(rows.map((row) => [row.rid, toDef(row).threshold])),
     setQuestions(questions) {
       rows = [];
       for (const def of questions)

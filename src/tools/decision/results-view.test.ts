@@ -7,6 +7,9 @@ import { templateQuestions } from './templates';
 
 let view: ResultsView;
 let questions: QuestionDef[];
+/** The builder rows' keys: what a card is matched to, not the question id (which a rename changes). */
+const KEYS = ['k1', 'k2', 'k3'];
+const show = (): void => view.show(parseDecision(documentedResponse, questions), questions, KEYS);
 
 beforeEach(() => {
   view = resultsView();
@@ -26,9 +29,7 @@ const $ = (testId: string, root?: ParentNode): HTMLElement => {
 describe('the results view', () => {
   it('starts empty, and shows the cards once there are answers', () => {
     expect($('dec-empty').closest('[hidden]')).toBeNull();
-    expect(view.hasResults()).toBe(false);
-    view.show(parseDecision(documentedResponse, questions), questions);
-    expect(view.hasResults()).toBe(true);
+    show();
     expect($$('dec-empty')[0]!.hidden).toBe(true);
     expect($$('dec-result')).toHaveLength(3);
     // A real heading per question and a list of cards, so a screen reader can move through them.
@@ -41,7 +42,7 @@ describe('the results view', () => {
   });
 
   it('writes every number as text and hides the drawings from assistive technology', () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
+    show();
     for (const track of view.element.querySelectorAll('.or-dec-track')) {
       expect(track.getAttribute('aria-hidden')).toBe('true');
     }
@@ -63,7 +64,7 @@ describe('the results view', () => {
   });
 
   it('marks one tick per level and a marker where the score is', () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
+    show();
     const ticks = [...view.element.querySelectorAll<HTMLElement>('.or-dec-tick')];
     expect(ticks.map((tick) => tick.textContent)).toEqual(['0', '1', '2']);
     expect(ticks.map((tick) => tick.style.left)).toEqual(['0%', '50%', '100%']);
@@ -74,7 +75,7 @@ describe('the results view', () => {
   });
 
   it('sets each fill to its probability after the first frames, so it can grow', async () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
+    show();
     const fills = [...view.element.querySelectorAll<HTMLElement>('.or-dec-fill')];
     expect(fills.length).toBe(4);
     // Starts empty (the transition has something to run from)…
@@ -90,7 +91,7 @@ describe('the results view', () => {
   });
 
   it('highlights the chosen option and marks it in words', () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
+    show();
     const [chosen, other] = $$('dec-option-result');
     expect(chosen!.dataset['chosen']).toBe('true');
     expect(chosen!.textContent).toContain('Chosen');
@@ -101,7 +102,7 @@ describe('the results view', () => {
   });
 
   it('re-labels in place: same elements, same fills, new badges and summary', () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
+    show();
     const cards = $$('dec-result');
     const fill = cards[0]!.querySelector('.or-dec-fill');
     expect(cards.map((c) => c.dataset['verdict'])).toEqual(['clear', 'review', 'clear']);
@@ -109,8 +110,8 @@ describe('the results view', () => {
 
     view.relabel(
       new Map([
-        ['is_bug', 99],
-        ['team', 50],
+        ['k1', 99],
+        ['k2', 50],
       ]),
     );
     expect($$('dec-result')).toEqual(cards);
@@ -132,7 +133,7 @@ describe('the results view', () => {
   });
 
   it('dims and marks the cards busy while a run replaces them', () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
+    show();
     view.busy(true);
     expect($('dec-results').getAttribute('aria-busy')).toBe('true');
     expect(view.element.classList.contains('opacity-50')).toBe(true);
@@ -142,18 +143,29 @@ describe('the results view', () => {
   });
 
   it('replaces the cards of an earlier run', () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
-    view.show(parseDecision(documentedResponse, questions.slice(0, 1)), questions.slice(0, 1));
+    show();
+    view.show(parseDecision(documentedResponse, questions.slice(0, 1)), questions.slice(0, 1), [
+      'k1',
+    ]);
     expect($$('dec-result')).toHaveLength(1);
     expect($('dec-summary').textContent).toBe('1 question answered · all clear');
   });
 
-  it('shows the model snapshot that answered and the cost', () => {
-    view.show(parseDecision(documentedResponse, questions), questions);
+  it('re-labels the card of a question that was renamed since, because cards are matched by key not id', () => {
+    show();
+    const [first] = $$('dec-result');
+    // The builder row k1 is now called something else on the wire; its key did not change.
+    view.relabel(new Map([['k1', 99]]));
+    expect(first!.dataset['verdict']).toBe('review');
+    expect(first!.dataset['question']).toBe('is_bug');
+  });
+
+  it('shows the model snapshot that answered, the input tokens billed and the cost', () => {
+    show();
     expect($('dec-meta').textContent).toBe(
-      'Answered by typesafe/jev-1.13-20260917 · Cost <$0.0001',
+      'Answered by typesafe/jev-1.13-20260917 · 476 input tokens · Cost <$0.0001',
     );
-    view.show(parseDecision({ answers: {}, model: '' }, questions), questions);
+    view.show(parseDecision({ answers: {}, model: '' }, questions), questions, KEYS);
     expect($('dec-meta').textContent).toBe('Cost not reported');
   });
 });

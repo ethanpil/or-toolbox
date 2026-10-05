@@ -7,6 +7,7 @@ import modelsFixture from '../../../tests/fixtures/openrouter/models.json';
 import type { DecisionRequest, DecisionResponse, RawModel } from '../../core/api/types';
 import { RateLimitError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
+import { acceptsFile, mimeMatches } from '../../ui/components/file-types';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import type { ToolInstance } from '../../ui/tool/types';
 import { getTool } from '../registry';
@@ -112,10 +113,12 @@ describe('the form', () => {
       levels: ['a', 'b', 'c'],
     });
     const state = {
-      prompt: 'Kept while the fields are in use',
+      // In fields mode the prompt says what is sent; the text block kept behind it rides in the settings.
+      prompt: `customer_tier: enterprise\nticket: ${TICKET}`,
       settings: {
         stateMode: 'fields',
         fields: [...FIELDS, { key: '', value: '' }],
+        text: 'Kept while the fields are in use',
         questions,
       },
     };
@@ -127,7 +130,9 @@ describe('the form', () => {
     expect($$(t.zones.input, 'dec-question')).toHaveLength(4);
     expect($$(t.zones.input, 'dec-field')).toHaveLength(3);
     expect(($(t.zones.input, 'dec-mode-fields') as HTMLInputElement).checked).toBe(true);
-    expect(($(t.zones.input, 'tool-prompt') as HTMLTextAreaElement).value).toBe(state.prompt);
+    expect(($(t.zones.input, 'tool-prompt') as HTMLTextAreaElement).value).toBe(
+      'Kept while the fields are in use',
+    );
     expect(
       ($$(t.zones.input, 'dec-threshold') as HTMLInputElement[]).map((input) => input.value),
     ).toEqual(['65', '90.5', '80', '80']);
@@ -144,6 +149,63 @@ describe('the form', () => {
     expect(state.settings['questions']).toEqual(triage());
     expect(state.settings['fields']).toEqual(FIELDS);
     expect($$(t.zones.input, 'dec-question')).toHaveLength(3);
+  });
+
+  it('describes in its prompt what is sent: the text block, or the key: value lines of the fields', async () => {
+    const { tool } = await mount(decideWith(documentedResponse));
+    tool.applyState({
+      prompt: 'A text block',
+      settings: { stateMode: 'text', questions: triage() },
+    });
+    expect(tool.getState().prompt).toBe('A text block');
+    expect(tool.getState().settings).not.toHaveProperty('text');
+
+    tool.applyState({
+      prompt: 'whatever a snapshot says here',
+      settings: {
+        stateMode: 'fields',
+        text: 'Hidden words that are never sent',
+        fields: [
+          { key: ' tier ', value: ' pro ' },
+          { key: '', value: '' },
+          { key: 'note', value: 'a\nb' },
+        ],
+        questions: triage(),
+      },
+    });
+    const state = tool.getState();
+    // Not the hidden text, not the blank row, and what the request would hold (names and values trimmed).
+    expect(state.prompt).toBe('tier: pro\nnote: a\nb');
+    expect(state.settings['text']).toBe('Hidden words that are never sent');
+    expect(state.settings['fields']).toEqual([
+      { key: ' tier ', value: ' pro ' },
+      { key: '', value: '' },
+      { key: 'note', value: 'a\nb' },
+    ]);
+    tool.applyState(state);
+    expect(tool.getState()).toEqual(state);
+
+    // Nothing in the fields: nothing to describe.
+    tool.applyState({
+      prompt: 'x',
+      settings: { stateMode: 'fields', fields: [{ key: '', value: '' }], questions: triage() },
+    });
+    expect(tool.getState().prompt).toBe('');
+  });
+
+  it('takes the fields from the settings in fields mode and the text from the prompt in text mode', async () => {
+    const { t, tool } = await mount(decideWith(documentedResponse));
+    tool.applyState({
+      prompt: 'ignored',
+      settings: { stateMode: 'fields', fields: FIELDS, text: 'hidden', questions: triage() },
+    });
+    expect(($$(t.zones.input, 'dec-field-key') as HTMLInputElement[]).map((k) => k.value)).toEqual([
+      'customer_tier',
+      'ticket',
+    ]);
+    expect(($(t.zones.input, 'tool-prompt') as HTMLTextAreaElement).value).toBe('hidden');
+    tool.applyState({ prompt: 'Back to text', settings: { stateMode: 'text' } });
+    expect(($(t.zones.input, 'tool-prompt') as HTMLTextAreaElement).value).toBe('Back to text');
   });
 
   it('carries a threshold typed in the form into the state', async () => {
@@ -183,6 +245,22 @@ describe('the form', () => {
     tool.onFiles?.([huge]);
     expect(t.status()).toContain('1 file skipped');
     expect(prompt.value).toBe('First\n\nSecond note');
+  });
+
+  it('leaves the form alone when what was dropped or sent adds nothing', async () => {
+    const { t, tool } = await mount(decideWith(documentedResponse));
+    loadTriage(tool);
+    const before = tool.getState();
+    const huge = new File(['x'], 'huge.txt', { type: 'text/plain' });
+    Object.defineProperty(huge, 'size', { value: 5_000_000 });
+    tool.onFiles?.([huge]);
+    tool.onFiles?.([new File([''], 'empty.txt', { type: 'text/plain' })]);
+    tool.onFiles?.([new File(['  \n '], 'blank.txt', { type: 'text/plain' })]);
+    tool.onReceive?.([{ kind: 'text', text: '  ' }]);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(tool.getState()).toEqual(before);
+    expect(($(t.zones.input, 'dec-mode-fields') as HTMLInputElement).checked).toBe(true);
+    expect(t.status()).toContain('nothing to add');
   });
 
   it('takes text sent from another tool in place of the situation', async () => {
@@ -407,7 +485,7 @@ describe('refusing before the run', () => {
     const decide = decideWith(documentedResponse);
     const { t, tool } = await mount(decide);
     tool.applyState({
-      prompt: 'x'.repeat(90_000),
+      prompt: 'x'.repeat(150_000),
       settings: { stateMode: 'text', questions: triage() },
     });
     await t.ctx.ui.refreshEstimate();
@@ -424,6 +502,22 @@ describe('refusing before the run', () => {
     expect($(t.zones.input, 'dec-context-alert').hidden).toBe(true);
     await t.runners[0]!.trigger();
     expect(decide).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets prose through that fits the context (the heavier JSON estimate is for the price only)', async () => {
+    const decide = decideWith(documentedResponse);
+    const { t, tool } = await mount(decide);
+    // About 22,500 tokens of text: it fits 32,000, though JSON of this size would not.
+    tool.applyState({
+      prompt: 'word '.repeat(18_000),
+      settings: { stateMode: 'text', questions: triage() },
+    });
+    await t.ctx.ui.refreshEstimate();
+    expect($(t.zones.input, 'dec-context-alert').hidden).toBe(true);
+    await t.runners[0]!.trigger();
+    expect(decide).toHaveBeenCalledTimes(1);
+    // The price estimate stays high: it is billed by the models' own count.
+    expect(t.estimate()).toBeGreaterThan(0.00003);
   });
 });
 
@@ -450,6 +544,91 @@ describe('when the request fails', () => {
 
     const statuses = (await t.core.history.query({ tool: 'decision' })).map((run) => run.status);
     expect(statuses.sort()).toEqual(['error', 'ok']);
+  });
+});
+
+describe('answers belong to the question rows, not to what their ids happen to be', () => {
+  const bugAnswer = (noul: number) => ({ model: 'm', answers: { bug: { type: 'noul', noul } } });
+
+  /** One Yes/No question named Bug, typed in. */
+  const typeBug = (t: ToolTestContext, tool: ToolInstance): void => {
+    tool.applyState({ prompt: 'A ticket', settings: { stateMode: 'text', questions: [] } });
+    $(t.zones.input, 'dec-add-question').click();
+    type($(t.zones.input, 'dec-name'), 'Bug');
+    type($(t.zones.input, 'dec-instructions'), 'Is it a bug?');
+  };
+
+  it('finds the answer of an id typed with a trailing space before the field lost focus', async () => {
+    const decide = decideWith(bugAnswer(0.9));
+    const { t, tool } = await mount(decide);
+    typeBug(t, tool);
+    const id = $(t.zones.input, 'dec-id') as HTMLInputElement;
+    id.value = 'bug ';
+    id.dispatchEvent(new Event('input', { bubbles: true }));
+    await t.runners[0]!.trigger();
+    expect(Object.keys(decide.mock.calls[0]![0].questions)).toEqual(['bug']);
+    const card = $$(t.zones.output, 'dec-result')[0]!;
+    expect(card.dataset['kind']).toBe('noul');
+    expect(textOf(card, 'dec-yes-text')).toBe('Yes 90%');
+  });
+
+  it('re-labels a card whose question was renamed after the run', async () => {
+    const { t, tool } = await mount(decideWith(bugAnswer(0.9)));
+    typeBug(t, tool);
+    await t.runners[0]!.trigger();
+    const card = $$(t.zones.output, 'dec-result')[0]!;
+    expect(card.dataset['verdict']).toBe('clear');
+    type($(t.zones.input, 'dec-name'), 'Defect');
+    expect(tool.getState().settings['questions']).toMatchObject([{ id: 'defect' }]);
+    type($(t.zones.input, 'dec-threshold'), '95');
+    expect(card.dataset['verdict']).toBe('review');
+    expect(textOf(card, 'dec-threshold-text')).toBe('Threshold 95%');
+  });
+
+  it('applies a threshold edited while the request was in flight', async () => {
+    let release: () => void = () => undefined;
+    const decide = vi.fn(
+      () =>
+        new Promise<DecisionResponse>((resolve) => {
+          release = () => resolve(documentedResponse as unknown as DecisionResponse);
+        }),
+    );
+    const context = createToolTestContext(getTool('decision'), { catalog, api: { decide } });
+    t = context;
+    const tool = await context.mount(setup);
+    loadTriage(tool);
+    const running = context.runners[0]!.trigger();
+    await vi.waitFor(() => expect(decide).toHaveBeenCalledTimes(1));
+    // 96% reaches 80% but not the 97% typed now.
+    type($$(context.zones.input, 'dec-threshold')[0]!, '97');
+    release();
+    await running;
+    const card = $$(context.zones.output, 'dec-result')[0]!;
+    expect(card.dataset['verdict']).toBe('review');
+    expect(textOf(card, 'dec-threshold-text')).toBe('Threshold 97%');
+  });
+});
+
+describe('what the tool takes in', () => {
+  it('accepts the text types it reads: Markdown, CSV, JSON, logs, YAML and plain text', () => {
+    const { accepts } = getTool('decision');
+    for (const name of [
+      'a.txt',
+      'notes.md',
+      'data.csv',
+      'x.json',
+      'app.log',
+      'ci.yaml',
+      'ci.yml',
+    ]) {
+      expect(acceptsFile({ type: '', name }, accepts), name).toBe(true);
+    }
+    expect(acceptsFile({ type: 'text/markdown', name: 'x' }, accepts)).toBe(true);
+    expect(acceptsFile({ type: 'application/json', name: 'x' }, accepts)).toBe(true);
+    // What "Send to…" offers from OCR.
+    expect(mimeMatches('text/markdown', accepts)).toBe(true);
+    expect(acceptsFile({ type: 'image/png', name: 'x.png' }, accepts)).toBe(false);
+    expect(acceptsFile({ type: 'application/pdf', name: 'x.pdf' }, accepts)).toBe(false);
   });
 });
 

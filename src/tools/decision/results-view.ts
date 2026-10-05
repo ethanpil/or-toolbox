@@ -8,7 +8,7 @@
  * off under the OS preference and the Reduced motion setting, so nothing here checks for either. Re-labelling
  * after a threshold changes edits the badges in place: nothing is redrawn, nothing animates again.
  */
-import { formatUsd, plural } from '../../ui/format';
+import { formatInt, formatUsd, plural } from '../../ui/format';
 import { emptyState } from '../../ui/components/empty-state';
 import { h, replace } from '../../ui/dom';
 import { icon } from '../../ui/icon';
@@ -29,13 +29,15 @@ export interface ResultsView {
   readonly element: HTMLElement;
   /** Where the tool puts its Download and Copy buttons (beside the summary). */
   readonly actions: HTMLElement;
-  /** Draws a run's answers for the questions that were asked, labelled against their thresholds. */
-  show(result: DecisionResult, questions: readonly QuestionDef[]): void;
-  /** Re-labels the shown answers against the thresholds now in the form (by question id); redraws nothing. */
+  /**
+   * Draws a run's answers for the questions that were asked, labelled against their thresholds. `keys` holds one
+   * key per question (the builder's, which a rename does not change): `relabel` finds the cards by them.
+   */
+  show(result: DecisionResult, questions: readonly QuestionDef[], keys: readonly string[]): void;
+  /** Re-labels the shown answers against the thresholds now in the form (by key); redraws nothing. */
   relabel(thresholds: ReadonlyMap<string, number>): void;
   /** A run is on: the answers shown are about to be replaced. */
   busy(on: boolean): void;
-  hasResults(): boolean;
 }
 
 const BASIS_TEXT: Record<ConfidenceBasis, string> = {
@@ -204,7 +206,8 @@ function scoreBody(result: Extract<QuestionResult, { kind: 'score' }>): HTMLElem
 }
 
 interface Card {
-  id: string;
+  /** The question's key in the form, not its id: a rename changes the id and leaves the key. */
+  key: string;
   result: QuestionResult;
   badge: HTMLElement;
   threshold: HTMLElement;
@@ -278,7 +281,7 @@ export function resultsView(): ResultsView {
     );
   };
 
-  const cardFor = (result: QuestionResult, def: QuestionDef): Card => {
+  const cardFor = (result: QuestionResult, def: QuestionDef, key: string): Card => {
     const badge = h('span');
     const threshold = h('span', { 'data-testid': 'dec-threshold-text' });
     const body =
@@ -318,7 +321,7 @@ export function resultsView(): ResultsView {
         threshold,
       ),
     );
-    const card: Card = { id: result.id, result, badge, threshold, element, shown: def.threshold };
+    const card: Card = { key, result, badge, threshold, element, shown: def.threshold };
     label(card, def.threshold);
     return card;
   };
@@ -326,10 +329,11 @@ export function resultsView(): ResultsView {
   return {
     element,
     actions,
-    show(result: DecisionResult, questions: readonly QuestionDef[]) {
+    show(result: DecisionResult, questions: readonly QuestionDef[], keys: readonly string[]) {
       cards = result.results.flatMap((entry, index) => {
         const def = questions[index];
-        return def ? [cardFor(entry, def)] : [];
+        const key = keys[index];
+        return def && key !== undefined ? [cardFor(entry, def, key)] : [];
       });
       list.replaceChildren(...cards.map((card) => card.element));
       summarise();
@@ -342,9 +346,21 @@ export function resultsView(): ResultsView {
       replace(
         meta,
         result.model
-          ? h('span', null, 'Answered by ', h('code', { class: 'text-body' }, result.model))
+          ? [
+              h('span', null, 'Answered by ', h('code', { class: 'text-body' }, result.model)),
+              ' · ',
+            ]
           : null,
-        result.model ? ' · ' : null,
+        result.inputTokens === null
+          ? null
+          : [
+              h(
+                'span',
+                { 'data-testid': 'dec-tokens-billed' },
+                `${formatInt(result.inputTokens)} input ${result.inputTokens === 1 ? 'token' : 'tokens'}`,
+              ),
+              ' · ',
+            ],
         h('span', { 'data-testid': 'dec-cost' }, cost),
       );
       empty.hidden = true;
@@ -354,7 +370,7 @@ export function resultsView(): ResultsView {
     },
     relabel(thresholds) {
       for (const card of cards) {
-        const next = thresholds.get(card.id);
+        const next = thresholds.get(card.key);
         if (next !== undefined && next !== card.shown) label(card, next);
       }
       summarise();
@@ -364,6 +380,5 @@ export function resultsView(): ResultsView {
       if (on) list.setAttribute('aria-busy', 'true');
       else list.removeAttribute('aria-busy');
     },
-    hasResults: () => cards.length > 0,
   };
 }
