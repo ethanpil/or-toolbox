@@ -186,3 +186,17 @@ describe('parseConversation', () => {
     expect(repaired.entries.map((entry) => entry.content)).toEqual(['Topic', 'kept']);
   });
 });
+
+describe('stored markers', () => {
+  it('keeps the write id (how tabs tell versions apart) and a maybe-billed failure', () => {
+    const conversation = make('a', {
+      ...bot('a', '', 'error'),
+      error: 'The connection dropped.',
+      outcomeUnknown: true,
+    });
+    conversation.writeId = 'w-1';
+    const parsed = parseConversation(JSON.parse(JSON.stringify(conversation)));
+    expect(parsed).toEqual(conversation);
+    expect(parsed?.entries[1]?.outcomeUnknown).toBe(true);
+  });
+});

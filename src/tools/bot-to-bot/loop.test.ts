@@ -79,7 +79,7 @@ describe('stop conditions', () => {
   it('ends at the turn limit', async () => {
     const { deps, takeTurn } = harness({ limits: { turns: 4 } });
     const end = await drive(runLoop(deps, 'continue', new AbortController().signal));
-    expect(end).toEqual({ reason: 'turns', turns: 4 });
+    expect(end).toMatchObject({ reason: 'turns', turns: 4 });
     expect(takeTurn).toHaveBeenCalledTimes(4);
   });
 
@@ -91,7 +91,7 @@ describe('stop conditions', () => {
       hang: (turn) => turn === 3,
     });
     const end = await drive(runLoop(deps, 'continue', new AbortController().signal));
-    expect(end).toEqual({ reason: 'time', turns: 3 });
+    expect(end).toMatchObject({ reason: 'time', turns: 3 });
     expect(state.partials).toEqual(['Turn 3 (part)']);
     expect(Date.now()).toBeGreaterThanOrEqual(MINUTE);
   });
@@ -101,7 +101,7 @@ describe('stop conditions', () => {
     const base = Date.now() - MINUTE; // as if a minute ran before a pause
     deps.progress = () => ({ turns: 2, elapsedMs: Date.now() - base, spentUsd: 0 });
     const end = await drive(runLoop(deps, 'continue', new AbortController().signal));
-    expect(end).toEqual({ reason: 'time', turns: 0 });
+    expect(end).toMatchObject({ reason: 'time', turns: 0 });
     expect(takeTurn).not.toHaveBeenCalled();
   });
 
@@ -113,7 +113,7 @@ describe('stop conditions', () => {
       estimate: 0.05,
     });
     const end = await drive(runLoop(deps, 'continue', new AbortController().signal));
-    expect(end).toEqual({ reason: 'cost', turns: 2 });
+    expect(end).toMatchObject({ reason: 'cost', turns: 2 });
     expect(takeTurn).toHaveBeenCalledTimes(2);
   });
 
@@ -121,7 +121,7 @@ describe('stop conditions', () => {
     const { deps } = harness({ limits: { costUsd: 0.1 }, costPerTurn: 0.06, estimate: 0.01 });
     const end = await drive(runLoop(deps, 'continue', new AbortController().signal));
     // 0.06 + 0.01 < 0.1, so turn 2 runs; then 0.12 >= 0.1.
-    expect(end).toEqual({ reason: 'cost', turns: 2 });
+    expect(end).toMatchObject({ reason: 'cost', turns: 2 });
   });
 
   it('skips the pre-check when the estimate is unknown, and never ends free conversations on a $0 cap', async () => {
@@ -130,22 +130,26 @@ describe('stop conditions', () => {
       costPerTurn: 0.01,
       estimate: null,
     });
-    expect(await drive(runLoop(unknown.deps, 'continue', new AbortController().signal))).toEqual({
+    expect(
+      await drive(runLoop(unknown.deps, 'continue', new AbortController().signal)),
+    ).toMatchObject({
       reason: 'turns',
       turns: 3,
     });
     const free = harness({ limits: { costUsd: 0, turns: 2 }, costPerTurn: 0, estimate: 0 });
-    expect(await drive(runLoop(free.deps, 'continue', new AbortController().signal))).toEqual({
-      reason: 'turns',
-      turns: 2,
-    });
+    expect(await drive(runLoop(free.deps, 'continue', new AbortController().signal))).toMatchObject(
+      {
+        reason: 'turns',
+        turns: 2,
+      },
+    );
   });
 
   it('ends when either bot says the stop phrase', async () => {
     const { deps } = harness({
       reply: (turn) => (turn === 3 ? 'Good talk. [END]' : `Turn ${turn}`),
     });
-    expect(await drive(runLoop(deps, 'continue', new AbortController().signal))).toEqual({
+    expect(await drive(runLoop(deps, 'continue', new AbortController().signal))).toMatchObject({
       reason: 'phrase',
       turns: 3,
     });
@@ -156,7 +160,7 @@ describe('stop conditions', () => {
       limits: { turns: 2 },
       reply: (turn) => (turn === 2 ? 'Done [END]' : 'Hi'),
     });
-    expect(await drive(runLoop(deps, 'continue', new AbortController().signal))).toEqual({
+    expect(await drive(runLoop(deps, 'continue', new AbortController().signal))).toMatchObject({
       reason: 'phrase',
       turns: 2,
     });
@@ -188,7 +192,7 @@ describe('stop conditions', () => {
 describe('moderation', () => {
   it('Step runs exactly one turn and holds', async () => {
     const { deps, takeTurn } = harness();
-    expect(await drive(runLoop(deps, 'step', new AbortController().signal))).toEqual({
+    expect(await drive(runLoop(deps, 'step', new AbortController().signal))).toMatchObject({
       reason: null,
       turns: 1,
     });
@@ -200,13 +204,13 @@ describe('moderation', () => {
     const loop = runLoop(deps, 'continue', new AbortController().signal);
     await vi.advanceTimersByTimeAsync(1000);
     state.pause = true; // pressed during turn 1
-    expect(await drive(loop)).toEqual({ reason: null, turns: 1 });
+    expect(await drive(loop)).toMatchObject({ reason: null, turns: 1 });
   });
 
   it('lets a stop condition win over a pause on the same turn', async () => {
     const { deps, state } = harness({ limits: { turns: 1 } });
     state.pause = true;
-    expect(await drive(runLoop(deps, 'continue', new AbortController().signal))).toEqual({
+    expect(await drive(runLoop(deps, 'continue', new AbortController().signal))).toMatchObject({
       reason: 'turns',
       turns: 1,
     });
@@ -230,5 +234,97 @@ describe('limit helpers', () => {
     expect(saysPhrase('All done [END]', '[END]')).toBe(true);
     expect(saysPhrase('All done', '[END]')).toBe(false);
     expect(saysPhrase('anything', '  ')).toBe(false);
+  });
+});
+
+describe('the time limit changed during a turn', () => {
+  /** A harness whose limits can change, telling the loop through `onLimitsChange`. */
+  function changing(timeMs: number) {
+    const h = harness({ limits: { timeMs }, hang: () => true });
+    let current: Limits = { ...h.limits };
+    const listeners = new Set<() => void>();
+    h.deps.limits = () => current;
+    h.deps.onLimitsChange = (fn) => {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    };
+    const set = (next: Partial<Limits>): void => {
+      current = { ...current, ...next };
+      for (const fn of listeners) fn();
+    };
+    return { ...h, set };
+  }
+
+  it('re-arms the timer when the limit is lowered, and reports the limit that applied', async () => {
+    const { deps, set, state } = changing(10 * MINUTE);
+    const t0 = Date.now();
+    const loop = runLoop(deps, 'continue', new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(MINUTE);
+    set({ timeMs: 2 * MINUTE });
+    const end = await drive(loop);
+    expect(end).toMatchObject({ reason: 'time', turns: 1, limits: { timeMs: 2 * MINUTE } });
+    expect(state.partials).toEqual(['Turn 1 (part)']);
+    expect(Date.now() - t0).toBeLessThan(2 * MINUTE + 1000);
+  });
+
+  it('cuts at once when the limit is lowered below the time already used', async () => {
+    const { deps, set } = changing(10 * MINUTE);
+    const t0 = Date.now();
+    const loop = runLoop(deps, 'continue', new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(3 * MINUTE);
+    set({ timeMs: MINUTE });
+    expect(await drive(loop)).toMatchObject({ reason: 'time', limits: { timeMs: MINUTE } });
+    expect(Date.now() - t0).toBeLessThan(3 * MINUTE + 1000);
+  });
+
+  it('waits longer when the limit is raised', async () => {
+    const { deps, set } = changing(MINUTE);
+    const t0 = Date.now();
+    const loop = runLoop(deps, 'continue', new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(30_000);
+    set({ timeMs: 3 * MINUTE });
+    expect(await drive(loop)).toMatchObject({ reason: 'time', limits: { timeMs: 3 * MINUTE } });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(3 * MINUTE);
+  });
+});
+
+describe('the stop phrase', () => {
+  it('counts only at the end of a message, ignoring case, punctuation and emphasis', () => {
+    expect(saysPhrase('We agree. [END]', '[END]')).toBe(true);
+    expect(saysPhrase('We agree. [end]\n', '[END]')).toBe(true);
+    expect(saysPhrase('We agree. **[END]**', '[END]')).toBe(true);
+    expect(saysPhrase('We agree. [END].', '[END]')).toBe(true);
+    expect(saysPhrase('_Goodbye!_', 'goodbye')).toBe(true);
+    // Mentioned, not said at the end.
+    expect(saysPhrase('Say [END] when you are finished. What next?', '[END]')).toBe(false);
+  });
+
+  it('needs a word boundary before a word phrase', () => {
+    expect(saysPhrase('Well done.', 'done')).toBe(true);
+    expect(saysPhrase('The plan was abandoned', 'done')).toBe(false);
+    expect(saysPhrase('Nothing is undone', 'done')).toBe(false);
+    expect(saysPhrase('done', 'done')).toBe(true);
+  });
+
+  it('ends the loop when the first bot says it, and when the second does', async () => {
+    const first = harness({ reply: (turn) => (turn === 1 ? 'Short talk. [END]' : 'Hi') });
+    expect(
+      await drive(runLoop(first.deps, 'continue', new AbortController().signal)),
+    ).toMatchObject({ reason: 'phrase', turns: 1 });
+    const mention = harness({
+      limits: { turns: 3 },
+      reply: (turn) => (turn === 1 ? 'Say [END] when we are finished, agreed?' : 'Hi'),
+    });
+    expect(
+      await drive(runLoop(mention.deps, 'continue', new AbortController().signal)),
+    ).toMatchObject({ reason: 'turns', turns: 3 });
+  });
+
+  it('reports the limits that applied when it ends', async () => {
+    const { deps } = harness({ limits: { turns: 2 } });
+    expect(await drive(runLoop(deps, 'continue', new AbortController().signal))).toMatchObject({
+      reason: 'turns',
+      limits: { turns: 2 },
+    });
   });
 });

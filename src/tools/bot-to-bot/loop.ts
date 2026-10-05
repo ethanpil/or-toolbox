@@ -5,15 +5,17 @@
  * Stop conditions, first one hit wins:
  * - **Stop button:** the run's signal aborts; the turn keeps its partial text (tool.ts) and the abort propagates.
  * - **Time limit:** the clock runs only while the loop runs (`progress().elapsedMs`, kept across pauses). A timer
- *   for what is left aborts the turn in flight; its partial text is kept, marked `cut`.
- * - **Stop phrase** said by either bot (checked on the turn just finished).
+ *   for what is left aborts the turn in flight; its partial text is kept, marked `cut`. A limit changed during
+ *   the turn re-arms the timer (`onLimitsChange`), at once when the new limit is already used up.
+ * - **Stop phrase** said by either bot at the end of its message (`saysPhrase`).
  * - **Cost cap:** before each turn against spent plus the next turn's estimate (an unknown estimate skips this
  *   check), and after it against what was spent.
  * - **Turn limit.**
  *
  * After a turn the order is: cut by time, stop phrase, cost, turns, time. Before a turn: turns, time, cost.
  * Pause asks the loop to hold after the turn in flight; Step runs exactly one turn. Both end the loop with no
- * reason (held), unless a stop condition ended it first.
+ * reason (held), unless a stop condition ended it first. The end carries the limits that applied, so what the
+ * transcript says matches what happened even if a field changed meanwhile.
  */
 import { MAX_TIMEOUT_MS, throwIfAborted } from '../../core/util';
 import type { StopReason } from './conversation';
@@ -37,10 +39,30 @@ export function capReached(spentUsd: number, capUsd: number): boolean {
   return spentUsd > 0 && spentUsd >= capUsd;
 }
 
-/** Whether a stop phrase ends a turn's text: said anywhere in it. */
+/** What may follow the phrase at the very end: whitespace, sentence punctuation, closing quotes, Markdown emphasis. */
+const TRAILING = /[\s.!?,;:…*_~`"'”’»)]$/u;
+const WORD = /[\p{L}\p{N}]/u;
+
+/**
+ * Whether a message ends with the stop phrase, as the framing asks ("end your message with …"). Case does not
+ * matter; what may trail it (whitespace, punctuation, closing quotes, Markdown emphasis) is ignored; and a phrase
+ * that starts with a letter or digit must start a word ("done" ends "Well done." but not "undone"). A phrase only
+ * mentioned earlier in the message does not count.
+ */
 export function saysPhrase(text: string, stopPhrase: string): boolean {
-  const phrase = stopPhrase.trim();
-  return phrase.length > 0 && text.includes(phrase);
+  const phrase = stopPhrase.trim().toLowerCase();
+  if (!phrase) return false;
+  let rest = text.toLowerCase();
+  for (;;) {
+    if (rest.endsWith(phrase)) {
+      const before = rest.slice(0, rest.length - phrase.length);
+      const boundary =
+        !WORD.test(phrase.charAt(0)) || before === '' || !WORD.test(Array.from(before).at(-1)!);
+      if (boundary) return true;
+    }
+    if (!TRAILING.test(rest)) return false;
+    rest = rest.slice(0, -1);
+  }
 }
 
 /**
@@ -83,6 +105,8 @@ export interface LoopDeps {
    */
   takeTurn(signal: AbortSignal, timeUp: () => boolean): Promise<TurnResult>;
   pauseRequested(): boolean;
+  /** Calls `fn` whenever the limits change (the time limit re-arms its timer); returns the unsubscribe. */
+  onLimitsChange?(fn: () => void): () => void;
 }
 
 export type LoopMode = 'continue' | 'step';
@@ -92,6 +116,8 @@ export interface LoopEnd {
   reason: StopReason | null;
   /** Turns taken by this loop. */
   turns: number;
+  /** The limits that applied when the loop ended (what the end marker reports). */
+  limits: Limits;
 }
 
 export async function runLoop(
@@ -100,40 +126,56 @@ export async function runLoop(
   signal: AbortSignal,
 ): Promise<LoopEnd> {
   let taken = 0;
+  const end = (reason: StopReason | null, limits = deps.limits()): LoopEnd => ({
+    reason,
+    turns: taken,
+    limits,
+  });
   for (;;) {
     throwIfAborted(signal);
-    if (taken > 0 && (mode === 'step' || deps.pauseRequested()))
-      return { reason: null, turns: taken };
+    if (taken > 0 && (mode === 'step' || deps.pauseRequested())) return end(null);
     const estimate = await deps.estimateNext();
     throwIfAborted(signal);
     const limits = deps.limits();
-    const before = deps.progress();
-    const blocked = blockedBy(before, limits, estimate);
-    if (blocked) return { reason: blocked, turns: taken };
+    const blocked = blockedBy(deps.progress(), limits, estimate);
+    if (blocked) return end(blocked, limits);
 
     const turn = new AbortController();
     let timeUp = false;
-    const timer = setTimeout(
-      () => {
-        timeUp = true;
-        turn.abort(new DOMException('The time limit was reached.', 'AbortError'));
-      },
-      Math.min(MAX_TIMEOUT_MS, limits.timeMs - before.elapsedMs),
-    );
+    /** The limits the time-limit timer was last armed with. */
+    let armed = limits;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (): void => {
+      clearTimeout(timer);
+      armed = deps.limits();
+      const left = armed.timeMs - deps.progress().elapsedMs;
+      timer = setTimeout(
+        () => {
+          timeUp = true;
+          turn.abort(new DOMException('The time limit was reached.', 'AbortError'));
+        },
+        Math.max(0, Math.min(MAX_TIMEOUT_MS, left)),
+      );
+    };
+    arm();
+    const unsubscribe = deps.onLimitsChange?.(() => {
+      if (!timeUp) arm();
+    });
     let result: TurnResult;
     try {
       result = await deps.takeTurn(turn.signal, () => timeUp);
     } finally {
       clearTimeout(timer);
+      unsubscribe?.();
     }
     taken++;
 
+    if (result.status === 'cut') return end('time', armed);
     const now = deps.limits();
     const after = deps.progress();
-    if (result.status === 'cut') return { reason: 'time', turns: taken };
-    if (saysPhrase(result.content, now.stopPhrase)) return { reason: 'phrase', turns: taken };
-    if (capReached(after.spentUsd, now.costUsd)) return { reason: 'cost', turns: taken };
-    if (after.turns >= now.turns) return { reason: 'turns', turns: taken };
-    if (after.elapsedMs >= now.timeMs) return { reason: 'time', turns: taken };
+    if (saysPhrase(result.content, now.stopPhrase)) return end('phrase', now);
+    if (capReached(after.spentUsd, now.costUsd)) return end('cost', now);
+    if (after.turns >= now.turns) return end('turns', now);
+    if (after.elapsedMs >= now.timeMs) return end('time', now);
   }
 }

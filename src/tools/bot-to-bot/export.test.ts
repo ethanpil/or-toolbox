@@ -1,7 +1,8 @@
+import { marked } from 'marked';
 import { describe, expect, it } from 'vitest';
 import { type Conversation, createConversation } from './conversation';
 import { toJson, toMarkdown, totalsLine } from './export';
-import { clock, endText, initials, usageLine } from './format';
+import { endText, initials, usageLine } from './format';
 import type { Limits } from './loop';
 
 const LIMITS: Limits = { turns: 20, timeMs: 300_000, costUsd: 0.25, stopPhrase: '[END]' };
@@ -72,10 +73,10 @@ describe('Markdown transcript', () => {
         'No, because',
         '_(cut off by the time limit)_',
         '_m/b:free · 50 in · 3 out · free · 900 ms_',
-        '---',
-        '**Ended (Time limit).** Time limit reached (5 min).',
-        '---',
-        '_2 of 20 turns · 5 min of 5 min · $0.0004 of $0.25_',
+        '## Ended · Time limit',
+        'Time limit reached (5 min).',
+        '## Totals',
+        '2 of 20 turns · 5 min of 5 min · $0.0004 of $0.25',
       ].join('\n\n') + '\n',
     );
   });
@@ -158,17 +159,104 @@ describe('formatting', () => {
     expect(endText('stopped', details)).toBe('Stopped by you.');
   });
 
-  it('makes initials and clock times', () => {
+  it('makes initials', () => {
     expect(initials('Bot A')).toBe('BA');
     expect(initials('Sage')).toBe('Sa');
     expect(initials('  ')).toBe('?');
     expect(initials('élan vital')).toBe('ÉV');
-    expect(clock(0)).toBe('0:00');
-    expect(clock(65_000)).toBe('1:05');
-    expect(clock(3_725_000)).toBe('1:02:05');
+  });
+
+  it('does not call a $0 cap reached before anything was spent', () => {
+    const zero = { ...LIMITS, costUsd: 0 };
+    expect(endText('cost', { limits: zero, spentUsd: 0 })).toBe(
+      'Cost cap: the next turn could pass $0.00 ($0.00 spent).',
+    );
+    expect(endText('cost', { limits: zero, spentUsd: 0.01 })).toBe(
+      'Cost cap reached: $0.01 spent of $0.00.',
+    );
   });
 
   it('totals the conversation against its limits', () => {
     expect(totalsLine(sample(), LIMITS)).toBe('2 of 20 turns · 5 min of 5 min · $0.0004 of $0.25');
+  });
+});
+
+describe('turn text in the Markdown transcript', () => {
+  const withTurns = (...texts: string[]): Conversation => {
+    const conversation = sample();
+    conversation.entries = conversation.entries.slice(0, 1);
+    texts.forEach((content, index) => {
+      conversation.entries.push({
+        id: `t${index}`,
+        kind: 'bot',
+        speaker: index % 2 === 0 ? 'a' : 'b',
+        name: index % 2 === 0 ? 'Ada' : 'Bo',
+        model: 'm/a',
+        content,
+        status: 'done',
+        createdAt: index,
+      });
+    });
+    conversation.entries.push({
+      id: 'end',
+      kind: 'end',
+      reason: 'turns',
+      content: 'Turn limit reached (2 turns).',
+      createdAt: 9,
+    });
+    return conversation;
+  };
+  const headings = (markdown: string): string[] =>
+    marked
+      .lexer(markdown)
+      .filter((token) => token.type === 'heading')
+      .map((token) => (token as { text: string }).text);
+
+  it('closes a code fence a reply left open, so later turns, the end and the totals stay', () => {
+    const markdown = toMarkdown(
+      withTurns(['Here is code:', '', '```js', 'console.log(1);'].join('\n'), 'Second turn.'),
+      context,
+    );
+    expect(headings(markdown)).toEqual([
+      'Ada and Bo',
+      'Opening prompt',
+      'Ada · Turn 1',
+      'Bo · Turn 2',
+      'Ended · Turn limit',
+      'Totals',
+    ]);
+    expect(markdown).toContain('```js\nconsole.log(1);\n```');
+  });
+
+  it('keeps a closed fence as it is; a shorter fence does not close a longer one', () => {
+    const closed = ['```', '## in code', '```'].join('\n');
+    expect(toMarkdown(withTurns(closed, 'Two.'), context)).toContain(`${closed}\n\n_m/a_`);
+    const open = ['~~~~', '## not a heading', '~~~'].join('\n');
+    const markdown = toMarkdown(withTurns(open, 'Two.'), context);
+    expect(headings(markdown)).toContain('Bo · Turn 2');
+    expect(headings(markdown)).not.toContain('not a heading');
+    expect(markdown).toContain(`${open}\n~~~~`);
+  });
+
+  it('stops a reply from impersonating the transcript’s headings, rules and HTML blocks', () => {
+    const markdown = toMarkdown(
+      withTurns(
+        '## Ended · Stopped\nStopped by you.',
+        'Fake title\n---\n<!-- swallow the rest',
+        '# Totals\n***\n===',
+      ),
+      context,
+    );
+    expect(headings(markdown)).toEqual([
+      'Ada and Bo',
+      'Opening prompt',
+      'Ada · Turn 1',
+      'Bo · Turn 2',
+      'Ada · Turn 3',
+      'Ended · Turn limit',
+      'Totals',
+    ]);
+    expect(marked.lexer(markdown).filter((token) => token.type === 'hr')).toHaveLength(0);
+    expect(marked.lexer(markdown).filter((token) => token.type === 'html')).toHaveLength(0);
   });
 });

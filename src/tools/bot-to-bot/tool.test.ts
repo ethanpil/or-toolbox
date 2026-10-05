@@ -32,6 +32,7 @@ const CATALOG = [
   model('b/other', '0.000002'),
   model('f/free:free', '0'),
   model('g/also:free', '0'),
+  model('t/tiny', '0.000001', 1000),
 ];
 
 type StreamOptions = CallOptions & { onEvent: (event: ChatStreamEvent) => void };
@@ -293,7 +294,7 @@ describe('a conversation', () => {
       prompt: 'Is zero even?',
     });
     expect(run?.output).toContain('## Bot A · Turn 1\n\nBot A says 1');
-    expect(run?.output).toContain('**Ended (Turn limit).**');
+    expect(run?.output).toContain('## Ended · Turn limit\n\nTurn limit reached (4 turns).');
     await eventually(async () => {
       const conversation = await stored();
       expect(run?.groupId).toBe(conversation?.id);
@@ -451,10 +452,12 @@ describe('moderation', () => {
     const input = $<HTMLTextAreaElement>('moderator-input');
     input.value = 'Use an example.';
     $('moderator-send').click();
-    expect($$('moderator-message').map((el) => el.dataset['kind'])).toEqual([
-      'opener',
-      'moderator',
-    ]);
+    await vi.waitFor(() =>
+      expect($$('moderator-message').map((el) => el.dataset['kind'])).toEqual([
+        'opener',
+        'moderator',
+      ]),
+    );
     expect(input.value).toBe('');
 
     await t!.runners[0]!.trigger('step');
@@ -487,9 +490,11 @@ describe('moderation', () => {
     expect($$('conversation-end')).toHaveLength(0);
     expect($('turn-edited')).not.toBeNull();
     expect(document.activeElement).toBe($$('turn-edit', turns()[0])[0]);
-    expect($('bots-edit-toast').textContent).toContain('3 messages after it removed');
+    await vi.waitFor(() =>
+      expect($('bots-edit-toast').textContent).toContain('3 messages after it removed'),
+    );
 
-    $('toast-undo').click();
+    await pressUndo();
     await vi.waitFor(() => expect(turns()).toHaveLength(3));
     expect(turnTexts()[0]).toBe('Bot A says 1');
     expect($('conversation-end')).not.toBeNull();
@@ -498,14 +503,14 @@ describe('moderation', () => {
     $$('turn-edit', turns()[0])[0]!.click();
     $<HTMLTextAreaElement>('edit-input').value = 'Edited opening turn.';
     $('edit-save').click();
+    await vi.waitFor(() => expect(turnTexts()).toEqual(['Edited opening turn.']));
     await t!.runners[0]!.trigger('step');
     expect(speakerOf(bodies.at(-1)!)).toBe('Bot B');
     expect(bodies.at(-1)?.messages.slice(1)).toEqual([
       { role: 'user', content: '[Moderator] Is zero even?\n\n[Bot A] Edited opening turn.' },
     ]);
     // The conversation went on: the second edit's Undo is refused.
-    const undo = $$('toast-undo').at(-1)!;
-    undo.click();
+    await pressUndo();
     await vi.waitFor(() => expect($('undo-refused')).not.toBeNull());
   });
 
@@ -515,11 +520,12 @@ describe('moderation', () => {
     configure(tool, {});
     await t!.runners[0]!.trigger('step');
     $('bots-new').click();
-    expect($('bots-empty')).not.toBeNull();
+    await vi.waitFor(() => expect($('bots-empty')).not.toBeNull());
     expect($('bots-primary').textContent).toContain('Start');
     await eventually(async () => expect(await stored()).toBeNull());
-    $('toast-undo').click();
+    await pressUndo();
     await vi.waitFor(() => expect(turns()).toHaveLength(1));
+    expect(document.activeElement).toBe($('bots-primary'));
     await eventually(async () => expect((await stored())?.entries).toHaveLength(2));
   });
 });
@@ -528,7 +534,9 @@ describe('persistence', () => {
   it('comes back paused after a reload, with the opener and the totals', async () => {
     const { chatStream } = fakeStream();
     const tool = await mount({ chatStream });
-    configure(tool, { turnLimit: 6 }, 'Plan a picnic.');
+    configure(tool, {}, 'Plan a picnic.');
+    // Saved when the field changes (a loaded setup is not saved: see "loading a setup…").
+    setField('bots-turn-limit', '6', 'change');
     await t!.runners[0]!.trigger('step');
     await t!.runners[0]!.trigger('step');
     await settle();
@@ -591,5 +599,368 @@ describe('persistence', () => {
     );
     await t!.ctx.state.delete('conversation');
     await vi.waitFor(() => expect($('bots-empty')).not.toBeNull());
+  });
+});
+
+// --- review fixes (Stage 7, Phase A) ------------------------------------------------------------------------
+
+const LOCK = 'ortoolbox:bot-to-bot';
+
+/** A LockManager like the browser's: one holder per name; `ifAvailable` gets null while it is taken. */
+function installLocks(): Set<string> {
+  const held = new Set<string>();
+  const locks = {
+    request: async (
+      name: string,
+      options: { ifAvailable?: boolean },
+      callback: (lock: { name: string } | null) => unknown,
+    ): Promise<unknown> => {
+      if (held.has(name)) {
+        if (options.ifAvailable) return callback(null);
+        throw new Error('The fake LockManager does not queue.');
+      }
+      held.add(name);
+      try {
+        return await callback({ name });
+      } finally {
+        held.delete(name);
+      }
+    },
+  };
+  Object.defineProperty(navigator, 'locks', { value: locks, configurable: true });
+  return held;
+}
+afterEach(() => {
+  Reflect.deleteProperty(navigator, 'locks');
+});
+
+/** Types into a field: `input` (and `change` when asked), as the browser does. */
+function setField(testId: string, value: string, event: 'input' | 'change' = 'input'): void {
+  const field = $<HTMLInputElement | HTMLTextAreaElement>(testId);
+  field.value = value;
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  if (event === 'change') field.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+/**
+ * Presses the newest toast's Undo (once it is there: a change is stored before its toast shows) as a pointer
+ * does: focus moves to it first (jsdom's click() does not).
+ */
+async function pressUndo(): Promise<void> {
+  await vi.waitFor(() => expect($$('toast-undo').length).toBeGreaterThan(0));
+  const undo = $$('toast-undo').at(-1)!;
+  undo.focus();
+  undo.click();
+}
+
+const sendModerator = (text: string): void => {
+  setField('moderator-input', text);
+  $('moderator-send').click();
+};
+const moderatorTexts = (): string[] =>
+  $$('moderator-message').map((el) => ($$('turn-content', el)[0]?.textContent ?? '').trim());
+
+describe('review fixes: turns that fail', () => {
+  it('B1: an empty reply is a failed turn, once; the loop stops and says so', async () => {
+    // Bot B never says anything (a reasoning model that spends its whole budget thinking).
+    const { bodies, chatStream } = fakeStream((body, index) =>
+      index >= 2 ? '' : `${speakerOf(body)} says ${index}`,
+    );
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger();
+    // Asked once, not again and again until a limit.
+    expect(bodies).toHaveLength(2);
+    await vi.waitFor(() => expect($('turn-error')?.textContent).toContain('sent no text'));
+    expect($('turn-error').textContent).toContain('Max tokens');
+    expect(t!.status()).toMatch(/^Bot B's turn failed: Bot B sent no text/);
+    expect($('bots-state').textContent).toBe('Paused');
+    expect($$('error-toast')).toHaveLength(0);
+    expect((await runs())[0]?.status).toBe('error');
+
+    // Step reports the failure too, never "spoke".
+    await t!.runners[0]!.trigger('step');
+    expect(bodies).toHaveLength(3);
+    expect(t!.status()).not.toContain('spoke');
+  });
+
+  it('B2: a turn that may have gone through says so, and offers no Retry', async () => {
+    const chatStream = vi.fn(() => {
+      const error = new ApiError('Bad gateway', 502);
+      error.outcomeUnknown = true;
+      return Promise.reject(error);
+    });
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger();
+    await vi.waitFor(() =>
+      expect($('error-toast')?.textContent).toContain('may have gone through'),
+    );
+    expect($$('toast-retry')).toHaveLength(0);
+    const bubble = $('turn-error').textContent ?? '';
+    expect(bubble).toContain('may have gone through and been billed');
+    expect(bubble).toContain('OpenRouter activity');
+    expect(bubble).not.toContain('Resume to try again');
+    expect(t!.status()).toContain('may have gone through');
+  });
+
+  it('B8: a conversation too long for the model is refused before the run', async () => {
+    const { chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, { botA: { name: 'Bot A', model: 't/tiny', persona: '' } }, 'x'.repeat(4000));
+    await t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect($('error-toast')?.textContent).toContain('too long'));
+    expect(chatStream).not.toHaveBeenCalled();
+    expect(await runs()).toHaveLength(0);
+    expect(await stored()).toBeNull();
+    expect($('bots-empty')).not.toBeNull();
+  });
+});
+
+describe('review fixes: other tabs (B3)', () => {
+  it('refuses to change or run the conversation while another tab runs it', async () => {
+    const held = installLocks();
+    const { bodies, chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger('step');
+    await settle();
+    held.add(LOCK); // another tab started running it
+
+    sendModerator('From here');
+    await vi.waitFor(() => expect($('bots-other-tab')).not.toBeNull());
+    $$('turn-edit', turns()[0])[0]!.click();
+    setField('edit-input', 'Changed');
+    $('edit-save').click();
+    // Refused, the edit is not lost: the editor stays open with what was typed.
+    await vi.waitFor(() => expect($$('bots-other-tab')).toHaveLength(2));
+    expect($<HTMLTextAreaElement>('edit-input').value).toBe('Changed');
+    $('edit-cancel').click();
+    $('bots-new').click();
+    await vi.waitFor(() => expect($$('bots-other-tab')).toHaveLength(3));
+    await t!.runners[0]!.trigger();
+    await vi.waitFor(() =>
+      expect($('error-toast')?.textContent).toContain('running in another tab'),
+    );
+    await settle();
+    expect(moderatorTexts()).toEqual(['Is zero even?']);
+    expect(turnTexts()).toEqual(['Bot A says 1']);
+    expect((await stored())?.entries).toHaveLength(2);
+    expect(bodies).toHaveLength(1);
+
+    // Once that tab is done, this one may.
+    held.delete(LOCK);
+    sendModerator('From here');
+    await vi.waitFor(() => expect(moderatorTexts()).toEqual(['Is zero even?', 'From here']));
+  });
+
+  it('takes the newest stored version before it runs', async () => {
+    installLocks();
+    const { bodies, chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger('step');
+    await settle();
+    // Another tab wrote, and this tab never heard of it.
+    const newer = (await stored())!;
+    newer.entries.push({ id: 'm', kind: 'moderator', content: 'From the other tab', createdAt: 5 });
+    newer.rev += 1;
+    newer.writeId = 'other-tab';
+    await (
+      await getDb()
+    ).put('kv', {
+      key: 'tool:bot-to-bot:conversation',
+      value: JSON.parse(JSON.stringify(newer)) as unknown,
+      updatedAt: 5,
+    });
+    await t!.runners[0]!.trigger();
+    expect(moderatorTexts()).toEqual(['Is zero even?', 'From the other tab']);
+    expect(t!.status()).toContain('changed in another tab');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('follows another tab’s version with the same rev (a tie is not "older")', async () => {
+    const { chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger('step');
+    await settle();
+    const tie = (await stored())!;
+    tie.entries[1]!.content = 'Rewritten elsewhere';
+    tie.writeId = 'other-tab';
+    await t!.ctx.state.set('conversation', tie);
+    await vi.waitFor(() => expect(turnTexts()).toEqual(['Rewritten elsewhere']));
+  });
+
+  it('catches a change announced while its own write was still pending', async () => {
+    const { chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger('step');
+    await settle();
+    const store = t!.ctx.state;
+    const realSet = store.set.bind(store);
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    store.set = async <T>(key: string, value: T): Promise<void> => {
+      await realSet(key, value);
+      await gate;
+    };
+    sendModerator('Mine');
+    await eventually(async () => expect((await stored())?.entries.at(-1)?.content).toBe('Mine'));
+    const theirs = (await stored())!;
+    theirs.entries.push({ id: 'x', kind: 'moderator', content: 'Theirs', createdAt: 9 });
+    theirs.rev += 1;
+    theirs.writeId = 'other-tab';
+    await realSet('conversation', theirs);
+    store.set = realSet;
+    open();
+    await vi.waitFor(() => expect(moderatorTexts()).toEqual(['Is zero even?', 'Mine', 'Theirs']));
+  });
+});
+
+describe('review fixes: the form', () => {
+  it('B4: Ctrl+Enter runs with limits typed but not yet committed', async () => {
+    const { bodies, chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, { turnLimit: 20, maxTokens: 1000 });
+    setField('bots-turn-limit', '2');
+    setField('bots-max-tokens', '50');
+    await t!.runners[0]!.trigger();
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]?.max_tokens).toBe(50);
+    expect($('conversation-end').textContent).toContain('Turn limit reached (2 turns).');
+  });
+
+  it('B5: either bot saying the stop phrase at the end ends it; a mention does not', async () => {
+    const { bodies, chatStream } = fakeStream((body, index) =>
+      index === 1
+        ? 'Say [END] when we are done, agreed?'
+        : index === 3
+          ? 'Good talk. **[end]**'
+          : `${speakerOf(body)} says ${index}`,
+    );
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger();
+    expect(bodies).toHaveLength(3);
+    expect($('conversation-end').textContent).toContain('Bot A said [END].');
+  });
+
+  it('B7: loading a setup with another opener sets the conversation aside, with Undo', async () => {
+    const { chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger('step');
+    expect($('bots-opener-hint').textContent).toContain('New conversation');
+    // Reopening this conversation's own setup keeps it.
+    configure(tool, { turnLimit: 9 });
+    expect(turns()).toHaveLength(1);
+    // Another opener (History's Re-run, a saved prompt, the sample) starts afresh.
+    configure(tool, {}, 'A different topic');
+    await vi.waitFor(() => expect($('bots-empty')).not.toBeNull());
+    expect($('bots-primary').textContent).toContain('Start');
+    expect($('bots-opener-hint').textContent).not.toContain('New conversation');
+    await pressUndo();
+    await vi.waitFor(() => expect(turns()).toHaveLength(1));
+    expect(document.activeElement).toBe($('bots-primary'));
+  });
+
+  it('sweep #3: a loaded setup (sample, link) does not overwrite the saved bots', async () => {
+    const tool = await mount();
+    setField('bot-a-name', 'Mine', 'change');
+    expect((t!.ctx.options.get()['botA'] as { name: string }).name).toBe('Mine');
+    await tool.sample!();
+    expect((tool.getState().settings['botA'] as { name: string }).name).toBe('Sage');
+    expect((t!.ctx.options.get()['botA'] as { name: string }).name).toBe('Mine');
+    expect(t!.ctx.options.get()['turnLimit']).toBe(DEFAULT_LIMITS.turnLimit);
+  });
+
+  it('B9: Resume with an open, changed editor keeps the edit', async () => {
+    const { bodies, chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger('step');
+    $$('turn-edit', turns()[0])[0]!.click();
+    setField('edit-input', 'Half-typed edit');
+    await t!.runners[0]!.trigger('step');
+    expect(bodies).toHaveLength(1);
+    expect(t!.status()).toBe('Save or cancel your edit first.');
+    expect($<HTMLTextAreaElement>('edit-input').value).toBe('Half-typed edit');
+    expect(document.activeElement).toBe($('edit-input'));
+    // An editor left unchanged just closes.
+    $('edit-cancel').click();
+    $$('turn-edit', turns()[0])[0]!.click();
+    await t!.runners[0]!.trigger('step');
+    expect(bodies).toHaveLength(2);
+    expect($$('entry-editor')).toHaveLength(0);
+  });
+
+  it('B10: Undo of an edit puts focus on the restored turn', async () => {
+    const { chatStream } = fakeStream();
+    const tool = await mount({ chatStream });
+    configure(tool, { turnLimit: 2 });
+    await t!.runners[0]!.trigger();
+    $$('turn-edit', turns()[0])[0]!.click();
+    setField('edit-input', 'Edited');
+    $('edit-save').click();
+    await vi.waitFor(() => expect(turns()).toHaveLength(1));
+    await pressUndo();
+    await vi.waitFor(() => expect(turns()).toHaveLength(2));
+    expect(document.activeElement).toBe($$('turn-edit', turns()[0])[0]);
+  });
+});
+
+describe('review fixes: following the text (B12)', () => {
+  it('keeps the newest text in view after a big render, unless the reader scrolled up', async () => {
+    const { chatStream, release } = heldStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    // Steps: nothing else scrolls (a run's start does, at the user's press).
+    const first = t!.runners[0]!.trigger('step');
+    await vi.waitFor(() => expect(turnTexts()).toEqual(['Partial']));
+    const log = $('bots-log');
+    let height = 1000;
+    let top = 800;
+    Object.defineProperty(log, 'scrollHeight', { get: () => height, configurable: true });
+    Object.defineProperty(log, 'clientHeight', { get: () => 200, configurable: true });
+    Object.defineProperty(log, 'scrollTop', {
+      get: () => top,
+      set: (value: number) => {
+        top = value;
+      },
+      configurable: true,
+    });
+    log.dispatchEvent(new Event('scroll')); // the reader is at the bottom
+    height = 1600; // a render adds 600 px
+    await release();
+    await first;
+    expect(top).toBe(1600);
+
+    // Turn 2: the reader scrolls up to read; growth no longer moves them.
+    const second = t!.runners[0]!.trigger('step');
+    await vi.waitFor(() => expect(turnTexts()).toEqual(['Partialays 1', 'Partial']));
+    top = 100;
+    log.dispatchEvent(new Event('scroll'));
+    height = 2400;
+    await release();
+    await second;
+    expect(top).toBe(100);
+  });
+});
+
+describe('review fixes: data reset (sweep #1)', () => {
+  it('drops the conversation and never writes it back', async () => {
+    const { chatStream } = heldStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    const done = t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect(turnTexts()).toEqual(['Partial']));
+    await (await getDb()).clear('kv');
+    t!.core.bus.emit({ type: 'data-reset' });
+    await done;
+    await settle();
+    expect(await stored()).toBeNull();
+    expect($('bots-empty')).not.toBeNull();
   });
 });

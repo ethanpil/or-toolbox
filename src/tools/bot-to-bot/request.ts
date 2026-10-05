@@ -65,7 +65,11 @@ export interface ContextPart {
   tokens: number;
 }
 
-function part(entry: Entry, speaker: Speaker): ContextPart | null {
+function part(
+  entry: Entry,
+  speaker: Speaker,
+  bots?: Record<Speaker, BotProfile>,
+): ContextPart | null {
   if (entry.kind === 'opener' || entry.kind === 'moderator') {
     const text = entry.content;
     return {
@@ -78,7 +82,9 @@ function part(entry: Entry, speaker: Speaker): ContextPart | null {
   }
   if (!isSpoken(entry) || !entry.content.trim()) return null;
   const own = entry.speaker === speaker;
-  const label = own ? null : `[${entry.name ?? ''}]`;
+  // The other bot by its current name, as its framing names it (a rename applies to what came before).
+  const name = (entry.speaker && bots?.[entry.speaker].name) || entry.name || '';
+  const label = own ? null : `[${name}]`;
   return {
     role: own ? 'assistant' : 'user',
     label,
@@ -88,15 +94,19 @@ function part(entry: Entry, speaker: Speaker): ContextPart | null {
   };
 }
 
-/** The opening prompt's part and the parts after it, as `speaker` sees them (end markers and failures left out). */
+/**
+ * The opening prompt's part and the parts after it, as `speaker` sees them (end markers and failures left out).
+ * `bots` gives the current names for the labels; without it, the names the turns were spoken under.
+ */
 export function contextParts(
   entries: readonly Entry[],
   speaker: Speaker,
+  bots?: Record<Speaker, BotProfile>,
 ): { opener: ContextPart | null; rest: ContextPart[] } {
   let opener: ContextPart | null = null;
   const rest: ContextPart[] = [];
   for (const entry of entries) {
-    const next = part(entry, speaker);
+    const next = part(entry, speaker, bots);
     if (!next) continue;
     if (entry.kind === 'opener') opener = next;
     else rest.push(next);
@@ -181,7 +191,7 @@ export function buildTurn(
 ): BuiltTurn {
   const system = framing(speaker, options.bots, options.stopPhrase);
   const systemTokens = approxTokens(system) + MESSAGE_OVERHEAD;
-  const { opener, rest } = contextParts(conversation.entries, speaker);
+  const { opener, rest } = contextParts(conversation.entries, speaker, options.bots);
   const fixed = systemTokens + (opener?.tokens ?? 0);
   const cap =
     options.maxCompletionTokens && options.maxCompletionTokens > 0

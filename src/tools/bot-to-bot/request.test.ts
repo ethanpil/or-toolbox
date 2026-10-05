@@ -187,3 +187,23 @@ describe('trimming and max_tokens', () => {
     ).toBe(true);
   });
 });
+
+describe('renamed bots', () => {
+  it('labels the other bot’s turns with its current name, as the framing does', () => {
+    const conversation = conversationWith(
+      { ...turn('a', 'Yes.'), name: 'Old name' },
+      moderator('Go on.'),
+    );
+    const forB = buildTurn(conversation, 'b', options({ model: 'm/b' }));
+    expect(forB.body.messages.at(-1)).toEqual({
+      role: 'user',
+      content: '[Moderator] Is zero even?\n\n[Ada] Yes.\n\n[Moderator] Go on.',
+    });
+    expect(textOfFirst(forB)).toContain('in a conversation with Ada');
+  });
+});
+
+function textOfFirst(built: { body: { messages: { content: unknown }[] } }): string {
+  const content = built.body.messages[0]?.content;
+  return typeof content === 'string' ? content : '';
+}
