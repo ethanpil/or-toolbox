@@ -10,6 +10,7 @@ function sampleRound(): Round {
       models: ['a/one', 'b/two'],
       system: 'Be brief.',
       temperature: 0.2,
+      maxTokens: null,
       blind: true,
       pdfEngine: 'cloudflare-ai',
     },
@@ -45,6 +46,33 @@ function sampleRound(): Round {
 const name = (id: string): string => (id === 'a/one' ? 'One' : 'Two');
 
 describe('round export', () => {
+  it('closes a code fence an answer left open, so the rest of the export stays readable', () => {
+    const round = sampleRound();
+    Object.assign(round.entries[0]!, {
+      status: 'stopped',
+      text: 'Here:\n\n````ts\nconst a = 1;\n```\nstill inside',
+    });
+    Object.assign(round.entries[1]!, {
+      status: 'done',
+      text: 'Fine\n~~~\ncode',
+      finishReason: 'length',
+    });
+    const markdown = roundMarkdown(round, name);
+    expect(markdown).toContain('```\nstill inside\n````\n\n_(stopped)_');
+    expect(markdown).toContain('~~~\ncode\n~~~\n\n_(cut off at the length limit)_');
+    // Every fence is closed: the vote is not swallowed into a code block.
+    const fences = markdown.split('\n').filter((line) => /^(`{3,}|~{3,})/.test(line));
+    expect(fences).toHaveLength(5); // ```` ``` ```` (one closed by us), ~~~ ~~~
+    expect(markdown.endsWith('## Vote\n\nModel B (One) won.\n')).toBe(true);
+  });
+
+  it('marks an answer cut off at the length limit in JSON', () => {
+    const round = sampleRound();
+    round.entries[0]!.finishReason = 'length';
+    expect(roundJson(round).contenders[1]).toMatchObject({ model: 'a/one', cutOff: true });
+    expect(roundJson(round).contenders[0]).toMatchObject({ model: 'b/two', cutOff: false });
+  });
+
   it('writes Markdown in panel order with metrics and the vote', () => {
     expect(roundMarkdown(sampleRound(), name)).toBe(
       [

@@ -22,6 +22,7 @@
  * their bytes stay in memory (rule 3). A `?model=` visit (History's "Re-run with another model") puts that
  * model in place of the contender whose run was opened (contender 1 without a run).
  */
+import type { WireUsage } from '../../core/api/types';
 import {
   ACCEPT_ATTRIBUTE,
   type AttachmentRef,
@@ -38,7 +39,7 @@ import { webLocks } from '../../core/jobs/index';
 import { isPdfEngineId, PDF_ENGINES, pdfEngine } from '../../core/models/pdf-engines';
 import { paidAddons } from '../../core/runs/addons';
 import type { ModelInfo, RunAddon, RunHandle, UsageTotals } from '../../core/types';
-import { debounce } from '../../core/util';
+import { debounce, isFiniteNumber } from '../../core/util';
 import { attachmentChip } from '../../ui/components/attachment-chip';
 import { emptyState } from '../../ui/components/empty-state';
 import { exportMenu } from '../../ui/components/export-menu';
@@ -54,7 +55,13 @@ import { uid } from '../../ui/id';
 import { retryGate } from '../../ui/tool/retry-gate';
 import type { SendItem, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
 import { roundJson, roundMarkdown } from './export';
-import { type ArenaInput, type ContenderRequest, contenderRequest } from './request';
+import {
+  type ArenaInput,
+  type ContenderRequest,
+  contenderRequest,
+  fitOutput,
+  inputTokens,
+} from './request';
 import {
   type ArenaSettings,
   canVote,
@@ -63,8 +70,10 @@ import {
   defaultContenders,
   type Entry,
   type EntryUsage,
+  exportReady,
   hasAnswer,
   MAX_CONTENDERS,
+  MAX_TOKENS_LIMIT,
   MIN_CONTENDERS,
   newRound,
   panelLabel,
@@ -81,7 +90,7 @@ import {
   type Naming,
   panelView,
   type PanelView,
-  tallyTable,
+  tallyView,
   voteBar,
 } from './view';
 
@@ -166,8 +175,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     const runId = new URLSearchParams(location.search).get('run');
     const record = runId ? await ctx.history.get(runId).catch(() => undefined) : undefined;
     pendingOverride = { target: record?.tool === ctx.manifest.id ? record.model : null };
-    // Without a round of this tool to reopen, no applyState follows: replace contender 1 now.
-    if (!record || record.tool !== ctx.manifest.id) applyOverride();
+    // Without a round of this tool to reopen, no applyState follows: replace contender 1 now, and keep it like
+    // any other form change (applyState saves the reopened round the same way).
+    if (!record || record.tool !== ctx.manifest.id) {
+      applyOverride();
+      saveForm();
+    }
   }
 
   function applyOverride(): void {
@@ -282,7 +295,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   );
 
   // --- settings drawer ----------------------------------------------------------------------------------
-  const drawerIds = { system: uid('system'), temperature: uid('temperature'), engine: uid('pdf') };
+  const drawerIds = {
+    system: uid('system'),
+    temperature: uid('temperature'),
+    maxTokens: uid('max-tokens'),
+    engine: uid('pdf'),
+  };
   const blindSwitch = switchField({
     label: 'Blind voting',
     help: 'Answers are shuffled and shown as Model A to D. Names and costs show after you vote.',
@@ -325,6 +343,29 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       saveForm();
     },
   });
+  const maxTokensInput = h('input', {
+    id: drawerIds.maxTokens,
+    type: 'number',
+    class: 'form-control',
+    min: '1',
+    max: String(MAX_TOKENS_LIMIT),
+    step: '1',
+    placeholder: 'Model default',
+    inputMode: 'numeric',
+    'data-testid': 'arena-max-tokens',
+    onchange: () => {
+      const raw = maxTokensInput.value.trim();
+      const value = raw === '' ? null : Number(raw);
+      form.maxTokens =
+        value === null || !Number.isFinite(value)
+          ? null
+          : Math.min(MAX_TOKENS_LIMIT, Math.max(1, Math.round(value)));
+      maxTokensInput.value = form.maxTokens === null ? '' : String(form.maxTokens);
+      saveForm();
+      renderContenders();
+      void ui.refreshEstimate();
+    },
+  });
   ui.drawer.append(
     blindSwitch.element,
     h(
@@ -336,10 +377,24 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     ),
     h(
       'div',
-      null,
-      h('label', { class: 'form-label', htmlFor: drawerIds.temperature }, 'Temperature'),
-      temperatureInput,
-      h('div', { class: 'form-text' }, '0 to 2. Empty uses each model’s default.'),
+      { class: 'row g-3' },
+      h(
+        'div',
+        { class: 'col-6' },
+        h('label', { class: 'form-label', htmlFor: drawerIds.temperature }, 'Temperature'),
+        temperatureInput,
+      ),
+      h(
+        'div',
+        { class: 'col-6' },
+        h('label', { class: 'form-label', htmlFor: drawerIds.maxTokens }, 'Max tokens'),
+        maxTokensInput,
+      ),
+      h(
+        'div',
+        { class: 'col-12 form-text mt-1' },
+        'Temperature 0 to 2. Max tokens caps each answer (and what the estimate assumes). Empty uses each model’s default.',
+      ),
     ),
   );
   const engineHint = h('div', { id: `${drawerIds.engine}-hint`, class: 'form-text' });
@@ -426,12 +481,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     'data-testid': 'arena-vote',
   });
   const compareTitleId = uid('compare-title');
-  const compareBody = h('div');
+  const compareView = comparisonTable(naming);
   const compareArea = h(
     'section',
     { hidden: true, 'aria-labelledby': compareTitleId, 'data-testid': 'arena-compare' },
     h('h3', { id: compareTitleId, class: 'h6' }, 'Side by side'),
-    compareBody,
+    compareView.element,
   );
   const tallyTitleId = uid('tally-title');
   const tallyTitle = h(
@@ -439,7 +494,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     { id: tallyTitleId, class: 'h6 mb-0 or-arena-heading', tabIndex: -1 },
     'Your votes',
   );
-  const tallyBody = h('div');
+  const tallyTableView = tallyView(naming);
   const resetButton = h(
     'button',
     {
@@ -460,7 +515,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       tallyTitle,
       h('div', { class: 'ms-auto' }, resetButton),
     ),
-    tallyBody,
+    tallyTableView.element,
   );
   ui.output.append(
     h(
@@ -476,17 +531,19 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   );
 
   // --- rendering ------------------------------------------------------------------------------------------
+  /** The form's input as it is now; a round takes it once, when Compare is pressed. */
   const input = (): ArenaInput => ({
     prompt: promptInput.value.trim(),
     system: form.system,
     temperature: form.temperature,
+    maxTokens: form.maxTokens,
     pdfEngine: form.pdfEngine,
-    attachments: files,
+    attachments: [...files],
     data: (id) => session.get(id),
   });
 
-  /** What stops a model from running this input, or null. */
-  function problemFor(model: string, request?: ContenderRequest): string | null {
+  /** What stops a model from running this input (`promptTokens` counted once for all), or null. */
+  function problemFor(model: string, promptTokens: number): string | null {
     const info = catalog.get(model);
     if (ctx.settings.get().freeOnly && !ctx.models.isFree(model)) {
       return 'Not free, and free-only mode is on';
@@ -496,7 +553,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         session.has(id),
       );
       if (missing) return `This model ${MISSING_INPUT[missing]}`;
-      if ((request ?? contenderRequest(model, info, input())).tooLong) {
+      if (fitOutput(promptTokens, info, form.maxTokens).tooLong) {
         return 'The prompt and files are too long for this model';
       }
     }
@@ -505,6 +562,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
 
   function renderContenders(): void {
     const count = form.models.length;
+    const promptTokens = inputTokens(input());
     contenderCount.textContent = `${count} of ${MAX_CONTENDERS}`;
     contenderCount.setAttribute('aria-label', `${count} of at most ${MAX_CONTENDERS}`);
     replace(
@@ -512,7 +570,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       form.models.map((model, index) => {
         const name = naming.name(model);
         const info = catalog.get(model);
-        const problem = problemFor(model);
+        const problem = problemFor(model, promptTokens);
         return h(
           'li',
           {
@@ -626,6 +684,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     blindSwitch.input.checked = form.blind;
     systemArea.value = form.system;
     temperatureInput.value = form.temperature === null ? '' : String(form.temperature);
+    maxTokensInput.value = form.maxTokens === null ? '' : String(form.maxTokens);
     engineSelect.value = form.pdfEngine;
     renderEngineHint();
     renderContenders();
@@ -665,15 +724,19 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     const round = live.round;
     for (const panel of live.panels) panel.update();
     roundTitle.textContent = `Round of ${plural(round.entries.length, 'model')}${round.settings.blind ? ' · blind' : ''}`;
-    menu.update({ disabled: !round.revealed });
-    exportHint.textContent = round.revealed ? '' : 'Vote or reveal to export';
-    replace(compareBody, comparisonTable(round, naming));
+    menu.update({ disabled: !exportReady(round) });
+    exportHint.textContent = exportReady(round)
+      ? ''
+      : round.revealed
+        ? 'Export when every answer is in'
+        : 'Vote or reveal to export';
+    compareView.update(round);
     renderVote();
   };
 
   const renderTally = (): void => {
     resetButton.hidden = isEmptyTally(tally);
-    replace(tallyBody, tallyTable(tally, naming));
+    tallyTableView.update(tally);
   };
 
   /** Puts a new round on screen: its panels in panel order. */
@@ -700,24 +763,32 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   }
 
   // --- runs -----------------------------------------------------------------------------------------------
-  const usageOf = (totals: UsageTotals): EntryUsage | undefined =>
-    totals.requests === 0
-      ? undefined
-      : {
-          promptTokens: totals.promptTokens,
-          completionTokens: totals.completionTokens,
-          costUsd: totals.costUsd,
-          costEstimated: totals.costEstimated,
-          costUnknown: totals.costUnknown,
-        };
+  /**
+   * The cost from the run's totals; the token counts only from the stream's own usage chunk (`wire`): without
+   * one (a stopped or cut stream) the client books zeros, which are unknown here, not 0.
+   */
+  const usageOf = (totals: UsageTotals, wire: WireUsage | null): EntryUsage | undefined => {
+    if (totals.requests === 0 && !wire) return undefined;
+    const count = (value: unknown): number | null => (isFiniteNumber(value) ? value : null);
+    const reasoning = wire?.completion_tokens_details?.reasoning_tokens;
+    return {
+      promptTokens: count(wire?.prompt_tokens),
+      completionTokens: count(wire?.completion_tokens),
+      ...(isFiniteNumber(reasoning) ? { reasoningTokens: reasoning } : {}),
+      costUsd: totals.costUsd,
+      costEstimated: totals.costEstimated,
+      costUnknown: totals.costUnknown,
+    };
+  };
 
   /** Plans `models` on `source` (the form, or a round's own input); throws what refuses it before anything. */
   async function plan(models: readonly string[], source: ArenaInput): Promise<Planned[]> {
     const problems: string[] = [];
     const paid: string[] = [];
+    const promptTokens = inputTokens(source);
     const planned = models.map((model): Planned => {
       const info = catalog.get(model);
-      const request = contenderRequest(model, info, source);
+      const request = contenderRequest(model, info, source, promptTokens);
       const name = naming.name(model);
       const missing = info
         ? missingInput(source.attachments, info.inputModalities, source.pdfEngine, (id) =>
@@ -774,6 +845,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       status: 'streaming',
       text: '',
       thinking: false,
+      reasoned: false,
       runId: run.id,
     } satisfies Partial<Entry>);
     delete entry.error;
@@ -782,7 +854,10 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     delete entry.endedAt;
     delete entry.usage;
     delete entry.servedModel;
+    delete entry.finishReason;
     const md = panel?.begin();
+    /** The stream's usage chunk, when one arrives. */
+    const seen: { usage: WireUsage | null } = { usage: null };
     entry.startedAt = now();
     panel?.update();
     try {
@@ -797,10 +872,13 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
             if (first) panel?.update();
           } else if (event.type === 'reasoning' && event.text) {
             entry.firstTokenAt ??= now();
+            entry.reasoned = true;
             if (!entry.thinking && !entry.text) {
               entry.thinking = true;
               panel?.update();
             }
+          } else if (event.type === 'usage') {
+            seen.usage = event.usage;
           } else if (event.type === 'meta' && event.model && event.model !== entry.model) {
             entry.servedModel = event.model;
           }
@@ -816,14 +894,13 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       }
       entry.finishReason = answer.finishReason;
       entry.status = 'done';
-      entry.usage = usageOf(run.totals);
-      // The answer is in; a failure to record it is shown, but does not turn it into a failed answer.
-      await run
-        .finish({ output: entry.text, meta: { panel: panelLabel(panelOf(round, index)) } })
-        .catch((error: unknown) => void presentError(error));
+      entry.usage = usageOf(run.totals, seen.usage ?? answer.usage);
+      // The answer is in; a failure to record it is shown, but does not turn it into a failed answer. No panel
+      // letter goes to History: it would tell which model a blind panel was before the vote.
+      await run.finish({ output: entry.text }).catch((error: unknown) => void presentError(error));
     } catch (error) {
       entry.endedAt ??= now();
-      const usage = usageOf(run.totals);
+      const usage = usageOf(run.totals, seen.usage);
       if (usage) entry.usage = usage;
       if (isStop(error)) {
         entry.status = 'stopped';
@@ -865,16 +942,19 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   }
 
   async function startRound(signal: AbortSignal): Promise<void> {
+    // The round is what the form says now: planning and a budget dialog take time, and a file dropped or a
+    // setting changed meanwhile belongs to the next round, not to this one (or its Retry).
     const source = input();
-    if (!source.prompt && files.length === 0) {
+    const settings: ArenaSettings = { ...form, models: [...form.models] };
+    const snapshot = getState();
+    const roundFiles = [...source.attachments];
+    if (!source.prompt && roundFiles.length === 0) {
       ui.status('Write a prompt or attach a file first.');
       promptInput.focus();
       return;
     }
-    const models = [...form.models];
+    const models = settings.models;
     const planned = await plan(models, source);
-    const settings: ArenaSettings = { ...form, models };
-    const snapshot = getState();
     const id = crypto.randomUUID();
     // Every contender's run is begun before any request goes out: one budget dialog for the group, and a round
     // refused as a whole changes nothing on the page.
@@ -898,7 +978,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       throw (begun[0] as PromiseRejectedResult).reason;
     }
 
-    const roundFiles = [...files];
     const round = newRound({
       id,
       prompt: source.prompt,
@@ -948,33 +1027,44 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       prompt: round.prompt,
       system: round.settings.system,
       temperature: round.settings.temperature,
+      maxTokens: round.settings.maxTokens,
       pdfEngine: round.settings.pdfEngine,
       attachments: current.files,
       data: (id) => session.get(id),
     };
-    const [planned] = await plan([entry.model], source);
-    const run = await ctx.beginRun(
-      {
-        model: planned!.model,
-        estimateUsd: planned!.estimate,
-        addons: planned!.addons,
-        prompt: round.prompt,
-        settings: { ...round.settings, models: [...round.settings.models] },
-        groupId: round.id,
-      },
-      signal,
-    );
-    const label = panelLabel(panelOf(round, index));
-    ui.status(`Running ${label} again.`);
-    await stream(round, index, run, planned!);
-    const after = round.entries[index]!;
-    ui.status(
-      signal.aborted
-        ? 'Stopped. The partial answer is kept.'
-        : after.status === 'done'
-          ? `${label} answered.${canVote(round) ? ' Voting is open.' : ''}`
-          : `${label} failed again.`,
-    );
+    // From the press until it settles (planning and a budget dialog included) the round takes no vote and no
+    // export: the panel is about to change, and a vote now would reveal the names before it streams.
+    round.retrying = index;
+    renderRound();
+    try {
+      const [planned] = await plan([entry.model], source);
+      const run = await ctx.beginRun(
+        {
+          model: planned!.model,
+          estimateUsd: planned!.estimate,
+          addons: planned!.addons,
+          prompt: round.prompt,
+          settings: { ...round.settings, models: [...round.settings.models] },
+          groupId: round.id,
+        },
+        signal,
+      );
+      const label = panelLabel(panelOf(round, index));
+      ui.status(`Running ${label} again.`);
+      await stream(round, index, run, planned!);
+      const after = round.entries[index]!;
+      delete round.retrying;
+      ui.status(
+        signal.aborted
+          ? 'Stopped. The partial answer is kept.'
+          : after.status === 'done'
+            ? `${label} answered.${canVote(round) ? ' Voting is open.' : ''}`
+            : `${label} failed again.`,
+      );
+    } finally {
+      delete round.retrying;
+      if (live?.round === round) renderRound();
+    }
   }
 
   const runner = ui.runner<RunArg>({
@@ -1189,6 +1279,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         models: [...form.models],
         system: form.system,
         temperature: form.temperature,
+        maxTokens: form.maxTokens,
         blind: form.blind,
         pdfEngine: form.pdfEngine,
       },
@@ -1215,19 +1306,20 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     applyState,
     // The sum over the contenders, each on its own request (context limits and output caps differ).
     estimate: async () => {
-      const source = input();
+      // The prompt counts the same for every contender: once, then each model's own limits.
+      const promptTokens = inputTokens(input());
       const costs = await Promise.all(
-        form.models.map((model) => {
-          const request = contenderRequest(model, catalog.get(model), source);
-          return ctx.models
+        form.models.map((model) =>
+          ctx.models
             .estimate({
               kind: 'tokens',
               model,
-              promptTokens: request.promptTokens,
-              completionTokens: request.completionTokens,
+              promptTokens,
+              completionTokens: fitOutput(promptTokens, catalog.get(model), form.maxTokens)
+                .completionTokens,
             })
-            .catch(() => null);
-        }),
+            .catch(() => null),
+        ),
       );
       return costs.some((cost) => cost === null)
         ? null

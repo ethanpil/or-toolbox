@@ -21,6 +21,8 @@ export interface ArenaSettings {
   models: string[];
   system: string;
   temperature: number | null;
+  /** Sent as `max_tokens` (clamped per model) and assumed by estimates; null = each model's default. */
+  maxTokens: number | null;
   blind: boolean;
   pdfEngine: PdfEngineId;
 }
@@ -28,9 +30,13 @@ export interface ArenaSettings {
 export const DEFAULT_SETTINGS: Readonly<Omit<ArenaSettings, 'models'>> = {
   system: '',
   temperature: null,
+  maxTokens: null,
   blind: true,
   pdfEngine: 'cloudflare-ai',
 };
+
+/** The largest Max tokens the form takes (as Chat). */
+export const MAX_TOKENS_LIMIT = 10_000_000;
 
 const isModelList = (value: unknown): value is string[] =>
   Array.isArray(value) &&
@@ -41,6 +47,10 @@ const isModelList = (value: unknown): value is string[] =>
 const isTemperature = (value: unknown): value is number | null =>
   value === null || (isFiniteNumber(value) && value >= 0 && value <= 2);
 
+const isMaxTokens = (value: unknown): value is number | null =>
+  value === null ||
+  (Number.isInteger(value) && Number(value) >= 1 && Number(value) <= MAX_TOKENS_LIMIT);
+
 /**
  * `base` with every valid field of `raw` applied (saved options, a snapshot from Prompts or History). Fields that
  * are missing or invalid keep `base`'s value, so older or damaged snapshots never break the form.
@@ -50,6 +60,7 @@ export function settingsFrom(raw: Record<string, unknown>, base: ArenaSettings):
     models: isModelList(raw['models']) ? [...raw['models']] : [...base.models],
     system: isString(raw['system']) ? raw['system'] : base.system,
     temperature: isTemperature(raw['temperature']) ? raw['temperature'] : base.temperature,
+    maxTokens: isMaxTokens(raw['maxTokens']) ? raw['maxTokens'] : base.maxTokens,
     blind: typeof raw['blind'] === 'boolean' ? raw['blind'] : base.blind,
     pdfEngine: isPdfEngineId(raw['pdfEngine']) ? raw['pdfEngine'] : base.pdfEngine,
   };
@@ -92,8 +103,11 @@ export function defaultContenders(
 export type EntryStatus = 'waiting' | 'streaming' | 'done' | 'stopped' | 'error';
 
 export interface EntryUsage {
-  promptTokens: number;
-  completionTokens: number;
+  /** From the stream's usage chunk; null when none arrived (a stopped or cut stream): unknown, not 0. */
+  promptTokens: number | null;
+  completionTokens: number | null;
+  /** Reasoning tokens counted in `completionTokens` (`completion_tokens_details.reasoning_tokens`). */
+  reasoningTokens?: number;
   costUsd: number;
   costEstimated: boolean;
   costUnknown: boolean;
@@ -108,6 +122,8 @@ export interface Entry {
   text: string;
   /** Reasoning arrived before any text (shown as "Thinking…"). */
   thinking?: boolean;
+  /** Some reasoning streamed (so the time after the first token includes it). */
+  reasoned?: boolean;
   /** A user-safe message (status `error`). */
   error?: string;
   /** The request may have gone through and been billed (`isOutcomeUnknown`). */
@@ -140,6 +156,8 @@ export interface Round {
   vote: Vote | null;
   /** Names and costs are shown: blind off, or after a vote or "Reveal without voting". */
   revealed: boolean;
+  /** The entry a Retry is running again, from the press (planning, the budget dialog) until it settles. */
+  retrying?: number;
   /** Wall clock, for the export. */
   startedAt: number;
 }
@@ -195,6 +213,13 @@ export const hasAnswer = (entry: Entry): boolean =>
 
 export const roundSettled = (round: Round): boolean => round.entries.every(isSettled);
 
+/** The answer ended at the length limit (Max tokens, or the model's own cap). */
+export const cutOff = (entry: Entry): boolean =>
+  entry.status === 'done' && entry.finishReason === 'length';
+
+/** Every answer is in: all settled, and no Retry pending (a retried panel is about to change). */
+export const allIn = (round: Round): boolean => roundSettled(round) && round.retrying === undefined;
+
 /**
  * The round still takes a vote: none cast, and in a blind round the names are still hidden (a vote after "Reveal
  * without voting" would not be blind any more).
@@ -202,9 +227,12 @@ export const roundSettled = (round: Round): boolean => round.entries.every(isSet
 export const openForVote = (round: Round): boolean =>
   round.vote === null && (!round.settings.blind || !round.revealed);
 
-/** Voting opens once every contender has settled and at least one answered; one vote per round. */
+/** Voting opens once every answer is in and at least one answered; one vote per round. */
 export const canVote = (round: Round): boolean =>
-  openForVote(round) && roundSettled(round) && round.entries.some(hasAnswer);
+  openForVote(round) && allIn(round) && round.entries.some(hasAnswer);
+
+/** Export once the names show and every answer is in (a half-streamed round is not a result yet). */
+export const exportReady = (round: Round): boolean => round.revealed && allIn(round);
 
 /** Records `vote` (a winner must have answered) and reveals the names. False when the vote is not allowed. */
 export function castVote(round: Round, vote: Vote): boolean {
@@ -223,13 +251,47 @@ export function reveal(round: Round): void {
   round.revealed = true;
 }
 
+/** Shorter terms are left alone: they would match too much of an ordinary message. */
+const MIN_TERM_LENGTH = 3;
+
 /**
- * `text` with the model's id and display name replaced by "this model", for a blind panel's error message
- * (provider errors often name the model).
+ * Every way an error message may name a model: its id (`qwen/qwen3.8-27b:free`), the id without its variant, the
+ * id's last segment with and without the variant, its provider segment; the display name
+ * (`Qwen: Qwen3.8 27B (free)`) without the "(free)" suffix, without the provider prefix, and the prefix itself.
  */
-export function anonymize(text: string, names: readonly string[]): string {
+export function blindTerms(model: string, name: string): string[] {
+  const terms = new Set<string>();
+  const add = (term: string | undefined): void => {
+    const clean = term?.trim();
+    if (clean && clean.length >= MIN_TERM_LENGTH) terms.add(clean);
+  };
+  const bare = model.split(':')[0] ?? model;
+  const [provider, ...rest] = bare.split('/');
+  for (const id of [model, bare]) {
+    add(id);
+    add(id.slice(id.lastIndexOf('/') + 1));
+  }
+  if (rest.length > 0) add(provider);
+  const unsuffixed = name.replace(/\s*\(free\)\s*$/i, '');
+  const prefix = /^([^:]+):\s*(.+)$/.exec(unsuffixed);
+  for (const value of [name, unsuffixed, prefix?.[2], prefix?.[1]]) add(value);
+  if (prefix) add(name.slice(name.indexOf(':') + 1));
+  return [...terms];
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * `text` with every term replaced by "this model", ignoring case and only as whole words (longest first), for a
+ * blind panel's error message: provider errors often name the model. Use `blindTerms()` for the terms.
+ */
+export function anonymize(text: string, terms: readonly string[]): string {
   let out = text;
-  for (const name of names) if (name.trim()) out = out.split(name).join('this model');
+  const sorted = terms.filter((term) => term.trim()).sort((a, b) => b.length - a.length);
+  for (const term of sorted) {
+    const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(term)}(?![\\p{L}\\p{N}])`, 'giu');
+    out = out.replace(pattern, 'this model');
+  }
   return out;
 }
 
@@ -262,14 +324,19 @@ export function metricsOf(entry: Entry): Metrics {
       : null;
   const generationMs =
     firstTokenAt !== undefined && endedAt !== undefined ? endedAt - firstTokenAt : null;
-  const completionTokens = usage ? usage.completionTokens : null;
+  const completionTokens = usage?.completionTokens ?? null;
+  // Reasoning that never streamed happened before the first token: the count includes it, the time does not.
+  const hiddenReasoning = (usage?.reasoningTokens ?? 0) > 0 && entry.reasoned !== true;
   return {
     ttftMs,
     totalMs,
-    promptTokens: usage ? usage.promptTokens : null,
+    promptTokens: usage?.promptTokens ?? null,
     completionTokens,
     tokensPerSecond:
-      completionTokens && generationMs !== null && generationMs >= MIN_GENERATION_MS
+      completionTokens &&
+      !hiddenReasoning &&
+      generationMs !== null &&
+      generationMs >= MIN_GENERATION_MS
         ? completionTokens / (generationMs / 1000)
         : null,
     costUsd: usage && !usage.costUnknown ? usage.costUsd : null,
@@ -286,17 +353,21 @@ export interface SummaryRow {
   cheapest: boolean;
 }
 
-/** The lowest value's holders among `values` (null skipped), when at least two values compare. */
+/**
+ * The lowest value's holders among `values` (null skipped), when at least two values compare and they are not
+ * all the same (a full tie marks nobody: two free models are not both "cheapest").
+ */
 function lowest(values: readonly (number | null)[]): Set<number> {
   const known = values.filter((value): value is number => value !== null);
   if (known.length < 2) return new Set();
   const min = Math.min(...known);
+  if (known.every((value) => value === min)) return new Set();
   return new Set(values.flatMap((value, index) => (value === min ? [index] : [])));
 }
 
 /**
  * The comparison table in panel order. Fastest is the lowest total time, cheapest the lowest known cost, both
- * among finished answers only and only when at least two compare (ties mark all of them).
+ * among finished answers only and only when at least two compare (a shared lowest marks each; a full tie none).
  */
 export function summary(round: Round): SummaryRow[] {
   const rows = round.order.map((index, panel) => {

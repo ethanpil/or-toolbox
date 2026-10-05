@@ -15,7 +15,14 @@ function round(models: string[], answered: boolean[]): Round {
   const r = newRound({
     id: 'r',
     prompt: 'Q',
-    settings: { models, system: '', temperature: null, blind: false, pdfEngine: 'cloudflare-ai' },
+    settings: {
+      models,
+      system: '',
+      temperature: null,
+      maxTokens: null,
+      blind: false,
+      pdfEngine: 'cloudflare-ai',
+    },
     attachments: [],
     startedAt: 0,
   });
