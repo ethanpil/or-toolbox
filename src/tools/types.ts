@@ -61,4 +61,12 @@ export interface ToolManifest {
   lazyLibs: string[];
   /** Tool-level defaults: the bottom of the cascade run → tool → capability → global. */
   defaults: Record<string, unknown>;
+  /**
+   * True for a tool that chooses its models inside the tool (Model arena's contenders, Bot-to-bot's two bots) and
+   * so shows no single model: its header has no model chip and no free-only substitution note (Run is still
+   * disabled when free-only leaves it no model at all), and Settings → Tools offers no model picker for it. The
+   * primary capability's model (the tool binding, else the capability default) is then only where a new setup
+   * starts; `?model=` still arrives as `ctx.modelOverride` and the tool decides what it means. Default false.
+   */
+  ownModels?: boolean;
 }

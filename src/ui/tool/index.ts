@@ -49,12 +49,6 @@ export type * from './types';
 export interface MountToolOptions {
   /** `'required'` for tools that need multi-threaded ffmpeg (Video studio). */
   isolation?: 'required';
-  /**
-   * `false` for a tool that chooses its models itself (Model arena's contenders): the header shows no model chip
-   * and no free-only substitution note for it. `?model=` still reaches the tool as `ctx.modelOverride`, and Run is
-   * still disabled when free-only mode leaves the primary capability without a model.
-   */
-  modelChip?: false;
 }
 
 /** URL parameters the framework consumes; removed from the address bar once applied (except `model`). */
@@ -73,7 +67,7 @@ export function mountTool(
       header: false,
       ...(options.isolation ? { isolation: options.isolation } : {}),
     },
-    ({ core, main }) => buildTool(core, main, manifest, setup, options.modelChip !== false),
+    ({ core, main }) => buildTool(core, main, manifest, setup),
   );
 }
 
@@ -82,8 +76,11 @@ async function buildTool(
   main: HTMLElement,
   manifest: ToolManifest,
   setup: ToolSetup,
-  showModelChip: boolean,
 ): Promise<void> {
+  // A tool that chooses its models itself (`manifest.ownModels`) has no model chip and no substitution note for
+  // the primary model; `?model=` still reaches it as `ctx.modelOverride`, and Run is still disabled when
+  // free-only mode leaves it no model at all.
+  const showModelChip = manifest.ownModels !== true;
   const params = new URLSearchParams(location.search);
   let modelOverride = params.get('model');
   const primary: Capability = manifest.capabilities[0]!;

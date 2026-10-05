@@ -13,9 +13,31 @@ import { announce } from '../../ui/feedback/announce';
 import { presentError } from '../../ui/feedback/errors';
 import { icon } from '../../ui/icon';
 import { setToolBinding } from '../../ui/settings-actions';
-import { toolUrl } from '../../ui/shell/links';
+import { settingsUrl, toolUrl } from '../../ui/shell/links';
 import { capabilityDefault } from './logic';
 import { card, rerender, type SectionView } from './ui';
+
+/**
+ * The Model cell of a tool that chooses its models inside the tool (`manifest.ownModels`: Model arena, Bot-to-bot).
+ * It has no header chip to pin one model and nothing here to pin it with either; `model` (a binding saved earlier,
+ * else the default for the tool's capability) is only where a new setup starts, and Reset still clears the binding.
+ */
+function ownModelsCell(model: string): HTMLElement {
+  return h(
+    'div',
+    { class: 'small', 'data-testid': 'tool-model', 'data-own-models': '' },
+    h('span', { class: 'text-body-secondary' }, 'Chosen inside the tool'),
+    h(
+      'span',
+      { class: 'd-block text-body-secondary' },
+      'New setups start from ',
+      h('span', { class: 'font-monospace text-break' }, model),
+      '. Change that in ',
+      h('a', { href: settingsUrl('models') }, 'Default models'),
+      '.',
+    ),
+  );
+}
 
 export function toolsSection(core: CoreServices): SectionView {
   const body = h('tbody');
@@ -88,43 +110,45 @@ export function toolsSection(core: CoreServices): SectionView {
       h(
         'td',
         { class: 'or-tool-model' },
-        h(
-          'div',
-          { class: 'd-flex align-items-center gap-2' },
-          h(
-            'div',
-            { class: 'min-w-0 flex-grow-1', 'data-testid': 'tool-model' },
-            model
-              ? h('span', { class: 'font-monospace small text-break' }, model)
-              : h(
-                  'span',
-                  { class: 'small' },
-                  h(
-                    'span',
-                    { class: 'text-body-secondary' },
-                    `Default for ${CAPABILITY_INFO[capability].title.toLowerCase()}`,
-                  ),
-                  h(
-                    'span',
-                    { class: 'd-block font-monospace text-body-secondary text-break' },
-                    fallback,
-                  ),
-                ),
-          ),
-          h(
-            'button',
-            {
-              type: 'button',
-              class: 'btn btn-sm btn-outline-secondary text-nowrap',
-              'aria-label': `Choose the model for ${tool.name}`,
-              'data-testid': 'tool-model-change',
-              'data-focus-key': `tool:${tool.id}:model`,
-              onclick: () =>
-                void chooseModel(tool).catch((error: unknown) => void presentError(error)),
-            },
-            'Change',
-          ),
-        ),
+        tool.ownModels
+          ? ownModelsCell(model ?? fallback)
+          : h(
+              'div',
+              { class: 'd-flex align-items-center gap-2' },
+              h(
+                'div',
+                { class: 'min-w-0 flex-grow-1', 'data-testid': 'tool-model' },
+                model
+                  ? h('span', { class: 'font-monospace small text-break' }, model)
+                  : h(
+                      'span',
+                      { class: 'small' },
+                      h(
+                        'span',
+                        { class: 'text-body-secondary' },
+                        `Default for ${CAPABILITY_INFO[capability].title.toLowerCase()}`,
+                      ),
+                      h(
+                        'span',
+                        { class: 'd-block font-monospace text-body-secondary text-break' },
+                        fallback,
+                      ),
+                    ),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'btn btn-sm btn-outline-secondary text-nowrap',
+                  'aria-label': `Choose the model for ${tool.name}`,
+                  'data-testid': 'tool-model-change',
+                  'data-focus-key': `tool:${tool.id}:model`,
+                  onclick: () =>
+                    void chooseModel(tool).catch((error: unknown) => void presentError(error)),
+                },
+                'Change',
+              ),
+            ),
       ),
       h(
         'td',
@@ -153,7 +177,7 @@ export function toolsSection(core: CoreServices): SectionView {
     {
       title: 'Key and model per tool',
       icon: 'tools',
-      text: 'Pin a key or a model to one tool; everything else follows the defaults. A tool’s own model chip sets the same thing.',
+      text: 'Pin a key or a model to one tool; everything else follows the defaults. A tool’s own model chip sets the same thing. Tools that choose their own models (Bot-to-bot, Model arena) have no chip and no model to pin here.',
       testId: 'tool-bindings',
     },
     dataTable({

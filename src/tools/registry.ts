@@ -56,6 +56,11 @@ const FIELDS: FieldCheck[] = [
   ],
 ];
 
+/** Fields a manifest may leave out. */
+const OPTIONAL_FIELDS: FieldCheck[] = [
+  ['ownModels', (v) => typeof v === 'boolean', 'true or false'],
+];
+
 /**
  * Checks a manifest against `ToolManifest`. A wrong manifest is a programming
  * error, so this throws at page start (and in the unit tests) rather than
@@ -75,7 +80,11 @@ export function validateManifest(folder: string, manifest: unknown): ToolManifes
     if (!valid(record[key]))
       fail(`"${key}" must be ${expected}, got ${JSON.stringify(record[key])}`);
   }
-  const known = new Set<string>(FIELDS.map(([key]) => key));
+  for (const [key, valid, expected] of OPTIONAL_FIELDS) {
+    if (key in record && !valid(record[key]))
+      fail(`"${key}" must be ${expected}, got ${JSON.stringify(record[key])}`);
+  }
+  const known = new Set<string>([...FIELDS, ...OPTIONAL_FIELDS].map(([key]) => key));
   for (const key of Object.keys(record)) {
     if (!known.has(key)) fail(`unknown field "${key}"`);
   }

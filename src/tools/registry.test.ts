@@ -42,6 +42,13 @@ describe('tool registry', () => {
       expect(Object.hasOwn(icons, tool.icon), `${tool.id}: ${tool.icon}`).toBe(true);
   });
 
+  it('marks the tools that choose their own models', () => {
+    expect(tools.filter((tool) => tool.ownModels === true).map((tool) => tool.id)).toEqual([
+      'bot-to-bot',
+      'model-arena',
+    ]);
+  });
+
   it('only names lazy libraries that are installed', () => {
     const dependencies = Object.keys(pkg.dependencies);
     for (const tool of tools) {
@@ -72,10 +79,18 @@ describe('validateManifest', () => {
     [{ usesJobs: 'no' }, /"usesJobs" must be true or false/],
     [{ lazyLibs: [1] }, /"lazyLibs" must be a list/],
     [{ defaults: [] }, /"defaults" must be an object/],
+    [{ ownModels: 'yes' }, /"ownModels" must be true or false/],
     [{ entry: './main.ts' }, /unknown field "entry"/],
   ])('rejects %o', (changes, message) => {
     expect(broken(changes)).toThrow(message);
     expect(broken(changes)).toThrow(/^src\/tools\/ocr\/manifest\.json: /);
+  });
+
+  it('takes ownModels as an optional flag', () => {
+    expect(validateManifest('ocr', { ...VALID, ownModels: true })).toMatchObject({
+      ownModels: true,
+    });
+    expect(VALID.ownModels).toBeUndefined();
   });
 
   it('rejects missing fields and non-objects', () => {
