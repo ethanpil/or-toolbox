@@ -108,6 +108,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- The sticky Run bar no longer covers a control focused by Tab when the page scrolls smoothly to it: the framework checks again once the scroll ends (fe6d291).
 - Reset everything can no longer be undone by a tool-state write already on its way: the guard runs inside each write's transaction against a reset generation that Reset bumps while it wipes; Bot-to-bot's extra delete is gone (2271fcd).
 - Model arena: a round asks one budget question for its total and starts all or none (`beginAll`; a declined dialog sends nothing); first token and total are timed from `onSend`; blind errors use `failureText` (no 402/429 or name differences); costs through `formatRunCost`; files through `attachmentIntake`; context fit from `src/core/tokens.ts`; the tally through `ctx.state.update` (3bbe92e).
 - Decision: a badge now agrees with the number beside it (Yes/No confidence float noise; no "100%" for 0.9999999995), an id typed with a trailing space finds its answer, a list you emptied stays empty, and the context check no longer refuses long prose that fits (2bdff81).

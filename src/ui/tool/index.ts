@@ -522,11 +522,30 @@ function reserveRunnerSpace(bar: HTMLElement): void {
       behavior: 'instant',
     });
   };
+  // A focus scroll is smooth (Bootstrap's `scroll-behavior: smooth` unless motion is reduced): one frame after
+  // focusin the control may still be on its way up from below the bar, so it is checked again once scrolling
+  // settles (`scrollend`, or a timeout where the event is missing or no scroll happens).
+  let cancelSettle: (() => void) | null = null;
+  const whenSettled = (check: () => void): void => {
+    cancelSettle?.();
+    const run = (): void => {
+      cancelSettle?.();
+      check();
+    };
+    const timer = window.setTimeout(run, 700);
+    window.addEventListener('scrollend', run);
+    cancelSettle = () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('scrollend', run);
+      cancelSettle = null;
+    };
+  };
   document.addEventListener('focusin', (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement) || bar.contains(target)) return;
-    // The browser's own focus scroll comes after focusin: check once it has happened.
+    // The browser's own focus scroll comes after focusin: check once it has happened, and again when it ends.
     requestAnimationFrame(() => uncover(target));
+    whenSettled(() => uncover(target));
   });
 }
 

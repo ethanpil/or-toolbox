@@ -240,9 +240,22 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
   let checked = 0;
   for (let step = 0; step < 40; step++) {
     await page.keyboard.press('Tab');
-    // The browser scrolls the focused control into view on the next frames; judge what the user then sees.
+    // The browser scrolls the focused control into view (smoothly unless motion is reduced), and the page
+    // corrects what the bar still covers once that scroll ends: judge what the user sees when it has settled.
     await page.evaluate(
-      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      () =>
+        new Promise<void>((resolve) => {
+          let last = scrollY;
+          let still = 0;
+          const tick = (): void => {
+            still = scrollY === last ? still + 1 : 0;
+            last = scrollY;
+            if (still >= 8) resolve();
+            else requestAnimationFrame(tick);
+          };
+          // Without `scrollend` the page re-checks on a 700 ms timer instead.
+          setTimeout(() => requestAnimationFrame(tick), 'onscrollend' in window ? 0 : 750);
+        }),
     );
     const state = await page.evaluate(() => {
       const active = document.activeElement as HTMLElement | null;
