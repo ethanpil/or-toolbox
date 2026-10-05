@@ -44,7 +44,7 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | Member | What it is |
 | --- | --- |
 | `manifest` | Your manifest. |
-| `state` | `ToolStateStore` for this tool (IndexedDB `kv`): JSON-safe, persistent, e.g. saved deciders or a video sequence. Never binaries. Every `set` and `delete` emits `{ type: 'tool-state-changed', tool, key }` on `ctx.bus`, in this tab and the others: a page showing stored values stays in step with `ctx.bus.on('tool-state-changed', (e) => e.tool === ctx.manifest.id && reread(e.key))` (your own writes arrive too). |
+| `state` | `ToolStateStore` for this tool (IndexedDB `kv`): JSON-safe, persistent, e.g. saved deciders or a video sequence. Never binaries. Every `set` and `delete` emits `{ type: 'tool-state-changed', tool, key }` on `ctx.bus`, in this tab and the others, and so do Reset everything, Delete all prompts and history and a backup import for every key they remove or write: a page showing stored values stays in step with `ctx.bus.on('tool-state-changed', (e) => e.tool === ctx.manifest.id && reread(e.key))` (your own writes arrive too). See Stored state below for `update` and resets. |
 | `options` | `{ get(), set(patch), reset() }`: `manifest.defaults` merged with the user's saved options (`settings.tools[id].options`). `set` stores only what you pass. |
 | `ui` | The zones and helpers below. |
 | `model(cap?)` | `ResolvedModel` for a capability (default: the primary one, `capabilities[0]`), with free-only applied. `model === null` means nothing may run; for the primary capability the framework already shows the notice and disables Run. See Models per capability. |
@@ -100,9 +100,54 @@ try {
 
 Outside the runner (reading a dropped file, an export, a button of your own), catch and call `presentError(error)` yourself; never show the same error twice and never `console.error` it away.
 
-`beginRun` (via `runs.begin`) refuses before anything is sent: no key (`no-key`), locked keys (`locked`), free-only with a paid model (`free-only`), a hard budget (`budget-blocked`). In Warn mode, or above the per-run threshold, the shell's **budget confirmation** opens by itself (one dialog for parallel runs of one `groupId`); Cancel throws `RunCancelledError`. You never handle any of this yourself: throw, and the rule above applies.
+`beginRun` (via `runs.begin`) refuses before anything is sent: no key (`no-key`), locked keys (`locked`), free-only with a paid model (`free-only`), a hard budget (`budget-blocked`). In Warn mode, or above the per-run threshold, the shell's **budget confirmation** opens by itself; Cancel throws `RunCancelledError`. You never handle any of this yourself: throw, and the rule above applies. Runs that belong together (arena contenders, the steps of a sequence) ask ONE question for the group instead: see Groups of runs.
 
 Long runs: `run.checkpoint({ output })` persists partial text (bot transcripts, batches), throttled to one write per interval. Pass `output` as a function (`run.checkpoint({ output: () => combined() })`) when building the text is costly: it is called only when a write actually happens (and once more by `finish()` without an output). Parallel runs of one action share a `groupId` (arena contenders). A run that calls several models lists them in `models` so free-only checks them all.
+
+A run stopped before it sent anything (Stop during the free-model wait, a step paused before its request) books nothing: History keeps it as stopped, Stats count no run. A run that failed with an error still counts as one error run.
+
+### Groups of runs: one budget question
+
+Several runs that the user starts with one action are checked and confirmed once, for their **total**: the key and the lock once, free-only across all their models and paid add-ons, the budgets against the total estimate (add-ons included), and one dialog that names the group (your label, its models, the total, an optional note). Each run still reserves its own estimate when it begins, and a hard (monthly) block still refuses it.
+
+**Runs that start together** (Model arena's contenders): `ctx.runs.beginAll(specs, { label, signal })` approves them as one group and begins them all, or none. When one is refused (Cancel, a block, the signal), the ones already begun are withdrawn: no record, no reservation, nothing sent or booked, and the refusal is thrown as `beginRun` would. Fill each spec as `ctx.beginRun` would (`tool`, `model`, `estimateUsd`, `addons`, `prompt` and `settings` from `getState()`); they share `specs[0].groupId`.
+
+```ts
+const snapshot = getState();
+const runs = await ctx.runs.beginAll(
+  planned.map((p) => ({
+    tool: ctx.manifest.id,
+    model: p.model,
+    estimateUsd: p.estimate,
+    addons: p.addons,
+    prompt: snapshot.prompt,
+    settings: snapshot.settings,
+    groupId: roundId,
+  })),
+  { label: `Model arena round: ${plural(planned.length, 'model')}`, signal },
+);
+// Only now change the page (Refused runs change nothing); then stream into each run.
+```
+
+**Runs that start over time** (a video sequence's steps, possibly after a reload or in another tab): approve once at Start, then begin each step with `useGroupApproval`:
+
+```ts
+await ctx.runs.approveGroup({            // throws like beginRun; RunCancelledError when declined
+  tool: ctx.manifest.id,
+  groupId: sequence.id,
+  label: `Video sequence: ${plural(steps, 'clip')}`,
+  models: [model],
+  runs: steps,                            // how many runs it covers
+  estimateUsd: total,                     // the whole group's estimate (null = unknown)
+  note: 'Spend cap $2.00: it stops before a step would pass it.',
+});
+// …later, for each step (no dialog while the approval has room for it):
+await ctx.beginRun({ estimateUsd: step, groupId: sequence.id, useGroupApproval: true }, signal);
+// A re-run outside the plan leaves useGroupApproval out: it asks for itself.
+await ctx.runs.releaseGroup(sequence.id); // when the group is done with (New sequence)
+```
+
+The approval is stored (IndexedDB `kv`), so it holds in every tab and after a reload until `releaseGroup`, a new approval of the same group id or a data reset. It covers at most `runs` runs, together within the approved total when that is known, on the approved key and models; a run beyond that asks for itself. A run that ends having sent nothing gives its share back. Groups on free models only need no approval and store none.
 
 ### Refused runs change nothing
 
@@ -211,6 +256,13 @@ await ctx.api.chatStream(body, { run, onEvent: (e) => e.type === 'text' && strea
 await stream.finish();
 ```
 
+To time a request ("first token", "total"), start the clock in `onSend(attempt)`, which every call takes (`CallOptions`): it fires right before each attempt is actually sent, after the free-model throttle's wait and after a retry's backoff, so neither counts as the model's time.
+
+```ts
+let sentAt = 0;
+await ctx.api.chatStream(body, { run, onSend: () => (sentAt = performance.now()), onEvent });
+```
+
 `chatStream` resolves with the assembled `ChatStreamResult`. Its `annotations` (present only when some came) are the streamed `delta.annotations`: for a PDF sent through the `file-parser` plugin, `{ type: 'file', file: { name, content } }` with the parser's text. Keep that text and send it on later turns instead of the PDF (no upload, no parsing, no parser charge), as Chat does.
 
 ## Cost estimates
@@ -220,6 +272,17 @@ Give the instance an `estimate(model)` hook and call `ctx.ui.refreshEstimate()` 
 ```ts
 estimate: (model) =>
   ctx.models.estimate({ kind: 'tokens', model, promptTokens: approxTokens(text.value), completionTokens: maxTokens }),
+```
+
+Count tokens with `src/core/tokens.ts`, the one approximation every tool uses (never a copy): `approxTokens(text)` (deliberately high and structure-aware: digits and punctuation weigh more than letters, so JSON and code are not under-counted), `MESSAGE_OVERHEAD` per message, `DEFAULT_OUTPUT_TOKENS`, and the context fit for chat-style requests:
+
+```ts
+const limits = { context: info.contextLength, maxTokens, maxCompletionTokens: info.maxCompletionTokens, fixed: systemTokens };
+const trimmed = trimOldest(tokens, promptBudget(limits));        // what may be sent besides `fixed`
+const fit = fitContext({ ...limits, prompt: keptTokens });       // { budget, tooLong, room, completionTokens, maxTokens }
+if (fit.tooLong) throw new InvalidInputError('This is too long for the model’s context window.');
+body.max_tokens = fit.maxTokens ?? undefined;                    // null: Max tokens not set, leave it out
+// estimate with completionTokens: fit.completionTokens
 ```
 
 The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it), and `ctx.beginRun` without `estimateUsd` always computes it afresh for the input as it is at that moment (so a paste followed by Ctrl+Enter, before your debounced `refreshEstimate`, books the right amount); only a value set with `ui.setEstimate` is booked as is. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
@@ -301,6 +364,15 @@ ctx.jobs.subscribe((record) => {
 **Completion is not download.** Return `usage: { costUsd }` with `succeeded` (metadata and cost only): the core books it on the run before the job turns final, so a download that fails later still counts. Download the content separately, with its own retries; when it cannot happen any more (retention), mark the result expired: the cost is already booked. Read `failureKind` on a failed job: `'remote'` (the provider failed, usually free) or `'gave-up'` (the core stopped asking: poll failures, a 404 after retention, a missing key; it may still be billed, and the reservation is booked). Notifications are opt-in: `jobs.add({ …, notify: true })`, or `'group'` for one per group. A deliberate "Stop waiting" ends the run with `run.cancel(reason)` (aborted, not an error).
 
 Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`. Work that only lives in this page until a later step (a sequence being assembled, parts not yet joined) is protected with `ui.holdWork(description)`. Handed-off runs do not count for the leave guard: the job carries on without the page.
+
+## Stored state
+
+`ctx.state` keeps JSON in IndexedDB. Rules for a value several tabs (or a tab and its own late writes) change:
+
+- **Read-modify-write with `update`.** `ctx.state.update(key, (current) => next)` runs under the Web Lock `ortoolbox:tool-state:<tool>:<key>`, so two tabs never lose each other's change (a vote tally, a list of saved items). Return `current` itself to write nothing, `undefined` to delete; it resolves with the stored value. It waits only for other `update`s of the key, so write such a key through `update` alone.
+- **Re-read on `tool-state-changed`** and show what is stored (see the context table). A data reset, "Delete all prompts and history" and a backup import announce every key they touch, so a page that follows the event shows them.
+- **A reset is final.** After Reset everything (in any tab), the store refuses (`StateResetError`, shown as "reload the page") to store a value from before it: a key this page read or wrote before the reset and has not read since, or an object it read or stored before. So the abort a reset causes cannot write the old conversation back. Deletes, new keys and values built after a fresh read are stored. To go on in an open page after a reset, drop what you hold on `data-reset` (`ctx.bus.on('data-reset', …)`) and read again.
+- **Locks of your own** come from `src/core/util.ts`: `withLock(name, fn)` for a short locked step (Web Lock plus an in-page queue, where Web Locks are missing too), `holdLock(name, { ifAvailable })` for a lock held as long as something lives (it resolves with the release, or null when another tab holds it). Name them `ortoolbox:<tool>:…`.
 
 ## Prompts, History and the form state
 

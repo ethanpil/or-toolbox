@@ -70,6 +70,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Group budget approvals: `runs.approveGroup()`/`releaseGroup()`, `RunSpec.useGroupApproval` and all-or-none `runs.beginAll()`; the budget dialog names a group with its models and total; Video studio approves its sequences through them (e7660ec).
+- A run stopped before it sent anything books no stats row (e7660ec).
+- `ToolStateStore.update()` under a per-key Web Lock; `webLocks()`, `withLock()` and `holdLock()` in `core/util` (85b2086).
+- `CallOptions.onSend` fires right before each request is sent, after throttle and retry waits (5f9cbea).
+- One token module, `src/core/tokens.ts`: `approxTokens` counts digits and punctuation higher (JSON and code), plus `fitContext()`, `promptBudget()` and `outputTokens()`; Chat uses them (5259647).
 - `trimMedia` takes `fadeOut` and `bitrate` for audio cuts (da8b7b9).
 - Image estimates treat a zero catalog price as unknown, not free (f6af99d).
 - Video estimates take an `images` count and add per-image input prices (`cents_per_image_input`) (e7aaee5).
@@ -95,6 +100,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Stage 7 review, core: a group of runs is checked against its total, and its dialog no longer shows only the first member's estimate (e7660ec); an open page can no longer undo Reset everything by writing its old state back, and open tools re-read their state after a reset, Delete all or a backup import (ff3f29e).
 - Video joins stay within what the browser can allocate (`MAX_JOIN_BYTES`); a result button no longer subscribes again on every redraw (5680493).
 - Stage 6 review, Video studio: a sequence asks one budget question at Start for its total (steps run without dialogs of their own); form edits reach the stored run field by field (no stale form overwrites another tab's cap) and are flushed before Resume and Re-run; Pause, Stop and the cap stop a step that is starting; maybe-billed steps count against the cap ("≈"); clip placement and step completion are one idempotent update, re-runs are attempts, stale chained takes are marked; a lost clip to continue or lost step images pause with choices instead of a text-only send; polling no longer downloads, an expired clip is marked; no blind Retry after a request that may have been sent; the History record is the form as pressed; trims, seed, reorder, join and frame grabber focus and feedback; the frame grabber uses the clip's own frame rate.
 - Stage 5 review, Isolated image: JPGs keep at least 24 px of white and their decoded border is part of the QA; the automatic threshold reads the lightest border population (a pale product can no longer lower it to its own value; an unreadable background is flagged); despeckle removes only compact specks (thin lines, threads and beads stay); a replayed Retry skips photos already made; results finishing after a pattern change get the new name; the review's margin and Previous/Next stay in step; focus and announcements (dab4103, a4cf3b0).
