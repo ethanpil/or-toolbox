@@ -38,6 +38,16 @@ export function createToolContext(parts: ContextParts): ToolContext {
   const model = (capability?: Capability): ResolvedModel =>
     resolveFor(core, manifest, parts.modelOverride(), capability);
 
+  /** The tool's estimate for the current input on `model`; null when it has none or it fails (unknown). */
+  const estimateFor = async (chosen: string): Promise<number | null> => {
+    try {
+      const usd = await parts.instance()?.estimate?.(chosen);
+      return typeof usd === 'number' && Number.isFinite(usd) && usd >= 0 ? usd : null;
+    } catch {
+      return null;
+    }
+  };
+
   const options: ToolOptions = {
     get: () => core.settings.toolOptions(manifest),
     set(patch) {
@@ -74,13 +84,14 @@ export function createToolContext(parts: ContextParts): ToolContext {
       const prompt = spec.prompt ?? snapshot?.prompt;
       const settings = spec.settings ?? snapshot?.settings;
       // The framework's estimate (recomputed if the model or the input changed since) is what budgets reserve,
-      // unless the tool passes its own. It only applies to the model it was computed for.
+      // unless the tool passes its own. For another model than the header's, the tool's hook computes it for
+      // that model (null without a hook: unknown).
       const estimateUsd =
         spec.estimateUsd !== undefined
           ? spec.estimateUsd
           : chosen === resolved.model
             ? await estimates.current()
-            : null;
+            : await estimateFor(chosen);
       const addons = spec.addons ?? parts.instance()?.addons?.() ?? [];
       const handle = await core.runs.begin({
         ...spec,
