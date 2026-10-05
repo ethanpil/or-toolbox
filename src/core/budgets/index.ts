@@ -12,6 +12,8 @@
 import type { BudgetCheck, BudgetReason, BudgetsService, CoreServices } from '../types';
 import { getDb } from '../storage/db';
 import { utcMonthRange } from '../stats';
+import { RUN_HOLD_PREFIX, holdOf, parseHold, type RunHold } from '../runs/holds';
+import { prefixRange } from '../tool-state';
 
 /** `$0.18`; amounts under a cent keep two significant digits (`$0.0042`). */
 export function formatUsd(value: number): string {
@@ -34,20 +36,48 @@ interface MonthSpend {
   byKey: Map<string, number>;
 }
 
+/**
+ * What every `running` run holds, read from the small `kv` holds the runs service keeps beside its records (never
+ * the records themselves, which carry up to 500 KB of output each). The running ids come from the `status` index
+ * (keys only); a running record without a hold (written before holds existed) is read once, and a hold whose run
+ * is no longer running is ignored.
+ */
+async function readHolds(): Promise<RunHold[]> {
+  const db = await getDb();
+  const tx = db.transaction(['runs', 'kv']);
+  const [ids, entries] = await Promise.all([
+    tx.objectStore('runs').index('status').getAllKeys('running'),
+    tx.objectStore('kv').getAll(prefixRange(RUN_HOLD_PREFIX)),
+  ]);
+  const byId = new Map<string, RunHold>();
+  for (const entry of entries) {
+    const hold = parseHold(entry.value);
+    if (hold) byId.set(entry.key.slice(RUN_HOLD_PREFIX.length), hold);
+  }
+  const holds: RunHold[] = [];
+  for (const id of ids) {
+    const hold = byId.get(id);
+    if (hold) {
+      holds.push(hold);
+      continue;
+    }
+    const run = await tx.objectStore('runs').get(id);
+    if (run?.status === 'running') holds.push(holdOf(run));
+  }
+  return holds;
+}
+
 export function createBudgetsService(core: CoreServices): BudgetsService {
   /** Finished spend this month plus running runs' holds, overall and per key. */
   const readSpend = async (): Promise<MonthSpend> => {
-    const [rows, running] = await Promise.all([
-      core.stats.rows(utcMonthRange()),
-      getDb().then((db) => db.getAllFromIndex('runs', 'status', 'running')),
-    ]);
+    const [rows, holds] = await Promise.all([core.stats.rows(utcMonthRange()), readHolds()]);
     const spend: MonthSpend = { total: 0, byKey: new Map() };
     const add = (keyId: string, usd: number): void => {
       spend.total += usd;
       spend.byKey.set(keyId, (spend.byKey.get(keyId) ?? 0) + usd);
     };
     for (const row of rows) add(row.keyId, row.costUsd);
-    for (const run of running) add(run.keyId, Math.max(run.reservedUsd || 0, run.usage.costUsd));
+    for (const hold of holds) add(hold.keyId, hold.usd);
     return spend;
   };
 

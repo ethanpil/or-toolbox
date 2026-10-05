@@ -502,7 +502,6 @@ export interface RunHandle {
   /** The job this run was handed off to (`handOff`), or null. A handed-off run is no longer the page's to lose. */
   readonly jobId: string | null;
   onUsage(fn: (totals: UsageTotals) => void): () => void;
-  /** Persist partial text output during long runs (bot transcripts, batches). */
   /**
    * Persists partial output (throttled: at most one write per interval, the latest wins). Pass `output` as a
    * function to build long text only when a write actually happens; it is also read once more by `finish()`
@@ -526,6 +525,14 @@ export interface RunHandle {
    * job's completion handler calls `runs.reattach(id)` and finishes it. Call right after the job is queued.
    */
   handOff(jobId: string): void;
+  /**
+   * The API client calls this right before each request leaves, and waits: it stores that a request is in flight
+   * (`RunRecord.inFlight`), so a run whose page dies before the answer is booked as an unknown cost (its
+   * reservation), never as "sent nothing". The returned function ends the mark; the client calls it once the
+   * request's usage is reported, or once it was answered without a cost. A run ended with a request still in flight
+   * books an unknown cost. Tools never call it.
+   */
+  sending(): Promise<() => void>;
 }
 
 /** What a budget confirmation asks about: one run (`runs.begin`), or a group at once (`runs.approveGroup`). */
@@ -714,6 +721,11 @@ export interface RunRecord {
   reservedUsd: number;
   /** Job id after `handOff()`; such runs are finalized by the job, never by unload or the sweep. */
   jobId: string | null;
+  /**
+   * Requests sent and not yet answered (`RunHandle.sending`), as last stored. An orphan with one in flight books an
+   * unknown cost. Absent on records stored before it existed.
+   */
+  inFlight?: number;
   meta: Record<string, unknown>;
   starred: boolean;
   groupId: string | null;
@@ -872,6 +884,11 @@ export interface JobHandler<P = unknown, R = unknown> {
   poll(job: JobRecord<P, R>, signal: AbortSignal): Promise<JobPollResult<R>>;
   /** Poll interval; default 5000 ms with gentle backoff on errors. */
   intervalMs?: number | ((job: JobRecord<P, R>) => number);
+  /**
+   * A job still running this long after it was added is given up (`gave-up`, its run books its reservation), so a
+   * remote status that never ends cannot keep it polling forever. Default `MAX_JOB_AGE_MS` (3 hours).
+   */
+  maxAgeMs?: number;
 }
 
 export interface JobsService {

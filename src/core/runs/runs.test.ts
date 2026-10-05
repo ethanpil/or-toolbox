@@ -171,6 +171,7 @@ describe('begin: bookkeeping', () => {
       },
       reservedUsd: 0,
       jobId: null,
+      inFlight: 0,
       meta: {},
       starred: false,
       groupId: 'g1',
@@ -562,6 +563,21 @@ describe('cost booking', () => {
     expect((await createTestCore().core.runs.reattach(run.id))?.reservedUsd).toBeCloseTo(0.1);
   });
 
+  it('stores a request in flight before it leaves, and books an unknown cost if the run ends with one', async () => {
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    const end = await run.sending();
+    expect(await stored(run.id)).toMatchObject({ inFlight: 1 });
+    end();
+    end(); // idempotent
+    await run.checkpoint({});
+    expect(await stored(run.id)).toMatchObject({ inFlight: 0 });
+
+    await run.sending(); // never answered
+    await run.fail(new Error('gone'));
+    expect(await stored(run.id)).toMatchObject({ status: 'error', usage: { costUnknown: true } });
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.05);
+  });
+
   it('books max(actual, reservation) when the cost is unknown', async () => {
     const run = await core.runs.begin({ ...spec, estimateUsd: 0.08 });
     run.addUsage(usage({ costUsd: 0, costUnknown: true }));
@@ -688,16 +704,85 @@ describe('sweep', () => {
   });
   afterEach(() => setLocks(undefined));
 
-  it('finalizes a run whose page is gone, booking max(checkpointed usage, reservation)', async () => {
+  it('finalizes a run whose page is gone, booking exactly its stored usage when nothing was in flight', async () => {
     const run = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    const end = await run.sending();
     run.addUsage(usage({ costUsd: 0.01 }));
+    end();
     await run.checkpoint({ output: 'partial' });
     expect(await createTestCore().core.runs.sweep()).toBe(0); // owner still alive
 
     locks.release(`ortoolbox:run:${run.id}`); // the owning tab closes
     expect(await createTestCore().core.runs.sweep()).toBe(1);
-    expect(await stored(run.id)).toMatchObject({ status: 'aborted', output: 'partial' });
+    expect(await stored(run.id)).toMatchObject({
+      status: 'aborted',
+      output: 'partial',
+      usage: { costUnknown: false },
+    });
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.01);
+  });
+
+  it('books max(usage, reservation) for an orphan whose request was in flight', async () => {
+    const run = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    await run.sending(); // the page dies before the answer: no usage was ever recorded
+    locks.release(`ortoolbox:run:${run.id}`);
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect(await stored(run.id)).toMatchObject({ status: 'aborted', usage: { costUnknown: true } });
     expect(await core.stats.monthSpend()).toBeCloseTo(0.05);
+    expect(await core.stats.modelSummary('openai/gpt-x')).toMatchObject({ runs: 1 });
+
+    // A second request in flight after a known first one: unknown too.
+    const second = await core.runs.begin({ ...spec, estimateUsd: 0.05 });
+    const end = await second.sending();
+    second.addUsage(usage({ costUsd: 0.01 }));
+    end();
+    await second.sending();
+    locks.release(`ortoolbox:run:${second.id}`);
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.1);
+  });
+
+  it('books a handed-off orphan as its job left it: booked cost, a remote failure, or unknown', async () => {
+    const handedOff = async (estimateUsd: number) => {
+      const run = await core.runs.begin({ ...spec, tool: 'video-studio', estimateUsd });
+      const job = await core.jobs.add({
+        tool: 'video-studio',
+        type: 'video',
+        payload: {},
+        keyId: 'k1',
+        runId: run.id,
+      });
+      run.handOff(job.id);
+      await until(async () => (await stored(run.id))?.jobId === job.id);
+      return { run, job };
+    };
+    // The job is gone (its record deleted): the clip may still bill.
+    const gone = await handedOff(0.5);
+    await core.jobs.remove(gone.job.id);
+    locks.release(`ortoolbox:run:${gone.run.id}`);
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.5);
+
+    // The provider failed the job: nothing was billed, but the run counts.
+    const failed = await handedOff(0.3);
+    await core.jobs.update(failed.job.id, {
+      state: 'failed',
+      error: 'Content policy',
+      failureKind: 'remote',
+    });
+    locks.release(`ortoolbox:run:${failed.run.id}`);
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.5);
+    expect(await stored(failed.run.id)).toMatchObject({ usage: { costUnknown: false } });
+
+    // The job's end booked its cost on the run: exactly that.
+    const done = await handedOff(0.4);
+    done.run.addUsage(usage({ costUsd: 0.12, model: 'openai/gpt-x' }));
+    await done.run.checkpoint({});
+    await core.jobs.update(done.job.id, { state: 'succeeded', result: null });
+    locks.release(`ortoolbox:run:${done.run.id}`);
+    expect(await createTestCore().core.runs.sweep()).toBe(1);
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.62);
   });
 
   it('books nothing for an orphan that never sent a request, and frees its reservation', async () => {
@@ -720,7 +805,7 @@ describe('sweep', () => {
     locks.release(`ortoolbox:run:${run.id}`);
     const counts = await Promise.all([1, 2, 3].map(() => createTestCore().core.runs.sweep()));
     expect(counts.reduce((a, b) => a + b, 0)).toBe(1);
-    expect(await core.stats.monthSpend()).toBeCloseTo(0.05);
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.01);
     expect(await core.stats.modelSummary('openai/gpt-x')).toMatchObject({ runs: 1 });
   });
 

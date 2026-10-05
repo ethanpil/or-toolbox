@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_POLL_MS, MAX_POLL_FAILURES, MAX_POLL_MS } from '.';
+import { DEFAULT_POLL_MS, JOB_COST_META, MAX_JOB_AGE_MS, MAX_POLL_FAILURES, MAX_POLL_MS } from '.';
 import type { CoreServices, JobPollResult, JobRecord } from '../types';
 import { ApiError, InvalidInputError, KeyLockedError, NetworkError, type OrError } from '../errors';
 import { getDb } from '../storage/db';
@@ -508,6 +508,52 @@ describe("booking a job's cost on its run", () => {
     });
     await handle.finish();
     expect(await core.stats.monthSpend()).toBeCloseTo(0.3);
+  });
+
+  it('never books twice when another tab takes the job over after the cost was stored', async () => {
+    // Tab A stored the cost on the run, then closed before it could mark the job final.
+    const run = await begin();
+    const added = await core.jobs.add({ ...input, runId: run.id });
+    run.handOff(added.id);
+    const marked = run.checkpoint({ meta: { [JOB_COST_META]: added.id } });
+    run.addUsage({
+      model: run.model,
+      promptTokens: 0,
+      completionTokens: 0,
+      costUsd: 0.2,
+      costEstimated: false,
+      latencyMs: 1,
+    });
+    await marked;
+    locks.release(`ortoolbox:run:${run.id}`);
+
+    // Tab B polls the job, sees it succeed, and finishes the run.
+    const other = createTestCore().core;
+    other.jobs.register(
+      'video',
+      scripted([{ state: 'succeeded', result: 'clip', usage: { costUsd: 0.2 } }]),
+    );
+    other.jobs.resume();
+    await until(async () => (await job(added.id))?.state === 'succeeded');
+    await (await other.runs.reattach(run.id))!.finish();
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.2);
+  });
+
+  it('gives a job up after MAX_JOB_AGE_MS, booking its reservation', async () => {
+    const run = await begin();
+    core.jobs.register('video', scripted([], 30 * 60_000));
+    const added = await core.jobs.add({ ...input, runId: run.id });
+    run.handOff(added.id);
+    for (let elapsed = 0; elapsed <= MAX_JOB_AGE_MS; elapsed += 30 * 60_000) {
+      await advance(30 * 60_000);
+    }
+    await until(async () => (await job(added.id))?.state === 'failed');
+    expect(await job(added.id)).toMatchObject({
+      failureKind: 'gave-up',
+      error: 'Stopped checking: the job did not finish in time.',
+    });
+    await (await core.runs.reattach(run.id))!.fail(new Error('gave up'));
+    expect(await core.stats.monthSpend()).toBeCloseTo(0.5);
   });
 
   it('books the reservation when it gives up, and nothing for a remote failure', async () => {

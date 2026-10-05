@@ -570,6 +570,20 @@ describe('beginAll', () => {
     expect(runs.every((run) => run.signal.aborted)).toBe(true);
     await Promise.all(runs.map((run) => run.fail(run.signal.reason)));
   });
+
+  it('aborts its runs when the signal aborted while it announced them (a late Stop is never lost)', async () => {
+    const stop = new AbortController();
+    // The last await window: after every member began, while the runs are announced.
+    const off = core.bus.on('history-changed', () => stop.abort());
+    const runs = await core.runs.beginAll([contender('a/one', 0.01), contender('b/two', 0.01)], {
+      signal: stop.signal,
+      label: 'Model arena round: 2 models',
+    });
+    off();
+    expect(runs.every((run) => run.signal.aborted)).toBe(true);
+    await Promise.all(runs.map((run) => run.fail(run.signal.reason)));
+    expect(await core.stats.monthSpend()).toBe(0);
+  });
 });
 
 describe('free runs', () => {
@@ -651,6 +665,33 @@ describe('spend reads', () => {
       );
     },
   );
+
+  it("reads running runs' holds, never their records and outputs", async () => {
+    setBudgets({ monthlyUsd: 5, perKeyMonthlyUsd: { k1: 1 }, perRunUsd: 10 });
+    const run = await core.runs.begin({ tool: 'chat', model: 'm/paid', estimateUsd: 0.3 });
+    run.addUsage({
+      model: 'm/paid',
+      promptTokens: 1,
+      completionTokens: 1,
+      costUsd: 0.4,
+      costEstimated: false,
+      latencyMs: 1,
+    });
+    await run.checkpoint({ output: 'x'.repeat(400_000) });
+    const db = await getDb();
+    const indexGetAll = vi.spyOn(IDBIndex.prototype, 'getAll');
+    const get = vi.spyOn(IDBObjectStore.prototype, 'get');
+    const check = await core.budgets.check({ keyId: 'k1', estimateUsd: 0.7 });
+    const readRuns = [
+      ...indexGetAll.mock.contexts.map((index) => (index as IDBIndex).objectStore.name),
+      ...get.mock.contexts.map((store) => (store as IDBObjectStore).name),
+    ].filter((name) => name === 'runs');
+    expect(readRuns).toEqual([]);
+    // The hold is max(reservation, spend): 0.4 + 0.7 passes the $1 key limit.
+    expect(check.reasons.map((reason) => reason.kind)).toEqual(['key-monthly']);
+    await run.finish();
+    expect(await db.get('kv', `meta:run-hold:${run.id}`)).toBeUndefined();
+  });
 
   it('does not read spend at all without monthly limits', async () => {
     const rows = vi.spyOn(core.stats, 'rows').mockRejectedValue(new Error('broken'));

@@ -21,12 +21,17 @@
  * - Group approvals (`approveGroup`) live in `kv` `meta:group-approval:<groupId>` as what they still cover (runs
  *   and USD); runs begun with `useGroupApproval` take their share under the budget lock, and give it back when they
  *   end having sent nothing. `beginAll` withdraws the members it began when a later one is refused.
+ * - In flight: the API client calls `sending()` before each request leaves; the mark (`inFlight`) is stored before
+ *   the request goes, so an orphan whose request was in flight books an unknown cost, and one with none in flight
+ *   books exactly what it stored.
+ * - Holds (`./holds.ts`): a running run's budget hold is kept in `kv` beside its record, in the same transactions.
  */
 
 import type {
   BudgetCheck,
   BudgetConfirmHandler,
   CoreServices,
+  JobRecord,
   ModelUsageTotals,
   RunAddon,
   RunGroupSpec,
@@ -50,6 +55,7 @@ import {
   userMessage,
 } from '../errors';
 import { getDb } from '../storage/db';
+import { holdEntry, holdKey } from './holds';
 import { jsonCopy } from '../settings/merge';
 import { RECENT_MODELS_CAP } from '../settings/schema';
 import { addRunToStats } from '../stats';
@@ -337,9 +343,11 @@ export function createRunsService(core: CoreServices): RunsService {
       }
       // A record deleted while running (history cleared) is not recreated, but its spend is booked.
       const record: RunRecord = { ...(stored ?? fallback), ...fields };
+      delete record.inFlight; // meaningful only while running; a final record keeps the stored shape
       if (stored) await runs.put(record);
       if (book) await addRunToStats(tx.objectStore('stats'), record, isFree);
       await tx.objectStore('kv').delete(heartbeatKey(id));
+      await tx.objectStore('kv').delete(holdKey(id));
       await done;
       return { record, booked: true };
     } catch (error) {
@@ -375,6 +383,8 @@ export function createRunsService(core: CoreServices): RunsService {
     };
     let meta: Record<string, unknown> = { ...initial.meta };
     let jobId: string | null = initial.jobId ?? null;
+    /** Requests sent and not yet answered (`sending`). */
+    let inFlight = initial.inFlight ?? 0;
     let abortReason: string | null = null;
     let finalRecord: RunRecord | null = null;
     let finalizing: Promise<RunRecord> | null = null;
@@ -401,12 +411,22 @@ export function createRunsService(core: CoreServices): RunsService {
       chain = next.catch(() => undefined);
       return next;
     };
-    const persist = (fields: Partial<RunRecord>): Promise<void> =>
+    /**
+     * Writes the handle's state as it is when the write happens (not when it was asked for), so changes made in the
+     * same task land together: `addUsage` followed by a `checkpoint({ meta })` is one write, never one without the
+     * other.
+     */
+    const persist = (fields: () => Partial<RunRecord>): Promise<void> =>
       serial(async () => {
         if (!valid()) return;
-        const tx = (await getDb()).transaction('runs', 'readwrite');
-        const stored = await tx.store.get(id);
-        if (stored?.status === 'running' && valid()) await tx.store.put({ ...stored, ...fields });
+        const tx = (await getDb()).transaction(['runs', 'kv'], 'readwrite');
+        const runs = tx.objectStore('runs');
+        const stored = await runs.get(id);
+        if (stored?.status === 'running' && valid()) {
+          const next = { ...stored, ...fields() };
+          await runs.put(next);
+          await tx.objectStore('kv').put(holdEntry(next));
+        }
         await tx.done;
       });
 
@@ -417,6 +437,7 @@ export function createRunsService(core: CoreServices): RunsService {
         usage: structuredClone(totals),
         meta: capped.truncated ? { ...meta, outputTruncated: true } : { ...meta },
         jobId,
+        inFlight,
       };
     };
     const snapshot = (): RunRecord => ({ ...initial, ...runningFields() });
@@ -432,7 +453,7 @@ export function createRunsService(core: CoreServices): RunsService {
     const flush = (): Promise<void> => {
       lastWriteAt = Date.now();
       unsaved = false;
-      lastWrite = persist(runningFields()).catch((error: unknown) => {
+      lastWrite = persist(runningFields).catch((error: unknown) => {
         unsaved = true; // the next checkpoint tries again
         throw error;
       });
@@ -475,9 +496,9 @@ export function createRunsService(core: CoreServices): RunsService {
       active.delete(id);
     };
 
-    /** Nothing reached OpenRouter as far as this run knows: no request, no job, no unknown cost. */
+    /** Nothing reached OpenRouter as far as this run knows: no request, none in flight, no job, no unknown cost. */
     const sentNothing = (): boolean =>
-      totals.requests === 0 && jobId === null && !totals.costUnknown;
+      totals.requests === 0 && inFlight === 0 && jobId === null && !totals.costUnknown;
     /** The approval share, while this run holds one. */
     let share = opts.share ?? null;
     const returnShare = (): void => {
@@ -491,6 +512,8 @@ export function createRunsService(core: CoreServices): RunsService {
       if (finalRecord) return Promise.resolve(finalRecord);
       if (finalizing) return finalizing;
       const attempt = serial(async () => {
+        // A request still in flight may bill after this: its cost is unknown.
+        if (inFlight > 0) totals.costUnknown = true;
         const finishedAt = Math.max(Date.now(), startedAt);
         const fields: Partial<RunRecord> = {
           ...runningFields(),
@@ -616,7 +639,23 @@ export function createRunsService(core: CoreServices): RunsService {
       handOff(newJobId) {
         if (finalRecord) return;
         jobId = newJobId;
-        persist(runningFields()).catch(warnStorage);
+        persist(runningFields).catch(warnStorage);
+      },
+      async sending() {
+        if (finalRecord) return () => undefined;
+        inFlight++;
+        unsaved = true;
+        let ended = false;
+        const end = (): void => {
+          if (ended) return;
+          ended = true;
+          inFlight = Math.max(0, inFlight - 1);
+          unsaved = true;
+          scheduleWrite().catch(warnStorage);
+        };
+        // Stored before the request leaves; a storage failure never stops it.
+        if (persisted && valid()) await flush().catch(warnStorage);
+        return end;
       },
       closeForUnload() {
         abort('The page was closed.');
@@ -638,6 +677,7 @@ export function createRunsService(core: CoreServices): RunsService {
               const stored = await tx.objectStore('runs').get(id);
               if (stored?.status === 'running') await tx.objectStore('runs').delete(id);
               await tx.objectStore('kv').delete(heartbeatKey(id));
+              await tx.objectStore('kv').delete(holdKey(id));
               await tx.done;
             }
           } catch (error) {
@@ -657,14 +697,27 @@ export function createRunsService(core: CoreServices): RunsService {
   };
 
   /**
-   * Finalizes an orphaned `running` record; false when it is gone or already final. An orphan that recorded a
-   * request books max(its usage, its reservation): what happened after the last write is unknown. One that never
-   * recorded a request (the page closed during the budget confirmation, say) sent nothing, so it books nothing
-   * and its reservation is simply released.
+   * Finalizes an orphaned `running` record; false when it is gone or already final.
+   *
+   * - A request stored as in flight may have billed after the last write: the cost is unknown, so it books
+   *   max(its usage, its reservation). (A record from before `inFlight` existed that recorded a request counts as
+   *   one with a request in flight.) With none in flight, the stored usage is complete and is booked as it is.
+   * - A handed-off run (`jobId`) was accepted by OpenRouter. Its job's end books the cost on the run (`usage`); one
+   *   whose job failed remotely cost nothing; otherwise (job gone or cancelled, or no cost booked) it is unknown.
+   * - One that never sent anything (the page closed during the budget confirmation, say) books nothing, and its
+   *   reservation is simply released.
    */
-  const finalizeOrphan = async (run: RunRecord): Promise<boolean> => {
+  const finalizeOrphan = async (run: RunRecord, job: JobRecord | null): Promise<boolean> => {
     const finishedAt = Math.max(Date.now(), run.startedAt);
-    const sent = (run.usage?.requests ?? 0) > 0;
+    const usage: UsageTotals = { ...emptyTotals(), ...run.usage };
+    const inFlight = run.inFlight ?? (usage.requests > 0 ? 1 : 0);
+    const handedOff = Boolean(run.jobId);
+    const jobUnsettled =
+      handedOff &&
+      usage.requests === 0 &&
+      !(job?.state === 'failed' && job.failureKind === 'remote');
+    const unknown = usage.costUnknown || inFlight > 0 || jobUnsettled;
+    const sent = usage.requests > 0 || handedOff || unknown;
     const { booked } = await writeFinal(
       run.id,
       {
@@ -672,9 +725,7 @@ export function createRunsService(core: CoreServices): RunsService {
         error: 'The page was closed before the run finished.',
         finishedAt,
         latencyMs: finishedAt - run.startedAt,
-        usage: sent
-          ? { ...emptyTotals(), ...run.usage, costUnknown: true }
-          : { ...emptyTotals(), ...run.usage },
+        usage: unknown ? { ...usage, costUnknown: true } : usage,
         ...(sent ? {} : { reservedUsd: 0 }),
       },
       run,
@@ -721,6 +772,7 @@ export function createRunsService(core: CoreServices): RunsService {
       usage: emptyTotals(),
       reservedUsd: isFiniteNumber(estimate) ? Math.max(0, estimate) : 0,
       jobId: null,
+      inFlight: 0,
       meta: {},
       starred: false,
       groupId: spec.groupId ?? null,
@@ -746,7 +798,10 @@ export function createRunsService(core: CoreServices): RunsService {
             });
           }
           try {
-            await (await getDb()).put('runs', record);
+            const tx = (await getDb()).transaction(['runs', 'kv'], 'readwrite');
+            await tx.objectStore('runs').put(record);
+            await tx.objectStore('kv').put(holdEntry(record));
+            await tx.done;
             persisted = true;
           } catch (error) {
             warnStorage(error);
@@ -766,7 +821,12 @@ export function createRunsService(core: CoreServices): RunsService {
       }
     } catch (error) {
       if (persisted) {
-        await (await getDb()).delete('runs', record.id).catch(warnStorage);
+        await (async () => {
+          const tx = (await getDb()).transaction(['runs', 'kv'], 'readwrite');
+          await tx.objectStore('runs').delete(record.id);
+          await tx.objectStore('kv').delete(holdKey(record.id));
+          await tx.done;
+        })().catch(warnStorage);
       }
       if (share) await giveBack(share);
       releaseLock?.();
@@ -891,13 +951,12 @@ export function createRunsService(core: CoreServices): RunsService {
       }
       for (const run of started) await announce(run);
       const handles = started.map(({ handle }) => handle);
-      signal?.addEventListener(
-        'abort',
-        () => {
-          for (const handle of handles) handle.abort('Stopped by the user.');
-        },
-        { once: true },
-      );
+      const stop = (): void => {
+        for (const handle of handles) handle.abort('Stopped by the user.');
+      };
+      // A Stop during the awaits above (releasing the group, announcing) has already fired: honour it now.
+      if (signal?.aborted) stop();
+      else signal?.addEventListener('abort', stop, { once: true });
       return handles;
     },
 
@@ -928,28 +987,33 @@ export function createRunsService(core: CoreServices): RunsService {
 
     async sweep() {
       const db = await getDb();
-      const running = await db.getAllFromIndex('runs', 'status', 'running');
+      // Ids only: a record (with up to 500 KB of output) is read just for the runs nobody owns.
+      const running = await db.getAllKeysFromIndex('runs', 'status', 'running');
       const locks = webLocks();
       let count = 0;
-      for (const run of running) {
-        if (active.has(run.id)) continue;
+      /** Finalizes the run when it is still running and not left to an open job. */
+      const tryFinalize = async (id: string): Promise<boolean> => {
+        const run = await db.get('runs', id);
+        if (!run || run.status !== 'running') return false;
+        const job = run.jobId ? ((await db.get('jobs', run.jobId)) ?? null) : null;
+        if (job && !isFinalState(job.state)) return false; // the job will finish it
+        if (!locks) {
+          const beat = await db.get('kv', heartbeatKey(id));
+          const lastSign = Math.max(beat?.updatedAt ?? 0, run.startedAt);
+          if (Date.now() - lastSign < HEARTBEAT_STALE_MS) return false;
+        }
+        return finalizeOrphan(run, job);
+      };
+      for (const id of running) {
+        if (active.has(id)) continue;
         try {
-          if (run.jobId) {
-            const job = await db.get('jobs', run.jobId);
-            if (job && !isFinalState(job.state)) continue; // the job will finish it
-          }
           if (locks) {
             let finalized = false;
-            await locks.request(runLockName(run.id), { ifAvailable: true }, async (lock) => {
-              if (lock) finalized = await finalizeOrphan(run);
+            await locks.request(runLockName(id), { ifAvailable: true }, async (lock) => {
+              if (lock) finalized = await tryFinalize(id);
             });
             if (finalized) count++;
-          } else {
-            const beat = await db.get('kv', heartbeatKey(run.id));
-            const lastSign = Math.max(beat?.updatedAt ?? 0, run.startedAt);
-            if (Date.now() - lastSign < HEARTBEAT_STALE_MS) continue;
-            if (await finalizeOrphan(run)) count++;
-          }
+          } else if (await tryFinalize(id)) count++;
         } catch (error) {
           console.error(error);
         }

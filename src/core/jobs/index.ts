@@ -7,13 +7,15 @@
  * Failures: storage errors are logged and retried with backoff. A poll error backs off (×2 per failure, up
  * to 60 s) and counts in `attempts`; a non-retryable error (4xx other than 408/429, no key, invalid input)
  * or MAX_POLL_FAILURES failures in a row mark the job `failed` with `failureKind: 'gave-up'` (a handler's own
- * `failed` is `'remote'`). KeyLockedError pauses polling until the keys change (unlock) instead. Results are
+ * `failed` is `'remote'`), and so does a job still running MAX_JOB_AGE_MS after it was added (a remote status
+ * that never ends). KeyLockedError pauses polling until the keys change (unlock) instead. Results are
  * applied with a read-modify-write that skips jobs that became final meanwhile, so a cancel from another tab is
  * never overwritten by a late poll.
  *
  * Cost: before a job is marked final, its run (`runId`) is re-attached and given what the end says about cost:
  * a `succeeded` result's `usage`, or an unknown cost when the core gave up (the work may still bill). It is
- * stored before the job turns final, so whichever tab then finishes the run books it.
+ * stored before the job turns final, so whichever tab then finishes the run books it, and the same write marks
+ * the run (`meta.jobCostBooked`), so a tab that takes the job over never books it twice.
  */
 
 import type {
@@ -27,12 +29,20 @@ import type {
 } from '../types';
 import { ApiError, InvalidInputError, KeyLockedError, OrError, userMessage } from '../errors';
 import { getDb } from '../storage/db';
-import { MAX_TIMEOUT_MS, isFiniteNumber, sleep, webLocks } from '../util';
+import { HOUR_MS, MAX_TIMEOUT_MS, isFiniteNumber, sleep, webLocks } from '../util';
 import { getTool } from '../../tools/registry';
 
 export const DEFAULT_POLL_MS = 5000;
 export const MAX_POLL_MS = 60_000;
 export const MAX_POLL_FAILURES = 20;
+/**
+ * A job still running this long after it was added is given up (`JobHandler.maxAgeMs` overrides it). The probed
+ * video jobs took about a minute, so 3 hours only ends a job whose remote status never ends (the API client reads
+ * an unknown video status as pending).
+ */
+export const MAX_JOB_AGE_MS = 3 * HOUR_MS;
+/** The run meta key that records which job's cost was booked on the run (see `bookOnRun`). */
+export const JOB_COST_META = 'jobCostBooked';
 
 const FINAL_STATES: readonly JobState[] = ['succeeded', 'failed', 'cancelled'];
 export const isFinalState = (state: JobState): boolean => FINAL_STATES.includes(state);
@@ -218,14 +228,23 @@ export function createJobsService(core: CoreServices): JobsService {
 
   /**
    * Adds what a job's end says about cost to its run and waits until that is stored. Called before the job is
-   * marked final, so a tab that finishes the run when it sees the job end (`runs.reattach`) books it too.
+   * marked final, so a tab that finishes the run when it sees the job end (`runs.reattach`) books it too. The run's
+   * meta records it (`JOB_COST_META`) in the same write as the cost, so a tab that takes the job over after this
+   * one closed between that write and the job's final write never adds it again.
    */
   const bookOnRun = async (job: JobRecord, usage: JobUsage): Promise<void> => {
     if (!job.runId || booked.has(job.id)) return;
+    const record = await (await getDb()).get('runs', job.runId);
+    if (record?.meta?.[JOB_COST_META] === job.id) {
+      booked.add(job.id);
+      return;
+    }
     const run = await core.runs.reattach(job.runId);
     if (!run) return; // already final
     const cost = isFiniteNumber(usage.costUsd) && usage.costUsd >= 0 ? usage.costUsd : null;
     booked.add(job.id);
+    // The write starts here and reads the run's state when it happens, so it carries the usage added next too.
+    const stored = run.checkpoint({ meta: { [JOB_COST_META]: job.id } });
     run.addUsage({
       model: run.model,
       promptTokens: 0,
@@ -235,7 +254,7 @@ export function createJobsService(core: CoreServices): JobsService {
       costUnknown: cost === null, // unknown is never free: the run books its reservation
       latencyMs: Math.max(0, Date.now() - job.createdAt),
     });
-    await run.checkpoint({});
+    await stored;
   };
 
   /** Groups this page has shown its one notification for. */
@@ -335,6 +354,22 @@ export function createJobsService(core: CoreServices): JobsService {
 
       try {
         if (await apply(job, result)) return;
+        if (Date.now() - job.createdAt > (handler.maxAgeMs ?? MAX_JOB_AGE_MS)) {
+          // The core gives up; the remote work may still finish and bill.
+          await bookOnRun(job, { costUsd: null });
+          ended(
+            await write(
+              id,
+              {
+                state: 'failed',
+                error: 'Stopped checking: the job did not finish in time.',
+                failureKind: 'gave-up',
+              },
+              true,
+            ),
+          );
+          return;
+        }
       } catch (error) {
         console.error(error);
         await pause(intervalFor(handler, job, ++failures), signal);
