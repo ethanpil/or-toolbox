@@ -11,7 +11,7 @@ import {
 } from '../../core/errors';
 import { h } from '../dom';
 import { confirmDialog, promptDialog, typedConfirm } from './dialogs';
-import { presentError } from './errors';
+import { failureText, presentError } from './errors';
 import { setFieldError } from './field-error';
 import { modalOpen, openModal } from './modal';
 import { toast } from './toast';
@@ -339,5 +339,51 @@ describe('presentError', () => {
     await presentError(new ApiError('Mocked refusal', 500), { retry });
     expect($('toast-retry')).not.toBeNull();
     expect($('error-toast')?.textContent).not.toContain('may have gone through');
+  });
+});
+
+describe('failureText', () => {
+  const unknownOutcome = <E extends NetworkError | ApiError>(error: E): E => {
+    error.outcomeUnknown = true;
+    return error;
+  };
+
+  it('is the plain message for an error that certainly did not go through', () => {
+    expect(failureText(new ApiError('The model is overloaded.', 503))).toEqual({
+      text: 'The model is overloaded.',
+      outcomeUnknown: false,
+      activityUrl: null,
+    });
+    expect(failureText(new TypeError('boom')).text).toContain('Something went wrong');
+  });
+
+  it('adds the caution and the activity link when a paid request may have gone through', () => {
+    const failure = failureText(
+      unknownOutcome(new ApiError('The provider timed out. Try again.', 524)),
+    );
+    expect(failure.outcomeUnknown).toBe(true);
+    expect(failure.activityUrl).toBe('https://openrouter.ai/activity');
+    // Said like the toast: what happened, then to check before sending again (no "try again" next to it).
+    expect(failure.text).toContain('(524)');
+    expect(failure.text).not.toContain('Try again');
+    expect(failure.text).toContain('may still have done the work and billed it');
+    expect(failure.text).toContain('check your OpenRouter activity before sending it again');
+    expect(failureText(unknownOutcome(new NetworkError())).text).toContain('connection dropped');
+  });
+
+  it('does not tell a blind voter that the model is paid', () => {
+    const failure = failureText(unknownOutcome(new NetworkError()), { blind: true });
+    expect(failure.outcomeUnknown).toBe(true);
+    expect(failure.activityUrl).not.toBeNull();
+    expect(failure.text).toContain('may still have done the work');
+    expect(failure.text).toContain('check your OpenRouter activity before sending it again');
+    expect(failure.text).not.toMatch(/billed|paid|cost/i);
+  });
+
+  it('marks nothing as presented, so the caller decides', async () => {
+    const error = unknownOutcome(new NetworkError());
+    failureText(error);
+    await presentError(error);
+    expect($('error-toast')).not.toBeNull();
   });
 });

@@ -78,7 +78,55 @@ export interface PresentErrorOptions {
 }
 
 /** OpenRouter's log of every request and its cost (linked from its FAQ, checked 2026-10-04). */
-const OPENROUTER_ACTIVITY_URL = 'https://openrouter.ai/activity';
+export const OPENROUTER_ACTIVITY_URL = 'https://openrouter.ai/activity';
+
+/** What happened to a paid request that may have gone through. */
+const unknownOutcomeCause = (error: unknown): string =>
+  error instanceof ApiError
+    ? `OpenRouter answered with an error (${error.status}) instead of the result.`
+    : 'The connection dropped after the request was sent.';
+
+/** Why not to send it again; `blind` leaves out that it was billed, which would give a paid model away. */
+const mayBeDone = (blind: boolean): string =>
+  blind
+    ? 'The provider may still have done the work'
+    : 'The provider may still have done the work and billed it';
+
+export interface FailureText {
+  /** The message to show inline. After an unknown outcome it says what happened and to check before sending again. */
+  text: string;
+  /** A paid request may have gone through (`isOutcomeUnknown`): offer no plain Retry, and link `activityUrl`. */
+  outcomeUnknown: boolean;
+  /** OpenRouter's activity page, where the user can see whether the request went through; null unless `outcomeUnknown`. */
+  activityUrl: string | null;
+}
+
+/**
+ * The text of an error a tool shows inline (on a reply, in a panel, on a row) instead of through `presentError`.
+ * `userMessage` alone drops the caution a paid request that may have gone through needs; this keeps it, in the same
+ * words as the toast. `blind` is for Model arena before names are shown: the caution then leaves out that the
+ * request was billed, so it does not reveal that the model is paid.
+ *
+ * ```ts
+ * const failure = failureText(error);
+ * reply.error = failure.text;
+ * if (failure.outcomeUnknown) show(externalLink(failure.activityUrl!, 'OpenRouter activity'));   // and no Retry
+ * markPresented(error);   // the inline text is the presentation; the runner adds nothing
+ * ```
+ *
+ * It only words the error: it does not mark it presented, and errors that need a dialog (`needsAction`) still go
+ * through `presentError`.
+ */
+export function failureText(error: unknown, options: { blind?: boolean } = {}): FailureText {
+  if (!isOutcomeUnknown(error)) {
+    return { text: userMessage(error), outcomeUnknown: false, activityUrl: null };
+  }
+  return {
+    text: `${unknownOutcomeCause(error)} ${mayBeDone(options.blind === true)}, so check your OpenRouter activity before sending it again.`,
+    outcomeUnknown: true,
+    activityUrl: OPENROUTER_ACTIVITY_URL,
+  };
+}
 
 export async function presentError(
   error: unknown,
@@ -91,14 +139,10 @@ export async function presentError(
   if (wasPresented(error)) return;
   markPresented(error);
   if (isOutcomeUnknown(error)) {
-    const cause =
-      error instanceof ApiError
-        ? `OpenRouter answered with an error (${error.status}) instead of the result.`
-        : 'The connection dropped after the request was sent.';
     toast({
       variant: 'warning',
       title: 'This may have gone through',
-      message: `${cause} The provider may still have done the work and billed it, so check before sending it again.`,
+      message: `${unknownOutcomeCause(error)} ${mayBeDone(false)}, so check before sending it again.`,
       action: options.safeAction
         ? { testId: 'toast-safe-action', ...options.safeAction }
         : {
