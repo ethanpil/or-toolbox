@@ -183,7 +183,8 @@ $bot-colours: (
   margin-top: 0.25rem;
 }
 
-// Icon buttons in turns and the setup: at least 24 × 24 px (WCAG 2.2 target size).
+// Icon buttons in turns and the setup: at least 2rem (32 px) square. Same rule as `.or-icon-action`
+// (_components.scss), which the next phase moves this tool to.
 .or-bot-action {
   min-width: 2rem;
   min-height: 2rem;

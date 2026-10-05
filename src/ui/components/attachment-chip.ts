@@ -58,7 +58,7 @@ export function attachmentChip(options: AttachmentChipOptions): HTMLLIElement {
         'button',
         {
           type: 'button',
-          class: 'btn btn-sm btn-link or-attachment-remove',
+          class: 'btn btn-sm btn-link or-icon-action',
           'aria-label': `Remove ${ref.name}`,
           title: `Remove ${ref.name}`,
           'data-focus-key': remove.focusKey,
