@@ -216,9 +216,10 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     const tool = await t.mount(setup);
     expect(t.estimate()).toBeNull();
     tool.onFiles?.([photo('a.png'), photo('b.png'), photo('c.png')]);
-    const perPhoto = 4175 * KLEIN_TOKEN_PRICE;
+    // The answer, plus the photo as a reference: klein lists no input price, so it counts as one more image (high).
+    const perPhoto = 2 * 4175 * KLEIN_TOKEN_PRICE;
     await vi.waitFor(() => expect(t?.estimate()).toBeCloseTo(3 * perPhoto, 8));
-    expect($(t.zones.input, 'iso-count')?.textContent).toBe('3 photos · ≈ $0.043');
+    expect($(t.zones.input, 'iso-count')?.textContent).toBe('3 photos · ≈ $0.086');
     expect(await tool.estimate?.(KLEIN)).toBeCloseTo(3 * perPhoto, 8);
   });
 
