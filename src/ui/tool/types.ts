@@ -17,6 +17,7 @@ import type {
   ToolStateStore,
 } from '../../core/types';
 import type { ToastAction } from '../feedback/toast';
+import type { StopOnEscapeOptions } from './stop-on-escape';
 
 /** What the Prompts panel saves and restores, and what History reopens. Must round-trip exactly. */
 export interface ToolSnapshot {
@@ -88,8 +89,9 @@ export interface RunnerOptions<A = unknown> {
   run: (signal: AbortSignal, arg?: A) => Promise<void>;
   /**
    * What the error toast's Retry replays, from the argument of the run that failed. Narrow it to the items still
-   * without a result (`pendingOnly(isDone)`), so a Retry after a fatal error part-way never pays for finished
-   * items again. Return null when nothing is left: Retry then does nothing and says so. Default: the same argument.
+   * without a result (`pendingOnly(isDone, allKeys)`; with `allKeys` a plain run's replay covers only them too),
+   * so a Retry after a fatal error part-way never pays for finished items again. Return null when nothing is
+   * left: Retry then does nothing and says so. Default: the same argument.
    */
   replayArg?: (arg: A | undefined) => A | undefined | null;
   /**
@@ -108,6 +110,12 @@ export interface RunnerOptions<A = unknown> {
    * `addAction` buttons with `when: 'busy'` (Pause) and Stop.
    */
   hideWhileBusy?: boolean;
+  /**
+   * Escape stops the run that is going (`stopOnEscape`, src/ui/tool/stop-on-escape.ts), on by default for the
+   * primary runner. Pass `{ allowIn: [field] }` for a field where Escape should stop it too (Chat's composer), or
+   * `false` for a tool where Escape must not stop.
+   */
+  stopOnEscape?: false | StopOnEscapeOptions;
   /** Text after the button (e.g. a reason it is disabled); also its description. */
   hint?: string;
   /** Where the bar goes; default the end of `ui.input`. */

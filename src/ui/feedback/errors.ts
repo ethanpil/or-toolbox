@@ -9,7 +9,7 @@
  * | `no-key` | a dialog to connect with OpenRouter or paste a key, then `retry()` |
  * | `free-only` | why, with a link to Settings → Default models |
  * | `budget-blocked` | the budget reasons, with a link to Settings → Budgets |
- * | `rate-limited` | the free-model limits, with Retry |
+ * | `rate-limited` | the message (whose limit it was), the limits in general, with Retry |
  * | `network` | the message, with Retry |
  * | `storage-full` | a link to Settings → Data |
  * | anything else | `userMessage(error)`, with Retry when given |
@@ -233,8 +233,7 @@ export async function presentError(
       toast({
         variant: 'warning',
         title: 'Rate limited',
-        message:
-          'Free models allow 20 requests a minute and a daily quota (50 a day, or 1,000 once you have bought credits). Wait a moment and try again, or use a paid model.',
+        message: `${userMessage(error)} Every model has rate limits; free models allow 20 requests a minute and a daily quota (50 a day, or 1,000 once you have bought credits).`,
         ...(retryAction ? { action: retryAction } : {}),
         testId: 'error-toast',
       });

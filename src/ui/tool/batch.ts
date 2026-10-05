@@ -9,7 +9,11 @@
  *   running items finish, the rest end `stopped`, and the error is rethrown for the runner to present.
  * - Stop (the signal aborts): nothing new starts; the abort reason is rethrown once running items settle.
  * - Every item failed: the last error is rethrown, marked as already shown (the items show their errors), so the
- *   runner stays quiet while the tool can still `run.fail(error)`. Errors that need an action stay unmarked.
+ *   runner stays quiet while the tool can still `run.fail(error)`. Errors that need an action stay unmarked, and
+ *   when any item's request may have been billed (`isOutcomeUnknown`) that error is rethrown unmarked instead, so
+ *   the runner's toast says to check before sending again (and offers no Retry).
+ * - Each failed outcome carries `failure` (`failureText(error)`): the text to show on the item. Its Retry goes
+ *   through `retryGate(runner).retryFailed(error, keys)`, which asks first after an unknown outcome.
  * - Otherwise it resolves with every item's outcome; partial failures are the tool's to report (`batchSummary`).
  *
  * ```ts
@@ -25,10 +29,16 @@
  * }
  * ```
  */
-import { ApiError, errorCode } from '../../core/errors';
+import { ApiError, errorCode, isOutcomeUnknown } from '../../core/errors';
 import { runPool } from '../../core/pool';
 import { abortError } from '../../core/util';
-import { isStop, markPresented, needsAction } from '../feedback/errors';
+import {
+  type FailureText,
+  failureText,
+  isStop,
+  markPresented,
+  needsAction,
+} from '../feedback/errors';
 import { plural } from '../format';
 
 export type ItemStatus = 'queued' | 'running' | 'done' | 'failed' | 'stopped';
@@ -41,6 +51,12 @@ export interface ItemOutcome<T, R> {
   value?: R;
   /** Why it failed (failed items). */
   error?: unknown;
+  /**
+   * How to show the failure inline (failed items): `failureText(error)`, so a request that may have been billed
+   * (`outcomeUnknown`) carries its caution and activity link. Show `failure.text`, never `userMessage(error)`, and
+   * offer its Retry through `retryGate(runner).retryFailed(error, keys)`.
+   */
+  failure?: FailureText;
 }
 
 export interface RunItemsOptions<T, R> {
@@ -91,7 +107,7 @@ export async function runItems<T, R>(
       outcomes,
       options.concurrency,
       async (_outcome, index) => {
-        set(index, { status: 'running', error: undefined });
+        set(index, { status: 'running', error: undefined, failure: undefined });
         try {
           set(index, { status: 'done', value: await options.work(outcomes[index]!.item, signal) });
         } catch (error) {
@@ -99,7 +115,7 @@ export async function runItems<T, R>(
             set(index, { status: 'stopped' });
             throw error;
           }
-          set(index, { status: 'failed', error });
+          set(index, { status: 'failed', error, failure: failureText(error) });
           if (isFatal(error)) {
             fatal ??= { error };
             throw error;
@@ -135,6 +151,9 @@ export async function runItems<T, R>(
     stopped: count('stopped'),
   };
   if (result.failed > 0 && result.failed === outcomes.length) {
+    // One that may have been billed goes to the runner unmarked: its toast says to check before sending again.
+    const unknown = outcomes.find((outcome) => isOutcomeUnknown(outcome.error));
+    if (unknown) throw unknown.error;
     const last = [...outcomes].reverse().find((outcome) => outcome.status === 'failed')!.error;
     if (!needsAction(last)) markPresented(last);
     throw last;

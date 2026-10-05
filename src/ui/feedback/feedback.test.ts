@@ -8,8 +8,10 @@ import {
   RateLimitError,
   RunCancelledError,
   StorageFullError,
+  userMessage,
 } from '../../core/errors';
 import { h } from '../dom';
+import { announce } from './announce';
 import { confirmDialog, promptDialog, typedConfirm } from './dialogs';
 import { BLIND_ACTIVITY_NOTE, failureText, presentError } from './errors';
 import { setFieldError } from './field-error';
@@ -62,6 +64,22 @@ describe('toast', () => {
   it('hides a plain message after its timeout', async () => {
     toast({ message: 'Saved.', timeoutMs: 20 });
     await vi.waitFor(() => expect($('toast')).toBeNull());
+  });
+
+  it('announces the same line once when several places say it at the same moment', () => {
+    vi.useFakeTimers();
+    try {
+      announce('Done · 3 pages');
+      announce('Done · 3 pages'); // the status line and the tool said it too
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(2000);
+      announce('Done · 3 pages'); // later: a new event, announced again
+      expect(vi.getTimerCount()).toBe(1);
+      vi.runAllTimers();
+      expect($('announcer-polite')?.textContent).toBe('Done · 3 pages');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('announces the message through the live region', async () => {
@@ -283,6 +301,28 @@ describe('presentError', () => {
     // Engine messages are never shown.
     expect($('error-toast')?.textContent).toContain('Something went wrong');
     expect($('toast-retry')).toBeNull();
+  });
+
+  it('keeps the specific 402 and 429 messages, and words a rate limit for paid models too', async () => {
+    const pool = new RateLimitError(
+      'The provider is rate-limiting this model. Try again shortly or pick another model.',
+      429,
+    );
+    const inFlight = new ApiError(
+      'Too many paid requests are running for your balance. Retrying shortly may work.',
+      402,
+      { metadata: { limit_source: 'openrouter_in_flight_budget' } },
+    );
+    expect(userMessage(pool)).toBe(pool.message);
+    expect(userMessage(inFlight)).toBe(inFlight.message);
+    expect(userMessage(new ApiError('', 402))).toMatch(/Not enough credits/);
+    expect(userMessage(new ApiError('', 429))).toMatch(/Rate limited/);
+
+    await presentError(pool);
+    const text = $('error-toast')?.textContent ?? '';
+    expect(text).toContain('The provider is rate-limiting this model.');
+    expect(text).toMatch(/Every model has rate limits/);
+    expect(text).not.toMatch(/use a paid model/);
   });
 
   /** What the API client throws when a paid request may have gone through. */

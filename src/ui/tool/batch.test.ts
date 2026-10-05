@@ -112,6 +112,44 @@ describe('runItems', () => {
     expect(wasPresented(last)).toBe(true);
   });
 
+  it('words every failed item with failureText, caution included for an unknown outcome', async () => {
+    const unknown = Object.assign(new ApiError('Bad gateway', 502), { outcomeUnknown: true });
+    const result = await runItems({
+      items: [1, 2, 3],
+      concurrency: 1,
+      signal: new AbortController().signal,
+      work: (n) =>
+        n === 1
+          ? Promise.reject(new ApiError('Bad request', 400))
+          : n === 2
+            ? Promise.reject(unknown)
+            : Promise.resolve(n),
+    });
+    expect(result.outcomes[0]?.failure).toMatchObject({
+      outcomeUnknown: false,
+      text: 'Bad request',
+    });
+    expect(result.outcomes[1]?.failure).toMatchObject({
+      outcomeUnknown: true,
+      activityUrl: 'https://openrouter.ai/activity',
+    });
+    expect(result.outcomes[1]?.failure?.text).toMatch(/check your OpenRouter activity/);
+    expect(result.outcomes[2]?.failure).toBeUndefined();
+  });
+
+  it('when every item failed and one may have gone through, throws that one unmarked (the runner cautions)', async () => {
+    const unknown = Object.assign(new ApiError('Bad gateway', 502), { outcomeUnknown: true });
+    const plain = new NetworkError();
+    const error = await runItems({
+      items: [1, 2],
+      concurrency: 1,
+      signal: new AbortController().signal,
+      work: (n) => Promise.reject(n === 1 ? unknown : plain),
+    }).catch((e: unknown) => e);
+    expect(error).toBe(unknown);
+    expect(wasPresented(unknown)).toBe(false);
+  });
+
   it('runs nothing for no items', async () => {
     const result = await runItems({
       items: [],

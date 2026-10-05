@@ -9,7 +9,8 @@
  *
  * Errors follow one rule (`fail(error)`): a Stop is silent (the partial text stays, the status says "Stopped"),
  * errors that need a dialog or a setting (no key, locked, free-only, budget, storage) are left to `presentError`,
- * and every other error is shown once, inline, and marked so the runner does not show it again.
+ * and every other error is shown once, inline (worded by `failureText`, so a request that may have been billed says
+ * to check OpenRouter's activity, with a link), and marked so the runner does not show it again.
  *
  * ```ts
  * const out = outputPanel({ format: 'markdown', filename: 'answer', sendTo: ctx.ui.sendTo });
@@ -20,9 +21,15 @@
  * ```
  */
 import { h } from '../dom';
-import { userMessage } from '../../core/errors';
 import { announce } from '../feedback/announce';
-import { isStop, markPresented, needsAction } from '../feedback/errors';
+import {
+  type FailureText,
+  failureText,
+  isStop,
+  markPresented,
+  needsAction,
+} from '../feedback/errors';
+import { failureLine } from './failure-line';
 import { copyWithToast } from '../clipboard';
 import { formatInt } from '../format';
 import { icon } from '../icon';
@@ -83,9 +90,10 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
     tabIndex: 0,
     'data-testid': 'output-content',
   });
+  // Not a live region: start/finish announce through `announce()`, which says a line once even when the tool's
+  // status line says the same thing (a live region here made it three times).
   const statusLine = h('div', {
     class: 'small text-body-secondary me-auto',
-    role: 'status',
     'data-testid': 'output-status',
   });
 
@@ -270,7 +278,11 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
         // presentError shows it with its action (unlock, add a key, budgets…); nothing inline.
         setStatus(kept ? 'Not finished. The partial result is kept.' : 'Not run.');
       } else {
-        const message = typeof error === 'string' ? error : userMessage(error);
+        // failureText keeps the caution (and the activity link) of a request that may have been billed.
+        const failure: FailureText =
+          typeof error === 'string'
+            ? { text: error, outcomeUnknown: false, activityUrl: null, note: null }
+            : failureText(error);
         if (typeof error !== 'string') markPresented(error);
         errorLine = h(
           'div',
@@ -280,7 +292,7 @@ export function outputPanel(options: OutputPanelOptions = {}): OutputPanel {
             'data-testid': 'output-error',
           },
           icon('exclamation-octagon'),
-          h('div', null, message),
+          failureLine(failure, { className: '', activityTestId: 'output-activity' }),
         );
         setStatus(kept ? 'Stopped with an error; the partial result is kept.' : 'Failed.');
       }

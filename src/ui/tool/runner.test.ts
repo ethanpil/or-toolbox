@@ -186,6 +186,80 @@ describe('createRunner', () => {
     expect(seen).toHaveLength(2);
   });
 
+  it('pendingOnly with the item keys turns a plain run’s replay into the items still without a result', () => {
+    const done = new Set<string>();
+    const all = (): string[] => ['a', 'b', 'c'];
+    const replay = pendingOnly((key: string) => done.has(key), all);
+    expect(replay(undefined)).toBeUndefined(); // nothing finished: a plain run again
+    done.add('a');
+    expect(replay(undefined)).toEqual(['b', 'c']);
+    expect(replay(['a', 'b'])).toEqual(['b']);
+    done.add('b').add('c');
+    expect(replay(undefined)).toBeNull();
+    // Without the keys a plain run stays a plain run.
+    expect(pendingOnly((key: string) => done.has(key))(undefined)).toBeUndefined();
+  });
+
+  it('says so when the error Retry cannot start, instead of closing silently', async () => {
+    let fail = true;
+    const runner = createRunner<string>(
+      { run: () => (fail ? Promise.reject(new Error('boom')) : Promise.resolve()) },
+      true,
+    );
+    document.body.append(runner.element);
+    await runner.trigger('x');
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-retry"]')).not.toBeNull(),
+    );
+    fail = false;
+    runner.setDisabled('Add a file first');
+    document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="retry-blocked-toast"]')?.textContent).toContain(
+        'Add a file first',
+      ),
+    );
+  });
+
+  it('Escape stops the primary runner by default; other runners and an opt-out do not install it', async () => {
+    const hold = () => (signal: AbortSignal) =>
+      new Promise<void>((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason as Error));
+      });
+    const escape = () =>
+      document.body.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+      );
+
+    const primary = createRunner({ run: hold() }, true);
+    const pending = primary.trigger();
+    escape();
+    await pending;
+    expect(primary.busy).toBe(false);
+    primary.dispose();
+
+    const secondary = createRunner({ run: hold() }, false);
+    const optedOut = createRunner({ run: hold(), stopOnEscape: false }, true);
+    const both = [secondary.trigger(), optedOut.trigger()];
+    escape();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(secondary.busy).toBe(true);
+    expect(optedOut.busy).toBe(true);
+    secondary.stop();
+    optedOut.stop();
+    await Promise.all(both);
+
+    // After dispose, Escape no longer reaches it.
+    const disposed = createRunner({ run: hold() }, true);
+    disposed.dispose();
+    const running = disposed.trigger();
+    escape();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disposed.busy).toBe(true);
+    disposed.stop();
+    await running;
+  });
+
   /** What the API client throws when a paid request may have gone through. */
   const mayHaveGoneThrough = (): NetworkError => {
     const error = new NetworkError('Could not reach OpenRouter.');

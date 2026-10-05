@@ -258,10 +258,11 @@ export function userMessage(error: unknown): string {
   if (isAbortError(error)) return 'Stopped.';
   if (error instanceof ApiError) {
     if (error.status === 401) return 'OpenRouter rejected the key. Check it in Settings → Keys.';
+    // The API client's message is specific for these (the in-flight budget, the provider's pool), so it wins.
+    if (error.message) return error.message;
     if (error.status === 402) return 'Not enough credits, or the key reached its spending limit.';
-    if (error.status === 429)
-      return 'Rate limited. Free models allow 20 requests a minute; try again shortly.';
-    return error.message || `OpenRouter returned an error (${error.status}).`;
+    if (error.status === 429) return 'Rate limited. Try again shortly.';
+    return `OpenRouter returned an error (${error.status}).`;
   }
   if (error instanceof OrError) return error.message;
   // Anything else is unexpected: never echo raw engine messages ("Cannot read properties of undefined").

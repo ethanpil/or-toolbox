@@ -1,7 +1,8 @@
 /**
  * The Run/Stop bar behind `ctx.ui.runner()`. Run stays focusable while busy (`aria-disabled`, not `disabled`, so
- * keyboard users do not lose their place); Stop aborts the signal handed to `run`. Errors other than aborts and
- * declined budget confirmations go through `presentError` with a Retry.
+ * keyboard users do not lose their place); Stop aborts the signal handed to `run`, and so does Escape for the
+ * primary runner (`stopOnEscape`, opt out with `stopOnEscape: false`). Errors other than aborts and declined
+ * budget confirmations go through `presentError` with a Retry; a Retry that cannot start says why.
  *
  * A tool whose bar needs more (Start/Resume, Step and Pause) changes Run's text with `setLabel`, hides it while
  * busy with `hideWhileBusy` and adds buttons with `addAction`; the bar keeps them in step with the runner's busy
@@ -11,9 +12,11 @@
 import { h } from '../dom';
 import { announce } from '../feedback/announce';
 import { isStop, presentError, wasPresented } from '../feedback/errors';
+import { toast } from '../feedback/toast';
 import { formatShortcut } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
+import { stopOnEscape } from './stop-on-escape';
 import type {
   Runner,
   RunnerAction,
@@ -33,6 +36,8 @@ interface ActionEntry<A> {
 export interface RunnerInternals<A = unknown> extends Runner<A> {
   /** Set by the framework (e.g. no model resolves); wins over the tool's own reason. */
   setFrameworkReason(reason: string | null): void;
+  /** Removes the page-wide Escape handler (test harness cleanup). */
+  dispose(): void;
 }
 
 export function createRunner<A = unknown>(
@@ -200,7 +205,15 @@ export function createRunner<A = unknown>(
       announce('Nothing left to retry: every item already has a result.');
       return;
     }
-    void trigger(next);
+    // The toast has closed: if the run cannot start, say why rather than nothing happening.
+    if (!trigger(next).started) {
+      toast({
+        variant: 'warning',
+        message:
+          `Retry could not start. ${busy ? 'Wait until the current run ends.' : (reason() ?? '')}`.trim(),
+        testId: 'retry-blocked-toast',
+      });
+    }
   }
 
   function stop(): void {
@@ -208,10 +221,27 @@ export function createRunner<A = unknown>(
   }
 
   render();
+  // Escape stops the primary run (a tool's own `stopOnEscape` for a field of its own still works beside it: the
+  // first handler takes the key, the second sees it handled).
+  const escapeOptions = options.stopOnEscape;
+  const removeEscape =
+    primary && escapeOptions !== false
+      ? stopOnEscape(
+          {
+            get busy() {
+              return busy;
+            },
+            stop,
+          },
+          escapeOptions ?? {},
+        )
+      : () => undefined;
+
   return {
     element,
     button,
     stopButton,
+    dispose: removeEscape,
     get busy() {
       return busy;
     },
@@ -282,14 +312,29 @@ export function createRunner<A = unknown>(
 
 /**
  * A `replayArg` for runners whose argument is a list of item keys: keeps the keys `isDone` says still need doing,
- * null when none is left. A plain run (no argument) stays a plain run; tools whose Run already skips finished
- * items need nothing more.
+ * null when none is left.
+ *
+ * A plain run (no argument) is replayed through `all`, the keys a plain run works on: once some of them have a
+ * result, the replay becomes a keyed run of the rest, so a Retry after a fatal error part-way (a 402 at item 7)
+ * never pays for items 1-6 again. While none has a result it stays a plain run. Without `all` a plain run stays a
+ * plain run (for tools whose Run already skips finished items).
+ *
+ * ```ts
+ * ui.runner<string[]>({ run, replayArg: pendingOnly((key) => hasResult(key), () => docs.map((d) => d.key)) });
+ * ```
  */
 export function pendingOnly<K>(
   isDone: (key: K) => boolean,
+  all?: () => readonly K[],
 ): (keys: readonly K[] | undefined) => K[] | undefined | null {
   return (keys) => {
-    if (keys === undefined) return undefined;
+    if (keys === undefined) {
+      if (!all) return undefined;
+      const every = all();
+      const left = every.filter((key) => !isDone(key));
+      if (left.length === 0) return null;
+      return left.length === every.length ? undefined : left;
+    }
     const left = keys.filter((key) => !isDone(key));
     return left.length > 0 ? left : null;
   };
