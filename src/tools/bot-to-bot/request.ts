@@ -12,7 +12,7 @@
  *   the framing and the opener always stay, and so does the entry being answered. `trimmed` says how many went.
  * - **`max_tokens`** is clamped as in Chat: to the model's output cap and to what the context leaves.
  *
- * Token counts and the context fit are core's (src/core/tokens.ts: `approxTokens`, `promptBudget`, `fitContext`),
+ * Token counts and the context fit are core's (src/core/tokens.ts: `approxTokens`, `promptBudget`, `trimOldest`, `fitContext`),
  * the same for every tool.
  */
 import type { ChatMessage, ChatRequest } from '../../core/api/types';
@@ -22,6 +22,7 @@ import {
   fitContext,
   MESSAGE_OVERHEAD,
   promptBudget,
+  trimOldest,
 } from '../../core/tokens';
 import { type Conversation, type Entry, isSpoken, type Speaker } from './conversation';
 
@@ -143,16 +144,6 @@ export function mergeParts(parts: readonly ContextPart[]): ChatMessage[] {
   });
 }
 
-/**
- * How many of `tokens` (oldest first) to leave out so the rest fits `budget`; the last is always kept.
- */
-export function trimCount(tokens: readonly number[], budget: number): number {
-  let total = tokens.reduce((sum, value) => sum + value, 0);
-  let dropped = 0;
-  while (dropped < tokens.length - 1 && total > budget) total -= tokens[dropped++]!;
-  return dropped;
-}
-
 export interface TurnOptions {
   model: string;
   bots: Record<Speaker, BotProfile>;
@@ -192,7 +183,7 @@ export function buildTurn(
     maxCompletionTokens: options.maxCompletionTokens,
     fixed: approxTokens(system) + MESSAGE_OVERHEAD + (opener?.tokens ?? 0),
   };
-  const trimmed = trimCount(
+  const trimmed = trimOldest(
     rest.map((item) => item.tokens),
     promptBudget(limits),
   );

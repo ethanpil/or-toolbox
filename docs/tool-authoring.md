@@ -316,12 +316,16 @@ Count tokens with `src/core/tokens.ts`, the one approximation every tool uses (n
 
 ```ts
 const limits = { context: info.contextLength, maxTokens, maxCompletionTokens: info.maxCompletionTokens, fixed: systemTokens };
-const trimmed = trimOldest(tokens, promptBudget(limits));        // what may be sent besides `fixed`
+const tokens = messages.map((m) => approxTokens(m.text) + MESSAGE_OVERHEAD); // oldest first, one per message
+const trimmed = trimOldest(tokens, promptBudget(limits));        // how many of the oldest to leave out (never the last)
+const keptTokens = tokens.slice(trimmed).reduce((sum, n) => sum + n, 0);
 const fit = fitContext({ ...limits, prompt: keptTokens });       // { budget, tooLong, room, completionTokens, maxTokens }
 if (fit.tooLong) throw new InvalidInputError('This is too long for the model’s context window.');
 body.max_tokens = fit.maxTokens ?? undefined;                    // null: Max tokens not set, leave it out
 // estimate with completionTokens: fit.completionTokens
 ```
+
+`trimOldest(tokens, budget, startsAt?)` drops the oldest first and always keeps the last message (the one being answered); with `startsAt(index)`, once something went it drops on until the kept part starts where you allow (Chat passes `(i) => turns[i].role === 'user'`, so no reply is left without its question).
 
 The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it), and `ctx.beginRun` without `estimateUsd` always computes it afresh for the input as it is at that moment (so a paste followed by Ctrl+Enter, before your debounced `refreshEstimate`, books the right amount); only a value set with `ui.setEstimate` is booked as is. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
 

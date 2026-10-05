@@ -21,6 +21,7 @@ import {
   fitContext,
   MESSAGE_OVERHEAD,
   promptBudget,
+  trimOldest,
 } from '../../core/tokens';
 import type { ChatNode } from './thread';
 
@@ -124,24 +125,6 @@ export function userContent(
 }
 
 /**
- * Drops messages from the start until the rest fits `budget` tokens. The last message (the one being answered)
- * is always kept, and the kept part starts with a user message. Returns how many were dropped.
- */
-export function trimToBudget(
-  tokens: readonly number[],
-  roles: readonly string[],
-  budget: number,
-): number {
-  let total = tokens.reduce((sum, value) => sum + value, 0);
-  let dropped = 0;
-  const last = tokens.length - 1;
-  while (dropped < last && total > budget) total -= tokens[dropped++]!;
-  // Once something was dropped, a reply whose question is gone goes too.
-  while (dropped > 0 && dropped < last && roles[dropped] !== 'user') dropped++;
-  return dropped;
-}
-
-/**
  * The request for answering the last message of `path` (a user message), with the active-path context before
  * it. `data` returns an attachment's data URL from the session.
  */
@@ -160,11 +143,12 @@ export function buildRequest(
     maxCompletionTokens: options.maxCompletionTokens ?? null,
     fixed: systemTokens,
   };
-  // Oldest messages go first until the rest fits, with room for the answer and a margin for the approximation.
-  const trimmed = trimToBudget(
+  // Oldest messages go first until the rest fits (room for the answer, a margin for the approximation), and the
+  // kept part starts with a user message: no reply without its question.
+  const trimmed = trimOldest(
     tokens,
-    turns.map((node) => node.role),
     promptBudget(limits),
+    (index) => turns[index]?.role === 'user',
   );
   const keptTokens = tokens.slice(trimmed).reduce((sum, value) => sum + value, 0);
   const { tooLong, completionTokens, maxTokens } = fitContext({ ...limits, prompt: keptTokens });
