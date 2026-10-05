@@ -61,7 +61,6 @@ import { formatDuration, formatMs, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { composing } from '../../ui/shell/shortcuts';
-import { stopOnEscape } from '../../ui/tool/stop-on-escape';
 import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
 import {
   type BotRecord,
@@ -1093,7 +1092,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     onClick: () => requestPause(),
     testId: 'bots-pause',
   });
-  stopOnEscape(runner);
 
   function requestPause(): void {
     if (!runState.busy || pauseRequested) return;

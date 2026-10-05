@@ -17,6 +17,7 @@ import type {
   ToolStateStore,
 } from '../../core/types';
 import type { ToastAction } from '../feedback/toast';
+import type { DiscardOptions } from './discard';
 import type { StopOnEscapeOptions } from './stop-on-escape';
 
 /** What the Prompts panel saves and restores, and what History reopens. Must round-trip exactly. */
@@ -240,6 +241,11 @@ export interface ToolUi {
    * saved or discarded (safe to call twice). Downloadable results use `addResult` instead.
    */
   holdWork: (description: string) => () => void;
+  /**
+   * Asks before a run, a load or a new file replaces unsaved work (an edited transcript, corrected values); resolves
+   * true to go ahead, at once when `isDirty()` is false. Call it before `ctx.beginRun`. See src/ui/tool/discard.ts.
+   */
+  confirmDiscard: (options: DiscardOptions) => Promise<boolean>;
   /** Registers a binary result with the leave guard and returns download helpers. */
   addResult: (input: { kind: ResultKind; name: string; blob: Blob }) => ResultHandle;
   /** Opens the "Send to…" chooser for these items (tools whose `accepts` match). */

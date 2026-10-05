@@ -61,6 +61,33 @@ describe('toast', () => {
     expect(() => handle.hide()).not.toThrow();
   });
 
+  it('Alt+Shift+N reaches the newest toast with an action, and focus comes back when it closes', async () => {
+    const before = h('button', { type: 'button' }, 'Run');
+    document.body.append(before);
+    before.focus();
+    toast({ message: 'Saved.' });
+    toast({
+      message: 'Failed.',
+      action: { label: 'Retry', onClick: () => undefined, testId: 'retry' },
+    });
+    const key = (target: EventTarget = document.activeElement ?? document.body) =>
+      target.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'N',
+          code: 'KeyN',
+          altKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    key();
+    expect(document.activeElement).toBe($('retry'));
+    $('retry')!.click();
+    await vi.waitFor(() => expect(document.activeElement).toBe(before));
+    await vi.waitFor(() => expect($('announcer-polite')?.textContent).toContain('Alt+Shift+N'));
+  });
+
   it('hides a plain message after its timeout', async () => {
     toast({ message: 'Saved.', timeoutMs: 20 });
     await vi.waitFor(() => expect($('toast')).toBeNull());

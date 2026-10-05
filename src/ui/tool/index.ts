@@ -36,8 +36,10 @@ import { setToolBinding } from '../settings-actions';
 import { mountPage } from '../shell/index';
 import { historyUrl, settingsUrl } from '../shell/links';
 import { createToolContext, resolveFor } from './context';
+import { confirmDiscard } from './discard';
 import { badgeValue, createEstimateTracker } from './estimate';
 import { createStatusLine } from './status-line';
+import { uncoverBy } from './uncover';
 import { installFileDrop } from './file-drop';
 import { resultHandle } from './results';
 import { createRunner, type RunnerInternals } from './runner';
@@ -150,8 +152,9 @@ async function buildTool(
     model: () => resolveModel().model,
     show: (usd, note) => estimate.set(badgeValue(usd, instance?.addons?.() ?? []), note),
   });
+  // One chip high from the start, so the chips arriving (or a model name resolving) does not push the page down.
   const chips = h('div', {
-    class: 'd-flex flex-wrap align-items-center gap-2 mt-3',
+    class: 'd-flex flex-wrap align-items-center gap-2 mt-3 or-tool-chips',
     'data-testid': 'tool-chips',
   });
   let prompts: PromptsPanel | null = null;
@@ -237,16 +240,16 @@ async function buildTool(
       ),
     );
 
-  main.append(
-    header,
-    notices,
-    h(
-      'div',
-      { class: 'row g-4 or-tool-zones' },
-      zone(inputId, 'Input', input, null, 'col-lg-5'),
-      zone(outputId, 'Output', output, statusLine.element, 'col-lg-7'),
-    ),
+  // The zones are filled by `setup`, which may wait (Chat reads IndexedDB first): until then they take their
+  // place but stay invisible (`visibility: hidden` keeps the layout, so nothing shifts when they appear, and
+  // nothing in them can take focus).
+  const zones = h(
+    'div',
+    { class: 'row g-4 or-tool-zones or-tool-pending' },
+    zone(inputId, 'Input', input, null, 'col-lg-5'),
+    zone(outputId, 'Output', output, statusLine.element, 'col-lg-7'),
   );
+  main.append(header, notices, zones);
 
   // --- model and key chips, free-only notice ----------------------------------------------------------
   const resolveModel = (capability: Capability = primary): ResolvedModel =>
@@ -456,6 +459,7 @@ async function buildTool(
     status: (text) => statusLine.status(text),
     progress: (text) => statusLine.progress(text),
     holdWork: (description) => core.results.hold(description),
+    confirmDiscard,
     addResult(resultInput) {
       return resultHandle(core, core.results.add({ tool: manifest.id, ...resultInput }));
     },
@@ -478,6 +482,7 @@ async function buildTool(
 
   // --- setup ------------------------------------------------------------------------------------------
   instance = await setup(ctx);
+  zones.classList.remove('or-tool-pending');
   const ready = instance;
   estimatedFor = resolveModel().model;
   void estimates.refresh();
@@ -496,9 +501,11 @@ async function buildTool(
 
 /**
  * The primary Run bar is sticky at the bottom of the window and must never hide the control that has focus
- * (WCAG 2.4.11). Its height goes to `--or-runner-height` on <html>, where `scroll-padding-bottom`
- * (src/styles/_tool.scss) keeps scrollIntoView and clicks above it. Chromium ignores scroll padding when Tab moves
- * focus, so a focused control the bar still covers is scrolled up by the overlap.
+ * (WCAG 2.4.11); nor must the sticky navbar at the top (Shift+Tab). The bar's height goes to `--or-runner-height`
+ * on <html>, where `scroll-padding-bottom` (src/styles/_tool.scss) keeps scrollIntoView and clicks above it (and
+ * the toasts above it on phones). Chromium ignores scroll padding when Tab moves focus, so a focused control a bar
+ * still covers is scrolled clear (`uncoverBy`): only when the bar is really over it, not beside it (on wide
+ * screens the bar sits in the left column), and never for controls in a dialog or drawer, which scroll themselves.
  */
 function reserveRunnerSpace(bar: HTMLElement): void {
   const root = document.documentElement;
@@ -513,14 +520,10 @@ function reserveRunnerSpace(bar: HTMLElement): void {
   const uncover = (target: HTMLElement): void => {
     if (document.activeElement !== target || !bar.isConnected) return;
     const control = target.getBoundingClientRect();
-    const covering = bar.getBoundingClientRect();
-    const overlap = control.bottom - covering.top;
-    if (overlap <= 0 || control.top >= covering.bottom) return;
-    // Up by the overlap plus a little air, but never pushing the control's top out of the window.
-    window.scrollBy({
-      top: Math.min(overlap + 8, Math.max(0, control.top - 8)),
-      behavior: 'instant',
-    });
+    const navbar = document.querySelector('.or-navbar');
+    const top = navbar ? uncoverBy(control, navbar.getBoundingClientRect(), 'top', innerHeight) : 0;
+    const by = top || uncoverBy(control, bar.getBoundingClientRect(), 'bottom', innerHeight);
+    if (by !== 0) window.scrollBy({ top: by, behavior: 'instant' });
   };
   // A focus scroll is smooth (Bootstrap's `scroll-behavior: smooth` unless motion is reduced): one frame after
   // focusin the control may still be on its way up from below the bar, so it is checked again once scrolling
@@ -543,6 +546,8 @@ function reserveRunnerSpace(bar: HTMLElement): void {
   document.addEventListener('focusin', (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement) || bar.contains(target)) return;
+    // A dialog or a drawer sits above both bars and scrolls itself.
+    if (target.closest('.modal, .offcanvas')) return;
     // The browser's own focus scroll comes after focusin: check once it has happened, and again when it ends.
     requestAnimationFrame(() => uncover(target));
     whenSettled(() => uncover(target));

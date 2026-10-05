@@ -1,8 +1,9 @@
 /**
- * Toasts: short, non-blocking status messages in the bottom-right corner, with optional actions (Undo, Retry,
- * a link). The text is announced through the page's live regions (danger toasts assertively), so the toast
- * itself is not a live region. A toast with an action stays until used or closed; others fade, and hovering or
- * focusing one pauses its timer (Bootstrap's behaviour).
+ * Toasts: short, non-blocking status messages in the bottom-right corner (above a tool's Run bar on narrow
+ * screens), with optional actions (Undo, Retry, a link). The text is announced through the page's live regions
+ * (danger toasts assertively), so the toast itself is not a live region. A toast with an action stays until used
+ * or closed, and Alt+Shift+N (`TOAST_SHORTCUT`, said in its announcement) moves focus to the newest one; focus goes
+ * back when it closes. Others fade, and hovering or focusing one pauses its timer (Bootstrap's behaviour).
  *
  * ```ts
  * toast({ message: 'Prompt deleted.', action: { label: 'Undo', onClick: restore } });
@@ -57,10 +58,39 @@ const MAX_TOASTS = 4;
 
 let container: HTMLElement | null = null;
 
+/** Reaches the newest toast that has an action (said in its announcement). */
+export const TOAST_SHORTCUT = 'Alt+Shift+N';
+let shortcutInstalled = false;
+/** Where focus was before the shortcut moved it into a toast; it goes back there when that toast closes. */
+let returnFocus: HTMLElement | null = null;
+
+/**
+ * The container is the last thing on the page, so keyboard users would tab through everything to reach a toast's
+ * Undo or Retry: Alt+Shift+N (Option+Shift+N) moves focus to the newest toast with an action instead.
+ */
+function installShortcut(): void {
+  if (shortcutInstalled) return;
+  shortcutInstalled = true;
+  document.addEventListener('keydown', (event) => {
+    if (!event.altKey || !event.shiftKey || event.ctrlKey || event.metaKey) return;
+    if (event.code !== 'KeyN') return;
+    const withActions = [
+      ...(container?.querySelectorAll<HTMLElement>('.or-toast:not([data-actions="0"])') ?? []),
+    ];
+    const target = withActions.at(-1)?.querySelector<HTMLElement>('.btn');
+    if (!target) return;
+    event.preventDefault();
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && !container?.contains(active)) returnFocus = active;
+    target.focus();
+  });
+}
+
 function ensureContainer(): HTMLElement {
+  installShortcut();
   if (container?.isConnected) return container;
   container = h('section', {
-    class: 'toast-container position-fixed bottom-0 end-0 p-3 or-toasts',
+    class: 'toast-container position-fixed end-0 p-3 or-toasts',
     'aria-label': 'Notifications',
     'data-testid': 'toasts',
   });
@@ -152,10 +182,17 @@ export function toast(options: ToastOptions): ToastHandle {
   // timer to act (WCAG 2.2.1). Plain messages fade after `timeoutMs`.
   const timeout = actions.length > 0 ? 0 : (options.timeoutMs ?? 5000);
   const instance = new Toast(element, { autohide: timeout > 0, delay: timeout });
+  // Focus inside a toast that closes goes back to where the shortcut took it from (else it would drop to <body>).
+  let hadFocus = false;
+  element.addEventListener('hide.bs.toast', () => {
+    hadFocus = element.contains(document.activeElement);
+  });
   element.addEventListener('hidden.bs.toast', () => {
     disposed = true;
     instance.dispose();
     element.remove();
+    if (hadFocus && returnFocus?.isConnected) returnFocus.focus();
+    if (hadFocus) returnFocus = null;
   });
   // Keep the stack short: beyond MAX_TOASTS the oldest message without an action goes first.
   const shown = [...host.querySelectorAll<HTMLElement>('.or-toast')];
@@ -164,8 +201,16 @@ export function toast(options: ToastOptions): ToastHandle {
     if (oldest && oldest !== element) Toast.getInstance(oldest)?.hide();
   }
   instance.show();
-  announce([options.title, options.message].filter(Boolean).join('. '), {
-    assertive: variant === 'danger',
-  });
+  announce(
+    [
+      options.title,
+      options.message,
+      actions.length > 0 ? `Press ${TOAST_SHORTCUT} to reach it.` : null,
+    ]
+      .filter(Boolean)
+      .join('. ')
+      .replace(/\.\. /g, '. '),
+    { assertive: variant === 'danger' },
+  );
   return { element, hide: close };
 }
