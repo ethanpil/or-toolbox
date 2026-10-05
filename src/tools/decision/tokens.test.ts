@@ -42,7 +42,7 @@ describe('token estimates', () => {
     const request = { state: 'word '.repeat(24_000), questions: triageQuestions };
     expect(contextProblem(contextInputTokens(request), DEFAULT_CONTEXT_TOKENS)).toBeNull();
     expect(estimateInputTokens(request)).toBeGreaterThan(DEFAULT_CONTEXT_TOKENS);
-    expect(estimateInputTokens(request)).toBeGreaterThan(contextInputTokens(request) * 2);
+    expect(estimateInputTokens(request)).toBeGreaterThan(contextInputTokens(request) * 1.5);
   });
 
   it('still refuses prose that cannot fit', () => {

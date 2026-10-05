@@ -3,8 +3,8 @@
  *
  * - `estimateInputTokens` is for the **price**. It is deliberately high, the way every estimate in this app errs,
  *   because a decision request is JSON and the models count more tokens than prose for it: Jev billed 476 input
- *   tokens for the 830 characters of the tutorial request (about 0.57 per character; four characters per token
- *   would give 208), Mercury 253 (docs/openrouter-api.md §8.2). The whole body is inflated by `JSON_FACTOR`.
+ *   tokens for the 830 characters of the tutorial request, where the structure-aware count of src/core/tokens.ts
+ *   gives 269; Mercury billed 253 (docs/openrouter-api.md §8.2). The whole body is inflated by `JSON_FACTOR`.
  * - `contextInputTokens` is for **refusing** a request that cannot fit the model's context before anything is
  *   sent. A refusal must not lean one way: it counts the situation's prose as prose (`approxTokens`,
  *   src/core/tokens.ts) and inflates only the structure around it (the questions, the field names), so a long
@@ -18,7 +18,8 @@ import { formatInt } from '../../ui/format';
 /** Jev's context window, the one the docs state (§8.1); used when the catalog does not say. */
 export const DEFAULT_CONTEXT_TOKENS = 32_000;
 
-const JSON_FACTOR = 2.5;
+/** 269 × 1.8 + 32 = 517, above Jev's 476 for the tutorial request. */
+const JSON_FACTOR = 1.8;
 /** The framing the service adds around state and questions. */
 const OVERHEAD_TOKENS = 32;
 
