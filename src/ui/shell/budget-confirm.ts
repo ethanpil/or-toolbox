@@ -6,7 +6,7 @@
  * RunCancelledError, which tools and `presentError` treat as a quiet stop. Following a link in it declines first.
  */
 import { getCore } from '../../core/index';
-import { paidAddons, withAddons } from '../../core/runs/addons';
+import { paidAddons, unknownAddons, withAddons } from '../../core/runs/addons';
 import type { BudgetCheck, BudgetQuestion, BudgetReason, RunAddon } from '../../core/types';
 import { getTool } from '../../tools/registry';
 import { h } from '../dom';
@@ -31,6 +31,8 @@ interface Shown {
   tool: string;
   models: readonly string[];
   estimateUsd: number | null;
+  /** Runs whose estimate is unknown and left out of `estimateUsd` (a group's). */
+  unknownEstimates: number;
   addons: readonly RunAddon[];
   note: string | null;
 }
@@ -46,6 +48,7 @@ function shown(question: BudgetQuestion): Shown {
       tool: getTool(spec.tool).name,
       models: [spec.model],
       estimateUsd: spec.estimateUsd ?? null,
+      unknownEstimates: 0,
       addons: spec.addons ?? [],
       note: null,
     };
@@ -59,9 +62,19 @@ function shown(question: BudgetQuestion): Shown {
     tool: getTool(group.tool).name,
     models: group.models,
     estimateUsd: group.estimateUsd,
+    unknownEstimates: group.unknownEstimates ?? 0,
     addons: group.addons ?? [],
     note: group.note ?? null,
   };
+}
+
+/** `≈ $0.27`, or `≈ $0.27 + 1 unknown` when parts of a known total are not (`Unknown` when nothing is known). */
+function estimateText(view: Shown): string {
+  const total = withAddons(view.estimateUsd, view.addons);
+  const unknown = view.unknownEstimates + unknownAddons(view.addons);
+  return total !== null && unknown > 0
+    ? `${formatEstimate(total)} + ${unknown} unknown`
+    : formatEstimate(total);
 }
 
 const term = (text: string): HTMLElement =>
@@ -126,7 +139,7 @@ export function budgetConfirm(check: BudgetCheck, question: BudgetQuestion): Pro
         h(
           'dd',
           { class: 'col-8 mb-1', 'data-testid': 'budget-estimate' },
-          formatEstimate(withAddons(view.estimateUsd, view.addons)),
+          estimateText(view),
           paidAddons(view.addons).map((addon) =>
             h(
               'div',

@@ -20,9 +20,13 @@ export function formatUsd(value: number): string {
   return `$${value.toFixed(digits)}`;
 }
 
-/** With an estimate: spend + estimate above the limit. Without one: the limit is already used up. */
-function exceeds(spent: number, estimate: number | null, limit: number): boolean {
-  return estimate == null ? spent >= limit : spent + estimate > limit;
+/**
+ * With an estimate: spend + estimate above the limit. Without one, or with parts of it unknown (a floor): any
+ * unknown cost passes a limit that is already reached.
+ */
+function exceeds(spent: number, estimate: number | null, limit: number, partly: boolean): boolean {
+  if (estimate == null) return spent >= limit;
+  return partly ? spent + estimate >= limit : spent + estimate > limit;
 }
 
 interface MonthSpend {
@@ -48,24 +52,31 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
   };
 
   return {
-    async check({ keyId, estimateUsd, group = false }) {
+    async check({ keyId, estimateUsd, group = false, unknownParts = 0 }) {
       const budgets = core.settings.get().budgets;
       if (budgets.mode === 'disabled') return { verdict: 'ok', reasons: [] };
 
       const estimate = estimateUsd ?? null;
       const reasons: BudgetReason[] = [];
       const subject = group ? 'These runs' : 'This run';
+      /** Part of the cost is unknown: the estimate is a floor. */
+      const partly = estimate != null && unknownParts > 0;
+      const unknownNote = `${unknownParts} unknown`;
 
       if (estimate != null && estimate > budgets.perRunUsd) {
+        const amount = `${formatUsd(estimate)}${group ? ' together' : ''}`;
         reasons.push({
           kind: 'per-run',
           limitUsd: budgets.perRunUsd,
           projectedUsd: estimate,
-          message: group
-            ? `These runs are estimated at ${formatUsd(estimate)} together, above your ${formatUsd(budgets.perRunUsd)} per-run limit.`
-            : `This run is estimated at ${formatUsd(estimate)}, above your ${formatUsd(budgets.perRunUsd)} per-run limit.`,
+          message: `${subject} ${group ? 'are' : 'is'} estimated at ${amount}${partly ? ` and ${unknownNote}` : ''}, above your ${formatUsd(budgets.perRunUsd)} per-run limit.`,
         });
       }
+      /** "would bring this month's spend [on …] to $x, above …" or, for a floor, "to at least $x (1 unknown), which reaches …". */
+      const wouldBring = (on: string, total: number, limit: number, its: string): string =>
+        partly
+          ? `${subject} would bring this month's spend${on} to at least ${formatUsd(total)} (${unknownNote}), which reaches ${its} ${formatUsd(limit)} monthly limit.`
+          : `${subject} would bring this month's spend${on} to ${formatUsd(total)}, above ${its} ${formatUsd(limit)} monthly limit.`;
 
       const monthly = budgets.monthlyUsd;
       const keyLimit = budgets.perKeyMonthlyUsd[keyId] ?? null;
@@ -88,7 +99,7 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
         return { verdict: 'confirm', reasons };
       }
 
-      if (monthly != null && exceeds(spend.total, estimate, monthly)) {
+      if (monthly != null && exceeds(spend.total, estimate, monthly, partly)) {
         const spent = spend.total;
         reasons.push({
           kind: 'monthly',
@@ -97,12 +108,12 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
           message:
             estimate == null
               ? `You have spent ${formatUsd(spent)} this month, which reaches your ${formatUsd(monthly)} monthly limit.`
-              : `${subject} would bring this month's spend to ${formatUsd(spent + estimate)}, above your ${formatUsd(monthly)} monthly limit.`,
+              : wouldBring('', spent + estimate, monthly, 'your'),
         });
       }
 
       const spentOnKey = spend.byKey.get(keyId) ?? 0;
-      if (keyLimit != null && exceeds(spentOnKey, estimate, keyLimit)) {
+      if (keyLimit != null && exceeds(spentOnKey, estimate, keyLimit, partly)) {
         const name = core.keys.get(keyId)?.name;
         const label = name ? `the key “${name}”` : 'this key';
         reasons.push({
@@ -112,7 +123,7 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
           message:
             estimate == null
               ? `You have spent ${formatUsd(spentOnKey)} on ${label} this month, which reaches its ${formatUsd(keyLimit)} monthly limit.`
-              : `${subject} would bring this month's spend on ${label} to ${formatUsd(spentOnKey + estimate)}, above its ${formatUsd(keyLimit)} monthly limit.`,
+              : wouldBring(` on ${label}`, spentOnKey + estimate, keyLimit, 'its'),
         });
       }
 

@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  buildRequest,
-  nodeTokens,
-  type RequestOptions,
-  trimToBudget,
-  unparsedPdfs,
-} from './request';
+import { buildRequest, nodeTokens, type RequestOptions, unparsedPdfs } from './request';
 import { activePath, addNode, appendUser, type ChatNode, createThread } from './thread';
 
 const options = (patch: Partial<RequestOptions> = {}): RequestOptions => ({
@@ -179,16 +173,6 @@ describe('context trimming', () => {
     const path = longPath(3, 100);
     expect(buildRequest(path, options({ contextLength: 128_000 }), none).trimmed).toBe(0);
     expect(buildRequest(path, options({ contextLength: null }), none).trimmed).toBe(0);
-  });
-
-  it('never drops the message being answered, even when it alone is too long', () => {
-    expect(trimToBudget([500, 500, 9000], ['user', 'assistant', 'user'], 100)).toBe(2);
-    expect(trimToBudget([9000], ['user'], 100)).toBe(0);
-  });
-
-  it('starts the kept part with a user message', () => {
-    // Dropping the first message is enough, but the reply after it goes too.
-    expect(trimToBudget([60, 10, 10, 10], ['user', 'assistant', 'user', 'assistant'], 40)).toBe(2);
   });
 
   it('counts attachments in the approximation', () => {

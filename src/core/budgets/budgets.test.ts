@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatUsd } from '.';
-import type { BudgetMode, BudgetSettings, CoreServices, RunRecord } from '../types';
+import type { BudgetCheck, BudgetMode, BudgetSettings, CoreServices, RunRecord } from '../types';
 import { BudgetBlockedError, RunCancelledError } from '../errors';
 import { getDb } from '../storage/db';
 import { recordRunStats } from '../stats';
@@ -437,7 +437,7 @@ describe('group approvals', () => {
 });
 
 describe('beginAll', () => {
-  const contender = (model: string, estimateUsd: number) =>
+  const contender = (model: string, estimateUsd: number | null) =>
     ({
       tool: 'model-arena',
       model,
@@ -445,6 +445,46 @@ describe('beginAll', () => {
       prompt: 'Which is best?',
       groupId: 'round-1',
     }) as const;
+
+  it('returns the handles in the order of the specs', async () => {
+    const models = ['d/four', 'a/one', 'c/three', 'b/two'];
+    const runs = await core.runs.beginAll(models.map((model) => contender(model, 0.01)));
+    expect(runs.map((run) => run.model)).toEqual(models);
+  });
+
+  it('says when part of the total is unknown, and checks the budgets as for an unknown estimate', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    const round = [
+      contender('a/one', 0.125),
+      contender('b/two', 0.125),
+      contender('c/three', null),
+    ];
+    await core.runs.beginAll(round, { label: 'Model arena round: 3 models' });
+    expect(confirm.mock.calls[0]![1]).toMatchObject({
+      kind: 'group',
+      group: { estimateUsd: 0.25, unknownEstimates: 1 },
+    });
+    expect((confirm.mock.calls[0]![0] as BudgetCheck).reasons[0]?.message).toBe(
+      'These runs are estimated at $0.25 together and 1 unknown, above your $0.10 per-run limit.',
+    );
+    await Promise.all(core.runs.active().map((run) => run.finish()));
+
+    // Hard stop at $1.00 with $0.75 spent: known parts alone reach the limit exactly. With every estimate known
+    // the round fits; with one unknown, as for a single unknown estimate, the limit counts as reached.
+    setBudgets({ mode: 'hard', monthlyUsd: 1 });
+    await spend('k1', 0.75);
+    const known = [contender('a/one', 0.125), contender('b/two', 0.125)];
+    const begun = await core.runs.beginAll(known, { label: 'Model arena round: 2 models' });
+    await Promise.all(begun.map((run) => run.finish()));
+    const error = (await core.runs
+      .beginAll(round, { label: 'Model arena round: 3 models' })
+      .catch((e: unknown) => e)) as BudgetBlockedError;
+    expect(error).toBeInstanceOf(BudgetBlockedError);
+    expect(error.check.reasons.find((r) => r.kind === 'monthly')?.message).toBe(
+      "These runs would bring this month's spend to at least $1.00 (1 unknown), which reaches your $1.00 monthly limit.",
+    );
+  });
 
   it('with a label, asks once for the summed total and begins every member without a dialog', async () => {
     const confirm = vi.fn().mockResolvedValue(true);

@@ -35,7 +35,7 @@ import { missingInput, needsParser, parserAddons } from '../../core/attachments/
 import { FreeOnlyError, InvalidInputError } from '../../core/errors';
 import { isPdfEngineId, PDF_ENGINES, pdfEngine } from '../../core/models/pdf-engines';
 import { paidAddons } from '../../core/runs/addons';
-import type { ModelInfo, RunAddon, RunHandle, UsageTotals } from '../../core/types';
+import type { ModelInfo, RunAddon, RunHandle } from '../../core/types';
 import { debounce, isFiniteNumber } from '../../core/util';
 import { attachmentChip } from '../../ui/components/attachment-chip';
 import { attachmentIntake } from '../../ui/components/attachment-intake';
@@ -768,7 +768,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
    * The cost from the run's totals; the token counts only from the stream's own usage chunk (`wire`): without
    * one (a stopped or cut stream) the client books zeros, which are unknown here, not 0.
    */
-  const usageOf = (totals: UsageTotals, wire: WireUsage | null): EntryUsage | undefined => {
+  const usageOf = (run: RunHandle, wire: WireUsage | null): EntryUsage | undefined => {
+    const totals = run.totals;
     if (totals.requests === 0 && !wire) return undefined;
     const count = (value: unknown): number | null => (isFiniteNumber(value) ? value : null);
     const reasoning = wire?.completion_tokens_details?.reasoning_tokens;
@@ -779,6 +780,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       costUsd: totals.costUsd,
       costEstimated: totals.costEstimated,
       costUnknown: totals.costUnknown,
+      // An unknown cost books max(cost, reservation): said with it as "Unknown (≈ $x counted)".
+      ...(totals.costUnknown ? { bookedUsd: Math.max(totals.costUsd, run.reservedUsd) } : {}),
     };
   };
 
@@ -899,13 +902,13 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       }
       entry.finishReason = answer.finishReason;
       entry.status = 'done';
-      entry.usage = usageOf(run.totals, seen.usage ?? answer.usage);
+      entry.usage = usageOf(run, seen.usage ?? answer.usage);
       // The answer is in; a failure to record it is shown, but does not turn it into a failed answer. No panel
       // letter goes to History: it would tell which model a blind panel was before the vote.
       await run.finish({ output: entry.text }).catch((error: unknown) => void presentError(error));
     } catch (error) {
       entry.endedAt ??= now();
-      const usage = usageOf(run.totals, seen.usage);
+      const usage = usageOf(run, seen.usage);
       if (usage) entry.usage = usage;
       if (isStop(error)) {
         entry.status = 'stopped';

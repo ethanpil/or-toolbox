@@ -7,6 +7,7 @@ import {
   outputCap,
   outputTokens,
   promptBudget,
+  trimOldest,
 } from './tokens';
 
 /** The count before structure-aware counting: 4 per token for everything below U+0250. */
@@ -120,5 +121,26 @@ describe('output and context limits', () => {
       completionTokens: 8000,
       maxTokens: 8000,
     });
+  });
+});
+
+describe('trimOldest', () => {
+  it('drops the oldest until the rest fits the budget, and always keeps the last', () => {
+    expect(trimOldest([10, 10, 10], 25)).toBe(1);
+    expect(trimOldest([10, 10, 10], 5)).toBe(2);
+    expect(trimOldest([10, 10, 10], 100)).toBe(0);
+    expect(trimOldest([500, 500, 9000], 100)).toBe(2); // the last alone does not fit: kept anyway
+    expect(trimOldest([9000], 100)).toBe(0);
+    expect(trimOldest([], 100)).toBe(0);
+    expect(trimOldest([10, 10], promptBudget({ context: null }))).toBe(0); // unknown window
+  });
+
+  it('with startsAt, once something went, the kept part starts where startsAt allows (never past the last)', () => {
+    const roles = ['user', 'assistant', 'user', 'assistant'];
+    const user = (index: number): boolean => roles[index] === 'user';
+    // Dropping the first message is enough, but the reply after it goes too.
+    expect(trimOldest([60, 10, 10, 10], 40, user)).toBe(2);
+    expect(trimOldest([5, 5, 5, 5], 100, user)).toBe(0); // nothing dropped, nothing moved
+    expect(trimOldest([50, 10, 10], 15, (index) => index === 0)).toBe(2); // the last is kept regardless
   });
 });

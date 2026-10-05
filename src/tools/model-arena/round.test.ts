@@ -233,6 +233,7 @@ describe('metrics', () => {
       costUsd: 0.002,
       costEstimated: false,
       costUnknown: false,
+      bookedUsd: null,
     });
   });
 
@@ -255,9 +256,9 @@ describe('metrics', () => {
         model: 'a',
         status: 'error',
         text: '',
-        usage: { ...usage, costUsd: 0, costUnknown: true },
+        usage: { ...usage, costUsd: 0, costUnknown: true, bookedUsd: 0.05 },
       }),
-    ).toMatchObject({ costUsd: null, costUnknown: true });
+    ).toMatchObject({ costUsd: null, costUnknown: true, bookedUsd: 0.05 });
   });
 
   it('shows no token count for an answer without usage (stopped, cut off) instead of 0', () => {

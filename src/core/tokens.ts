@@ -98,6 +98,25 @@ export interface ContextFit {
 }
 
 /**
+ * How many of `tokens` (one count per message, oldest first) to leave out so the rest fits `budget`: the oldest go
+ * first and the last (the message being answered) always stays, even when it alone does not fit (`fitContext`
+ * then says `tooLong`). With `startsAt`, once something went, more go until the kept part starts at an index it
+ * accepts (Chat: a user message, so no reply is left without its question), never past the last.
+ */
+export function trimOldest(
+  tokens: readonly number[],
+  budget: number,
+  startsAt?: (index: number) => boolean,
+): number {
+  const last = tokens.length - 1;
+  let total = tokens.reduce((sum, value) => sum + value, 0);
+  let dropped = 0;
+  while (dropped < last && total > budget) total -= tokens[dropped++]!;
+  if (startsAt) while (dropped > 0 && dropped < last && !startsAt(dropped)) dropped++;
+  return dropped;
+}
+
+/**
  * The prompt tokens (besides `fixed`) a request may send: the window less a 5% margin for the approximation, less
  * room for the answer (`outputTokens`, at most half the window), less `fixed`. Trim to it, then call `fitContext`.
  */

@@ -51,6 +51,7 @@ export function fakeRun(
     tool,
     model,
     keyId,
+    reservedUsd: 0,
     signal: controller.signal,
     controller,
     usages,

@@ -9,6 +9,7 @@ import type {
 import { ApiError, RunCancelledError } from '../../core/errors';
 import { getDb } from '../../core/storage/db';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
+import { wipeKv } from '../../core/tool-state';
 import type { ApiClient, CallOptions, RunRecord } from '../../core/types';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import type { ToolInstance } from '../../ui/tool/types';
@@ -967,7 +968,11 @@ describe('review fixes: data reset (sweep #1)', () => {
     configure(tool, {});
     const done = t!.runners[0]!.trigger();
     await vi.waitFor(() => expect(turnTexts()).toEqual(['Partial']));
-    await (await getDb()).clear('kv');
+    // What Reset everything does to kv (clear it, bump the reset generation), with this tab's writes in flight;
+    // its data-reset event comes afterwards.
+    const wipe = (await getDb()).transaction('kv', 'readwrite');
+    await wipeKv(wipe.store);
+    await wipe.done;
     t!.core.bus.emit({ type: 'data-reset' });
     await done;
     await settle();

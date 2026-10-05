@@ -119,7 +119,7 @@ A run stopped before it sent anything (Stop during the free-model wait, a step p
 
 Several runs that the user starts with one action are checked and confirmed once, for their **total**: the key and the lock once, free-only across all their models and paid add-ons, the budgets against the total estimate (add-ons included), and one dialog that names the group (your label, its models, the total, an optional note). Each run still reserves its own estimate when it begins, and a hard (monthly) block still refuses it.
 
-**Runs that start together** (Model arena's contenders): `ctx.runs.beginAll(specs, { label, signal })` approves them as one group and begins them all, or none. When one is refused (Cancel, a block, the signal), the ones already begun are withdrawn: no record, no reservation, nothing sent or booked, and the refusal is thrown as `beginRun` would. Fill each spec as `ctx.beginRun` would (`tool`, `model`, `estimateUsd`, `addons`, `prompt` and `settings` from `getState()`); they share `specs[0].groupId`.
+**Runs that start together** (Model arena's contenders): `ctx.runs.beginAll(specs, { label, signal })` approves them as one group and begins them all, or none. When one is refused (Cancel, a block, the signal), the ones already begun are withdrawn: no record, no reservation, nothing sent or booked, and the refusal is thrown as `beginRun` would. Fill each spec as `ctx.beginRun` would (`tool`, `model`, `estimateUsd`, `addons`, `prompt` and `settings` from `getState()`); they share `specs[0].groupId`, and the handles come back in the order of `specs`. A member whose estimate is unknown is left out of the total and counted (the dialog says "≈ $0.27 + 1 unknown"; budgets treat the total as a floor).
 
 ```ts
 const snapshot = getState();
@@ -156,7 +156,9 @@ await ctx.beginRun({ estimateUsd: step, groupId: sequence.id, useGroupApproval: 
 await ctx.runs.releaseGroup(sequence.id); // when the group is done with (New sequence)
 ```
 
-The approval is stored (IndexedDB `kv`), so it holds in every tab and after a reload until `releaseGroup`, a new approval of the same group id or a data reset. It covers at most `runs` runs, together within the approved total when that is known, on the approved key and models; a run beyond that asks for itself. A run that ends having sent nothing gives its share back. Groups on free models only need no approval and store none.
+The approval is stored (IndexedDB `kv`), so it holds in every tab and after a reload until `releaseGroup`, a new approval of the same group id or a data reset. It covers at most `runs` runs, together within the approved total when that is known, on the approved key and models; a run beyond that asks for itself. A run that ends having sent nothing gives its share back. Groups on free models only need no approval and store none. When some runs' estimates are unknown, pass the sum of the known ones as `estimateUsd` and how many are unknown as `unknownEstimates`.
+
+A run's reservation is on its handle, `run.reservedUsd` (its estimate plus add-ons). When its cost turns out unknown, budgets and Stats book `max(cost, reservedUsd)`: show it as `formatRunCost(cost, { booked: Math.max(totals.costUsd, run.reservedUsd) })`, which reads "Unknown (≈ $x counted)".
 
 ### Refused runs change nothing
 
@@ -316,12 +318,16 @@ Count tokens with `src/core/tokens.ts`, the one approximation every tool uses (n
 
 ```ts
 const limits = { context: info.contextLength, maxTokens, maxCompletionTokens: info.maxCompletionTokens, fixed: systemTokens };
-const trimmed = trimOldest(tokens, promptBudget(limits));        // what may be sent besides `fixed`
+const tokens = messages.map((m) => approxTokens(m.text) + MESSAGE_OVERHEAD); // oldest first, one per message
+const trimmed = trimOldest(tokens, promptBudget(limits));        // how many of the oldest to leave out (never the last)
+const keptTokens = tokens.slice(trimmed).reduce((sum, n) => sum + n, 0);
 const fit = fitContext({ ...limits, prompt: keptTokens });       // { budget, tooLong, room, completionTokens, maxTokens }
 if (fit.tooLong) throw new InvalidInputError('This is too long for the model’s context window.');
 body.max_tokens = fit.maxTokens ?? undefined;                    // null: Max tokens not set, leave it out
 // estimate with completionTokens: fit.completionTokens
 ```
+
+`trimOldest(tokens, budget, startsAt?)` drops the oldest first and always keeps the last message (the one being answered); with `startsAt(index)`, once something went it drops on until the kept part starts where you allow (Chat passes `(i) => turns[i].role === 'user'`, so no reply is left without its question).
 
 The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it), and `ctx.beginRun` without `estimateUsd` always computes it afresh for the input as it is at that moment (so a paste followed by Ctrl+Enter, before your debounced `refreshEstimate`, books the right amount); only a value set with `ui.setEstimate` is booked as is. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
 
@@ -409,7 +415,7 @@ Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manife
 
 - **Read-modify-write with `update`.** `ctx.state.update(key, (current) => next)` runs under the Web Lock `ortoolbox:tool-state:<tool>:<key>`, so two tabs never lose each other's change (a vote tally, a list of saved items). Return `current` itself to write nothing, `undefined` to delete; it resolves with the stored value. It waits only for other `update`s of the key, so write such a key through `update` alone.
 - **Re-read on `tool-state-changed`** and show what is stored (see the context table). A data reset, "Delete all prompts and history" and a backup import announce every key they touch, so a page that follows the event shows them.
-- **A reset is final.** After Reset everything (in any tab), the store refuses (`StateResetError`, shown as "reload the page") to store a value from before it: a key this page read or wrote before the reset and has not read since, or an object it read or stored before. So the abort a reset causes cannot write the old conversation back. Deletes, new keys and values built after a fresh read are stored. To go on in an open page after a reset, drop what you hold on `data-reset` (`ctx.bus.on('data-reset', …)`) and read again.
+- **A reset is final.** After Reset everything (in any tab), the store refuses (`StateResetError`, shown as "reload the page") to store a value from before it: a key this page read or wrote before the reset and has not read since, or an object it read or stored before. So the abort a reset causes cannot write the old conversation back, even a write already on its way when the reset happened: the check runs in the write's own transaction against a reset generation that Reset bumps while it wipes, so you need no extra delete behind your writes. Deletes, new keys and values built after a fresh read are stored. To go on in an open page after a reset, drop what you hold on `data-reset` (`ctx.bus.on('data-reset', …)`) and read again.
 - **Locks of your own** come from `src/core/util.ts`: `lockRunner(name)` for short locked steps (make it once, then `locked(fn)`: the Web Lock plus the runner's own in-page queue, which also serves where Web Locks are missing), `holdLock(name, { ifAvailable })` for a lock held as long as something lives (it resolves with the release, or null when another tab holds it). Name them `ortoolbox:<tool>:…`.
 
 ## Prompts, History and the form state

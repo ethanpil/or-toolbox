@@ -6,7 +6,6 @@ import {
   framing,
   framingLine,
   mergeParts,
-  trimCount,
   type TurnOptions,
 } from './request';
 
@@ -134,12 +133,6 @@ describe('messages per speaker', () => {
 });
 
 describe('trimming and max_tokens', () => {
-  it('drops the oldest first and always keeps the last', () => {
-    expect(trimCount([10, 10, 10], 25)).toBe(1);
-    expect(trimCount([10, 10, 10], 5)).toBe(2);
-    expect(trimCount([10, 10, 10], 100)).toBe(0);
-  });
-
   it('keeps the framing and the opener and says how many turns went', () => {
     const long = 'word '.repeat(400); // ~500 tokens each
     const conversation = conversationWith(

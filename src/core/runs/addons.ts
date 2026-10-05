@@ -18,3 +18,8 @@ export function withAddons(estimate: number | null, addons: readonly RunAddon[])
 export function paidAddons(addons: readonly RunAddon[]): RunAddon[] {
   return addons.filter((addon) => addon.estimateUsd !== 0);
 }
+
+/** How many add-ons have an unknown price (left out of `withAddons`' sum, so it is a floor). */
+export function unknownAddons(addons: readonly RunAddon[]): number {
+  return addons.filter((addon) => !isFiniteNumber(addon.estimateUsd)).length;
+}
