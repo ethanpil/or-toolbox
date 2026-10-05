@@ -14,6 +14,7 @@ Browser-only toolbox of 14 AI tools on top of OpenRouter. No server, no accounts
 | `npm run test` | Vitest unit tests |
 | `npm run e2e:dev -- <spec>` | Playwright against the dev server (reuses a running one) — use this while developing |
 | `npm run e2e` | Build, then Playwright against `preview` — the gate run; do not run it while other agents are working (it rewrites `dist/`). `E2E_SKIP_BROWSERS=firefox` leaves out a browser this machine cannot run; CI never sets it |
+| `npm run budgets` | After a build: the shell's and each tool page's eagerly loaded JS against rule 8's budgets (CI runs it) |
 | `npm run icons` | Regenerate `public/icons/*.png` and `favicon.ico` from `public/icons/logo.svg` (outputs are committed) |
 
 ## Layout

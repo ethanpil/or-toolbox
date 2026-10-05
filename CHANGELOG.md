@@ -71,6 +71,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `npm run budgets` checks the built JS budgets (shell at most 150 KB gzipped, each tool at most 80 KB more); CI runs it after the build.
 - US spelling "Favorites" everywhere (text, test ids, code and the settings fields `favoriteTools` and `models.favorites`); settings saved under the old field names are still read.
 - `trimOldest()` in `src/core/tokens.ts` replaces Chat's `trimToBudget` and Bot-to-bot's `trimCount` (94c14cf).
 - `RunHandle.reservedUsd`; Model arena says what an unknown cost counted; a group total with unknown members shows "+ N unknown" and budgets treat it as a floor; `beginAll` returns handles in spec order (4f88cad).

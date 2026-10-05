@@ -38,6 +38,9 @@ jobs:
       # The build that is tested below is the build that is deployed.
       - run: npm run build
 
+      # Shell at most 150 KB gzipped, each tool at most 80 KB more (CLAUDE.md, rule 8).
+      - run: npm run budgets
+
       - uses: actions/upload-artifact@v7
         with:
           name: dist

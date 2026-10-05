@@ -19,6 +19,7 @@
     "check": "npm run typecheck && npm run lint && npm run test",
     "e2e:dev": "playwright test --config playwright.dev.config.ts",
     "e2e": "npm run build && playwright test",
+    "budgets": "node scripts/check-budgets.mjs",
     "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {
