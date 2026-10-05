@@ -296,7 +296,9 @@ export function createModelsService(
     switch (input.kind) {
       case 'tokens': {
         const model = await get(input.model);
-        return model ? estimateTokens(model, input.promptTokens, input.completionTokens) : null;
+        return model
+          ? estimateTokens(model, input.promptTokens, input.completionTokens, input.audio)
+          : null;
       }
       case 'decision': {
         const model = await get(input.model);
