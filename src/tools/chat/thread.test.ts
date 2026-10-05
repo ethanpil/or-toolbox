@@ -232,6 +232,22 @@ describe('parseThread', () => {
     expect(leaf(parsed)?.status).toBe('stopped');
   });
 
+  it('remembers that a failed reply may have gone through, and only on a failed reply', () => {
+    const thread = conversation();
+    const reply = leaf(thread)!;
+    Object.assign(reply, {
+      status: 'error',
+      error: 'It may have gone through.',
+      outcomeUnknown: true,
+    });
+    const parsed = parseThread(JSON.parse(JSON.stringify(thread)))!;
+    expect(leaf(parsed)).toMatchObject({ status: 'error', outcomeUnknown: true });
+
+    reply.status = 'done';
+    const done = parseThread(JSON.parse(JSON.stringify(thread)))!;
+    expect(leaf(done)?.outcomeUnknown).toBeUndefined();
+  });
+
   it('keeps text attachments’ text and only the name, type and size of binaries', () => {
     const thread = createThread();
     appendUser(thread, 'Look', [

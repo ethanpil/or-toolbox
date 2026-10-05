@@ -50,6 +50,8 @@ export interface ChatNode {
   status?: ReplyStatus;
   /** A user-safe error message (status `error`). */
   error?: string;
+  /** The failed request may have gone through and been billed (`isOutcomeUnknown`): no plain Retry is offered. */
+  outcomeUnknown?: true;
   /** Earliest messages left out of the request to fit the model's context. */
   trimmed?: number;
 }
@@ -395,6 +397,7 @@ const REPLY_FIELDS = [
   'usage',
   'status',
   'error',
+  'outcomeUnknown',
   'trimmed',
 ] as const;
 
@@ -516,6 +519,7 @@ function parseNode(raw: unknown, fallbackTime: number): ChatNode | null {
         : (status as ReplyStatus)
       : 'done';
     if (isString(raw['error'])) node.error = raw['error'];
+    if (node.status === 'error' && raw['outcomeUnknown'] === true) node.outcomeUnknown = true;
     if (isFiniteNumber(raw['trimmed']) && raw['trimmed'] > 0) node.trimmed = raw['trimmed'];
   }
   return node;
