@@ -95,6 +95,19 @@ describe('catalog cache', () => {
     expect(models.lastRefreshed()).toBe(clock);
   });
 
+  it('announces a refresh only once it is stored, so tabs never refetch in a loop', async () => {
+    const db = await getDb();
+    const put = vi
+      .spyOn(db, 'put')
+      .mockRejectedValue(new DOMException('full', 'QuotaExceededError'));
+    const { models, events } = tab();
+    expect(await models.list()).toHaveLength(RAW.length);
+    await vi.waitFor(() => expect(put).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).toEqual([]);
+    put.mockRestore();
+  });
+
   it('shares concurrent loads', async () => {
     const catalog = catalogApi();
     const models = service(catalog);
