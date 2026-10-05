@@ -61,7 +61,7 @@ describe('defaults and validation', () => {
     const repaired = normalizeSettings({
       version: 1,
       onboarding: { completed: 'yes' },
-      favouriteTools: ['chat', 'nope', 'chat', 7, 'ocr'],
+      favoriteTools: ['chat', 'nope', 'chat', 7, 'ocr'],
       defaultKeyId: 42,
       defaultModels: { text: 'openai/gpt-x', bogus: 'x', image: '' },
       freeOnly: true,
@@ -80,7 +80,7 @@ describe('defaults and validation', () => {
       data: { retentionDays: 'forever', recordRecentPrompts: false },
       security: { autoLockMinutes: Number.NaN },
       models: {
-        favourites: ['a', 'a', '', 3],
+        favorites: ['a', 'a', '', 3],
         recent: Array.from({ length: 30 }, (_, i) => `m${i}`),
       },
       ui: { 'home.view': 'grid' },
@@ -90,7 +90,7 @@ describe('defaults and validation', () => {
     expect(repaired).toEqual<Settings>({
       version: 1,
       onboarding: { completed: false },
-      favouriteTools: ['chat', 'ocr'],
+      favoriteTools: ['chat', 'ocr'],
       defaultKeyId: null,
       defaultModels: { text: 'openai/gpt-x' },
       freeOnly: true,
@@ -104,9 +104,19 @@ describe('defaults and validation', () => {
       appearance: { theme: 'system', accent: '#abcdef', density: 'compact', reducedMotion: false },
       data: { retentionDays: 90, recordRecentPrompts: false },
       security: { autoLockMinutes: 15 },
-      models: { favourites: ['a'], recent: Array.from({ length: 20 }, (_, i) => `m${i}`) },
+      models: { favorites: ['a'], recent: Array.from({ length: 20 }, (_, i) => `m${i}`) },
       ui: { 'home.view': 'grid' },
     });
+  });
+
+  it('reads favorites saved under the older spelling', () => {
+    const settings = normalizeSettings({
+      version: 1,
+      favouriteTools: ['chat'],
+      models: { favourites: ['a/b'] },
+    });
+    expect(settings.favoriteTools).toEqual(['chat']);
+    expect(settings.models.favorites).toEqual(['a/b']);
   });
 
   it('clamps numbers to sane ranges', () => {

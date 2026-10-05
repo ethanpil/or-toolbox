@@ -106,7 +106,7 @@ mountPage(
           rows: [
             [
               'Local storage',
-              'Settings, favourites and your API keys (keys encrypted when the passphrase lock is on).',
+              'Settings, favorites and your API keys (keys encrypted when the passphrase lock is on).',
             ],
             [
               'IndexedDB',

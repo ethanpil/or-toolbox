@@ -110,10 +110,10 @@ test('Home search filters the tools and Enter opens the best match', async ({ pa
   await expect(page).toHaveURL(/\/tools\/speech-to-text\/$/);
 });
 
-test('a starred tool appears in Favourites', async ({ page, context }) => {
+test('a starred tool appears in Favorites', async ({ page, context }) => {
   await seedApp(context);
   await page.goto('');
-  await expect(page.getByTestId('favourites-empty')).toBeVisible();
+  await expect(page.getByTestId('favorites-empty')).toBeVisible();
   const star = page.getByTestId('category-audio').getByTestId('star-text-to-speech');
   await star.focus();
   await page.keyboard.press('Enter');

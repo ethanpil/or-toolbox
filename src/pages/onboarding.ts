@@ -1,6 +1,6 @@
 /**
  * First-run onboarding, inline at the top of Home while `settings.onboarding.completed` is false:
- * (1) connect OpenRouter or paste a key, with an optional free-only switch; (2) pick favourite tools;
+ * (1) connect OpenRouter or paste a key, with an optional free-only switch; (2) pick favorite tools;
  * (3) try a sample (opens a tool with `?sample=1`). "Skip setup" on any step ends it for good; so does
  * finishing. The current step is kept in `settings.ui['home.onboardingStep']`, so the OAuth round trip (which
  * leaves the page) comes back to the right place.
@@ -78,7 +78,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
 
   const savedStep = core.settings.get().ui[STEP_KEY];
   let step = savedStep === 2 || savedStep === 3 ? savedStep : 1;
-  /** The favourites being picked; read from the settings each time step 2 opens (they may have changed). */
+  /** The favorites being picked; read from the settings each time step 2 opens (they may have changed). */
   let picked = new Set<ToolId>();
 
   const persistStep = (next: number): void => {
@@ -186,8 +186,8 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
     ];
   };
 
-  const stepFavourites = (): Child[] => {
-    picked = new Set<ToolId>(core.settings.get().favouriteTools);
+  const stepFavorites = (): Child[] => {
+    picked = new Set<ToolId>(core.settings.get().favoriteTools);
     const count = h('span', { class: 'text-body-secondary small', role: 'status' });
     const updateCount = (): void => {
       count.textContent = `${picked.size} picked`;
@@ -227,7 +227,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
     );
     updateCount();
     return [
-      stepTitle('Pick your favourite tools'),
+      stepTitle('Pick your favorite tools'),
       h(
         'p',
         { class: 'text-body-secondary' },
@@ -249,7 +249,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
             'data-testid': 'onboarding-next',
             onclick: () => {
               const saved = saveSettings(core, (draft) => {
-                draft.favouriteTools = [...picked];
+                draft.favoriteTools = [...picked];
               });
               if (saved) go(3);
             },
@@ -263,8 +263,8 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
   };
 
   const stepSample = (): Child[] => {
-    const favourites = core.settings.get().favouriteTools;
-    const suggestions = (favourites.length > 0 ? favourites : SUGGESTED).slice(0, 3).map(getTool);
+    const favorites = core.settings.get().favoriteTools;
+    const suggestions = (favorites.length > 0 ? favorites : SUGGESTED).slice(0, 3).map(getTool);
     return [
       stepTitle('Try a sample'),
       h(
@@ -323,7 +323,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
   };
 
   function render(): void {
-    const labels = ['Connect', 'Favourites', 'Try it'];
+    const labels = ['Connect', 'Favorites', 'Try it'];
     progress.replaceChildren(
       ...labels.map((label, index) => {
         const number = index + 1;
@@ -347,7 +347,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
         );
       }),
     );
-    replace(body, step === 1 ? stepConnect() : step === 2 ? stepFavourites() : stepSample());
+    replace(body, step === 1 ? stepConnect() : step === 2 ? stepFavorites() : stepSample());
     body.classList.add('mt-4');
   }
 

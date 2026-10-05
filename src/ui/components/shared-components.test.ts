@@ -15,20 +15,20 @@ afterEach(() => {
 describe('starButton', () => {
   it('toggles through onToggle and shows its state with aria-pressed, icon and tooltip', () => {
     const onToggle = vi.fn();
-    const star = starButton({ pressed: false, label: 'Favourite: Chat', onToggle });
-    expect(star.getAttribute('aria-label')).toBe('Favourite: Chat');
+    const star = starButton({ pressed: false, label: 'Favorite: Chat', onToggle });
+    expect(star.getAttribute('aria-label')).toBe('Favorite: Chat');
     expect(star.getAttribute('aria-pressed')).toBe('false');
-    expect(star.title).toBe('Add to favourites');
+    expect(star.title).toBe('Add to favorites');
     expect(star.querySelector('.bi-star')).not.toBeNull();
     star.click();
     expect(onToggle).toHaveBeenCalledTimes(1);
 
     setStarred(star, true);
     expect(star.getAttribute('aria-pressed')).toBe('true');
-    expect(star.title).toBe('Remove from favourites');
+    expect(star.title).toBe('Remove from favorites');
     expect(star.querySelector('.bi-star-fill')).not.toBeNull();
     // The label does not change with the state: aria-pressed carries it.
-    expect(star.getAttribute('aria-label')).toBe('Favourite: Chat');
+    expect(star.getAttribute('aria-label')).toBe('Favorite: Chat');
   });
 
   it('takes its own tooltips, focus key and test id', () => {

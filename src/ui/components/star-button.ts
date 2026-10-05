@@ -1,10 +1,10 @@
 /**
- * The star that marks a favourite tool, a favourite model or a starred run: an icon-only toggle button.
+ * The star that marks a favorite tool, a favorite model or a starred run: an icon-only toggle button.
  * `aria-pressed` carries the state (the label stays the same), the icon and tooltip follow it, and `setStarred`
  * updates a button in place, so a list does not have to re-render (and drop keyboard focus) to show a change.
  *
  * ```ts
- * const star = starButton({ pressed: isFavourite(id), label: `Favourite: ${name}`, onToggle: () => toggle(id) });
+ * const star = starButton({ pressed: isFavorite(id), label: `Favorite: ${name}`, onToggle: () => toggle(id) });
  * setStarred(star, true);
  * ```
  */
@@ -13,10 +13,10 @@ import { icon } from '../icon';
 
 export interface StarButtonOptions {
   pressed: boolean;
-  /** The accessible name, e.g. `Favourite: Chat`. */
+  /** The accessible name, e.g. `Favorite: Chat`. */
   label: string;
   onToggle: () => void;
-  /** Tooltip while not pressed and while pressed; default `Add to favourites` / `Remove from favourites`. */
+  /** Tooltip while not pressed and while pressed; default `Add to favorites` / `Remove from favorites`. */
   titles?: readonly [off: string, on: string];
   /** Extra classes after `btn btn-sm btn-link or-star`. */
   class?: string;
@@ -26,7 +26,7 @@ export interface StarButtonOptions {
   part?: string;
 }
 
-const DEFAULT_TITLES = ['Add to favourites', 'Remove from favourites'] as const;
+const DEFAULT_TITLES = ['Add to favorites', 'Remove from favorites'] as const;
 const titlesOf = new WeakMap<HTMLElement, readonly [string, string]>();
 
 export function starButton(options: StarButtonOptions): HTMLButtonElement {

@@ -1,6 +1,6 @@
 /**
  * Home: search first (filters the tools as you type; Enter opens the best match; `/` focuses it), the first-run
- * onboarding, Favourites (starred tools), the five latest runs, then every tool by category. A tool card shows
+ * onboarding, Favorites (starred tools), the five latest runs, then every tool by category. A tool card shows
  * a "Free" badge when its primary capability currently resolves to a free model.
  */
 import type { RunRecord, Settings } from '../core/types';
@@ -14,7 +14,7 @@ import { announce } from '../ui/feedback/announce';
 import { formatDateTime, formatRelativeTime, formatUsd, plural } from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
-import { toggleFavouriteTool } from '../ui/settings-actions';
+import { toggleFavoriteTool } from '../ui/settings-actions';
 import { mountPage } from '../ui/shell/index';
 import { CATEGORY_INFO, historyUrl, toolUrl } from '../ui/shell/links';
 import { togglePalette } from '../ui/shell/palette';
@@ -35,11 +35,11 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     'data-testid': 'home-search',
   });
 
-  const isFavourite = (id: ToolId): boolean => core.settings.get().favouriteTools.includes(id);
-  const toggleFavourite = (tool: ToolManifest): void => {
-    const on = toggleFavouriteTool(core, tool.id);
+  const isFavorite = (id: ToolId): boolean => core.settings.get().favoriteTools.includes(id);
+  const toggleFavorite = (tool: ToolManifest): void => {
+    const on = toggleFavoriteTool(core, tool.id);
     if (on === null) return;
-    announce(on ? `${tool.name} added to favourites.` : `${tool.name} removed from favourites.`);
+    announce(on ? `${tool.name} added to favorites.` : `${tool.name} removed from favorites.`);
   };
 
   const isFreeTool = (tool: ToolManifest): boolean => {
@@ -48,7 +48,7 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
   };
 
   const card = (tool: ToolManifest, testPrefix: string): HTMLElement => {
-    const starred = isFavourite(tool.id);
+    const starred = isFavorite(tool.id);
     return h(
       'div',
       { class: 'col' },
@@ -90,12 +90,12 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
         ),
         starButton({
           pressed: starred,
-          label: `Favourite: ${tool.name}`,
+          label: `Favorite: ${tool.name}`,
           class: 'or-card-star',
           // Re-rendering a grid gives focus back to the same tool's star (see replace() in dom.ts).
           focusKey: `star-${tool.id}`,
           testId: `star-${tool.id}`,
-          onToggle: () => toggleFavourite(tool),
+          onToggle: () => toggleFavorite(tool),
         }),
       ),
     );
@@ -128,10 +128,10 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
 
   // --- sections -----------------------------------------------------------------------------------------
   const onboardingSlot = h('div');
-  const favourites = h('section', {
+  const favorites = h('section', {
     class: 'mb-5',
-    'aria-labelledby': 'favourites-title',
-    'data-testid': 'favourites',
+    'aria-labelledby': 'favorites-title',
+    'data-testid': 'favorites',
   });
   const recentList = h('div');
   const recent = h(
@@ -154,19 +154,19 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
   });
   const resultCount = h('div', { class: 'visually-hidden', role: 'status' });
 
-  const renderFavourites = (): void => {
-    const list = core.settings.get().favouriteTools.map(getTool);
+  const renderFavorites = (): void => {
+    const list = core.settings.get().favoriteTools.map(getTool);
     replace(
-      favourites,
-      sectionHeading('favourites-title', 'star', 'Favourites'),
+      favorites,
+      sectionHeading('favorites-title', 'star', 'Favorites'),
       list.length > 0
         ? grid(list, 'fav-')
         : emptyState({
             icon: 'star',
-            title: 'No favourites yet',
+            title: 'No favorites yet',
             text: 'Star the tools you use most and they stay right here.',
             inline: true,
-            testId: 'favourites-empty',
+            testId: 'favorites-empty',
           }),
     );
   };
@@ -267,7 +267,7 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
   const applySearch = (): void => {
     const query = search.value.trim();
     const searching = query !== '';
-    for (const section of [onboardingSlot, favourites, recent, categories])
+    for (const section of [onboardingSlot, favorites, recent, categories])
       section.hidden = searching;
     results.hidden = !searching;
     if (!searching) {
@@ -363,13 +363,13 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     ),
     onboardingSlot,
     results,
-    favourites,
+    favorites,
     recent,
     categories,
   );
 
   showOnboarding();
-  renderFavourites();
+  renderFavorites();
   renderRecent();
   renderCategories();
 
@@ -380,15 +380,15 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     JSON.stringify(next.tools) !== JSON.stringify(prev.tools);
 
   core.settings.subscribe((next, prev) => {
-    const favouritesChanged = next.favouriteTools.join() !== prev.favouriteTools.join();
-    if (favouritesChanged || affectsCards(next, prev)) {
-      // A star un-starred inside Favourites disappears with its card: continue on that tool's other star.
+    const favoritesChanged = next.favoriteTools.join() !== prev.favoriteTools.join();
+    if (favoritesChanged || affectsCards(next, prev)) {
+      // A star un-starred inside Favorites disappears with its card: continue on that tool's other star.
       const focused = document.activeElement;
       const key =
-        focused instanceof HTMLElement && favourites.contains(focused)
+        focused instanceof HTMLElement && favorites.contains(focused)
           ? focused.closest('[data-focus-key]')?.getAttribute('data-focus-key')
           : null;
-      renderFavourites();
+      renderFavorites();
       renderCategories();
       if (search.value.trim()) applySearch();
       if (key && !main.contains(document.activeElement)) {

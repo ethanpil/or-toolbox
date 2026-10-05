@@ -1,11 +1,11 @@
 /**
  * Stage 2 gate: first-run onboarding on Home. Paste a key (format-checked, saved, checked with GET /key),
- * optional free-only, pick favourites, try a sample; or skip. Never shown again once finished or skipped.
+ * optional free-only, pick favorites, try a sample; or skip. Never shown again once finished or skipped.
  */
 import { expect, TEST_API_KEY, test } from '../mock/index.ts';
 import { watchForProblems } from './support.ts';
 
-test('paste a key, pick favourites and try a sample', async ({ page, mock }) => {
+test('paste a key, pick favorites and try a sample', async ({ page, mock }) => {
   test.slow(); // the whole first-run journey
   const problems = await watchForProblems(page);
   await page.goto('');
@@ -31,7 +31,7 @@ test('paste a key, pick favourites and try a sample', async ({ page, mock }) => 
   await expect(page.getByTestId('free-only-badge')).toBeVisible();
   await page.getByTestId('onboarding-next').click();
 
-  await expect(wizard.getByRole('heading', { level: 3 })).toHaveText('Pick your favourite tools');
+  await expect(wizard.getByRole('heading', { level: 3 })).toHaveText('Pick your favorite tools');
   for (const id of ['chat', 'ocr', 'text-to-speech']) {
     const pick = page.getByTestId(`pick-tool-${id}`);
     await pick.click();
@@ -49,7 +49,7 @@ test('paste a key, pick favourites and try a sample', async ({ page, mock }) => 
   await page.goto('');
   await expect(page.getByTestId('onboarding')).toHaveCount(0);
   // Free-only is on and all three have a free model, so each card says "Free".
-  await expect(page.getByTestId('favourites').getByRole('heading', { level: 3 })).toHaveText([
+  await expect(page.getByTestId('favorites').getByRole('heading', { level: 3 })).toHaveText([
     /^Chat\s*Free$/,
     /^OCR\s*Free$/,
     /^Text-to-speech\s*Free$/,

@@ -1,7 +1,7 @@
 /**
- * `modelPicker()`: a modal to choose a model for one capability. Favourites and recently used models come first
- * (`settings.models.favourites` / `recent`), every row shows the free badge or price, context size and id, and a
- * star toggles the favourite (persisted at once). The list honours free-only mode (`models.forCapability`).
+ * `modelPicker()`: a modal to choose a model for one capability. Favorites and recently used models come first
+ * (`settings.models.favorites` / `recent`), every row shows the free badge or price, context size and id, and a
+ * star toggles the favorite (persisted at once). The list honours free-only mode (`models.forCapability`).
  * Resolves the chosen model id, or null when cancelled.
  *
  * ```ts
@@ -15,7 +15,7 @@ import { h, replace } from '../dom';
 import { openModal } from '../feedback/modal';
 import { formatContext, formatModelPrice } from '../format';
 import { uid } from '../id';
-import { toggleFavouriteModel } from '../settings-actions';
+import { toggleFavoriteModel } from '../settings-actions';
 import { rankBy, type SearchItem } from '../shell/palette-search';
 import { settingsUrl } from '../shell/links';
 import { emptyState } from './empty-state';
@@ -62,26 +62,26 @@ export function modelPicker(
   const results = h('div', { class: 'or-model-results', 'data-testid': 'model-results' });
   const status = h('div', { class: 'visually-hidden', role: 'status' });
 
-  const isFavourite = (id: string): boolean => core.settings.get().models.favourites.includes(id);
+  const isFavorite = (id: string): boolean => core.settings.get().models.favorites.includes(id);
 
-  const toggleFavourite = (model: ModelInfo, button: HTMLButtonElement): void => {
-    const next = toggleFavouriteModel(core, model.id);
+  const toggleFavorite = (model: ModelInfo, button: HTMLButtonElement): void => {
+    const next = toggleFavoriteModel(core, model.id);
     if (next === null) return;
     setStarred(button, next);
     status.textContent = next
-      ? `${model.name} added to favourites.`
-      : `${model.name} removed from favourites.`;
+      ? `${model.name} added to favorites.`
+      : `${model.name} removed from favorites.`;
   };
 
   const row = (model: ModelInfo): HTMLElement => {
     const selected = model.id === options.selected;
-    const favourite = isFavourite(model.id);
+    const favorite = isFavorite(model.id);
     const context = formatContext(model.contextLength);
     const star = starButton({
-      pressed: favourite,
-      label: `Favourite: ${model.name}`,
-      testId: 'model-favourite',
-      onToggle: () => toggleFavourite(model, star),
+      pressed: favorite,
+      label: `Favorite: ${model.name}`,
+      testId: 'model-favorite',
+      onToggle: () => toggleFavorite(model, star),
     });
     return h(
       'div',
@@ -183,15 +183,15 @@ export function modelPicker(
     const byId = new Map(models.map((model) => [model.id, model]));
     const pick = (ids: readonly string[]): ModelInfo[] =>
       ids.map((id) => byId.get(id)).filter((model): model is ModelInfo => model !== undefined);
-    const favourites = pick(settings.models.favourites);
-    const recent = pick(settings.models.recent).filter((model) => !isFavourite(model.id));
-    const shownIds = new Set([...favourites, ...recent].map((model) => model.id));
+    const favorites = pick(settings.models.favorites);
+    const recent = pick(settings.models.recent).filter((model) => !isFavorite(model.id));
+    const shownIds = new Set([...favorites, ...recent].map((model) => model.id));
     const rest = [...models]
       .filter((model) => !shownIds.has(model.id))
       .sort((a, b) => Number(b.isFree) - Number(a.isFree) || a.name.localeCompare(b.name));
     replace(
       results,
-      ...section('Favourites', favourites),
+      ...section('Favorites', favorites),
       ...section('Recently used', recent),
       ...section('All models', rest.slice(0, MAX_ROWS)),
       rest.length > MAX_ROWS

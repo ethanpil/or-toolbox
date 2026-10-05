@@ -34,21 +34,21 @@ function toggled<T>(list: readonly T[], item: T): T[] {
 }
 
 /** Stars or unstars a model. Resolves to its new state, or null when the change could not be saved. */
-export function toggleFavouriteModel(core: WithSettings, id: string): boolean | null {
+export function toggleFavoriteModel(core: WithSettings, id: string): boolean | null {
   let on = false;
   const saved = saveSettings(core, (draft) => {
-    draft.models.favourites = toggled(draft.models.favourites, id);
-    on = draft.models.favourites.includes(id);
+    draft.models.favorites = toggled(draft.models.favorites, id);
+    on = draft.models.favorites.includes(id);
   });
   return saved ? on : null;
 }
 
 /** Stars or unstars a tool on Home. Resolves to its new state, or null when it could not be saved. */
-export function toggleFavouriteTool(core: WithSettings, id: ToolId): boolean | null {
+export function toggleFavoriteTool(core: WithSettings, id: ToolId): boolean | null {
   let on = false;
   const saved = saveSettings(core, (draft) => {
-    draft.favouriteTools = toggled(draft.favouriteTools, id);
-    on = draft.favouriteTools.includes(id);
+    draft.favoriteTools = toggled(draft.favoriteTools, id);
+    on = draft.favoriteTools.includes(id);
   });
   return saved ? on : null;
 }

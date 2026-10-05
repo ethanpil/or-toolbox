@@ -28,7 +28,7 @@ export interface ModelFilters {
   /** The author, i.e. the text before the slash of the id. */
   provider: string;
   freeOnly: boolean;
-  favouritesOnly: boolean;
+  favoritesOnly: boolean;
   /** USD per 1M tokens, input plus output; null = no limit. */
   maxPrice: number | null;
   /** Minimum context window in tokens; 0 = any. */
@@ -42,7 +42,7 @@ export const NO_FILTERS: Readonly<ModelFilters> = {
   output: '',
   provider: '',
   freeOnly: false,
-  favouritesOnly: false,
+  favoritesOnly: false,
   maxPrice: null,
   minContext: 0,
 };
@@ -55,7 +55,7 @@ export function activeFilterCount(filters: ModelFilters): number {
     filters.output !== '',
     filters.provider !== '',
     filters.freeOnly,
-    filters.favouritesOnly,
+    filters.favoritesOnly,
     filters.maxPrice !== null,
     filters.minContext > 0,
   ].filter(Boolean).length;
@@ -106,10 +106,10 @@ function withinPriceLimit(model: ModelInfo, maxPrice: number): boolean {
 export function hiddenByPriceLimit(
   models: readonly ModelInfo[],
   filters: ModelFilters,
-  favourites: ReadonlySet<string>,
+  favorites: ReadonlySet<string>,
 ): number {
   if (filters.maxPrice === null) return 0;
-  return queryModels(models, { ...filters, maxPrice: null }, 'name', favourites).filter((model) => {
+  return queryModels(models, { ...filters, maxPrice: null }, 'name', favorites).filter((model) => {
     const price = comparablePrice(modelPrice(model));
     return price === null || price.group > 1;
   }).length;
@@ -167,13 +167,13 @@ export function modelFacets(models: readonly ModelInfo[]): ModelFacets {
   };
 }
 
-function passes(model: ModelInfo, filters: ModelFilters, favourites: ReadonlySet<string>): boolean {
+function passes(model: ModelInfo, filters: ModelFilters, favorites: ReadonlySet<string>): boolean {
   if (filters.capability && !model.capabilities.includes(filters.capability)) return false;
   if (filters.input && !model.inputModalities.includes(filters.input)) return false;
   if (filters.output && !model.outputModalities.includes(filters.output)) return false;
   if (filters.provider && model.author !== filters.provider) return false;
   if (filters.freeOnly && !model.isFree) return false;
-  if (filters.favouritesOnly && !favourites.has(model.id)) return false;
+  if (filters.favoritesOnly && !favorites.has(model.id)) return false;
   if (filters.maxPrice !== null && !withinPriceLimit(model, filters.maxPrice)) return false;
   if (filters.minContext > 0 && (model.contextLength ?? 0) < filters.minContext) return false;
   return true;
@@ -231,9 +231,9 @@ export function queryModels(
   models: readonly ModelInfo[],
   filters: ModelFilters,
   sort: ModelSort,
-  favourites: ReadonlySet<string>,
+  favorites: ReadonlySet<string>,
 ): ModelInfo[] {
-  let list = models.filter((model) => passes(model, filters, favourites));
+  let list = models.filter((model) => passes(model, filters, favorites));
   const text = filters.text.trim();
   const searching = text !== '';
   if (searching) {

@@ -143,7 +143,7 @@ The shell around the tools is what makes this a product rather than a folder of 
 **Model catalog**
 
 - Cached copy of `/models` (refreshed daily or on demand) with search and filters: modality in/out, free, price, context length, provider.
-- Favourites and a "recently used" list feed every model picker.
+- Favorites and a "recently used" list feed every model picker.
 - Each model card shows price per 1M tokens, context, modalities and the user's own stats for that model (runs, average latency, spend).
 
 **History**
@@ -175,7 +175,7 @@ The shell around the tools is what makes this a product rather than a folder of 
 - Drag-and-drop and paste (images, files, audio) onto any tool; "Send to…" moves an output into another tool.
 - Streaming output, stop button, retry with fallback model, copy/download in sensible formats.
 - Installable PWA with an offline shell (tools need network, history and settings do not).
-- First-run onboarding: paste/connect key → pick 3 favourite tools → try a sample.
+- First-run onboarding: paste/connect key → pick 3 favorite tools → try a sample.
 
 ## Architecture (proposed)
 
@@ -191,7 +191,7 @@ Pages never talk to OpenRouter or storage directly; they go through the core, wh
 
 | Store | Holds | Why |
 | --- | --- | --- |
-| localStorage | Settings, key aliases, defaults, favourites, UI state (< 100 KB) | Synchronous read at page start, shared by every page on the origin |
+| localStorage | Settings, key aliases, defaults, favorites, UI state (< 100 KB) | Synchronous read at page start, shared by every page on the origin |
 | IndexedDB | Text-only run history, saved and recent prompts per tool, video job queue and sequence state, cached model list, stats rollups | Larger capacity than localStorage, async, survives reloads |
 | Memory only | Images, audio, video and uploaded files during a session | Never written to disk; leave-page warning protects undownloaded results |
 | sessionStorage | Unlocked key material when the passphrase lock is on | Cleared when the tab closes |
@@ -246,7 +246,7 @@ Every tool page uses the same three-zone layout, so a user who learns one tool k
 
 **Key screens**
 
-1. **Home** — search bar first, then Favourites, Recent runs and a category grid of tool cards (icon, name, one-line purpose, "free" badge when the tool's default model is free).
+1. **Home** — search bar first, then Favorites, Recent runs and a category grid of tool cards (icon, name, one-line purpose, "free" badge when the tool's default model is free).
 2. **Tool page** — header with tool name, model chip (click to switch), key chip, cost estimate; big drop zone; primary Run button; streaming output with actions bar.
 3. **Settings** — tabs: Keys, Models, Defaults, Appearance, Data and backup.
 4. **Models** — filterable catalog with comparison tray.

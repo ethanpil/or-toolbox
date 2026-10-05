@@ -71,7 +71,7 @@ export interface Settings {
   version: number;
   onboarding: { completed: boolean };
   /** Tools pinned on Home (onboarding asks for three). */
-  favouriteTools: ToolId[];
+  favoriteTools: ToolId[];
   defaultKeyId: string | null;
   /** User overrides of the shipped default model per capability. */
   defaultModels: Partial<Record<Capability, string>>;
@@ -100,7 +100,7 @@ export interface Settings {
     autoLockMinutes: number;
   };
   models: {
-    favourites: string[];
+    favorites: string[];
     /** Most recent first, capped at 20. */
     recent: string[];
   };

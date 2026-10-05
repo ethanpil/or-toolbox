@@ -106,7 +106,7 @@ export const PAGES: readonly {
   path: string;
   keywords: string;
 }[] = [
-  { key: 'home', label: 'Home', icon: 'house', path: '', keywords: 'start tools favourites' },
+  { key: 'home', label: 'Home', icon: 'house', path: '', keywords: 'start tools favorites' },
   {
     key: 'models',
     label: 'Models',

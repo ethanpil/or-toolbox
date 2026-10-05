@@ -1,6 +1,6 @@
 /**
  * Models: the OpenRouter catalog (cached by `models.list()`) with search, filters, sorting, a cards or table
- * view, favourites, recently used models, your own stats per model, and a comparison tray for 2 to 4 models.
+ * view, favorites, recently used models, your own stats per model, and a comparison tray for 2 to 4 models.
  *
  * About 650 models are kept in memory and filtered with the pure functions of models-logic.ts; only the first
  * page of the result is drawn (more on "Show more" or when the end scrolls into view), so the page stays smooth.
@@ -21,7 +21,7 @@ import { toast } from '../ui/feedback/toast';
 import { formatContext, formatRelativeTime, formatDateTime, plural } from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
-import { saveSettings, toggleFavouriteModel } from '../ui/settings-actions';
+import { saveSettings, toggleFavoriteModel } from '../ui/settings-actions';
 import { mountPage } from '../ui/shell/index';
 import { whenVisible } from './lazy';
 import { ALL_TIME } from './stats-logic';
@@ -98,7 +98,7 @@ class ModelsPage {
     minContext: uid('models-min-context'),
     sort: uid('models-sort'),
     free: uid('models-free'),
-    favourites: uid('models-favourites'),
+    favorites: uid('models-favorites'),
   };
 
   private readonly search = h('input', {
@@ -144,8 +144,8 @@ class ModelsPage {
     class: 'form-check-input',
     'data-testid': 'models-free-only',
   });
-  private readonly favouritesOnly = h('input', {
-    id: this.ids.favourites,
+  private readonly favoritesOnly = h('input', {
+    id: this.ids.favorites,
     type: 'checkbox',
     class: 'form-check-input',
     'data-testid': 'models-fav-only',
@@ -273,10 +273,10 @@ class ModelsPage {
     this.core.bus.on('models-refreshed', () => void this.reload());
     this.core.stats.subscribe(() => void this.loadUsage());
     this.core.settings.subscribe((next, prev) => {
-      const favouritesChanged = next.models.favourites.join() !== prev.models.favourites.join();
-      if (favouritesChanged) {
+      const favoritesChanged = next.models.favorites.join() !== prev.models.favorites.join();
+      if (favoritesChanged) {
         this.syncStars();
-        if (this.filters.favouritesOnly) this.apply({ keepShown: true });
+        if (this.filters.favoritesOnly) this.apply({ keepShown: true });
       }
       if (next.models.recent.join() !== prev.models.recent.join()) this.renderRecent();
     });
@@ -351,7 +351,7 @@ class ModelsPage {
             'div',
             { class: 'col-12 col-lg-4 col-xl-3 d-flex flex-wrap align-items-center gap-3 pb-1' },
             check(this.ids.free, this.freeOnly, 'Free only'),
-            check(this.ids.favourites, this.favouritesOnly, 'Favourites only'),
+            check(this.ids.favorites, this.favoritesOnly, 'Favorites only'),
             this.resetButton,
           ),
         ),
@@ -376,7 +376,7 @@ class ModelsPage {
       this.minContext,
       this.sortSelect,
       this.freeOnly,
-      this.favouritesOnly,
+      this.favoritesOnly,
     ]) {
       control.addEventListener('change', () => this.readControls());
     }
@@ -393,7 +393,7 @@ class ModelsPage {
       output: this.output.value,
       provider: this.provider.value,
       freeOnly: this.freeOnly.checked,
-      favouritesOnly: this.favouritesOnly.checked,
+      favoritesOnly: this.favoritesOnly.checked,
       maxPrice: Number.isFinite(price) && price >= 0 ? price : null,
       minContext: Number(this.minContext.value) || 0,
     };
@@ -411,7 +411,7 @@ class ModelsPage {
     this.minContext.value = '0';
     this.maxPrice.value = '';
     this.freeOnly.checked = false;
-    this.favouritesOnly.checked = false;
+    this.favoritesOnly.checked = false;
     this.readControls();
     this.search.focus();
   }
@@ -559,12 +559,12 @@ class ModelsPage {
     );
   }
 
-  private favouriteSet(): ReadonlySet<string> {
-    return new Set(this.core.settings.get().models.favourites);
+  private favoriteSet(): ReadonlySet<string> {
+    return new Set(this.core.settings.get().models.favorites);
   }
 
-  private isFavourite(id: string): boolean {
-    return this.core.settings.get().models.favourites.includes(id);
+  private isFavorite(id: string): boolean {
+    return this.core.settings.get().models.favorites.includes(id);
   }
 
   // --- the list -----------------------------------------------------------------------------------------
@@ -572,7 +572,7 @@ class ModelsPage {
   /** Filters and sorts again, then draws the first page (or as many as were open when `keepShown`). */
   private apply(options: { keepShown: boolean }): void {
     if (!this.loaded) return;
-    this.visible = queryModels(this.models, this.filters, this.sort, this.favouriteSet());
+    this.visible = queryModels(this.models, this.filters, this.sort, this.favoriteSet());
     if (!options.keepShown) this.shown = PAGE_SIZE;
     this.renderList();
   }
@@ -589,7 +589,7 @@ class ModelsPage {
     const found = this.visible.length;
     this.count.textContent =
       found === total ? plural(total, 'model') : `${found} of ${plural(total, 'model')} match`;
-    const hidden = hiddenByPriceLimit(this.models, this.filters, this.favouriteSet());
+    const hidden = hiddenByPriceLimit(this.models, this.filters, this.favoriteSet());
     this.priceNote.hidden = hidden === 0;
     this.priceNote.textContent =
       hidden === 0
@@ -644,7 +644,7 @@ class ModelsPage {
             testId: 'models-table',
             head: [
               h('span', { class: 'visually-hidden' }, 'Compare'),
-              h('span', { class: 'visually-hidden' }, 'Favourite'),
+              h('span', { class: 'visually-hidden' }, 'Favorite'),
               'Model',
               'Provider',
               'Capabilities',
@@ -753,10 +753,10 @@ class ModelsPage {
 
   private star(model: ModelInfo): HTMLButtonElement {
     const button = starButton({
-      pressed: this.isFavourite(model.id),
-      label: `Favourite: ${model.name}`,
+      pressed: this.isFavorite(model.id),
+      label: `Favorite: ${model.name}`,
       testId: 'model-star',
-      onToggle: () => this.toggleFavourite(model),
+      onToggle: () => this.toggleFavorite(model),
     });
     this.stars.set(model.id, button);
     return button;
@@ -906,17 +906,17 @@ class ModelsPage {
     );
   }
 
-  // --- favourites, recent -------------------------------------------------------------------------------
+  // --- favorites, recent -------------------------------------------------------------------------------
 
-  private toggleFavourite(model: ModelInfo): void {
-    const on = toggleFavouriteModel(this.core, model.id);
+  private toggleFavorite(model: ModelInfo): void {
+    const on = toggleFavoriteModel(this.core, model.id);
     if (on === null) return;
-    announce(on ? `${model.name} added to favourites.` : `${model.name} removed from favourites.`);
+    announce(on ? `${model.name} added to favorites.` : `${model.name} removed from favorites.`);
   }
 
   /** Updates every star in place (a re-render would drop keyboard focus). */
   private syncStars(): void {
-    for (const [id, button] of this.stars) setStarred(button, this.isFavourite(id));
+    for (const [id, button] of this.stars) setStarred(button, this.isFavorite(id));
   }
 
   private renderRecent(): void {

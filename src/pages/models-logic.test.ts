@@ -34,9 +34,9 @@ const NONE = new Set<string>();
 const run = (
   filters: Partial<ModelFilters> = {},
   sort: ModelSort = 'name',
-  favourites: ReadonlySet<string> = NONE,
+  favorites: ReadonlySet<string> = NONE,
 ): string[] =>
-  queryModels(models, { ...NO_FILTERS, ...filters }, sort, favourites).map((model) => model.id);
+  queryModels(models, { ...NO_FILTERS, ...filters }, sort, favorites).map((model) => model.id);
 
 const group = (id: string): number | null => comparablePrice(modelPrice(get(id)))?.group ?? null;
 
@@ -180,11 +180,11 @@ describe('filters', () => {
     expect(run({ minContext: 8_000 })).not.toContain('google/veo-3.1');
   });
 
-  it('favourites only', () => {
-    expect(run({ favouritesOnly: true }, 'name', new Set(['openai/gpt-6.1-sol', 'nope']))).toEqual([
+  it('favorites only', () => {
+    expect(run({ favoritesOnly: true }, 'name', new Set(['openai/gpt-6.1-sol', 'nope']))).toEqual([
       'openai/gpt-6.1-sol',
     ]);
-    expect(run({ favouritesOnly: true })).toEqual([]);
+    expect(run({ favoritesOnly: true })).toEqual([]);
   });
 
   it('combines filters', () => {

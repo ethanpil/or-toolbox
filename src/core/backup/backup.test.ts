@@ -63,7 +63,7 @@ async function populate(): Promise<void> {
     d.appearance.theme = 'dark';
     d.budgets.monthlyUsd = 20;
     d.tools.chat = { model: 'm/chat', options: { temperature: 0.3 } };
-    d.models.favourites = ['a/b'];
+    d.models.favorites = ['a/b'];
   });
   await core.prompts.save({ tool: 'chat', text: 'saved one', settings: { t: 1 }, name: 'S1' });
   await core.prompts.addRecent('ocr', 'recent one', { lang: 'en' });

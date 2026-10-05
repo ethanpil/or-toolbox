@@ -33,10 +33,10 @@ All notable changes to this project are documented here. The format follows
 - Feedback: toasts with Undo, confirm, typed-confirm, prompt and unlock dialogs, `presentError()` per error code (a94c4fe).
 - Shared components: drop zone, model and key pickers, cost badge, prompts panel, output panel, export menu, image, audio and video players, job list (3dd8a33).
 - Tool framework `mountTool()`: header chips, three-zone layout, Run/Stop, URL state, drop and paste, Send to…; all 14 tools mount through it (0e06dde).
-- Home with search, favourites, recent runs and first-run onboarding; Privacy page (39fd198).
+- Home with search, favorites, recent runs and first-run onboarding; Privacy page (39fd198).
 - Tool authoring guide and Stage 2 e2e specs (4c42391).
 - Settings page: keys and balances, default models and free-only mode, tool bindings, budgets, appearance, passphrase lock, data, backup and restore; every section deep-linkable (d8c959f).
-- Models page: searchable, filterable and sortable catalog as cards or table, favourites, recently used, your own stats per model, expiry warnings, comparison of 2 to 4 models, refresh (cb1e30a).
+- Models page: searchable, filterable and sortable catalog as cards or table, favorites, recently used, your own stats per model, expiry warnings, comparison of 2 to 4 models, refresh (cb1e30a).
 - History page: timeline by day with search and filters, run detail drawer (reopen, re-run with another model, star, copy, export, delete with Undo), bulk export and delete, live updates, `?tool=` and `?run=` links (d7fdb94).
 - Stats page: KPI tiles, spend, requests and tokens charts (Chart.js, loaded on demand, light and dark, table view for each), breakdowns by tool, model and key, budget burn-down, key balances and free requests today (1f5ecd7).
 - `HistoryService.restore()` for Undo (d7fdb94).
@@ -71,6 +71,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- US spelling "Favorites" everywhere (text, test ids, code and the settings fields `favoriteTools` and `models.favorites`); settings saved under the old field names are still read.
 - Bot-to-bot chat uses the framework's run bar (Step and Pause as runner actions, Escape through `stopOnEscape`), the shared Markdown cache, cost wording ("cost unknown (≈ $x counted)"), `failureText`, core token counting and `holdLock`; it re-reads its state after a data reset (752fdfe, 41d107d).
 - Group budget approvals: `runs.approveGroup()`/`releaseGroup()`, `RunSpec.useGroupApproval` and all-or-none `runs.beginAll()`; the budget dialog names a group with its models and total; Video studio approves its sequences through them (e7660ec).
 - A run stopped before it sent anything books no stats row (e7660ec).

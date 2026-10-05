@@ -6,8 +6,8 @@ import {
   saveSettings,
   setTheme,
   setToolBinding,
-  toggleFavouriteModel,
-  toggleFavouriteTool,
+  toggleFavoriteModel,
+  toggleFavoriteTool,
 } from './settings-actions';
 
 let core: CoreServices;
@@ -38,27 +38,27 @@ describe('saveSettings', () => {
   });
 });
 
-describe('favourites', () => {
+describe('favorites', () => {
   it('stars and unstars a model, reporting the new state', () => {
-    expect(toggleFavouriteModel(core, 'a/b')).toBe(true);
-    expect(toggleFavouriteModel(core, 'c/d')).toBe(true);
-    expect(core.settings.get().models.favourites).toEqual(['a/b', 'c/d']);
-    expect(toggleFavouriteModel(core, 'a/b')).toBe(false);
-    expect(core.settings.get().models.favourites).toEqual(['c/d']);
+    expect(toggleFavoriteModel(core, 'a/b')).toBe(true);
+    expect(toggleFavoriteModel(core, 'c/d')).toBe(true);
+    expect(core.settings.get().models.favorites).toEqual(['a/b', 'c/d']);
+    expect(toggleFavoriteModel(core, 'a/b')).toBe(false);
+    expect(core.settings.get().models.favorites).toEqual(['c/d']);
   });
 
   it('stars and unstars a tool', () => {
-    expect(toggleFavouriteTool(core, 'ocr')).toBe(true);
-    expect(core.settings.get().favouriteTools).toContain('ocr');
-    expect(toggleFavouriteTool(core, 'ocr')).toBe(false);
-    expect(core.settings.get().favouriteTools).not.toContain('ocr');
+    expect(toggleFavoriteTool(core, 'ocr')).toBe(true);
+    expect(core.settings.get().favoriteTools).toContain('ocr');
+    expect(toggleFavoriteTool(core, 'ocr')).toBe(false);
+    expect(core.settings.get().favoriteTools).not.toContain('ocr');
   });
 
   it('reports null when the change could not be saved', () => {
     vi.spyOn(core.settings, 'update').mockImplementation(() => {
       throw new StorageFullError();
     });
-    expect(toggleFavouriteModel(core, 'a/b')).toBeNull();
+    expect(toggleFavoriteModel(core, 'a/b')).toBeNull();
   });
 });
 

@@ -1,6 +1,6 @@
 /**
  * Stage 2 gate: the Models page. Search (and the `?q=` deep link), filters, sorting, cards and table views,
- * favourites, recently used, the comparison tray and dialog, your own stats per model, refresh, and axe in both
+ * favorites, recently used, the comparison tray and dialog, your own stats per model, refresh, and axe in both
  * themes. The catalog is the recorded fixture of 55 models (more than one page of 48).
  */
 import { readFileSync } from 'node:fs';
@@ -243,7 +243,7 @@ test('expiring models carry a warning badge', async ({ page }) => {
   await expect(page.getByTestId('expiry-badge')).toHaveCount(1);
 });
 
-test('favourites persist, filter and update in place', async ({ page }) => {
+test('favorites persist, filter and update in place', async ({ page }) => {
   await open(page, 'models/?q=kokoro');
   const star = card(page, 'hexgrad/kokoro-82m').getByTestId('model-star');
   await expect(star).toHaveAttribute('aria-pressed', 'false');
@@ -255,9 +255,9 @@ test('favourites persist, filter and update in place', async ({ page }) => {
     () =>
       (
         JSON.parse(localStorage.getItem('ortoolbox:settings') ?? '{}') as {
-          models?: { favourites?: string[] };
+          models?: { favorites?: string[] };
         }
-      ).models?.favourites,
+      ).models?.favorites,
   );
   expect(saved).toEqual(['hexgrad/kokoro-82m']);
 
@@ -269,7 +269,7 @@ test('favourites persist, filter and update in place', async ({ page }) => {
     'true',
   );
 
-  // Removing the last favourite while "Favourites only" is on empties the list.
+  // Removing the last favorite while "Favorites only" is on empties the list.
   await card(page, 'hexgrad/kokoro-82m').getByTestId('model-star').click();
   await expect(page.getByTestId('models-empty')).toBeVisible();
 });
@@ -283,7 +283,7 @@ test('recently used models come first as a strip that searches for them', async 
       unknown
     >;
     settings['models'] = {
-      favourites: [],
+      favorites: [],
       recent: ['openai/whisper-1', 'hexgrad/kokoro-82m', 'gone/model'],
     };
     localStorage.setItem('ortoolbox:settings', JSON.stringify(settings));
@@ -511,7 +511,7 @@ test.describe('accessibility', () => {
     await expectNoSeriousA11yViolations(page);
   });
 
-  test('works with the keyboard: search, filters, favourite, compare', async ({ page }) => {
+  test('works with the keyboard: search, filters, favorite, compare', async ({ page }) => {
     await open(page, 'models/?q=kokoro');
     const star = card(page, 'hexgrad/kokoro-82m').getByTestId('model-star');
     await star.focus();

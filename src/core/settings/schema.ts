@@ -23,7 +23,7 @@ export function defaultSettings(): Settings {
   return {
     version: SETTINGS_VERSION,
     onboarding: { completed: false },
-    favouriteTools: [],
+    favoriteTools: [],
     defaultKeyId: null,
     defaultModels: {},
     freeOnly: false,
@@ -32,7 +32,7 @@ export function defaultSettings(): Settings {
     appearance: { theme: 'system', accent: null, density: 'comfortable', reducedMotion: false },
     data: { retentionDays: 90, recordRecentPrompts: true },
     security: { autoLockMinutes: 15 },
-    models: { favourites: [], recent: [] },
+    models: { favorites: [], recent: [] },
     ui: {},
   };
 }
@@ -155,13 +155,13 @@ export function normalizeSettings(input: unknown): Settings {
   }
 
   const accent = appearance['accent'];
+  // Settings written before the US spelling used `favouriteTools` and `models.favourites`.
+  const favoriteTools = raw['favoriteTools'] ?? raw['favouriteTools'];
 
   return {
     version: SETTINGS_VERSION,
     onboarding: { completed: bool(onboarding['completed'], d.onboarding.completed) },
-    favouriteTools: [
-      ...new Set(Array.isArray(raw['favouriteTools']) ? raw['favouriteTools'] : []),
-    ].filter(isToolId),
+    favoriteTools: [...new Set(Array.isArray(favoriteTools) ? favoriteTools : [])].filter(isToolId),
     defaultKeyId: stringOrNull(raw['defaultKeyId'], d.defaultKeyId),
     defaultModels,
     freeOnly: bool(raw['freeOnly'], d.freeOnly),
@@ -194,7 +194,7 @@ export function normalizeSettings(input: unknown): Settings {
       ),
     },
     models: {
-      favourites: uniqueStrings(models['favourites']),
+      favorites: uniqueStrings(models['favorites'] ?? models['favourites']),
       recent: uniqueStrings(models['recent'], RECENT_MODELS_CAP),
     },
     ui: jsonObject(raw['ui']),
