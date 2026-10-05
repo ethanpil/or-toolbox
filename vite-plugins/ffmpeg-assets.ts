@@ -1,7 +1,15 @@
-import { createReadStream, cpSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import {
+  createReadStream,
+  cpSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import type { Plugin } from 'vite';
 import { ISOLATION_HEADERS } from './site.ts';
+import { thirdPartyNotices } from './third-party-notices.ts';
 
 /**
  * Self-hosts the ffmpeg.wasm core files.
@@ -16,6 +24,10 @@ import { ISOLATION_HEADERS } from './site.ts';
  *
  * We ship the ESM builds because @ffmpeg/ffmpeg always starts its worker as a
  * module worker, which loads the core with `import()`.
+ *
+ * The cores are GPL-2.0-or-later, so the build also writes `licenses.txt` at
+ * the site root: the third-party notices (third-party-notices.ts), with the
+ * cores' license and source pointer.
  */
 
 /** What the browser code needs to know about one core. Mirrors `__FFMPEG_ASSETS__` in src/env.d.ts. */
@@ -106,13 +118,14 @@ export function ffmpegAssets(): Plugin {
       });
     },
 
-    // Build: copy the files next to the bundle.
+    // Build: copy the files next to the bundle, with the notices that go with them.
     writeBundle() {
       for (const source of Object.values(coreSources(root))) {
         const to = join(outDir, source.dir);
         mkdirSync(to, { recursive: true });
         for (const name of source.files) cpSync(join(source.from, name), join(to, name));
       }
+      writeFileSync(join(outDir, 'licenses.txt'), thirdPartyNotices(root));
     },
   };
 }
