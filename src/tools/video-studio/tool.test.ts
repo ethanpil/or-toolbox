@@ -430,6 +430,57 @@ describe('Video studio', () => {
     });
   });
 
+  it('asks ONE budget question at Start for the whole sequence; a declined Start sends nothing, steps ask nothing', async () => {
+    const tool = await mount();
+    // Each 1 s step ($0.05) is over the per-run threshold: only the sequence's approval keeps them quiet.
+    t.core.settings.update((draft) => {
+      draft.budgets = { ...draft.budgets, mode: 'warn', perRunUsd: 0.04 };
+    });
+    const confirm = vi.fn().mockResolvedValue(false);
+    t.core.runs.setConfirmHandler(confirm);
+    tool.applyState({
+      prompt: '',
+      settings: settingsJson({
+        ...DEFAULT_SETTINGS,
+        tab: 'sequence',
+        format: { ...DEFAULT_SETTINGS.format, duration: 1 },
+        sequence: {
+          ...DEFAULT_SETTINGS.sequence,
+          mode: 'independent',
+          steps: ['One', 'Two', 'Three'].map((prompt, i) => ({
+            id: `s${i}`,
+            prompt,
+            imageRole: 'references' as const,
+          })),
+        },
+      }),
+    });
+
+    await t.runners[0]!.trigger();
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0]![1]).toMatchObject({
+      kind: 'group',
+      group: {
+        label: 'Video sequence: 3 clips',
+        models: [GROK],
+        runs: 3,
+        note: 'No spend cap: it runs every step.',
+      },
+    });
+    expect(t.status()).toBe('Not started: nothing was sent.');
+    expect(submits).toEqual([]);
+    expect(await t.ctx.state.get(SEQUENCE_KEY)).toBeUndefined();
+    expect(await t.core.history.query({ tool: 'video-studio' })).toEqual([]);
+
+    confirm.mockClear();
+    confirm.mockResolvedValue(true);
+    await t.runners[0]!.trigger();
+    await vi.waitFor(() => expect(submits).toHaveLength(3));
+    expect(confirm).toHaveBeenCalledOnce(); // the Start question; no step asked
+    const runs = await t.core.history.query({ tool: 'video-studio' });
+    expect(runs.map((run) => run.reservedUsd)).toEqual([0.05, 0.05, 0.05]);
+  });
+
   it("writes only this tab's edits over a stored run: a cap lowered elsewhere stays, and the form follows it", async () => {
     const { createRun } = await import('./sequence');
     const { SEQUENCE_KEY } = await import('./store');

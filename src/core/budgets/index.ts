@@ -48,19 +48,22 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
   };
 
   return {
-    async check({ keyId, estimateUsd }) {
+    async check({ keyId, estimateUsd, group = false }) {
       const budgets = core.settings.get().budgets;
       if (budgets.mode === 'disabled') return { verdict: 'ok', reasons: [] };
 
       const estimate = estimateUsd ?? null;
       const reasons: BudgetReason[] = [];
+      const subject = group ? 'These runs' : 'This run';
 
       if (estimate != null && estimate > budgets.perRunUsd) {
         reasons.push({
           kind: 'per-run',
           limitUsd: budgets.perRunUsd,
           projectedUsd: estimate,
-          message: `This run is estimated at ${formatUsd(estimate)}, above your ${formatUsd(budgets.perRunUsd)} per-run limit.`,
+          message: group
+            ? `These runs are estimated at ${formatUsd(estimate)} together, above your ${formatUsd(budgets.perRunUsd)} per-run limit.`
+            : `This run is estimated at ${formatUsd(estimate)}, above your ${formatUsd(budgets.perRunUsd)} per-run limit.`,
         });
       }
 
@@ -94,7 +97,7 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
           message:
             estimate == null
               ? `You have spent ${formatUsd(spent)} this month, which reaches your ${formatUsd(monthly)} monthly limit.`
-              : `This run would bring this month's spend to ${formatUsd(spent + estimate)}, above your ${formatUsd(monthly)} monthly limit.`,
+              : `${subject} would bring this month's spend to ${formatUsd(spent + estimate)}, above your ${formatUsd(monthly)} monthly limit.`,
         });
       }
 
@@ -109,7 +112,7 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
           message:
             estimate == null
               ? `You have spent ${formatUsd(spentOnKey)} on ${label} this month, which reaches its ${formatUsd(keyLimit)} monthly limit.`
-              : `This run would bring this month's spend on ${label} to ${formatUsd(spentOnKey + estimate)}, above its ${formatUsd(keyLimit)} monthly limit.`,
+              : `${subject} would bring this month's spend on ${label} to ${formatUsd(spentOnKey + estimate)}, above its ${formatUsd(keyLimit)} monthly limit.`,
         });
       }
 

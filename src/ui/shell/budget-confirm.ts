@@ -1,16 +1,17 @@
 /**
  * The budget confirmation every page registers with `runs.setConfirmHandler`: when a run's estimate or the
  * month's spend crosses a Warn-mode rule (or the per-run threshold in Hard-stop mode), `runs.begin` asks here
- * before anything is sent. Cancel makes `begin` throw RunCancelledError, which tools and `presentError` treat
- * as a quiet stop. Parallel runs of one group share one dialog; following a link in it declines first.
+ * before anything is sent. A group approved at once (`runs.approveGroup`: an arena round, a video sequence) is
+ * asked about once, by its label, with its models and its total. Cancel makes `begin`/`approveGroup` throw
+ * RunCancelledError, which tools and `presentError` treat as a quiet stop. Following a link in it declines first.
  */
 import { getCore } from '../../core/index';
 import { paidAddons, withAddons } from '../../core/runs/addons';
-import type { BudgetCheck, BudgetReason, RunSpec } from '../../core/types';
+import type { BudgetCheck, BudgetQuestion, BudgetReason, RunAddon } from '../../core/types';
 import { getTool } from '../../tools/registry';
 import { h } from '../dom';
 import { openModal } from '../feedback/modal';
-import { formatEstimate, formatUsd } from '../format';
+import { formatEstimate, formatUsd, plural } from '../format';
 import { guardedNavigate } from './leave-guard';
 import { settingsUrl } from './links';
 
@@ -20,22 +21,54 @@ const REASON_LABELS: Record<BudgetReason['kind'], string> = {
   'key-monthly': 'Monthly budget for this key',
 };
 
-/** One dialog per group of parallel runs (arena contenders): every member gets the same answer. */
-const pendingByGroup = new Map<string, Promise<boolean>>();
-
-export function budgetConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
-  const group = spec.groupId;
-  if (group) {
-    const pending = pendingByGroup.get(group);
-    if (pending) return pending;
-    const answer = askToConfirm(check, spec).finally(() => pendingByGroup.delete(group));
-    pendingByGroup.set(group, answer);
-    return answer;
-  }
-  return askToConfirm(check, spec);
+/** What the dialog shows, the same for one run and for a group. */
+interface Shown {
+  title: string;
+  intro: string;
+  /** "with this run" / "with these runs", after a reason's limit. */
+  withWhat: string;
+  group: { label: string; runs: number } | null;
+  tool: string;
+  models: readonly string[];
+  estimateUsd: number | null;
+  addons: readonly RunAddon[];
+  note: string | null;
 }
 
-function askToConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
+function shown(question: BudgetQuestion): Shown {
+  if (question.kind === 'run') {
+    const { spec } = question;
+    return {
+      title: 'Confirm this run',
+      intro: 'This run goes over a limit you set:',
+      withWhat: 'with this run',
+      group: null,
+      tool: getTool(spec.tool).name,
+      models: [spec.model],
+      estimateUsd: spec.estimateUsd ?? null,
+      addons: spec.addons ?? [],
+      note: null,
+    };
+  }
+  const { group } = question;
+  return {
+    title: 'Confirm these runs',
+    intro: 'Together, these runs go over a limit you set:',
+    withWhat: 'with these runs',
+    group: { label: group.label, runs: group.runs },
+    tool: getTool(group.tool).name,
+    models: group.models,
+    estimateUsd: group.estimateUsd,
+    addons: group.addons ?? [],
+    note: group.note ?? null,
+  };
+}
+
+const term = (text: string): HTMLElement =>
+  h('dt', { class: 'col-4 fw-normal text-body-secondary' }, text);
+
+export function budgetConfirm(check: BudgetCheck, question: BudgetQuestion): Promise<boolean> {
+  const view = shown(question);
   let confirmed = false;
   let leaveTo: string | null = null;
   const cancel = h(
@@ -49,11 +82,11 @@ function askToConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
     'Cancel',
   );
   const modal = openModal({
-    title: 'Confirm this run',
+    title: view.title,
     icon: 'piggy-bank',
     tone: 'warning',
     body: [
-      h('p', null, 'This run goes over a limit you set:'),
+      h('p', null, view.intro),
       h(
         'ul',
         { class: 'list-unstyled vstack gap-2 mb-3', 'data-testid': 'budget-reasons' },
@@ -66,7 +99,7 @@ function askToConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
             h(
               'div',
               { class: 'small text-body-secondary' },
-              `Limit ${formatUsd(reason.limitUsd)} · with this run ${formatUsd(reason.projectedUsd)}`,
+              `Limit ${formatUsd(reason.limitUsd)} · ${view.withWhat} ${formatUsd(reason.projectedUsd)}`,
             ),
           ),
         ),
@@ -74,12 +107,27 @@ function askToConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
       h(
         'dl',
         { class: 'row small mb-2' },
-        h('dt', { class: 'col-4 fw-normal text-body-secondary' }, 'Estimate'),
+        view.group
+          ? [
+              term('Runs'),
+              h(
+                'dd',
+                { class: 'col-8 mb-1', 'data-testid': 'budget-group' },
+                view.group.label,
+                h(
+                  'div',
+                  { class: 'small text-body-secondary' },
+                  `${plural(view.group.runs, 'run')}, asked once for all of them`,
+                ),
+              ),
+            ]
+          : null,
+        term(view.group ? 'Total estimate' : 'Estimate'),
         h(
           'dd',
           { class: 'col-8 mb-1', 'data-testid': 'budget-estimate' },
-          formatEstimate(withAddons(spec.estimateUsd ?? null, spec.addons ?? [])),
-          paidAddons(spec.addons ?? []).map((addon) =>
+          formatEstimate(withAddons(view.estimateUsd, view.addons)),
+          paidAddons(view.addons).map((addon) =>
             h(
               'div',
               { class: 'small text-body-secondary' },
@@ -87,11 +135,22 @@ function askToConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
             ),
           ),
         ),
-        h('dt', { class: 'col-4 fw-normal text-body-secondary' }, 'Tool'),
-        h('dd', { class: 'col-8 mb-1' }, getTool(spec.tool).name),
-        h('dt', { class: 'col-4 fw-normal text-body-secondary' }, 'Model'),
-        h('dd', { class: 'col-8 mb-0 text-break' }, spec.model),
+        term('Tool'),
+        h('dd', { class: 'col-8 mb-1' }, view.tool),
+        term(view.models.length === 1 ? 'Model' : 'Models'),
+        h(
+          'dd',
+          { class: 'col-8 mb-0 text-break', 'data-testid': 'budget-models' },
+          view.models.length === 1
+            ? view.models[0]
+            : h(
+                'ul',
+                { class: 'list-unstyled mb-0' },
+                view.models.map((model) => h('li', null, model)),
+              ),
+        ),
       ),
+      view.note ? h('p', { class: 'small mb-2', 'data-testid': 'budget-note' }, view.note) : null,
       h(
         'a',
         {
@@ -121,7 +180,7 @@ function askToConfirm(check: BudgetCheck, spec: RunSpec): Promise<boolean> {
             modal.hide();
           },
         },
-        'Run anyway',
+        view.group ? 'Run them anyway' : 'Run anyway',
       ),
     ],
     initialFocus: cancel,

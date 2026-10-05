@@ -179,10 +179,10 @@ describe('runs.begin applies the verdict', () => {
     const confirm = vi.fn().mockResolvedValue(true);
     core.runs.setConfirmHandler(confirm);
     const run = await core.runs.begin(spec);
-    expect(confirm).toHaveBeenCalledWith(
-      expect.objectContaining({ verdict: 'confirm' }),
-      expect.objectContaining({ model: 'm/paid' }),
-    );
+    expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ verdict: 'confirm' }), {
+      kind: 'run',
+      spec: expect.objectContaining({ model: 'm/paid' }) as unknown,
+    });
     expect(run.keyId).toBe('k1');
   });
 
@@ -269,6 +269,266 @@ describe('reservations of running runs', () => {
     await core.runs.begin({ ...arena, estimateUsd: 0.09 });
     await first.finish(); // cost 0: the 0.09 reservation goes away
     await expect(core.runs.begin({ ...arena, estimateUsd: 0.09 })).resolves.toBeDefined();
+  });
+});
+
+describe('group approvals', () => {
+  const sequence = {
+    tool: 'video-studio',
+    groupId: 'seq-1',
+    label: 'Video sequence: 3 clips',
+    models: ['m/paid'],
+    runs: 3,
+    estimateUsd: 0.45,
+  } as const;
+  const step = {
+    tool: 'video-studio',
+    model: 'm/paid',
+    estimateUsd: 0.15,
+    groupId: 'seq-1',
+    useGroupApproval: true,
+  } as const;
+  const approval = async (groupId = 'seq-1') =>
+    (await (await getDb()).get('kv', `meta:group-approval:${groupId}`))?.value;
+  const reserved = async (id: string) => (await (await getDb()).get('runs', id))?.reservedUsd;
+
+  it('checks the total once, asks once naming the group, and its runs then ask nothing', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    await core.runs.approveGroup(sequence);
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm).toHaveBeenCalledWith(
+      {
+        verdict: 'confirm',
+        reasons: [
+          expect.objectContaining({
+            kind: 'per-run',
+            projectedUsd: 0.45,
+            message: 'These runs are estimated at $0.45 together, above your $0.10 per-run limit.',
+          }),
+        ],
+      },
+      {
+        kind: 'group',
+        group: expect.objectContaining({ label: 'Video sequence: 3 clips' }) as unknown,
+      },
+    );
+    const runs = [];
+    for (let i = 0; i < 3; i++) runs.push(await core.runs.begin(step));
+    expect(confirm).toHaveBeenCalledOnce();
+    // Each still reserves its own estimate.
+    for (const run of runs) expect(await reserved(run.id)).toBe(0.15);
+  });
+
+  it('a declined or blocked approval stores and reserves nothing; its runs then ask for themselves', async () => {
+    const confirm = vi.fn().mockResolvedValue(false);
+    core.runs.setConfirmHandler(confirm);
+    await expect(core.runs.approveGroup(sequence)).rejects.toBeInstanceOf(RunCancelledError);
+    setBudgets({ mode: 'hard', monthlyUsd: 0.4 });
+    await expect(core.runs.approveGroup(sequence)).rejects.toBeInstanceOf(BudgetBlockedError);
+    expect(await approval()).toBeUndefined();
+    expect(await (await getDb()).count('runs')).toBe(0);
+
+    setBudgets({ mode: 'warn', monthlyUsd: null });
+    confirm.mockClear();
+    await expect(core.runs.begin(step)).rejects.toBeInstanceOf(RunCancelledError);
+    expect(confirm).toHaveBeenCalledWith(expect.anything(), {
+      kind: 'run',
+      spec: expect.objectContaining({ groupId: 'seq-1' }) as unknown,
+    });
+  });
+
+  it('refuses before asking: no key, a locked key, a paid model or add-on in free-only mode', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    core.settings.update((draft) => {
+      draft.freeOnly = true;
+    });
+    await expect(
+      core.runs.approveGroup({ ...sequence, models: ['a/b:free', 'm/paid'] }),
+    ).rejects.toMatchObject({ code: 'free-only', models: ['m/paid'] });
+    await expect(
+      core.runs.approveGroup({
+        ...sequence,
+        models: ['a/b:free'],
+        estimateUsd: 0,
+        addons: [{ id: 'pdf-engine:mistral-ocr', label: 'Mistral OCR', estimateUsd: 0.06 }],
+      }),
+    ).rejects.toMatchObject({ code: 'free-only' });
+    const locked = createTestCore({ locked: true }).core;
+    await expect(locked.runs.approveGroup(sequence)).rejects.toMatchObject({ code: 'locked' });
+    const keyless = createTestCore({ keys: [] }).core;
+    await expect(keyless.runs.approveGroup(sequence)).rejects.toMatchObject({ code: 'no-key' });
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('covers its runs up to the approved total and count; a hard block still refuses', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    await core.runs.approveGroup({ ...sequence, runs: 2, estimateUsd: 0.3 });
+    confirm.mockClear();
+    await core.runs.begin(step);
+    await core.runs.begin(step);
+    expect(confirm).not.toHaveBeenCalled();
+    await core.runs.begin(step); // no room left: it asks for itself
+    expect(confirm).toHaveBeenCalledOnce();
+
+    await core.runs.approveGroup({ ...sequence, groupId: 'seq-2', estimateUsd: 0.2 });
+    confirm.mockClear();
+    await core.runs.begin({ ...step, groupId: 'seq-2' });
+    await core.runs.begin({ ...step, groupId: 'seq-2' }); // 0.15 + 0.15 > 0.2
+    expect(confirm).toHaveBeenCalledOnce();
+
+    // Five runs of 0.15 are still running (0.75 reserved); the third sequence fits the month, then spend arrives.
+    setBudgets({ mode: 'hard', monthlyUsd: 2 });
+    await core.runs.approveGroup({ ...sequence, groupId: 'seq-3' });
+    await spend('k1', 1.2);
+    await expect(core.runs.begin({ ...step, groupId: 'seq-3' })).rejects.toBeInstanceOf(
+      BudgetBlockedError,
+    );
+  });
+
+  it('does not cover a re-run outside the approval, another model or another key', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    await core.runs.approveGroup(sequence);
+    confirm.mockClear();
+    await core.runs.begin({ ...step, useGroupApproval: false });
+    await core.runs.begin({ ...step, model: 'm/other' });
+    await core.runs.begin({ ...step, keyId: 'k2' });
+    expect(confirm).toHaveBeenCalledTimes(3);
+  });
+
+  it('a run that ends having sent nothing gives its share back', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    await core.runs.approveGroup({ ...sequence, runs: 1, estimateUsd: 0.15 });
+    confirm.mockClear();
+    const first = await core.runs.begin(step);
+    await first.fail(new DOMException('Paused.', 'AbortError'));
+    await vi.waitFor(async () => expect(await approval()).toMatchObject({ runsLeft: 1 }));
+    await core.runs.begin(step);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('holds in other tabs and after a reload, until released', async () => {
+    core.runs.setConfirmHandler(() => Promise.resolve(true));
+    await core.runs.approveGroup(sequence);
+    const otherTab = createTestCore({ keys: [fakeKey({ id: 'k1' })] }).core;
+    const confirm = vi.fn().mockResolvedValue(true);
+    otherTab.runs.setConfirmHandler(confirm);
+    await otherTab.runs.begin(step);
+    expect(confirm).not.toHaveBeenCalled();
+    await otherTab.runs.releaseGroup('seq-1');
+    expect(await approval()).toBeUndefined();
+    await core.runs.begin(step).catch(() => undefined);
+    await otherTab.runs.begin(step);
+    expect(confirm).toHaveBeenCalledOnce();
+  });
+
+  it('needs no approval for free models: nothing is asked or stored', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    setBudgets({ perRunUsd: 0 });
+    await core.runs.approveGroup({ ...sequence, models: ['a/b:free'], estimateUsd: 0 });
+    expect(confirm).not.toHaveBeenCalled();
+    expect(await approval()).toBeUndefined();
+  });
+});
+
+describe('beginAll', () => {
+  const contender = (model: string, estimateUsd: number) =>
+    ({
+      tool: 'model-arena',
+      model,
+      estimateUsd,
+      prompt: 'Which is best?',
+      groupId: 'round-1',
+    }) as const;
+
+  it('with a label, asks once for the summed total and begins every member without a dialog', async () => {
+    const confirm = vi.fn().mockResolvedValue(true);
+    core.runs.setConfirmHandler(confirm);
+    const runs = await core.runs.beginAll(
+      [contender('a/one', 0.04), contender('b/two', 0.04), contender('c/three', 0.04)],
+      { label: 'Model arena round: 3 models' },
+    );
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ verdict: 'confirm' }), {
+      kind: 'group',
+      group: expect.objectContaining({
+        label: 'Model arena round: 3 models',
+        models: ['a/one', 'b/two', 'c/three'],
+        runs: 3,
+        estimateUsd: expect.closeTo(0.12) as number,
+      }) as unknown,
+    });
+    expect(runs.map((run) => run.model)).toEqual(['a/one', 'b/two', 'c/three']);
+    const records = await (await getDb()).getAll('runs');
+    expect(records.map((r) => [r.groupId, r.reservedUsd])).toEqual([
+      ['round-1', 0.04],
+      ['round-1', 0.04],
+      ['round-1', 0.04],
+    ]);
+    // The approval served the round only.
+    expect(await (await getDb()).get('kv', 'meta:group-approval:round-1')).toBeUndefined();
+  });
+
+  it('a refused member withdraws the members already begun: no record, no reservation, no booking', async () => {
+    const events: string[] = [];
+    for (const type of ['history-changed', 'stats-changed', 'run-finished'] as const) {
+      core.bus.on(type, (event) => events.push(event.type));
+    }
+    setBudgets({ mode: 'hard', monthlyUsd: 0.25 });
+    const error = await core.runs
+      .beginAll([contender('a/one', 0.1), contender('b/two', 0.1), contender('c/three', 0.1)])
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(BudgetBlockedError);
+    expect(await (await getDb()).count('runs')).toBe(0);
+    expect(core.runs.active()).toEqual([]);
+    expect(await core.stats.rows({ from: '2000-01-01', to: '2999-12-31' })).toEqual([]);
+    expect(await core.prompts.list('model-arena', 'recent')).toEqual([]);
+    expect(events).toEqual([]);
+    // Nothing is held: the whole round fits again once allowed.
+    setBudgets({ monthlyUsd: 0.35 });
+    await expect(
+      core.runs.beginAll([
+        contender('a/one', 0.1),
+        contender('b/two', 0.1),
+        contender('c/three', 0.1),
+      ]),
+    ).resolves.toHaveLength(3);
+  });
+
+  it('a declined member, or a stop, withdraws the others too', async () => {
+    core.runs.setConfirmHandler(() => Promise.resolve(false));
+    await expect(
+      core.runs.beginAll([contender('a/one', 0.01), contender('b/two', 0.5)]),
+    ).rejects.toBeInstanceOf(RunCancelledError);
+    expect(await (await getDb()).count('runs')).toBe(0);
+
+    const stop = new AbortController();
+    core.runs.setConfirmHandler(() => {
+      stop.abort();
+      return Promise.resolve(true);
+    });
+    await expect(
+      core.runs.beginAll([contender('a/one', 0.01), contender('b/two', 0.5), contender('c', 0)], {
+        signal: stop.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(await (await getDb()).count('runs')).toBe(0);
+    expect(core.runs.active()).toEqual([]);
+  });
+
+  it('aborts its runs when the signal aborts after they began', async () => {
+    const stop = new AbortController();
+    const runs = await core.runs.beginAll([contender('a/one', 0.01), contender('b/two', 0.01)], {
+      signal: stop.signal,
+    });
+    stop.abort();
+    expect(runs.every((run) => run.signal.aborted)).toBe(true);
+    await Promise.all(runs.map((run) => run.fail(run.signal.reason)));
   });
 });
 

@@ -429,6 +429,36 @@ export interface RunSpec {
   title?: string;
   /** Links parallel runs of one action (e.g. arena contenders). */
   groupId?: string;
+  /**
+   * Begin under the approval `runs.approveGroup` gave this run's `groupId`: no budget confirmation of its own while
+   * the approval has room for it (its key, its models, and its estimate within what is left). A hard block still
+   * refuses. Without an approval, or without room, the run asks like any other.
+   */
+  useGroupApproval?: boolean;
+}
+
+/** A group of runs approved at once (`RunsService.approveGroup`): an arena round, a video sequence. */
+export interface RunGroupSpec {
+  tool: ToolId;
+  /** The `groupId` its runs carry. */
+  groupId: string;
+  /** Names the group in the budget dialog: "Model arena round: 4 models", "Video sequence: 12 clips". */
+  label: string;
+  /**
+   * Every model its runs may call: free-only mode checks them all, the dialog lists them, and a run that calls
+   * another model is not covered by the approval.
+   */
+  models: readonly string[];
+  /** How many runs the approval covers. */
+  runs: number;
+  /** The models' estimate for the whole group; null = unknown. Add-on estimates are added, as for a run. */
+  estimateUsd: number | null;
+  /** Paid extras of the whole group (see `RunAddon`). */
+  addons?: readonly RunAddon[];
+  /** One more sentence for the dialog, e.g. the sequence's spend cap. */
+  note?: string;
+  /** Overrides the key resolved from the tool binding / default key. */
+  keyId?: string;
 }
 
 /** `RunHandle.checkpoint`'s input: `output` may be a function, called only when the throttled write happens. */
@@ -484,8 +514,15 @@ export interface RunHandle {
   handOff(jobId: string): void;
 }
 
-/** Asked by `runs.begin` when a budget rule wants confirmation; the shell registers a modal implementation. */
-export type BudgetConfirmHandler = (check: BudgetCheck, spec: RunSpec) => Promise<boolean>;
+/** What a budget confirmation asks about: one run (`runs.begin`), or a group at once (`runs.approveGroup`). */
+export type BudgetQuestion =
+  { kind: 'run'; spec: RunSpec } | { kind: 'group'; group: RunGroupSpec };
+
+/** Asked when a budget rule wants confirmation; the shell registers a modal implementation. */
+export type BudgetConfirmHandler = (
+  check: BudgetCheck,
+  question: BudgetQuestion,
+) => Promise<boolean>;
 
 export interface RunsService {
   /**
@@ -496,6 +533,33 @@ export interface RunsService {
    * History/prompt write failures must not block the run (storage full is not a reason to refuse a model call).
    */
   begin(spec: RunSpec): Promise<RunHandle>;
+  /**
+   * Approves a group of runs once, for its total (a video sequence; `beginAll` for runs that start together): the
+   * key and the lock are checked once, free-only mode across all its models and paid add-ons, and the budgets
+   * against the group's TOTAL estimate (add-ons included), with ONE confirmation naming the group. Refuses like
+   * `begin` (NoKeyError, KeyLockedError, FreeOnlyError, BudgetBlockedError, RunCancelledError when declined) and then
+   * stores and reserves nothing. Once approved, runs of the group begun with `useGroupApproval` skip their own
+   * confirmation while it has room: at most `group.runs` runs, together within the approved total when it is
+   * known, on its key and its models. Each still reserves its own estimate, and a hard block still refuses. A run
+   * that ends having sent nothing gives its share back. The approval is stored (IndexedDB `kv`), so it holds in
+   * every tab and across reloads, until `releaseGroup`, a new approval of the same group, or a data reset. A group
+   * on free models only needs no approval: its runs never ask.
+   */
+  approveGroup(group: RunGroupSpec): Promise<void>;
+  /** Ends a group's approval (idempotent): its later runs ask for themselves. */
+  releaseGroup(groupId: string): Promise<void>;
+  /**
+   * Begins runs that start together (arena contenders), all or none. With `label`, they are approved first as one
+   * group (`approveGroup` over their models, add-ons and summed estimates: one check, one confirmation) and the
+   * approval is released once they have begun. When any member is refused (or `signal` aborts), the members already
+   * begun are withdrawn: their records and reservations are removed, nothing was sent and nothing is booked; then
+   * the refusal is thrown. The members share `specs[0].groupId` (one is made when it has none) and must be of one
+   * tool. After they have begun, `signal` aborting aborts them, as `ctx.beginRun` does.
+   */
+  beginAll(
+    specs: readonly RunSpec[],
+    opts?: { label?: string; note?: string; signal?: AbortSignal },
+  ): Promise<RunHandle[]>;
   /** Re-attach to a persisted run after a reload (video jobs). Null when the run is unknown or already final. */
   reattach(runId: string): Promise<RunHandle | null>;
   setConfirmHandler(fn: BudgetConfirmHandler): void;
@@ -587,8 +651,13 @@ export interface BudgetsService {
   /**
    * disabled → ok. warn → confirm when any rule is exceeded. hard → block when a monthly rule is exceeded,
    * confirm when only the per-run threshold is exceeded. Spend comes from local stats (current UTC month).
+   * `group`: the estimate is a group's total (`runs.approveGroup`); the reasons then speak of "these runs".
    */
-  check(input: { keyId: string; estimateUsd: number | null }): Promise<BudgetCheck>;
+  check(input: {
+    keyId: string;
+    estimateUsd: number | null;
+    group?: boolean;
+  }): Promise<BudgetCheck>;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -16,6 +16,11 @@
  * - pagehide only aborts (the page may be gone before any IndexedDB work finishes). Handed-off runs
  *   (`handOff(jobId)`) ignore aborts; their job's completion handler finishes them via `reattach()`, or ends
  *   them with `cancel()` (aborted, booking max(actual, reservation): the job may still bill).
+ * - A run that sent nothing (no request recorded, never handed off, no unknown cost) and ends aborted books no
+ *   stats row, like an orphan that sent nothing: there was no run to count.
+ * - Group approvals (`approveGroup`) live in `kv` `meta:group-approval:<groupId>` as what they still cover (runs
+ *   and USD); runs begun with `useGroupApproval` take their share under the budget lock, and give it back when they
+ *   end having sent nothing. `beginAll` withdraws the members it began when a later one is refused.
  */
 
 import type {
@@ -23,11 +28,15 @@ import type {
   BudgetConfirmHandler,
   CoreServices,
   ModelUsageTotals,
+  RunAddon,
+  RunGroupSpec,
   RunHandle,
   RunRecord,
   RunCheckpoint,
+  RunSpec,
   RunsService,
   RunStatus,
+  ToolId,
   Usage,
   UsageTotals,
 } from '../types';
@@ -45,7 +54,17 @@ import { jsonCopy } from '../settings/merge';
 import { RECENT_MODELS_CAP } from '../settings/schema';
 import { addRunToStats } from '../stats';
 import { isFinalState } from '../jobs';
-import { MINUTE_MS, abortError, holdLock, isFiniteNumber, webLocks, withLock } from '../util';
+import {
+  MINUTE_MS,
+  abortError,
+  holdLock,
+  isFiniteNumber,
+  isPlainObject,
+  isString,
+  throwIfAborted,
+  webLocks,
+  withLock,
+} from '../util';
 import { paidAddons, withAddons } from './addons';
 import { getTool } from '../../tools/registry';
 
@@ -59,6 +78,48 @@ const TITLE_CHARS = 80;
 const BUDGET_LOCK = 'ortoolbox:budget';
 const runLockName = (id: string): string => `ortoolbox:run:${id}`;
 const heartbeatKey = (id: string): string => `meta:run-heartbeat:${id}`;
+const approvalKey = (groupId: string): string => `meta:group-approval:${groupId}`;
+/** Sums of estimates are compared with this much slack (floating point). */
+const USD_EPSILON = 1e-9;
+
+/** What a group approval still covers (`kv` `meta:group-approval:<groupId>`). */
+interface StoredApproval {
+  tool: ToolId;
+  keyId: string;
+  models: string[];
+  /** Runs it still covers. */
+  runsLeft: number;
+  /** USD it still covers; null when the group's total was unknown (then the count alone bounds it). */
+  usdLeft: number | null;
+}
+
+function parseApproval(value: unknown): StoredApproval | null {
+  if (!isPlainObject(value)) return null;
+  const { tool, keyId, models, runsLeft, usdLeft } = value;
+  if (
+    !isString(tool) ||
+    !isString(keyId) ||
+    !Array.isArray(models) ||
+    !models.every(isString) ||
+    !isFiniteNumber(runsLeft) ||
+    !(usdLeft === null || isFiniteNumber(usdLeft))
+  ) {
+    return null;
+  }
+  return { tool: tool as ToolId, keyId, models, runsLeft, usdLeft };
+}
+
+/** A run's part of its group's approval, given back when the run ends having sent nothing. */
+interface ApprovalShare {
+  groupId: string;
+  usd: number;
+}
+
+/** The sum of the known estimates; null when none is known (like `withAddons`). */
+function sumKnown(values: readonly (number | null | undefined)[]): number | null {
+  const known = values.filter(isFiniteNumber);
+  return known.length === 0 ? null : known.reduce((sum, usd) => sum + Math.max(0, usd), 0);
+}
 
 /** Whitespace-collapsed excerpt, cut at a word boundary when one is near the end. */
 export function excerpt(text: string, max = TITLE_CHARS): string {
@@ -95,7 +156,7 @@ function capOutput(output: string | null): { output: string | null; truncated: b
   return { output: output.slice(0, OUTPUT_CAP), truncated: true };
 }
 
-const unique = (values: string[]): string[] => [...new Set(values)];
+const unique = (values: readonly string[]): string[] => [...new Set(values)];
 
 /** A JSON copy of tool-supplied meta, or null (logged) when it is not JSON-safe. */
 function copyMeta(meta: Record<string, unknown>): Record<string, unknown> | null {
@@ -116,9 +177,23 @@ interface InternalHandle extends RunHandle {
   closeForUnload(): void;
   /** Data reset: abort and never write anything for this run again. */
   discard(): void;
+  /**
+   * `beginAll` refused: the run never started. Aborts it, deletes its record (and with it the reservation), gives
+   * its approval share back and books nothing.
+   */
+  withdraw(): Promise<void>;
+}
+
+/** A run `start` admitted: its handle, and what `announce` records once the run is sure to go ahead. */
+interface Started {
+  handle: InternalHandle;
+  spec: RunSpec;
+  models: string[];
+  persisted: boolean;
 }
 
 const RESET_MESSAGE = 'All data was reset.';
+const WITHDRAWN_MESSAGE = 'Not started: another run of its group was refused.';
 
 export function createRunsService(core: CoreServices): RunsService {
   const active = new Map<string, InternalHandle>();
@@ -137,6 +212,83 @@ export function createRunsService(core: CoreServices): RunsService {
 
   // Check-and-reserve runs one at a time per page, and across tabs under a Web Lock.
   const withBudgetLock = <T>(fn: () => Promise<T>): Promise<T> => withLock(BUDGET_LOCK, fn);
+
+  // --- group approvals (read and written under the budget lock only) ---------------------------------------
+  const readApproval = async (groupId: string): Promise<StoredApproval | null> =>
+    parseApproval((await (await getDb()).get('kv', approvalKey(groupId)))?.value);
+  const writeApproval = async (groupId: string, approval: StoredApproval): Promise<void> => {
+    await (
+      await getDb()
+    ).put('kv', { key: approvalKey(groupId), value: approval, updatedAt: Date.now() });
+  };
+
+  /** Takes a run's share of its group's approval when the approval has room for it; else null. */
+  const takeShare = async (
+    spec: RunSpec,
+    keyId: string,
+    models: readonly string[],
+    estimate: number | null,
+  ): Promise<ApprovalShare | null> => {
+    if (!spec.useGroupApproval || !spec.groupId) return null;
+    const approval = await readApproval(spec.groupId);
+    if (
+      !approval ||
+      approval.tool !== spec.tool ||
+      approval.keyId !== keyId ||
+      approval.runsLeft < 1 ||
+      !models.every((model) => approval.models.includes(model)) ||
+      (approval.usdLeft !== null && estimate !== null && estimate > approval.usdLeft + USD_EPSILON)
+    ) {
+      return null;
+    }
+    const usd = estimate ?? 0;
+    await writeApproval(spec.groupId, {
+      ...approval,
+      runsLeft: approval.runsLeft - 1,
+      usdLeft: approval.usdLeft === null ? null : Math.max(0, approval.usdLeft - usd),
+    });
+    return { groupId: spec.groupId, usd };
+  };
+
+  /** Gives a share back (the run sent nothing); nothing when the approval was released meanwhile. */
+  const giveBack = (share: ApprovalShare): Promise<void> =>
+    withBudgetLock(async () => {
+      const approval = await readApproval(share.groupId);
+      if (!approval) return;
+      await writeApproval(share.groupId, {
+        ...approval,
+        runsLeft: approval.runsLeft + 1,
+        usdLeft: approval.usdLeft === null ? null : approval.usdLeft + share.usd,
+      });
+    }).catch(warnStorage);
+
+  const releaseGroup = (groupId: string): Promise<void> =>
+    withBudgetLock(async () => {
+      await (await getDb()).delete('kv', approvalKey(groupId));
+    });
+
+  /** Free-only mode: every model and every paid add-on must be free. */
+  const checkFreeOnly = (models: readonly string[], addons: readonly RunAddon[]): void => {
+    if (!core.settings.get().freeOnly) return;
+    const paid = models.filter((m) => !core.models.isFree(m));
+    const paidExtras = paidAddons(addons);
+    if (paid.length > 0 || paidExtras.length > 0) {
+      throw new FreeOnlyError(
+        paid,
+        paidExtras.map((addon) => addon.label),
+      );
+    }
+  };
+
+  /** Free models only, nothing paid on top, and no cost estimated: budgets never block or question it. */
+  const costsNothing = (
+    models: readonly string[],
+    addons: readonly RunAddon[],
+    estimate: number | null,
+  ): boolean =>
+    (estimate === null || estimate === 0) &&
+    paidAddons(addons).length === 0 &&
+    models.every((m) => isFree(m));
 
   /** Bumped by every data reset; handles from an earlier generation never write again. */
   let generation = 0;
@@ -202,7 +354,7 @@ export function createRunsService(core: CoreServices): RunsService {
 
   const createHandle = (
     initial: RunRecord,
-    opts: { persisted: boolean; releaseLock: (() => void) | null },
+    opts: { persisted: boolean; releaseLock: (() => void) | null; share?: ApprovalShare | null },
   ): InternalHandle => {
     const { id, tool, model, keyId, startedAt } = initial;
     const { persisted } = opts;
@@ -323,6 +475,18 @@ export function createRunsService(core: CoreServices): RunsService {
       active.delete(id);
     };
 
+    /** Nothing reached OpenRouter as far as this run knows: no request, no job, no unknown cost. */
+    const sentNothing = (): boolean =>
+      totals.requests === 0 && jobId === null && !totals.costUnknown;
+    /** The approval share, while this run holds one. */
+    let share = opts.share ?? null;
+    const returnShare = (): void => {
+      if (!share) return;
+      const given = share;
+      share = null;
+      void giveBack(given);
+    };
+
     const finalize = (status: Exclude<RunStatus, 'running'>, error: string | null) => {
       if (finalRecord) return Promise.resolve(finalRecord);
       if (finalizing) return finalizing;
@@ -335,9 +499,12 @@ export function createRunsService(core: CoreServices): RunsService {
           finishedAt,
           latencyMs: finishedAt - startedAt,
         };
+        const idle = sentNothing();
+        // Stopped before anything was sent: no run to count, nothing spent.
+        const book = !(status === 'aborted' && idle);
         let result: { record: RunRecord; booked: boolean };
         try {
-          result = await writeFinal(id, fields, initial, valid);
+          result = await writeFinal(id, fields, initial, valid, book);
         } catch (writeError) {
           if (persisted) throw writeError; // retryable: finish()/fail() again
           warnStorage(writeError);
@@ -346,7 +513,8 @@ export function createRunsService(core: CoreServices): RunsService {
         release(result.record);
         if (!valid()) return result.record; // reset meanwhile: nothing to announce
 
-        if (result.booked) core.bus.emit({ type: 'stats-changed' });
+        if (idle) returnShare();
+        if (result.booked && book) core.bus.emit({ type: 'stats-changed' });
         if (persisted) core.bus.emit({ type: 'history-changed', ids: [id] });
         core.bus.emit({ type: 'run-finished', id, tool, status: result.record.status });
         return result.record;
@@ -458,6 +626,31 @@ export function createRunsService(core: CoreServices): RunsService {
         if (!controller.signal.aborted) controller.abort(abortError(RESET_MESSAGE));
         release({ ...snapshot(), status: 'aborted', error: RESET_MESSAGE });
       },
+      async withdraw() {
+        if (finalRecord || finalizing) return;
+        abortReason = WITHDRAWN_MESSAGE;
+        if (!controller.signal.aborted) controller.abort(abortError(WITHDRAWN_MESSAGE));
+        const attempt = serial(async () => {
+          try {
+            if (persisted && valid()) {
+              const tx = (await getDb()).transaction(['runs', 'kv'], 'readwrite');
+              const stored = await tx.objectStore('runs').get(id);
+              if (stored?.status === 'running') await tx.objectStore('runs').delete(id);
+              await tx.objectStore('kv').delete(heartbeatKey(id));
+              await tx.done;
+            }
+          } catch (error) {
+            // Left `running`: the next sweep finalizes it, and as it sent nothing it books nothing.
+            warnStorage(error);
+          }
+          const record: RunRecord = { ...snapshot(), status: 'aborted', error: WITHDRAWN_MESSAGE };
+          release(record);
+          returnShare();
+          return record;
+        });
+        finalizing = attempt;
+        await attempt;
+      },
     };
     return handle;
   };
@@ -490,115 +683,213 @@ export function createRunsService(core: CoreServices): RunsService {
     return booked; // finalized now (with or without stats rows)
   };
 
+  /**
+   * `begin`'s gatekeeping: checks, reserves (the `running` record) and asks, then creates the live handle. Records
+   * nothing else yet (`announce` does, once the run is sure to go ahead), so `beginAll` can withdraw it cleanly.
+   */
+  const start = async (spec: RunSpec): Promise<Started> => {
+    const key = core.keys.resolve(spec.tool, spec.keyId);
+    if (!key) throw new NoKeyError();
+    if (!core.keys.lock.unlocked()) throw new KeyLockedError();
+
+    const models = unique([spec.model, ...(spec.models ?? [])]);
+    const addons = spec.addons ?? [];
+    checkFreeOnly(models, addons);
+
+    const estimate = withAddons(spec.estimateUsd ?? null, addons);
+    // Strictly increasing within this page, so `before` pagination never splits parallel runs.
+    const startedAt = Math.max(Date.now(), lastStartedAt + 1);
+    lastStartedAt = startedAt;
+    const prompt = spec.prompt ?? null;
+    const record: RunRecord = {
+      id: crypto.randomUUID(),
+      tool: spec.tool,
+      status: 'running',
+      model: spec.model,
+      models,
+      keyId: key.id,
+      keyName: key.name,
+      startedAt,
+      finishedAt: null,
+      latencyMs: null,
+      title: spec.title?.trim() || (prompt?.trim() ? excerpt(prompt) : getTool(spec.tool).name),
+      prompt,
+      settings: spec.settings ? (copyMeta(spec.settings) ?? null) : null,
+      output: null,
+      error: null,
+      usage: emptyTotals(),
+      reservedUsd: isFiniteNumber(estimate) ? Math.max(0, estimate) : 0,
+      jobId: null,
+      meta: {},
+      starred: false,
+      groupId: spec.groupId ?? null,
+    };
+
+    // A run on free models only costs nothing: budgets never block or question it.
+    const free = costsNothing(models, addons, estimate);
+
+    // Own the run before it becomes visible, so no sweep can mistake it for an orphan.
+    const releaseLock = await holdRunLock(record.id);
+    let persisted = false;
+    let share: ApprovalShare | null = null;
+    try {
+      const check = await withBudgetLock(async () => {
+        const verdict: BudgetCheck = free
+          ? { verdict: 'ok', reasons: [] }
+          : await core.budgets.check({ keyId: key.id, estimateUsd: estimate });
+        if (verdict.verdict !== 'block') {
+          if (!free) {
+            share = await takeShare(spec, key.id, models, estimate).catch((error: unknown) => {
+              warnStorage(error);
+              return null;
+            });
+          }
+          try {
+            await (await getDb()).put('runs', record);
+            persisted = true;
+          } catch (error) {
+            warnStorage(error);
+          }
+        }
+        return verdict;
+      });
+      if (check.verdict === 'block') throw new BudgetBlockedError(check);
+      // Under its group's approval the run asks nothing more; otherwise it asks for itself.
+      if (
+        check.verdict === 'confirm' &&
+        !share &&
+        confirmHandler &&
+        !(await confirmHandler(check, { kind: 'run', spec }))
+      ) {
+        throw new RunCancelledError();
+      }
+    } catch (error) {
+      if (persisted) {
+        await (await getDb()).delete('runs', record.id).catch(warnStorage);
+      }
+      if (share) await giveBack(share);
+      releaseLock?.();
+      throw error;
+    }
+
+    const handle = createHandle(record, { persisted, releaseLock, share });
+    active.set(record.id, handle);
+    wirePage();
+    return { handle, spec, models, persisted };
+  };
+
+  /** What a run that goes ahead records: recent models, the Recent prompt, and the history announcement. */
+  const announce = async ({ handle, spec, models, persisted }: Started): Promise<void> => {
+    try {
+      core.settings.update((draft) => {
+        draft.models.recent = unique([...models, ...draft.models.recent]).slice(
+          0,
+          RECENT_MODELS_CAP,
+        );
+      });
+    } catch (error) {
+      warnStorage(error);
+    }
+    if (spec.prompt?.trim()) {
+      await core.prompts
+        .addRecent(spec.tool, spec.prompt, spec.settings ?? {})
+        .catch((error: unknown) => {
+          warnStorage(error);
+          return null;
+        });
+    }
+    if (persisted) core.bus.emit({ type: 'history-changed', ids: [handle.id] });
+  };
+
+  const approveGroup = async (group: RunGroupSpec): Promise<void> => {
+    const key = core.keys.resolve(group.tool, group.keyId);
+    if (!key) throw new NoKeyError();
+    if (!core.keys.lock.unlocked()) throw new KeyLockedError();
+    const models = unique(group.models);
+    const addons = group.addons ?? [];
+    checkFreeOnly(models, addons);
+    const estimate = withAddons(group.estimateUsd, addons);
+    if (costsNothing(models, addons, estimate)) return; // its runs never ask
+
+    const check = await core.budgets.check({ keyId: key.id, estimateUsd: estimate, group: true });
+    if (check.verdict === 'block') throw new BudgetBlockedError(check);
+    if (
+      check.verdict === 'confirm' &&
+      confirmHandler &&
+      !(await confirmHandler(check, { kind: 'group', group: { ...group, models } }))
+    ) {
+      throw new RunCancelledError();
+    }
+    const approval: StoredApproval = {
+      tool: group.tool,
+      keyId: key.id,
+      models,
+      runsLeft: Math.max(0, Math.floor(group.runs)),
+      usdLeft: estimate,
+    };
+    // Unstored, its runs simply ask for themselves: never a reason to refuse the group.
+    await withBudgetLock(() => writeApproval(group.groupId, approval)).catch(warnStorage);
+  };
+
   return {
     async begin(spec) {
-      const key = core.keys.resolve(spec.tool, spec.keyId);
-      if (!key) throw new NoKeyError();
-      if (!core.keys.lock.unlocked()) throw new KeyLockedError();
+      const started = await start(spec);
+      await announce(started);
+      return started.handle;
+    },
 
-      const models = unique([spec.model, ...(spec.models ?? [])]);
-      const addons = spec.addons ?? [];
-      const paidExtras = paidAddons(addons);
-      if (core.settings.get().freeOnly) {
-        const paid = models.filter((m) => !core.models.isFree(m));
-        if (paid.length > 0 || paidExtras.length > 0) {
-          throw new FreeOnlyError(
-            paid,
-            paidExtras.map((addon) => addon.label),
-          );
-        }
-      }
+    approveGroup,
 
-      const estimate = withAddons(spec.estimateUsd ?? null, addons);
-      // Strictly increasing within this page, so `before` pagination never splits parallel runs.
-      const startedAt = Math.max(Date.now(), lastStartedAt + 1);
-      lastStartedAt = startedAt;
-      const prompt = spec.prompt ?? null;
-      const record: RunRecord = {
-        id: crypto.randomUUID(),
-        tool: spec.tool,
-        status: 'running',
-        model: spec.model,
-        models,
-        keyId: key.id,
-        keyName: key.name,
-        startedAt,
-        finishedAt: null,
-        latencyMs: null,
-        title: spec.title?.trim() || (prompt?.trim() ? excerpt(prompt) : getTool(spec.tool).name),
-        prompt,
-        settings: spec.settings ? (copyMeta(spec.settings) ?? null) : null,
-        output: null,
-        error: null,
-        usage: emptyTotals(),
-        reservedUsd: isFiniteNumber(estimate) ? Math.max(0, estimate) : 0,
-        jobId: null,
-        meta: {},
-        starred: false,
-        groupId: spec.groupId ?? null,
-      };
+    releaseGroup,
 
-      // A run on free models only costs nothing: budgets never block or question it.
-      const free =
-        (estimate === null || estimate === 0) &&
-        paidExtras.length === 0 &&
-        models.every((m) => isFree(m));
-
-      // Own the run before it becomes visible, so no sweep can mistake it for an orphan.
-      const releaseLock = await holdRunLock(record.id);
-      let persisted = false;
-      let check: BudgetCheck;
-      try {
-        check = await withBudgetLock(async () => {
-          const verdict: BudgetCheck = free
-            ? { verdict: 'ok', reasons: [] }
-            : await core.budgets.check({ keyId: key.id, estimateUsd: estimate });
-          if (verdict.verdict !== 'block') {
-            try {
-              await (await getDb()).put('runs', record);
-              persisted = true;
-            } catch (error) {
-              warnStorage(error);
-            }
-          }
-          return verdict;
+    async beginAll(specs, opts = {}) {
+      const first = specs[0];
+      if (!first) return [];
+      const groupId = first.groupId ?? crypto.randomUUID();
+      const members = specs.map((spec) => ({
+        ...spec,
+        tool: first.tool,
+        groupId,
+        ...(opts.label ? { useGroupApproval: true } : {}),
+      }));
+      const { label, note, signal } = opts;
+      throwIfAborted(signal);
+      if (label) {
+        await approveGroup({
+          tool: first.tool,
+          groupId,
+          label,
+          ...(note ? { note } : {}),
+          models: members.flatMap((spec) => [spec.model, ...(spec.models ?? [])]),
+          runs: members.length,
+          estimateUsd: sumKnown(members.map((spec) => spec.estimateUsd)),
+          addons: members.flatMap((spec) => spec.addons ?? []),
+          ...(first.keyId ? { keyId: first.keyId } : {}),
         });
-        if (check.verdict === 'block') throw new BudgetBlockedError(check);
-        if (check.verdict === 'confirm' && confirmHandler && !(await confirmHandler(check, spec))) {
-          throw new RunCancelledError();
+      }
+      const started: Started[] = [];
+      try {
+        for (const spec of members) {
+          throwIfAborted(signal);
+          started.push(await start(spec));
         }
+        throwIfAborted(signal);
       } catch (error) {
-        if (persisted) {
-          await (await getDb()).delete('runs', record.id).catch(warnStorage);
-        }
-        releaseLock?.();
+        await Promise.all(started.map(({ handle }) => handle.withdraw()));
         throw error;
+      } finally {
+        if (label) await releaseGroup(groupId).catch(warnStorage);
       }
-
-      try {
-        core.settings.update((draft) => {
-          draft.models.recent = unique([...models, ...draft.models.recent]).slice(
-            0,
-            RECENT_MODELS_CAP,
-          );
-        });
-      } catch (error) {
-        warnStorage(error);
-      }
-      if (prompt?.trim()) {
-        await core.prompts
-          .addRecent(spec.tool, prompt, spec.settings ?? {})
-          .catch((error: unknown) => {
-            warnStorage(error);
-            return null;
-          });
-      }
-      if (persisted) core.bus.emit({ type: 'history-changed', ids: [record.id] });
-
-      const handle = createHandle(record, { persisted, releaseLock });
-      active.set(record.id, handle);
-      wirePage();
-      return handle;
+      for (const run of started) await announce(run);
+      const handles = started.map(({ handle }) => handle);
+      signal?.addEventListener(
+        'abort',
+        () => {
+          for (const handle of handles) handle.abort('Stopped by the user.');
+        },
+        { once: true },
+      );
+      return handles;
     },
 
     async reattach(runId) {

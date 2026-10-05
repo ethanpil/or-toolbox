@@ -387,6 +387,24 @@ describe('handle: finish and fail', () => {
     expect(record).toMatchObject({ status: 'aborted', error: 'Stopped by budget' });
   });
 
+  it('books nothing for a run stopped before it sent anything; a failed one still counts', async () => {
+    const all = { from: '2000-01-01', to: '2999-12-31' };
+    const stopped = await core.runs.begin({ ...spec, estimateUsd: 0.08 });
+    const cancelled = await core.runs.begin({ ...spec, estimateUsd: 0.08 });
+    events.length = 0;
+    expect(await stopped.fail(new DOMException('stop', 'AbortError'))).toMatchObject({
+      status: 'aborted',
+    });
+    expect(await cancelled.cancel('No longer needed.')).toMatchObject({ status: 'aborted' });
+    expect(await stored(cancelled.id)).toMatchObject({ status: 'aborted' }); // History keeps it
+    expect(await core.stats.rows(all)).toEqual([]);
+    expect(events.map((event) => event.type)).not.toContain('stats-changed');
+
+    const failed = await core.runs.begin(spec);
+    await failed.fail(new ApiError('Bad request', 400));
+    expect(await core.stats.rows(all)).toMatchObject([{ runs: 1, errors: 1, costUsd: 0 }]);
+  });
+
   it('records other errors with a user-safe message', async () => {
     const run = await core.runs.begin(spec);
     const record = await run.fail(new ApiError('Unauthorized', 401));
