@@ -5,7 +5,7 @@
   "category": "reasoning",
   "icon": "signpost-split",
   "capabilities": ["decisions"],
-  "accepts": ["text/plain"],
+  "accepts": ["text/*", "application/json", "application/xml"],
   "produces": ["application/json"],
   "usesJobs": false,
   "lazyLibs": [],

@@ -33,27 +33,28 @@ const switchTo = (mode: 'text' | 'fields'): void => {
   radio.checked = true;
   radio.dispatchEvent(new Event('change', { bubbles: true }));
 };
+const promptField = (): HTMLTextAreaElement => $('tool-prompt') as HTMLTextAreaElement;
 const invalid = (element: HTMLElement): boolean => element.getAttribute('aria-invalid') === 'true';
 
 describe('the situation panel', () => {
   it('starts in text mode with the main prompt field', () => {
-    expect(panel.text.getAttribute('data-testid')).toBe('tool-prompt');
+    expect(promptField().getAttribute('data-testid')).toBe('tool-prompt');
     expect(panel.state()).toEqual(blankState());
     expect(panel.state().mode).toBe('text');
-    expect(panel.text.closest('[hidden]')).toBeNull();
+    expect(promptField().closest('[hidden]')).toBeNull();
     expect($('dec-fields').closest('[hidden]')).not.toBeNull();
   });
 
   it('switches between the text block and the fields, keeping both', () => {
-    type(panel.text, 'A ticket');
+    type(promptField(), 'A ticket');
     switchTo('fields');
     expect(panel.state().mode).toBe('fields');
-    expect(panel.text.closest('[hidden]')).not.toBeNull();
+    expect(promptField().closest('[hidden]')).not.toBeNull();
     expect($('dec-fields').closest('[hidden]')).toBeNull();
     type($('dec-field-key'), 'tier');
     type($('dec-field-value'), 'pro');
     switchTo('text');
-    expect(panel.text.value).toBe('A ticket');
+    expect(promptField().value).toBe('A ticket');
     expect(panel.state().fields).toEqual([{ key: 'tier', value: 'pro' }]);
     expect(changes).toBeGreaterThan(0);
   });
@@ -123,11 +124,11 @@ describe('the situation panel', () => {
 
   it('refuses an empty text block and focuses it', () => {
     expect(panel.validate()).toBe(false);
-    expect(invalid(panel.text)).toBe(true);
-    expect(document.activeElement).toBe(panel.text);
+    expect(invalid(promptField())).toBe(true);
+    expect(document.activeElement).toBe(promptField());
     expect(panel.element.textContent).toContain('Describe the situation to decide on.');
-    type(panel.text, 'Something');
-    expect(invalid(panel.text)).toBe(false);
+    type(promptField(), 'Something');
+    expect(invalid(promptField())).toBe(false);
     expect(panel.validate()).toBe(true);
   });
 

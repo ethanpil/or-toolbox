@@ -315,6 +315,61 @@ describe('Score levels', () => {
       expect(builder.questions()[0]!.levels).toEqual(['Low', 'Medium', 'High']);
     });
 
+    /** A DataTransfer stand-in (jsdom has none) that remembers what the drag put on it. */
+    const transfer = (): { data: Map<string, string>; object: object } => {
+      const data = new Map<string, string>();
+      return {
+        data,
+        object: {
+          effectAllowed: '',
+          dropEffect: '',
+          setData: (type: string, value: string) => data.set(type, value),
+          setDragImage: () => undefined,
+        },
+      };
+    };
+    const withTransfer = (event: Event, object: object): Event => {
+      Object.defineProperty(event, 'dataTransfer', { value: object });
+      return event;
+    };
+
+    it('puts a type of its own on the drag, never text/plain a text field would take in', () => {
+      builder.setQuestions([score()]);
+      const { data, object } = transfer();
+      $$('dec-level-handle')[0]!.dispatchEvent(
+        withTransfer(new Event('dragstart', { bubbles: true }), object),
+      );
+      expect([...data.keys()]).toEqual(['application/x-ortoolbox-level']);
+      expect(data.has('text/plain')).toBe(false);
+    });
+
+    it('forgets the drag when the level is dropped, even if dragend never arrives', () => {
+      builder.setQuestions([score()]);
+      $$('dec-level-handle')[0]!.dispatchEvent(new Event('dragstart', { bubbles: true }));
+      $$('dec-level')[2]!.dispatchEvent(
+        new MouseEvent('dragover', { bubbles: true, cancelable: true, clientY: 1 }),
+      );
+      $$('dec-level')[2]!.dispatchEvent(new Event('drop', { bubbles: true, cancelable: true }));
+      // The redraw removed the dragged node, so its dragend does not come. Another level now being
+      // dragged over must not look like part of the finished drag.
+      const over = new MouseEvent('dragover', { bubbles: true, cancelable: true, clientY: 1 });
+      $$('dec-level')[0]!.dispatchEvent(over);
+      expect(over.defaultPrevented).toBe(false);
+      expect(builder.element.querySelector('.or-dec-drop-after, .or-dec-drop-before')).toBeNull();
+      const drop = new Event('drop', { bubbles: true, cancelable: true });
+      $$('dec-level')[0]!.dispatchEvent(drop);
+      expect(levels()).toEqual(['Medium', 'High', 'Low']);
+    });
+
+    it('leaves focus on the level that was moved, not the one it was dropped on', () => {
+      builder.setQuestions([score()]);
+      drag(0, 2, 'after');
+      expect(levels()).toEqual(['Medium', 'High', 'Low']);
+      expect((document.activeElement as HTMLInputElement).value).toBe('Low');
+      drag(2, 0, 'before');
+      expect((document.activeElement as HTMLInputElement).value).toBe('Low');
+    });
+
     it('marks the handle as decoration: the buttons are the accessible way', () => {
       builder.setQuestions([score()]);
       const handle = $$('dec-level-handle')[0]!;
@@ -322,6 +377,66 @@ describe('Score levels', () => {
       expect(handle.draggable).toBe(true);
       expect(handle.tabIndex).toBe(-1);
     });
+  });
+});
+
+describe('ids and rows', () => {
+  it('uses the id as typed without its surrounding spaces, before the field loses focus', () => {
+    builder.setQuestions([blankQuestion()]);
+    type($('dec-name'), 'Bug');
+    const id = $('dec-id') as HTMLInputElement;
+    id.value = 'bug ';
+    id.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(builder.questions()[0]!.id).toBe('bug');
+    id.value = ' ';
+    id.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(builder.questions()[0]!.id).toBe('');
+  });
+
+  it('names each question by a key of its own that survives renames, in the order of the questions', () => {
+    builder.setQuestions([
+      { ...blankQuestion(60), name: 'First', id: 'first' },
+      { ...blankQuestion(70), name: 'Second', id: 'second' },
+    ]);
+    const keys = builder.keys();
+    expect(keys).toHaveLength(2);
+    expect(new Set(keys).size).toBe(2);
+    expect(builder.thresholds()).toEqual(
+      new Map([
+        [keys[0], 60],
+        [keys[1], 70],
+      ]),
+    );
+    type($('dec-name', card(0)), 'Renamed');
+    expect(builder.questions()[0]!.id).toBe('renamed');
+    expect(builder.keys()).toEqual(keys);
+    type($('dec-threshold', card(1)), '75');
+    expect(builder.thresholds().get(keys[1]!)).toBe(75);
+    $('dec-question-remove', card(0)).click();
+    expect(builder.keys()).toEqual([keys[1]]);
+  });
+
+  it('keeps a list the user emptied empty', () => {
+    builder.setQuestions([
+      {
+        ...blankQuestion(),
+        name: 'Q',
+        id: 'q',
+        instructions: 'Q?',
+        type: 'choice',
+        options: [],
+        levels: [],
+      },
+    ]);
+    expect($$('dec-option')).toHaveLength(0);
+    expect(builder.questions()[0]!.options).toEqual([]);
+    expect(builder.questions()[0]!.levels).toEqual([]);
+    expect(builder.validate()).toBe(false);
+    expect(card().textContent).toContain('Add at least 2 options.');
+    choose(0, 'score');
+    expect($$('dec-level')).toHaveLength(0);
+    expect(builder.validate()).toBe(false);
+    expect(card().textContent).toContain('Add at least 2 levels.');
   });
 });
 

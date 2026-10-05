@@ -21,8 +21,6 @@ import {
 
 export interface StatePanel {
   readonly element: HTMLElement;
-  /** The main prompt field. */
-  readonly text: HTMLTextAreaElement;
   state(): StateDef;
   setState(state: StateDef): void;
   /** Shows what is wrong at its field, focuses the first, and says whether the situation can be sent. */
@@ -325,7 +323,6 @@ export function statePanel(options: { onChange: () => void }): StatePanel {
   fieldsBox.hidden = true;
   const panel: StatePanel = {
     element,
-    text,
     state: () => ({
       mode,
       text: text.value,

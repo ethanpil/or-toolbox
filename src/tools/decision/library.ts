@@ -20,7 +20,9 @@ import { uid } from '../../ui/id';
 import type { Bus, ToolStateStore } from '../../core/types';
 import {
   findByName,
+  type LoadLoss,
   loadDeciders,
+  lossOnLoad,
   newDeciderId,
   removeDecider,
   type SavedDecider,
@@ -52,6 +54,15 @@ export interface Library {
 }
 
 const MAX_NAME = 80;
+
+function lossMessage(loss: LoadLoss): string {
+  if (loss.questions && loss.situation) {
+    return 'The questions in the form have changed since they were loaded or saved, and this decider also brings a situation that replaces the one you typed. Use “Save as…” first to keep your questions.';
+  }
+  return loss.questions
+    ? 'The questions in the form have changed since they were loaded or saved. Use “Save as…” first to keep them.'
+    : 'This decider comes with a situation, which replaces the one in the form. Copy what you typed first if you still need it.';
+}
 
 /** Name and whether to keep the situation, or null when cancelled. */
 function saveDialog(options: {
@@ -250,11 +261,15 @@ export function libraryBar(options: LibraryOptions): Library {
           }
         : null;
     if (!entry) return;
-    if (options.dirty()) {
+    const loss = lossOnLoad({
+      questionsEdited: options.dirty(),
+      current: options.state(),
+      incoming: entry.state,
+    });
+    if (loss.questions || loss.situation) {
       const replaceIt = await confirmDialog({
-        title: 'Replace your questions?',
-        message:
-          'The questions in the form have changed since they were loaded or saved. Use “Save as…” first to keep them.',
+        title: loss.questions ? 'Replace your questions?' : 'Replace your situation?',
+        message: lossMessage(loss),
         confirmLabel: 'Replace',
         tone: 'warning',
       });

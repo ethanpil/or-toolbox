@@ -180,6 +180,52 @@ describe('thresholds', () => {
     expect(verdictOf(0.58, 58)).toBe('clear');
   });
 
+  it('never shows a number the badge disagrees with (Yes/No confidence is 1 - p, which carries float noise)', () => {
+    // 1 - 0.07 is 0.9299999999999999: compared exactly it missed 93, though the card says 93%.
+    for (const [yes, threshold] of [
+      [0.07, 93],
+      [0.32, 68],
+      [0.33, 67],
+      [0.34, 66],
+    ] as const) {
+      const answer = readAnswer(noulQuestion, { type: 'noul', noul: yes });
+      const confidence = answer.kind === 'noul' ? answer.confidence : null;
+      expect(formatPercent(confidence ?? Number.NaN)).toBe(`${threshold}%`);
+      expect(resultVerdict(answer, threshold), `${yes} at ${threshold}`).toBe('clear');
+      expect(resultVerdict(answer, threshold + 1)).toBe('review');
+    }
+  });
+
+  it('clear exactly when the displayed percentage reaches the threshold, for every tenth of a percent', () => {
+    const shown = (p: number): number => {
+      const text = formatPercent(p);
+      return text.startsWith('<') ? 0 : Number.parseFloat(text);
+    };
+    const disagreements: string[] = [];
+    for (let k = 0; k <= 1000; k++) {
+      const yes = k / 1000;
+      for (const confidence of [yes, 1 - yes, Math.max(yes, 1 - yes)]) {
+        for (let threshold = 0; threshold <= 100; threshold++) {
+          const clear = verdictOf(confidence, threshold) === 'clear';
+          if (clear !== shown(confidence) >= threshold) {
+            disagreements.push(`${confidence} at ${threshold}: ${formatPercent(confidence)}`);
+          }
+        }
+      }
+    }
+    expect(disagreements.slice(0, 5)).toEqual([]);
+  });
+
+  it('does not round a probability just under 1 up to 100%', () => {
+    expect(formatPercent(0.9999999995)).toBe('99.9%');
+    expect(formatPercent(1 - 5e-10)).toBe('99.9%');
+    expect(verdictOf(0.9999999995, 100)).toBe('review');
+    // Float noise around exactly 1 is still 100%.
+    expect(formatPercent(1 - 1e-16)).toBe('100%');
+    expect(verdictOf(1 - 1e-16, 100)).toBe('clear');
+    expect(formatPercent(0.1 + 0.2 + 0.7)).toBe('100%');
+  });
+
   it('never calls an answer without a confidence clear', () => {
     expect(verdictOf(null, 0)).toBe('review');
     const answer = readAnswer(choiceQuestion(), { choice: 'payments' });
@@ -209,6 +255,16 @@ describe('thresholds', () => {
     expect(formatScore(2)).toBe('2');
     expect(formatScore(0.123456)).toBe('0.12');
     expect(formatScore(0)).toBe('0');
+  });
+});
+
+describe('question ids', () => {
+  it('looks answers up by the id the request used, without surrounding spaces', () => {
+    const asked = { ...noulQuestion, id: ' bug ' };
+    const decision = parseDecision({ model: 'm', answers: { bug: { type: 'noul', noul: 0.9 } } }, [
+      asked,
+    ]);
+    expect(decision.results[0]).toMatchObject({ kind: 'noul', id: 'bug', yes: 0.9 });
   });
 });
 

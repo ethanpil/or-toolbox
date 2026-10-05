@@ -142,20 +142,19 @@ function readOptions(value: unknown): OptionDef[] {
 export function readQuestion(value: unknown): QuestionDef | null {
   if (!isRecord(value)) return null;
   const name = text(value['name']);
-  const rawId = text(value['id']);
+  const id = text(value['id']).trim();
   const blank = blankQuestion();
-  const options = readOptions(value['options']);
-  const levels = Array.isArray(value['levels']) ? value['levels'].filter(isString) : [];
   return {
     name,
-    id: rawId || slugify(name),
+    id: id || slugify(name),
     instructions: text(value['instructions']),
     type: isQuestionType(value['type']) ? value['type'] : 'noul',
     threshold: thresholdOf(value['threshold']),
     yes: text(value['yes']),
     no: text(value['no']),
-    options: options.length > 0 ? options : blank.options,
-    levels: levels.length > 0 ? levels : blank.levels,
+    // A list the user emptied stays empty (validation flags it); only one that is missing starts as blanks.
+    options: Array.isArray(value['options']) ? readOptions(value['options']) : blank.options,
+    levels: Array.isArray(value['levels']) ? value['levels'].filter(isString) : blank.levels,
   };
 }
 
@@ -204,6 +203,9 @@ export interface Problem {
   message: string;
 }
 
+/** A question's key in the request and in the answers: its id without surrounding spaces. */
+export const wireId = (question: Pick<QuestionDef, 'id'>): string => question.id.trim();
+
 const same = (a: string, b: string): boolean => a.trim().toLowerCase() === b.trim().toLowerCase();
 
 /** Every reason the questions cannot be sent, in the order the form shows them (the first is what to fix first). */
@@ -212,13 +214,13 @@ export function validateQuestions(questions: readonly QuestionDef[]): Problem[] 
   if (questions.length === 0) {
     return [{ question: -1, field: 'questions', message: 'Add at least one question.' }];
   }
-  const ids = questions.map((question) => question.id.trim());
+  const ids = questions.map(wireId);
   questions.forEach((question, index) => {
     const add = (field: ProblemField, message: string, item?: number): void => {
       problems.push({ question: index, field, message, ...(item === undefined ? {} : { item }) });
     };
     if (!question.name.trim()) add('name', 'Give the question a short name.');
-    const id = question.id.trim();
+    const id = wireId(question);
     // A blank id only matters once there is a name to make it from (the name's own message comes first).
     if (!id) {
       if (question.name.trim()) add('id', 'Give the question an id.');
@@ -295,6 +297,25 @@ export function validateState(state: StateDef): StateProblem[] {
   return problems;
 }
 
+// --- the snapshot ----------------------------------------------------------------------------------------
+
+/** True when the form holds any situation at all: text, or a field with a name or a value (in either mode). */
+export const hasSituation = (state: StateDef): boolean =>
+  state.text.trim() !== '' || state.fields.some((row) => !isBlankRow(row));
+
+/**
+ * The prompt of a snapshot (what Prompts saves, Recent lists and History records and searches): the text block in
+ * text mode, and in fields mode the `name: value` lines of what is sent, so it says what the model was asked
+ * about. The text block kept behind the fields is not part of it (it is never sent); it rides in the settings.
+ */
+export function promptOf(state: StateDef): string {
+  if (state.mode === 'text') return state.text;
+  return state.fields
+    .filter((row) => !isBlankRow(row))
+    .map((row) => `${row.key.trim()}: ${row.value.trim()}`.trimEnd())
+    .join('\n');
+}
+
 // --- the request -----------------------------------------------------------------------------------------
 
 /** What the model is asked to judge: the text block, or an object of the fields (blank rows left out). */
@@ -343,14 +364,14 @@ export function buildRequest(
     model,
     state: stateValue(state),
     questions: Object.fromEntries(
-      questions.map((question) => [question.id.trim(), wireQuestion(question)]),
+      questions.map((question) => [wireId(question), wireQuestion(question)]),
     ),
   };
 }
 
 /** A short label for History: the question names. */
 export function runTitle(questions: readonly QuestionDef[]): string {
-  const names = questions.map((question) => question.name.trim() || question.id.trim());
+  const names = questions.map((question) => question.name.trim() || wireId(question));
   const joined = names.filter(Boolean).join(', ');
   const label = `Decide: ${joined || 'questions'}`;
   return label.length > 80 ? `${label.slice(0, 79)}…` : label;
