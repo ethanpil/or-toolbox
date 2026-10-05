@@ -12,19 +12,20 @@
  *   the framing and the opener always stay, and so does the entry being answered. `trimmed` says how many went.
  * - **`max_tokens`** is clamped as in Chat: to the model's output cap and to what the context leaves.
  *
- * Token counts use the shared approximation (src/core/tokens.ts), deliberately high.
+ * Token counts and the context fit are core's (src/core/tokens.ts: `approxTokens`, `promptBudget`, `fitContext`),
+ * the same for every tool.
  */
 import type { ChatMessage, ChatRequest } from '../../core/api/types';
-import { approxTokens } from '../../core/tokens';
+import {
+  approxTokens,
+  type ContextLimits,
+  fitContext,
+  MESSAGE_OVERHEAD,
+  promptBudget,
+} from '../../core/tokens';
 import { type Conversation, type Entry, isSpoken, type Speaker } from './conversation';
 
 export const MODERATOR_LABEL = '[Moderator]';
-
-/** Output assumed by estimates and kept free in the context when Max tokens is not set (as in Chat). */
-export const DEFAULT_OUTPUT_TOKENS = 4096;
-
-/** Per-message overhead (role markers) in the token approximation. */
-const MESSAGE_OVERHEAD = 4;
 
 export interface BotProfile {
   name: string;
@@ -176,13 +177,6 @@ export interface BuiltTurn {
   tooLong: boolean;
 }
 
-/** The output a turn may take: the setting, else the default, within the model's cap. */
-export function outputTokens(maxTokens: number | null, maxCompletionTokens: number | null): number {
-  const cap =
-    maxCompletionTokens && maxCompletionTokens > 0 ? maxCompletionTokens : Number.POSITIVE_INFINITY;
-  return Math.min(maxTokens ?? DEFAULT_OUTPUT_TOKENS, cap);
-}
-
 /** The request for `speaker`'s next turn in `conversation`. */
 export function buildTurn(
   conversation: Pick<Conversation, 'entries'>,
@@ -190,33 +184,21 @@ export function buildTurn(
   options: TurnOptions,
 ): BuiltTurn {
   const system = framing(speaker, options.bots, options.stopPhrase);
-  const systemTokens = approxTokens(system) + MESSAGE_OVERHEAD;
   const { opener, rest } = contextParts(conversation.entries, speaker, options.bots);
-  const fixed = systemTokens + (opener?.tokens ?? 0);
-  const cap =
-    options.maxCompletionTokens && options.maxCompletionTokens > 0
-      ? options.maxCompletionTokens
-      : Number.POSITIVE_INFINITY;
-  let maxTokens = options.maxTokens === null ? null : Math.min(options.maxTokens, cap);
-  const wanted = outputTokens(options.maxTokens, options.maxCompletionTokens);
-
-  let trimmed = 0;
-  let tooLong = false;
-  let completionTokens = wanted;
-  const context = options.contextLength;
-  const tokens = rest.map((item) => item.tokens);
-  if (context && context > 0) {
-    // Leave room for the answer and a margin for the approximation.
-    const budget = Math.floor(context * 0.95) - Math.min(wanted, Math.floor(context / 2)) - fixed;
-    trimmed = trimCount(tokens, budget);
-    const kept = tokens.slice(trimmed).reduce((sum, value) => sum + value, 0);
-    tooLong = kept > budget;
-    // The prompt and the answer together must fit the window.
-    const room = Math.max(1, context - fixed - kept);
-    if (maxTokens !== null) maxTokens = Math.min(maxTokens, room);
-    completionTokens = Math.min(wanted, room);
-  }
+  // The framing and the opener always go; the rest is trimmed oldest first to fit what the window leaves.
+  const limits: ContextLimits = {
+    context: options.contextLength,
+    maxTokens: options.maxTokens,
+    maxCompletionTokens: options.maxCompletionTokens,
+    fixed: approxTokens(system) + MESSAGE_OVERHEAD + (opener?.tokens ?? 0),
+  };
+  const trimmed = trimCount(
+    rest.map((item) => item.tokens),
+    promptBudget(limits),
+  );
   const kept = rest.slice(trimmed);
+  const keptTokens = kept.reduce((sum, item) => sum + item.tokens, 0);
+  const fit = fitContext({ ...limits, prompt: keptTokens });
   const messages: ChatMessage[] = [
     { role: 'system', content: system },
     ...mergeParts(opener ? [opener, ...kept] : kept),
@@ -225,11 +207,11 @@ export function buildTurn(
     body: {
       model: options.model,
       messages,
-      ...(maxTokens !== null ? { max_tokens: maxTokens } : {}),
+      ...(fit.maxTokens !== null ? { max_tokens: fit.maxTokens } : {}),
     },
     trimmed,
-    promptTokens: fixed + kept.reduce((sum, item) => sum + item.tokens, 0),
-    completionTokens,
-    tooLong,
+    promptTokens: (limits.fixed ?? 0) + keptTokens,
+    completionTokens: fit.completionTokens,
+    tooLong: fit.tooLong,
   };
 }

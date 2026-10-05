@@ -2,7 +2,7 @@ import { marked } from 'marked';
 import { describe, expect, it } from 'vitest';
 import { type Conversation, createConversation } from './conversation';
 import { toJson, toMarkdown, totalsLine } from './export';
-import { endText, initials, usageLine } from './format';
+import { endText, initials, turnUsageLine } from './format';
 import type { Limits } from './loop';
 
 const LIMITS: Limits = { turns: 20, timeMs: 300_000, costUsd: 0.25, stopPhrase: '[END]' };
@@ -136,13 +136,33 @@ describe('JSON transcript', () => {
 });
 
 describe('formatting', () => {
-  it('writes usage lines for paid, free, estimated and unknown costs', () => {
+  it('words a turn’s cost by the shared rule; an unknown cost is never "≈", it says what was counted', () => {
     const usage = { promptTokens: 1200, completionTokens: 30, costUsd: 0.0021, latencyMs: 2500 };
-    expect(usageLine(usage, false)).toBe('1.2K in · 30 out · $0.0021 · 2.5 s');
-    expect(usageLine({ ...usage, costUsd: 0 }, true)).toBe('1.2K in · 30 out · free · 2.5 s');
-    expect(usageLine({ ...usage, costUnknown: true }, false)).toContain('≈ $0.0021');
-    expect(usageLine({ ...usage, costUsd: 0, costUnknown: true }, false)).toContain('cost unknown');
-    expect(usageLine(undefined, false)).toBe('');
+    expect(turnUsageLine(usage, false)).toBe('1.2K in · 30 out · $0.0021 · 2.5 s');
+    expect(turnUsageLine({ ...usage, costUsd: 0 }, true)).toBe('1.2K in · 30 out · free · 2.5 s');
+    expect(turnUsageLine({ ...usage, costEstimated: true }, false)).toContain('≈ $0.0021 ·');
+    // A turn whose cost is unknown holds its estimate, which budgets counted for it.
+    expect(turnUsageLine({ ...usage, costUnknown: true }, false)).toBe(
+      '1.2K in · 30 out · cost unknown (≈ $0.0021 counted) · 2.5 s',
+    );
+    expect(turnUsageLine({ ...usage, costUsd: 0, costUnknown: true }, true)).toContain(
+      'cost unknown',
+    );
+    expect(turnUsageLine(undefined, false)).toBe('');
+  });
+
+  it('writes an unknown turn cost the same way in the Markdown transcript', () => {
+    const conversation = sample();
+    conversation.entries[1]!.usage = {
+      promptTokens: 40,
+      completionTokens: 2,
+      costUsd: 0.0009,
+      latencyMs: 1200,
+      costUnknown: true,
+    };
+    expect(toMarkdown(conversation, context)).toContain(
+      '_m/a · 40 in · 2 out · cost unknown (≈ $0.0009 counted) · 1.2 s_',
+    );
   });
 
   it('says what ended a conversation', () => {

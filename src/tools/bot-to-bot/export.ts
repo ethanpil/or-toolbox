@@ -9,7 +9,7 @@
  */
 import { formatMs, formatUsd, plural } from '../../ui/format';
 import { type Conversation, type Entry, turnCount } from './conversation';
-import { END_TITLES, usageLine } from './format';
+import { END_TITLES, turnUsageLine } from './format';
 import type { Limits } from './loop';
 
 export interface ExportContext {
@@ -117,7 +117,7 @@ export function toMarkdown(conversation: Conversation, context: ExportContext): 
           entry.edited ? '_(edited)_' : undefined,
         ].filter(Boolean);
         if (notes.length > 0) parts.push(notes.join(' '));
-        const usage = usageLine(entry.usage, context.isFree(entry.model ?? ''));
+        const usage = turnUsageLine(entry.usage, context.isFree(entry.model ?? ''));
         parts.push(`_${[entry.model, usage].filter(Boolean).join(' · ')}_`);
       }
     }

@@ -90,13 +90,16 @@ function heldStream() {
         bodies.push(body);
         const text = `${speakerOf(body)} says ${bodies.length}`;
         opts.onEvent({ type: 'text', text: 'Partial' });
-        // The client combines the call's signal (the time limit) with the run's (Stop).
+        // The client combines the call's signal (the time limit) with the run's (Stop). An aborted stream leaves
+        // the queue, so `release()` finishes the next live one.
         for (const signal of [opts.signal, opts.run.signal]) {
-          signal?.addEventListener('abort', () =>
-            reject(new DOMException('Stopped by the user.', 'AbortError')),
-          );
+          signal?.addEventListener('abort', () => {
+            const index = waiting.indexOf(finish);
+            if (index >= 0) waiting.splice(index, 1);
+            reject(new DOMException('Stopped by the user.', 'AbortError'));
+          });
         }
-        waiting.push(() => {
+        const finish = (): void => {
           opts.onEvent({ type: 'text', text: text.slice('Partial'.length) });
           opts.run.addUsage({
             model: body.model,
@@ -107,7 +110,8 @@ function heldStream() {
             latencyMs: 100,
           });
           resolve(result(`Partial${text.slice('Partial'.length)}`, body.model));
-        });
+        };
+        waiting.push(finish);
       }),
   );
   const release = async (): Promise<void> => {
@@ -283,7 +287,7 @@ describe('a conversation', () => {
     expect($('bots-state').textContent).toBe('Ended · Turn limit');
     expect($('bots-turns').textContent).toBe('4 / 4');
     expect($('bots-cost').textContent).toBe('$0.0016 / $0.25');
-    expect($('bots-primary').textContent).toContain('Resume');
+    expect($('run-button').textContent).toContain('Resume');
 
     const [run] = await runs();
     expect(run).toMatchObject({
@@ -521,11 +525,11 @@ describe('moderation', () => {
     await t!.runners[0]!.trigger('step');
     $('bots-new').click();
     await vi.waitFor(() => expect($('bots-empty')).not.toBeNull());
-    expect($('bots-primary').textContent).toContain('Start');
+    expect($('run-button').textContent).toContain('Start');
     await eventually(async () => expect(await stored()).toBeNull());
     await pressUndo();
     await vi.waitFor(() => expect(turns()).toHaveLength(1));
-    expect(document.activeElement).toBe($('bots-primary'));
+    expect(document.activeElement).toBe($('run-button'));
     await eventually(async () => expect((await stored())?.entries).toHaveLength(2));
   });
 });
@@ -546,7 +550,7 @@ describe('persistence', () => {
     await mount({ chatStream });
     await vi.waitFor(() => expect(turnTexts()).toEqual(['Bot A says 1', 'Bot B says 2']));
     expect($('bots-state').textContent).toBe('Paused');
-    expect($('bots-primary').textContent).toContain('Resume');
+    expect($('run-button').textContent).toContain('Resume');
     expect($<HTMLTextAreaElement>('tool-prompt').value).toBe('Plan a picnic.');
     expect($('bots-turns').textContent).toBe('2 / 6');
   });
@@ -684,7 +688,7 @@ describe('review fixes: turns that fail', () => {
     expect(t!.status()).not.toContain('spoke');
   });
 
-  it('B2: a turn that may have gone through says so, and offers no Retry', async () => {
+  it('B2: a turn that may have gone through says so on the turn, links the activity, offers no Retry', async () => {
     const chatStream = vi.fn(() => {
       const error = new ApiError('Bad gateway', 502);
       error.outcomeUnknown = true;
@@ -693,15 +697,22 @@ describe('review fixes: turns that fail', () => {
     const tool = await mount({ chatStream });
     configure(tool, {});
     await t!.runners[0]!.trigger();
-    await vi.waitFor(() =>
-      expect($('error-toast')?.textContent).toContain('may have gone through'),
-    );
+    await vi.waitFor(() => expect($('turn-error')).not.toBeNull());
+    // failureText's caution, on the turn; the link to check; no invitation to resume (a resend could pay twice).
+    const bubble = $('turn-error');
+    expect(bubble.textContent).toContain('may still have done the work and billed it');
+    expect(bubble.textContent).toContain('check your OpenRouter activity');
+    expect(bubble.textContent).not.toContain('Resume to try again');
+    const link = bubble.querySelector('a')!;
+    expect(link.getAttribute('href')).toBe('https://openrouter.ai/activity');
+    expect(link.textContent).toContain('OpenRouter activity');
+    expect(t!.status()).toContain('may still have done the work and billed it');
+    // The turn is the presentation: no toast, so no Retry either.
+    expect($$('error-toast')).toHaveLength(0);
     expect($$('toast-retry')).toHaveLength(0);
-    const bubble = $('turn-error').textContent ?? '';
-    expect(bubble).toContain('may have gone through and been billed');
-    expect(bubble).toContain('OpenRouter activity');
-    expect(bubble).not.toContain('Resume to try again');
-    expect(t!.status()).toContain('may have gone through');
+    await eventually(async () =>
+      expect((await stored())?.entries.at(-1)?.outcomeUnknown).toBe(true),
+    );
   });
 
   it('B8: a conversation too long for the model is refused before the run', async () => {
@@ -859,11 +870,11 @@ describe('review fixes: the form', () => {
     // Another opener (History's Re-run, a saved prompt, the sample) starts afresh.
     configure(tool, {}, 'A different topic');
     await vi.waitFor(() => expect($('bots-empty')).not.toBeNull());
-    expect($('bots-primary').textContent).toContain('Start');
+    expect($('run-button').textContent).toContain('Start');
     expect($('bots-opener-hint').textContent).not.toContain('New conversation');
     await pressUndo();
     await vi.waitFor(() => expect(turns()).toHaveLength(1));
-    expect(document.activeElement).toBe($('bots-primary'));
+    expect(document.activeElement).toBe($('run-button'));
   });
 
   it('sweep #3: a loaded setup (sample, link) does not overwrite the saved bots', async () => {
@@ -951,7 +962,7 @@ describe('review fixes: following the text (B12)', () => {
 
 describe('review fixes: data reset (sweep #1)', () => {
   it('drops the conversation and never writes it back', async () => {
-    const { chatStream } = heldStream();
+    const { chatStream, release } = heldStream();
     const tool = await mount({ chatStream });
     configure(tool, {});
     const done = t!.runners[0]!.trigger();
@@ -962,5 +973,16 @@ describe('review fixes: data reset (sweep #1)', () => {
     await settle();
     expect(await stored()).toBeNull();
     expect($('bots-empty')).not.toBeNull();
+    // Nothing from before the reset was offered for saving again, so the store refused nothing aloud.
+    expect($$('error-toast')).toHaveLength(0);
+
+    // The page goes on: a new conversation after the reset is stored (no "reload the page").
+    configure(tool, {}, 'After the reset');
+    const next = t!.runners[0]!.trigger('step');
+    await release();
+    await next;
+    await settle();
+    expect((await stored())?.entries[0]?.content).toBe('After the reset');
+    expect($$('error-toast')).toHaveLength(0);
   });
 });
