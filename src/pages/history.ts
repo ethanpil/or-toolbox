@@ -437,6 +437,8 @@ class HistoryPage {
       keys.map((key) => h('option', { value: key.id }, key.name)),
     );
     this.keySelect.value = keys.some((key) => key.id === current) ? current : '';
+    // The filtered key was removed: the select now says "Any key", so the list must stop filtering by it.
+    if (this.filters.keyId !== this.keySelect.value) this.readControls();
   }
 
   /**

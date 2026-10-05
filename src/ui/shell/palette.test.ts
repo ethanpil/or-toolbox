@@ -1,6 +1,43 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { CoreServices } from '../../core/types';
-import { arrange, type PaletteItem, staticItems } from './palette';
+import { arrange, type PaletteItem, staticItems, togglePalette } from './palette';
+
+describe('the palette dialog', () => {
+  it('leaves Enter and the arrows to an input method that is composing (Japanese, Chinese, Korean)', async () => {
+    const core = {
+      ...fakeCore({ enabled: false, unlocked: true }).core,
+      history: { query: () => Promise.resolve([]) },
+      models: { list: () => Promise.resolve([]) },
+    } as unknown as CoreServices;
+    Element.prototype.scrollIntoView = () => undefined; // jsdom has none
+    togglePalette(core);
+    const input = document.querySelector<HTMLInputElement>('[data-testid="palette-input"]')!;
+    const active = () => input.getAttribute('aria-activedescendant');
+    const first = active();
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
+        isComposing: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(active()).toBe(first);
+    const enter = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      isComposing: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    input.dispatchEvent(enter);
+    expect(enter.defaultPrevented).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(document.querySelector('[data-testid="palette"]')?.classList.contains('show')).toBe(
+      true,
+    );
+    togglePalette(core); // close
+  });
+});
 
 function fakeCore(lock: { enabled: boolean; unlocked: boolean }) {
   const update = vi.fn();
@@ -48,11 +85,24 @@ describe('staticItems', () => {
 describe('arrange', () => {
   const items = staticItems(fakeCore({ enabled: false, unlocked: true }).core);
 
-  it('keeps group order and at most six per group', () => {
+  it('keeps group order; with no query every tool and page is listed, other groups six at most', () => {
     const arranged = arrange(items, '');
     const groups = [...new Set(arranged.map((item) => item.group))];
     expect(groups).toEqual(['Tools', 'Pages', 'Settings', 'Actions']);
-    expect(arranged.filter((item) => item.group === 'Tools')).toHaveLength(6);
+    const all = (group: string) => items.filter((item) => item.group === group).length;
+    expect(arranged.filter((item) => item.group === 'Tools')).toHaveLength(all('Tools'));
+    expect(arranged.filter((item) => item.group === 'Pages')).toHaveLength(all('Pages'));
+    for (const id of ['tool:video-studio', 'tool:model-arena', 'page:diagnostics']) {
+      expect(
+        arranged.some((item) => item.id === id),
+        id,
+      ).toBe(true);
+    }
+    expect(arranged.filter((item) => item.group === 'Settings').length).toBeLessThanOrEqual(6);
+    // While searching, six per group.
+    expect(arrange(items, 'a').filter((item) => item.group === 'Tools').length).toBeLessThanOrEqual(
+      6,
+    );
   });
 
   it('ranks within a group', () => {

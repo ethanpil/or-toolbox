@@ -207,6 +207,14 @@ describe('documentInput', () => {
     expect(document.body.textContent).toContain('bad.pdf');
   });
 
+  it('reveals a page without forcing a smooth scroll (reduced motion is left to the CSS)', async () => {
+    const scroll = vi.fn();
+    Element.prototype.scrollIntoView = scroll;
+    await input.add([png('a.png')]);
+    input.reveal(input.selection()[0]!);
+    expect(scroll).toHaveBeenCalledWith({ block: 'center', behavior: 'auto' });
+  });
+
   it('refuses to load a page of a removed file', async () => {
     await input.add([png('a.png')]);
     const [ref] = input.selection();

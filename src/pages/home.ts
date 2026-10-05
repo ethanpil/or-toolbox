@@ -11,7 +11,7 @@ import { listSkeleton, loadInto } from '../ui/components/load-into';
 import { starButton } from '../ui/components/star-button';
 import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
-import { formatDateTime, formatRelativeTime, formatUsd, plural } from '../ui/format';
+import { describeRunCost, formatDateTime, formatRelativeTime, plural } from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
 import { toggleFavoriteTool } from '../ui/settings-actions';
@@ -19,7 +19,7 @@ import { mountPage } from '../ui/shell/index';
 import { CATEGORY_INFO, historyUrl, toolUrl } from '../ui/shell/links';
 import { togglePalette } from '../ui/shell/palette';
 import { rank } from '../ui/shell/palette-search';
-import { plainShortcutAllowed } from '../ui/shell/shortcuts';
+import { composing, plainShortcutAllowed } from '../ui/shell/shortcuts';
 import { onboarding } from './onboarding';
 
 mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, navigate }) => {
@@ -173,16 +173,16 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
 
   const runRow = (run: RunRecord): HTMLElement => {
     const tool = getTool(run.tool);
-    // "Free" only for runs on free models; a failed paid run that cost nothing shows $0.00.
+    // The one cost rule (`describeRunCost`): "Free" only on free models, "≈" for an estimate, never a number for an
+    // unknown cost.
     const allFree = run.models.length > 0 && run.models.every((model) => core.models.isFree(model));
+    const described = describeRunCost(run.usage, { free: allFree, booked: run.reservedUsd });
     const cost =
       run.status === 'running'
         ? 'Running'
-        : run.usage.costUnknown
+        : described.kind === 'unknown'
           ? 'Cost unknown'
-          : run.usage.costUsd === 0 && allFree
-            ? 'Free'
-            : formatUsd(run.usage.costUsd);
+          : described.text;
     return h(
       'a',
       {
@@ -322,6 +322,8 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
 
   search.addEventListener('input', applySearch);
   search.addEventListener('keydown', (event) => {
+    // The Enter (or Escape) that confirms an input method's composition is not ours.
+    if (composing(event)) return;
     if (event.key === 'Enter' && matches[0]) {
       event.preventDefault();
       void navigate(toolUrl(matches[0].id));

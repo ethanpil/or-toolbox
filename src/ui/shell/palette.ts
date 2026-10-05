@@ -22,6 +22,7 @@ import { THEME_MODES } from './appearance';
 import { guardedNavigate } from './leave-guard';
 import { CATEGORY_INFO, modelsUrl, PAGES, SETTINGS_SECTIONS, settingsUrl, toolUrl } from './links';
 import { rank, rankBy, scoreItem, type SearchItem } from './palette-search';
+import { composing } from './shortcuts';
 
 export interface PaletteItem extends SearchItem {
   id: string;
@@ -103,10 +104,13 @@ export function staticItems(core: Pick<CoreServices, 'settings' | 'keys'>): Pale
   return items;
 }
 
+/** Listed in full while the search box is empty, so every tool and page can be reached without typing. */
+const COMPLETE_WHEN_EMPTY: ReadonlySet<PaletteGroup> = new Set(['Tools', 'Pages']);
+
 /**
- * Ranks every group and keeps at most `PER_GROUP` of each. Without a query the groups keep their fixed order;
- * with one, the group holding the best match comes first (so "models" puts the Models page above a tool whose
- * description mentions models).
+ * Ranks every group and keeps at most `PER_GROUP` of each (all tools and pages while there is no query). Without
+ * a query the groups keep their fixed order; with one, the group holding the best match comes first (so "models"
+ * puts the Models page above a tool whose description mentions models).
  */
 export function arrange(items: readonly PaletteItem[], query: string): PaletteItem[] {
   const searching = query.trim() !== '';
@@ -115,7 +119,8 @@ export function arrange(items: readonly PaletteItem[], query: string): PaletteIt
     // Recent runs are already newest-first and filtered by History; ranking would reorder them by title.
     const ranked = group === 'Recent runs' && !searching ? inGroup : rank(inGroup, query);
     const best = searching && ranked[0] ? scoreItem(query, ranked[0]) : 0;
-    return { order, best, items: ranked.slice(0, PER_GROUP) };
+    const limit = !searching && COMPLETE_WHEN_EMPTY.has(group) ? ranked.length : PER_GROUP;
+    return { order, best, items: ranked.slice(0, limit) };
   });
   if (searching) groups.sort((a, b) => b.best - a.best || a.order - b.order);
   return groups.flatMap((group) => group.items);
@@ -331,6 +336,8 @@ function showPalette(core: CoreServices): ModalHandle {
     scheduleAsync();
   });
   input.addEventListener('keydown', (event) => {
+    // Keys that confirm or move an input method's composition (Japanese, Chinese, Korean) belong to it.
+    if (composing(event)) return;
     if (event.key === 'ArrowDown') move(1);
     else if (event.key === 'ArrowUp') move(-1);
     else if (event.key === 'PageDown') move(5);

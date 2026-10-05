@@ -856,7 +856,9 @@ export function documentInput(options: DocumentInputOptions = {}): DocumentInput
           : fileCard?.querySelector<HTMLElement>(`[data-focus-key="remove:${entry.id}"]`)) ??
         fileCard;
       if (!target) return;
-      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      // 'auto' follows the page's CSS: smooth, except under the OS preference or the Reduced motion setting
+      // (_motion.scss). An explicit 'smooth' would animate regardless.
+      target.scrollIntoView({ block: 'center', behavior: 'auto' });
       target.focus({ preventScroll: true });
       const highlighted = entry.kind === 'pdf' ? target : fileCard;
       highlighted?.classList.add('is-revealed');

@@ -86,7 +86,7 @@ export function budgetsSection(core: CoreServices): SectionView {
 
   const perRun = numberField<number | null>({
     label: 'Per-run threshold',
-    help: 'A single run estimated above this asks first (Warn and Hard stop); 0 asks before every paid run. Default $0.10.',
+    help: 'A run estimated above this asks first (Warn and Hard stop). Runs started together, such as an arena round or a video sequence, ask once for their total. 0 asks before every paid run. Default $0.10.',
     prefix: '$',
     testId: 'budget-per-run',
     className: 'or-field-narrow',
