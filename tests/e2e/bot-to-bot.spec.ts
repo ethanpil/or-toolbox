@@ -209,7 +209,7 @@ async function setLimits(
 
 async function start(page: Page, opener = 'Is zero an even number?'): Promise<void> {
   await page.getByTestId('tool-prompt').fill(opener);
-  await page.getByTestId('bots-primary').click();
+  await page.getByTestId('run-button').click();
 }
 
 test.beforeEach(async ({ context }) => {
@@ -303,7 +303,7 @@ test('the cost cap ends the conversation once spending reaches it', async ({ pag
   expect(mock.calls(CHAT, 'POST')).toHaveLength(2);
 
   // Resume says why it cannot go on, and sends nothing.
-  await page.getByTestId('bots-primary').click();
+  await page.getByTestId('run-button').click();
   await expect(status(page)).toContainText('could pass the cost cap');
   await expect(page.getByTestId('bots-cost-cap')).toBeFocused();
   expect(mock.calls(CHAT, 'POST')).toHaveLength(2);
@@ -311,7 +311,7 @@ test('the cost cap ends the conversation once spending reaches it', async ({ pag
   // Raised, the cap lets it go on; the next turn passes it and the check after the turn ends it.
   answerTurns(mock, { cost: 0.01 });
   await setLimits(page, { cap: 0.015 });
-  await page.getByTestId('bots-primary').click();
+  await page.getByTestId('run-button').click();
   await expect(end(page).last()).toContainText('Cost cap reached: $0.018 spent of $0.015.');
   await expect(turns(page)).toHaveCount(3);
   expect(problems).toEqual([]);
@@ -367,8 +367,8 @@ test('Stop keeps the partial turn and ends it, silently', async ({ page, context
   await expect(status(page)).toHaveText('Stopped. The partial turn is kept.');
   await expect(page.getByTestId('stop-button')).toBeHidden();
   // Focus moves from Stop to Resume, which took its place.
-  await expect(page.getByTestId('bots-primary')).toBeFocused();
-  await expect(page.getByTestId('bots-primary')).toContainText('Resume');
+  await expect(page.getByTestId('run-button')).toBeFocused();
+  await expect(page.getByTestId('run-button')).toContainText('Resume');
   await expect(page.getByTestId('error-toast')).toHaveCount(0);
   expect(problems).toEqual([]);
 });
@@ -404,7 +404,7 @@ test('Pause holds after the turn in flight; Step runs one turn; Resume goes on',
   await expect(page.getByTestId('bots-state')).toHaveText('Paused');
   await expect(status(page)).toHaveText('Bot B spoke. Resume or Step to go on.');
 
-  await page.getByTestId('bots-primary').click();
+  await page.getByTestId('run-button').click();
   await expect(end(page)).toHaveAttribute('data-reason', 'turns');
   await expect(turns(page)).toHaveCount(4);
   expect(problems).toEqual([]);
@@ -508,7 +508,7 @@ test('a failed turn shows inline (a 429), and Resume tries that bot again', asyn
   await expect(page.getByTestId('bots-state')).toHaveText('Paused');
   await expect(page.getByTestId('error-toast')).toHaveCount(0);
 
-  await page.getByTestId('bots-primary').click();
+  await page.getByTestId('run-button').click();
   await expect(end(page)).toHaveAttribute('data-reason', 'turns');
   await expect(error).toHaveCount(0);
   await expect(turnText(page, 1)).toHaveText('Bot B says 3');
@@ -644,10 +644,10 @@ test('works at 320 px with the keyboard only', async ({ page, mock }) => {
   await page.getByTestId('tool-prompt').fill('');
   await page.getByTestId('tool-prompt').focus();
   await page.keyboard.type('Say hello.');
-  await tabTo(page, 'bots-primary');
+  await tabTo(page, 'run-button');
   await page.keyboard.press('Enter');
   await expect(end(page)).toHaveAttribute('data-reason', 'turns');
-  await expect(page.getByTestId('bots-primary')).toBeFocused();
+  await expect(page.getByTestId('run-button')).toBeFocused();
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );

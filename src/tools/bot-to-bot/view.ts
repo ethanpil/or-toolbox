@@ -7,13 +7,16 @@
  * `applyBusy` turns the buttons that change the transcript (Edit) off with `aria-disabled`, so they keep focus,
  * and focus keys name the entry (`edit-button:<id>`), so focus survives a redraw.
  */
+import { externalLink } from '../../ui/components/external-link';
+import type { MarkdownCache } from '../../ui/components/markdown-cache';
 import { h } from '../../ui/dom';
-import { renderMarkdown } from '../../ui/markdown';
+import { OPENROUTER_ACTIVITY_URL } from '../../ui/feedback/errors';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { plural } from '../../ui/format';
+import { composing } from '../../ui/shell/shortcuts';
 import type { Entry, Speaker } from './conversation';
-import { END_TITLES, initials, usageLine } from './format';
+import { END_TITLES, initials, turnUsageLine } from './format';
 
 export interface EntryActions {
   copy(entry: Entry): void;
@@ -30,6 +33,8 @@ export interface EntryContext {
   after: (id: string) => number;
   modelName: (id: string) => string;
   isFree: (id: string) => boolean;
+  /** The tool's one cache of rendered turns (a finished turn is pre-rendered before its redraw). */
+  markdown: MarkdownCache;
   actions: EntryActions;
 }
 
@@ -50,40 +55,6 @@ export function avatar(speaker: Speaker, name: string, size: 'sm' | 'md' = 'md')
     },
     initials(name),
   );
-}
-
-// --- Markdown of finished turns, cached so redraws do not parse again ------------------------------------------
-
-const CACHE_SIZE = 200;
-const cache = new Map<string, { text: string; fragment: DocumentFragment }>();
-const wanted = new WeakMap<HTMLElement, string>();
-
-/** Renders a turn into the cache ahead of its redraw, so a finished turn never flashes as plain text. */
-export async function prerender(key: string, text: string): Promise<void> {
-  if (cache.get(key)?.text === text) return;
-  const fragment = await renderMarkdown(text);
-  cache.delete(key);
-  cache.set(key, { text, fragment });
-  if (cache.size > CACHE_SIZE) cache.delete(cache.keys().next().value!);
-}
-
-/** Fills `target` with the rendered turn; plain text until it is rendered, or if rendering fails. */
-export function fillMarkdown(target: HTMLElement, key: string, text: string): void {
-  wanted.set(target, text);
-  const hit = cache.get(key);
-  if (hit?.text === text) {
-    target.replaceChildren(hit.fragment.cloneNode(true));
-    return;
-  }
-  target.textContent = text;
-  renderMarkdown(text)
-    .then((fragment) => {
-      cache.delete(key);
-      cache.set(key, { text, fragment: fragment.cloneNode(true) as DocumentFragment });
-      if (cache.size > CACHE_SIZE) cache.delete(cache.keys().next().value!);
-      if (wanted.get(target) === text) target.replaceChildren(fragment);
-    })
-    .catch(() => undefined);
 }
 
 // --- buttons that follow the run ---------------------------------------------------------------------------
@@ -133,7 +104,7 @@ const iconButton = (
     'button',
     {
       type: 'button',
-      class: 'btn btn-sm btn-link or-bot-action',
+      class: 'btn btn-sm btn-link or-icon-action',
       'aria-label': label,
       title: label,
       'data-focus-key': focusKey,
@@ -142,10 +113,6 @@ const iconButton = (
     },
     icon(name),
   );
-
-/** True while an input method is composing: Enter and Escape belong to it. */
-export const composing = (event: KeyboardEvent): boolean =>
-  event.isComposing || event.keyCode === 229;
 
 function editor(entry: Entry, ctx: EntryContext): HTMLElement {
   const id = uid('edit');
@@ -236,14 +203,18 @@ export function entrySignature(entry: Entry, ctx: EntryContext): string {
 }
 
 /**
- * What a failed turn says. One that may have gone through (the connection dropped after sending) must not invite a
- * plain retry: it may already be billed.
+ * What a failed turn says: the stored `failureText` wording. One that may have gone through (`outcomeUnknown`)
+ * already says to check before sending again, so it links the OpenRouter activity instead of inviting a Resume.
  */
-export function failureNote(entry: Pick<Entry, 'error' | 'outcomeUnknown'>): string {
-  const error = entry.error ?? 'The turn failed.';
-  return entry.outcomeUnknown
-    ? `${error} It may have gone through and been billed: check your OpenRouter activity before resuming.`
-    : `${error} Resume to try again.`;
+function failureNote(entry: Entry): HTMLElement {
+  const text = entry.error ?? 'The turn failed.';
+  return h(
+    'span',
+    null,
+    entry.outcomeUnknown
+      ? [text, ' ', externalLink(OPENROUTER_ACTIVITY_URL, 'OpenRouter activity', 'alert-link')]
+      : `${text} Resume to try again.`,
+  );
 }
 
 const STATUS_BADGES: Partial<
@@ -262,7 +233,7 @@ function footer(entry: Entry, ctx: EntryContext, editable: boolean): HTMLElement
       ? h(
           'span',
           { class: 'small text-body-secondary me-auto', 'data-testid': 'turn-usage' },
-          usageLine(entry.usage, ctx.isFree(entry.model ?? '')),
+          turnUsageLine(entry.usage, ctx.isFree(entry.model ?? '')),
         )
       : h('span', { class: 'me-auto' }),
     badge
@@ -287,7 +258,7 @@ function footer(entry: Entry, ctx: EntryContext, editable: boolean): HTMLElement
     editable
       ? idleButton(
           {
-            class: 'btn btn-sm btn-link or-bot-action',
+            class: 'btn btn-sm btn-link or-icon-action',
             'aria-label': 'Edit this message',
             title: 'Edit this message',
             'data-focus-key': `edit-button:${entry.id}`,
@@ -307,7 +278,7 @@ function botView(entry: Entry, ctx: EntryContext): EntryView {
   const editing = ctx.editingId === entry.id;
   const failed = entry.status === 'error';
   const body = h('div', { class: 'or-bot-body or-markdown', 'data-testid': 'turn-content' });
-  if (!streaming && entry.content) fillMarkdown(body, entry.id, entry.content);
+  if (!streaming && entry.content) ctx.markdown.fill(body, entry.id, entry.content);
   const name = entry.name ?? (speaker === 'a' ? 'Bot A' : 'Bot B');
   const element = h(
     'article',
@@ -359,7 +330,7 @@ function botView(entry: Entry, ctx: EntryContext): EntryView {
               'data-testid': 'turn-error',
             },
             icon('exclamation-octagon'),
-            h('span', null, failureNote(entry)),
+            failureNote(entry),
           )
         : null,
       editing || streaming ? null : footer(entry, ctx, !failed),

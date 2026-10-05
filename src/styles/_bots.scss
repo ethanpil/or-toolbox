@@ -185,21 +185,6 @@ $bot-colours: (
   margin-top: 0.25rem;
 }
 
-// Icon buttons in turns and the setup: at least 2rem (32 px) square. Same rule as `.or-icon-action`
-// (_components.scss), which the next phase moves this tool to.
-.or-bot-action {
-  min-width: 2rem;
-  min-height: 2rem;
-  padding: 0.25rem;
-  color: var(--bs-secondary-color);
-  text-decoration: none;
-
-  &:hover,
-  &:focus-visible {
-    color: var(--bs-emphasis-color);
-  }
-}
-
 // The opening prompt and moderator messages: centred, set apart from both bots.
 .or-bot-mod {
   display: flex;

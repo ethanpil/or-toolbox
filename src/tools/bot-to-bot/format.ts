@@ -2,26 +2,16 @@
  * Text shown for a conversation (in the page, the exports and History's replay): per-turn usage lines, what
  * ended a conversation, avatar initials and the limit summaries.
  */
-import { formatCount, formatMs, formatUsd, plural } from '../../ui/format';
+import { formatMs, formatUsd, plural, usageLine } from '../../ui/format';
 import type { StopReason, TurnUsage } from './conversation';
 import { capReached, type Limits } from './loop';
 
-/** `123 in · 456 out · $0.0012 · 1.4 s`; `free` on a free model, `≈` for estimated or unknown costs. */
-export function usageLine(usage: TurnUsage | undefined, free: boolean): string {
-  if (!usage) return '';
-  const cost =
-    free && usage.costUsd === 0 && !usage.costUnknown
-      ? 'free'
-      : usage.costUnknown && usage.costUsd === 0
-        ? 'cost unknown'
-        : `${usage.costEstimated || usage.costUnknown ? '≈ ' : ''}${formatUsd(usage.costUsd)}`;
-  return [
-    `${formatCount(usage.promptTokens)} in · ${formatCount(usage.completionTokens)} out`,
-    cost,
-    usage.latencyMs > 0 ? formatMs(usage.latencyMs) : null,
-  ]
-    .filter(Boolean)
-    .join(' · ');
+/**
+ * A turn's `123 in · 456 out · $0.0012 · 1.4 s`, worded by the shared cost rule (`usageLine`). A turn whose cost is
+ * unknown holds what was counted for it (its estimate) in `costUsd`: "cost unknown (≈ $0.0021 counted)".
+ */
+export function turnUsageLine(usage: TurnUsage | undefined, free: boolean): string {
+  return usageLine(usage, { free, booked: usage?.costUnknown ? usage.costUsd : null });
 }
 
 /** What ended a conversation, as one sentence (the end marker, the status line, the exports). */

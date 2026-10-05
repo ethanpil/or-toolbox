@@ -71,6 +71,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Bot-to-bot chat uses the framework's run bar (Step and Pause as runner actions, Escape through `stopOnEscape`), the shared Markdown cache, cost wording ("cost unknown (≈ $x counted)"), `failureText`, core token counting and `holdLock`; it re-reads its state after a data reset (752fdfe, 41d107d).
 - Group budget approvals: `runs.approveGroup()`/`releaseGroup()`, `RunSpec.useGroupApproval` and all-or-none `runs.beginAll()`; the budget dialog names a group with its models and total; Video studio approves its sequences through them (e7660ec).
 - A run stopped before it sent anything books no stats row (e7660ec).
 - `ToolStateStore.update()` under a per-key Web Lock; `webLocks()`, `lockRunner()` and `holdLock()` in `core/util` (85b2086).

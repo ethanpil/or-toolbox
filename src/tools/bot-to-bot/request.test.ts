@@ -6,7 +6,6 @@ import {
   framing,
   framingLine,
   mergeParts,
-  outputTokens,
   trimCount,
   type TurnOptions,
 } from './request';
@@ -176,8 +175,6 @@ describe('trimming and max_tokens', () => {
     expect(
       buildTurn(conversationWith(), 'a', options({ maxTokens: null })).body.max_tokens,
     ).toBeUndefined();
-    expect(outputTokens(null, null)).toBe(4096);
-    expect(outputTokens(null, 1000)).toBe(1000);
   });
 
   it('says when even the last message does not fit', () => {

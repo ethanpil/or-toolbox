@@ -30,24 +30,38 @@
  * Entries are redrawn only when their signature changes (view.ts); the run's state never rebuilds them.
  */
 import { toJsonBlob } from '../../core/export/table';
-import { InvalidInputError, isAbortError, isOutcomeUnknown, userMessage } from '../../core/errors';
-import { webLocks } from '../../core/jobs/index';
+import { errorCode, InvalidInputError, isAbortError, userMessage } from '../../core/errors';
 import { excerpt } from '../../core/runs/index';
 import type { ModelInfo, RunHandle, Usage } from '../../core/types';
-import { debounce, isFiniteNumber, isPlainObject, isString, MINUTE_MS } from '../../core/util';
+import {
+  debounce,
+  holdLock,
+  isFiniteNumber,
+  isPlainObject,
+  isString,
+  MINUTE_MS,
+} from '../../core/util';
 import { copyWithToast } from '../../ui/clipboard';
 import { emptyState } from '../../ui/components/empty-state';
 import { exportMenu } from '../../ui/components/export-menu';
+import { createMarkdownCache } from '../../ui/components/markdown-cache';
 import { modelPicker } from '../../ui/components/model-picker';
 import { type MarkdownStream, streamMarkdown } from '../../ui/components/stream-markdown';
 import { focusedKey, focusKey, h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
-import { modalOpen } from '../../ui/feedback/modal';
+import {
+  failureText,
+  isStop,
+  markPresented,
+  needsAction,
+  presentError,
+} from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
-import { formatDuration, formatMs, formatShortcut, formatUsd, plural } from '../../ui/format';
+import { formatDuration, formatMs, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
+import { composing } from '../../ui/shell/shortcuts';
+import { stopOnEscape } from '../../ui/tool/stop-on-escape';
 import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
 import {
   type BotRecord,
@@ -86,13 +100,10 @@ import { type BotProfile, buildTurn, type BuiltTurn, framing, type TurnOptions }
 import {
   applyBusy,
   avatar,
-  composing,
   type EntryContext,
   entrySignature,
   entryView,
   type EntryView,
-  failureNote,
-  prerender,
 } from './view';
 
 const STATE_KEY = 'conversation';
@@ -254,22 +265,9 @@ export function turnUsage(
 const LOCK_NAME = 'ortoolbox:bot-to-bot';
 const OTHER_TAB = 'The conversation is running in another tab. Pause or stop it there first.';
 
-/** Holds the tool's Web Lock until the returned release is called; null when another tab holds it. */
-function lockConversation(): Promise<(() => void) | null> {
-  const locks = webLocks();
-  if (!locks) return Promise.resolve(() => undefined);
-  return new Promise((resolve) => {
-    locks
-      .request(LOCK_NAME, { ifAvailable: true }, (lock) => {
-        if (!lock) {
-          resolve(null);
-          return undefined;
-        }
-        return new Promise<void>((release) => resolve(release));
-      })
-      .catch(() => resolve(() => undefined));
-  });
-}
+/** The tool's Web Lock if no other tab holds it (the release), else null. Probed, never waited for. */
+const lockConversation = (): Promise<(() => void) | null> =>
+  holdLock(LOCK_NAME, { ifAvailable: true });
 
 export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   const { ui } = ctx;
@@ -281,9 +279,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   } catch (error) {
     void presentError(error);
   }
+  /** Rendered turns, so a redraw parses nothing again (a turn still arriving streams instead). */
+  const markdown = createMarkdownCache();
   /** The turn that is streaming, and the renderer drawing it. */
   let live: { entry: Entry; stream: MarkdownStream | null } | null = null;
-  let runState: { busy: boolean; blocked: string | null } = { busy: false, blocked: null };
+  let runState: { busy: boolean } = { busy: false };
   let pauseRequested = false;
   /** The clock while the loop runs: elapsed = base + (now - startedAt). */
   let clockState: { base: number; startedAt: number } | null = null;
@@ -355,7 +355,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     pendingWrites++;
     writes = writes
       .then(() => (mine === epoch ? write() : undefined))
-      .catch((error: unknown) => void presentError(error))
+      .catch((error: unknown) => {
+        // A write from before a data reset that the store refused: exactly what should happen, nothing to say.
+        if (mine !== epoch && errorCode(error) === 'state-reset') return;
+        void presentError(error);
+      })
       .finally(() => {
         pendingWrites--;
         if (pendingWrites === 0 && followStale) void followStore();
@@ -433,11 +437,13 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     return true;
   }
 
-  // A data reset (Settings → Data, any tab) wipes the stored conversation: drop this tab's copy, never write it
-  // back, and stop a run in progress (the core discards it too).
+  // A data reset (Settings → Data, any tab) wipes the stored conversation: drop this tab's copy and stop a run in
+  // progress (the core discards it too). Writes queued before it are dropped (`epoch`); the store refuses one that
+  // starts its check after the reset (StateResetError). A write whose check ran before the reset but whose `put`
+  // is queued behind the wipe still lands, so a delete follows it. Reading the key again re-arms it, so the next
+  // conversation is stored without a "reload the page".
   ctx.bus.on('data-reset', () => {
     epoch++;
-    // A write already under way may land after the wipe: remove what it stored once it has.
     if (pendingWrites > 0) queueWrite(() => ctx.state.delete(STATE_KEY));
     conversation = null;
     editing = null;
@@ -446,6 +452,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     runner.stop();
     renderParams();
     renderAll();
+    void followStore();
   });
 
   /** Fields whose change re-arms the time limit of a turn in flight. */
@@ -522,7 +529,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       'button',
       {
         type: 'button',
-        class: 'btn btn-sm btn-link or-bot-action',
+        class: 'btn btn-sm btn-link or-icon-action',
         'aria-label': `Use the default model for ${slot}`,
         title: 'Use the default model',
         'data-testid': `bot-${speaker}-model-reset`,
@@ -1064,93 +1071,30 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     ),
   );
 
-  // --- run bar: Start/Resume and Step, or Pause and Stop --------------------------------------------------------
-  const primaryLabel = h('span', null, 'Start');
-  const primaryButton = h(
-    'button',
-    {
-      type: 'button',
-      class: 'btn btn-primary d-inline-flex align-items-center gap-2 px-4',
-      'aria-disabled': 'false',
-      'data-testid': 'bots-primary',
-      onclick: () => press(undefined),
-    },
-    icon('play-fill'),
-    primaryLabel,
-    h('kbd', { class: 'or-kbd or-kbd-on-primary d-none d-md-inline' }, formatShortcut('↵')),
-  );
-  const stepButton = h(
-    'button',
-    {
-      type: 'button',
-      class: 'btn btn-outline-primary d-inline-flex align-items-center gap-2',
-      'aria-disabled': 'false',
-      title: 'Run exactly one turn, then hold',
-      'data-testid': 'bots-step',
-      onclick: () => press('step'),
-    },
-    icon('skip-end-fill'),
-    'Step',
-  );
-  const pauseLabel = h('span', null, 'Pause');
-  const pauseButton = h(
-    'button',
-    {
-      type: 'button',
-      class: 'btn btn-outline-secondary d-inline-flex align-items-center gap-2',
-      hidden: true,
-      'data-testid': 'bots-pause',
-      onclick: () => requestPause(),
-    },
-    icon('pause-fill'),
-    pauseLabel,
-  );
-
+  // --- run bar: Start/Resume and Step, or Pause and Stop (the runner's own bar) ----------------------------------
   // Ctrl/Cmd+Enter (no argument) is the primary action: Start, or Resume once there is a conversation.
   const runner = ui.runner<Action>({
     label: 'Start',
     icon: 'play-fill',
+    hideWhileBusy: true,
     run: (signal, action) => perform(action, signal),
   });
-  runner.button.hidden = true;
-  runner.element.prepend(primaryButton, stepButton, pauseButton);
-  /** The bar's control that last had focus, so focus can move on when it hides. */
-  let barFocus: HTMLElement | null = null;
-  runner.element.addEventListener('focusin', (event) => {
-    barFocus = event.target instanceof HTMLElement ? event.target : null;
+  runner.addAction({
+    label: 'Step',
+    icon: 'skip-end-fill',
+    run: 'step',
+    title: 'Run exactly one turn, then hold',
+    tone: 'primary',
+    testId: 'bots-step',
   });
-  runner.element.addEventListener('focusout', (event) => {
-    const next = event.relatedTarget;
-    if (next instanceof Node && runner.element.contains(next)) return;
-    // Focus left the bar: forget it, unless it left because its control hid (fixBarFocus moves it on).
-    const left = event.target;
-    if (!(left instanceof HTMLElement) || left.closest('[hidden]') === null) barFocus = null;
+  const pause = runner.addAction({
+    label: 'Pause',
+    icon: 'pause-fill',
+    when: 'busy',
+    onClick: () => requestPause(),
+    testId: 'bots-pause',
   });
-  /** A focused bar control that hid (Start → Pause, Stop → Resume) hands focus to the one that took its place. */
-  const fixBarFocus = (): void => {
-    const active = document.activeElement;
-    const lost =
-      !active ||
-      active === document.body ||
-      (active instanceof HTMLElement && active.closest('[hidden]') !== null);
-    if (!lost || !barFocus || !runner.element.contains(barFocus)) return;
-    const target = runState.busy
-      ? pauseButton.hidden
-        ? runner.stopButton
-        : pauseButton
-      : primaryButton;
-    target.focus();
-    barFocus = target;
-  };
-
-  function press(action: Action | undefined): void {
-    if (runState.busy) return;
-    if (runState.blocked) {
-      ui.status(runState.blocked);
-      return;
-    }
-    void runner.trigger(action);
-  }
+  stopOnEscape(runner);
 
   function requestPause(): void {
     if (!runState.busy || pauseRequested) return;
@@ -1158,22 +1102,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     renderControls();
     ui.status('Pausing after this turn…');
   }
-
-  // Escape stops a conversation that is running (not while a field, a menu or a dialog uses the key).
-  document.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape' || composing(event) || !runner.busy || event.defaultPrevented)
-      return;
-    if (modalOpen() || document.querySelector('.offcanvas.show, .dropdown-menu.show')) return;
-    const target = event.target;
-    if (
-      target instanceof HTMLElement &&
-      (target.isContentEditable || target.matches('input, select, textarea'))
-    ) {
-      return;
-    }
-    event.preventDefault();
-    runner.stop();
-  });
 
   // --- rendering ----------------------------------------------------------------------------------------------
   /** The form's fields from `params` (not on every render: the user may be typing). */
@@ -1271,23 +1199,17 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     );
   };
 
-  const setOff = (button: HTMLElement, off: boolean, reason: string | null = null): void => {
+  const setOff = (button: HTMLElement, off: boolean): void => {
     button.setAttribute('aria-disabled', String(off));
     button.classList.toggle('disabled', off);
-    if (reason) button.title = reason;
-    else button.removeAttribute('title');
   };
 
   const renderControls = (): void => {
-    const { busy, blocked } = runState;
-    primaryLabel.textContent = conversation ? 'Resume' : 'Start';
-    primaryButton.hidden = busy;
-    stepButton.hidden = busy;
-    pauseButton.hidden = !busy;
-    setOff(primaryButton, blocked !== null, blocked);
-    setOff(stepButton, blocked !== null, blocked ?? 'Run exactly one turn, then hold');
-    setOff(pauseButton, pauseRequested);
-    pauseLabel.textContent = pauseRequested ? 'Pausing…' : 'Pause';
+    const { busy } = runState;
+    // The runner keeps Run, Step and Pause in step with busy and blocked; the tool only names them.
+    runner.setLabel(conversation ? 'Resume' : 'Start');
+    pause.setLabel(pauseRequested ? 'Pausing…' : 'Pause');
+    pause.setDisabled(pauseRequested ? 'Pausing after this turn' : null);
     setOff(clearButton, busy || !conversation);
     copyButton.disabled = !conversation;
     if (exportOff !== !conversation) {
@@ -1309,7 +1231,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     openerHintEl.textContent = conversation
       ? 'Used by your next conversation: this one keeps its own (edit it in the transcript). New conversation starts with this one.'
       : 'Both bots see it as the moderator’s first message.';
-    fixBarFocus();
   };
 
   /**
@@ -1357,6 +1278,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     },
     modelName,
     isFree,
+    markdown,
     actions: entryActions,
   });
 
@@ -1547,7 +1469,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       persist();
       renderAll();
       // The toast's button goes away: focus goes back to the turn the edit was on.
-      if (!focusKey(log, `edit-button:${undo.id}`)) primaryButton.focus();
+      if (!focusKey(log, `edit-button:${undo.id}`)) runner.button.focus();
       void ui.refreshEstimate();
     });
     if (!allowed) return;
@@ -1581,7 +1503,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       // New conversation turned itself off: Start is next.
       const active = document.activeElement;
       if (!active || active === document.body || clearButton.contains(active)) {
-        primaryButton.focus();
+        runner.button.focus();
       }
       void ui.refreshEstimate();
     });
@@ -1603,7 +1525,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       persist();
       renderAll();
       // The toast's button goes away: focus goes to Resume.
-      primaryButton.focus();
+      runner.button.focus();
       void ui.refreshEstimate();
     });
     if (!allowed) return;
@@ -1893,9 +1815,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           entry.status = 'stopped';
           throw error;
         } else {
+          // The shared wording, and the caution kept with it when the request may have gone through.
+          const failed = failureText(error);
           entry.status = 'error';
-          entry.error = userMessage(error);
-          if (isOutcomeUnknown(error)) entry.outcomeUnknown = true;
+          entry.error = failed.text;
+          if (failed.outcomeUnknown) entry.outcomeUnknown = true;
           failedTurn = entry;
           throw error;
         }
@@ -1911,7 +1835,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         if (!entry.content.trim() && entry.status !== 'error') {
           conv.entries = conv.entries.filter((item) => item !== entry);
         }
-        if (entry.content) await prerender(entry.id, entry.content).catch(() => undefined);
+        if (entry.content) await markdown.prerender(entry.id, entry.content).catch(() => undefined);
         live?.stream?.dispose();
         live = null;
         touch(conv);
@@ -1989,12 +1913,11 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         );
         markPresented(failure.error); // announced here; the runner adds nothing
       } else if (failedTurn) {
-        ui.status(`${failedTurn.name ?? 'The bot'}'s turn failed: ${failureNote(failedTurn)}`);
-        // Shown on the turn. Still left to the runner: errors that need a dialog (a locked key…, whose Retry
-        // resumes) and a request that may have gone through (presentError warns it may be billed, no Retry).
-        if (!needsAction(failure.error) && !isOutcomeUnknown(failure.error)) {
-          markPresented(failure.error);
-        }
+        ui.status(`${failedTurn.name ?? 'The bot'}'s turn failed: ${failedTurn.error ?? ''}`);
+        // Shown on the turn: that is the presentation (with the caution and the activity link, and no Resume
+        // prompt, when it may have gone through). Errors that need a dialog (a locked key…) still go to the
+        // runner, whose Retry resumes.
+        if (!needsAction(failure.error)) markPresented(failure.error);
       } else {
         ui.status(`The conversation is on hold: ${userMessage(failure.error)}`);
       }
@@ -2074,8 +1997,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   renderParams();
   renderAll();
   loadCatalog();
-  runner.subscribe(({ busy, disabledReason }) => {
-    runState = { busy, blocked: disabledReason };
+  runner.subscribe(({ busy }) => {
+    runState = { busy };
     // A Pause asked for during a run that ended (or never began) does not carry over to the next one.
     if (!busy) pauseRequested = false;
     renderControls();
