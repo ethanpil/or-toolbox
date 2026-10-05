@@ -9,10 +9,16 @@
  * `exportFile`/`replaceFile`/`clear`, never through localStorage directly.
  *
  * Unlocking is per tab: sessionStorage `ortoolbox:unlocked` holds `{key, at}`, the raw AES key (base64) and the
- * time of the last `touch()`. It survives navigation between the site's pages in that tab and dies with the
- * tab. A session key that no longer opens the file (passphrase changed elsewhere) is dropped at page start and
- * before it encrypts anything. After `settings.security.autoLockMinutes` (capped at 24 h; 0 disables it)
- * without `touch()` the entry is deleted.
+ * time of the last `touch()`. It survives navigation between the site's pages in that tab (a memory-only key
+ * would ask for the passphrase on every page of this multi-page app). It does NOT reliably die with the tab:
+ * browsers restore sessionStorage when they reopen a closed tab or restore a session (and may keep it on disk
+ * for that), so auto-lock is what bounds it. A session key that no longer opens the file (passphrase changed
+ * elsewhere) is dropped at page start and before it encrypts anything. After
+ * `settings.security.autoLockMinutes` (capped at 24 h; 0 disables it) without `touch()` the entry is deleted;
+ * the check reads `at`, so a tab restored after that delay comes back locked.
+ *
+ * A stored file this build cannot read (another version, damaged JSON, an unreadable lock) is never written
+ * over; entries of a readable file that this build cannot parse are written back unchanged.
  *
  * The default key is `settings.defaultKeyId`, set when the first key is added; when it is null or stale (e.g.
  * after a settings reset) the first key acts as default, so a user with keys is never told to add one.

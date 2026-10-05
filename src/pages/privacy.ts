@@ -114,11 +114,11 @@ mountPage(
             ],
             [
               'Session storage',
-              'The unlocked key while the passphrase lock is open, and the short-lived sign-in state of “Connect with OpenRouter”. Cleared when the tab closes.',
+              'The unlocked key while the passphrase lock is open, and the short-lived sign-in state of “Connect with OpenRouter”. It belongs to the tab, but browsers bring it back when they reopen a closed tab or restore your last session, so an unlocked key can come back too. Auto-lock and Lock now remove it.',
             ],
             [
               'Memory only',
-              'Images, audio, video and files you upload or generate. They are never written to disk by the site; download them before you leave the page.',
+              'Images, audio, video and files you upload or generate. They are never written to disk by the site; download them before you leave the page. The exception is Chat: the text of text files you attach, and the text read from PDFs, is kept with the conversation in IndexedDB (and in full backups).',
             ],
           ],
         }),
@@ -157,7 +157,7 @@ mountPage(
             null,
             'The optional ',
             h('a', { href: settingsUrl('security') }, 'passphrase lock'),
-            ' encrypts keys at rest (AES-GCM) and locks them again after a period of inactivity.',
+            ' encrypts keys at rest (AES-GCM) and locks them again after a period of inactivity. Keep auto-lock on: closing the tab alone may not lock them (see Session storage above).',
           ),
           h(
             'li',
@@ -179,7 +179,7 @@ mountPage(
           h(
             'p',
             { class: 'mb-0' },
-            'On ethanpil.github.io, every project site shares one origin, so another page on that address could read what ORtoolbox stores in this browser. Turn on the passphrase lock, or use a key with a small credit limit. On a custom domain this risk does not exist.',
+            'On ethanpil.github.io, every project site shares one origin, so another page on that address could read what ORtoolbox stores in this browser. Turn on the passphrase lock, or use a key with a small credit limit. Such a page could copy your encrypted keys and try passphrases offline as fast as its computer allows, so choose a long passphrase (four or more unrelated words). While the keys are unlocked, a page from that address opened in the same tab could read the unlocked key too. On a custom domain this risk does not exist.',
           ),
         ),
       ),
