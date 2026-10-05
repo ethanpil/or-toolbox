@@ -63,7 +63,7 @@ import {
   isString,
   throwIfAborted,
   webLocks,
-  withLock,
+  lockRunner,
 } from '../util';
 import { paidAddons, withAddons } from './addons';
 import { getTool } from '../../tools/registry';
@@ -211,7 +211,7 @@ export function createRunsService(core: CoreServices): RunsService {
   };
 
   // Check-and-reserve runs one at a time per page, and across tabs under a Web Lock.
-  const withBudgetLock = <T>(fn: () => Promise<T>): Promise<T> => withLock(BUDGET_LOCK, fn);
+  const withBudgetLock = lockRunner(BUDGET_LOCK);
 
   // --- group approvals (read and written under the budget lock only) ---------------------------------------
   const readApproval = async (groupId: string): Promise<StoredApproval | null> =>

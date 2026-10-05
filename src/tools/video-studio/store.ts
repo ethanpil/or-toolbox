@@ -5,7 +5,7 @@
  * announces each write as `tool-state-changed`, and the tool reads it again.
  */
 import type { ToolStateStore } from '../../core/types';
-import { withLock } from '../../core/util';
+import { lockRunner } from '../../core/util';
 import { parseRun, type SequenceRun } from './sequence';
 import { parseTimeline, type TimelineClip, timelineJson } from './timeline';
 
@@ -35,7 +35,7 @@ export interface StudioStore {
 }
 
 export function createStore(state: ToolStateStore): StudioStore {
-  const locked = <T>(fn: () => Promise<T>): Promise<T> => withLock(LOCK, fn);
+  const locked = lockRunner(LOCK);
 
   const tx: StoreTransaction = {
     timeline: async () => parseTimeline(await state.get(TIMELINE_KEY)),

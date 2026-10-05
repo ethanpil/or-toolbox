@@ -1,19 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeLockManager } from './testing/state-fakes';
-import { debounce, holdLock, withLock } from './util';
+import { debounce, holdLock, lockRunner } from './util';
 
 const setLocks = (value: FakeLockManager | undefined): void => {
   Object.defineProperty(navigator, 'locks', { value, configurable: true });
 };
 
-describe('withLock', () => {
+describe('lockRunner', () => {
   afterEach(() => setLocks(undefined));
 
   it('runs callers one at a time, in order, also after a failure (no Web Locks: the page queue)', async () => {
     setLocks(undefined);
+    const locked = lockRunner('test:lock');
     const order: string[] = [];
     const step = (name: string, fail = false) =>
-      withLock('test:lock', async () => {
+      locked(async () => {
         order.push(`${name} start`);
         await new Promise((resolve) => setTimeout(resolve, 5));
         order.push(`${name} end`);
@@ -29,7 +30,7 @@ describe('withLock', () => {
     const locks = new FakeLockManager();
     setLocks(locks);
     let held = false;
-    await withLock('test:held', () => {
+    await lockRunner('test:held')(() => {
       held = locks.held.has('test:held');
       return Promise.resolve();
     });

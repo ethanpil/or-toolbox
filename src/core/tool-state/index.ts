@@ -17,7 +17,7 @@ import { TOOL_IDS } from '../../tools/types';
 import type { Bus, ToolId, ToolStateStore } from '../types';
 import { NotJsonSafeError, StateResetError } from '../errors';
 import { getDb } from '../storage/db';
-import { isPlainObject, withLock } from '../util';
+import { isPlainObject, lockRunner, type LockRunner } from '../util';
 
 export { NotJsonSafeError };
 
@@ -119,6 +119,9 @@ export function createToolStateStore(
     changed(key);
   };
 
+  /** `update`'s lock per key, made on first use. */
+  const keyLocks = new Map<string, LockRunner>();
+
   return {
     get,
     set,
@@ -128,7 +131,12 @@ export function createToolStateStore(
       return keys.map((key) => key.slice(prefix.length));
     },
     update<T>(key: string, fn: (current: T | undefined) => T | undefined | Promise<T | undefined>) {
-      return withLock(`ortoolbox:tool-state:${tool}:${key}`, async () => {
+      let locked = keyLocks.get(key);
+      if (!locked) {
+        locked = lockRunner(`ortoolbox:tool-state:${tool}:${key}`);
+        keyLocks.set(key, locked);
+      }
+      return locked(async () => {
         const current = await get<T>(key);
         const next = await fn(current);
         if (next === current) return current;

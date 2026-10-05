@@ -73,36 +73,36 @@ export function webLocks(): LockManager | null {
   }
 }
 
-/** The tail of each lock name's in-page queue (see `withLock`). */
-const lockQueues = new Map<string, Promise<unknown>>();
+/** Runs `fn` holding a lock (see `lockRunner`). */
+export type LockRunner = <T>(fn: () => Promise<T>) => Promise<T>;
 
 /**
- * Runs `fn` holding the Web Lock `name`: one at a time across tabs, and in this page through an in-page queue,
- * which is all there is where Web Locks are missing or refused. Never nest two calls with the same name (it
- * waits for itself, as a Web Lock would).
+ * A runner for the Web Lock `name`: each call runs `fn` holding it, one at a time across tabs, and one at a time
+ * in this page through the runner's own queue, which is all there is where Web Locks are missing or refused.
+ * Make one per service or store and keep it (two runners of one name share the Web Lock, not the in-page queue).
+ * Never nest two runs of one name: it waits for itself, as a Web Lock would.
  */
-export function withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
-  const run = async (): Promise<T> => {
-    const locks = webLocks();
-    if (!locks) return fn();
-    let started = false;
-    try {
-      return await locks.request(name, () => {
-        started = true;
-        return fn();
-      });
-    } catch (error) {
-      if (started) throw error;
-      return fn(); // the Locks API refused: the in-page queue still serialises this page
-    }
+export function lockRunner(name: string): LockRunner {
+  let queue: Promise<unknown> = Promise.resolve();
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = async (): Promise<T> => {
+      const locks = webLocks();
+      if (!locks) return fn();
+      let started = false;
+      try {
+        return await locks.request(name, () => {
+          started = true;
+          return fn();
+        });
+      } catch (error) {
+        if (started) throw error;
+        return fn(); // the Locks API refused: the in-page queue still serialises this page
+      }
+    };
+    const result = queue.then(run, run);
+    queue = result.catch(() => undefined);
+    return result;
   };
-  const result = (lockQueues.get(name) ?? Promise.resolve()).then(run, run);
-  const tail = result.catch(() => undefined);
-  lockQueues.set(name, tail);
-  void tail.then(() => {
-    if (lockQueues.get(name) === tail) lockQueues.delete(name);
-  });
-  return result;
 }
 
 const noop = (): void => undefined;

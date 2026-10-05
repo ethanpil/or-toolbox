@@ -72,7 +72,7 @@ All notable changes to this project are documented here. The format follows
 
 - Group budget approvals: `runs.approveGroup()`/`releaseGroup()`, `RunSpec.useGroupApproval` and all-or-none `runs.beginAll()`; the budget dialog names a group with its models and total; Video studio approves its sequences through them (e7660ec).
 - A run stopped before it sent anything books no stats row (e7660ec).
-- `ToolStateStore.update()` under a per-key Web Lock; `webLocks()`, `withLock()` and `holdLock()` in `core/util` (85b2086).
+- `ToolStateStore.update()` under a per-key Web Lock; `webLocks()`, `lockRunner()` and `holdLock()` in `core/util` (85b2086).
 - `CallOptions.onSend` fires right before each request is sent, after throttle and retry waits (5f9cbea).
 - One token module, `src/core/tokens.ts`: `approxTokens` counts digits and punctuation higher (JSON and code), plus `fitContext()`, `promptBudget()` and `outputTokens()`; Chat uses them (5259647).
 - `trimMedia` takes `fadeOut` and `bitrate` for audio cuts (da8b7b9).
