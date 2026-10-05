@@ -1,5 +1,5 @@
 /*
- * Sets the colour theme (and the density and reduced-motion switches) before the first paint, so a dark-mode
+ * Hides the page when it is framed (see below). Sets the colour theme (and the density and reduced-motion switches) before the first paint, so a dark-mode
  * user never sees a white flash and a compact layout never jumps, and keeps following the operating system while
  * the theme is "system". Loaded by every page as a classic, render-blocking <script> in <head> (injected by
  * vite-plugins/html-head.ts); it is an external file because the CSP forbids inline scripts. Once the page's
@@ -14,6 +14,13 @@
 (function () {
   'use strict';
 
+  var root = document.documentElement;
+
+  // Nothing frames this site. Documents the service worker serves carry `frame-ancestors 'none'`, but a first
+  // visit comes straight from GitHub Pages, which cannot send that header and ignores it in a meta tag. A framed
+  // page could be clickjacked into a paid run (`?prompt=` and `?model=`), so a framed page shows nothing.
+  if (window.top !== window.self) root.style.setProperty('display', 'none', 'important');
+
   function appearance() {
     try {
       var settings = JSON.parse(localStorage.getItem('ortoolbox:settings') || 'null');
@@ -27,7 +34,6 @@
     typeof window.matchMedia === 'function'
       ? window.matchMedia('(prefers-color-scheme: dark)')
       : null;
-  var root = document.documentElement;
 
   function apply() {
     var saved = appearance();
