@@ -40,8 +40,10 @@ import type { KeyInfo, KeysService, ModelsService } from '../types';
 import {
   API_BASE,
   DECISIONS_URL,
+  STATUS_TIMEOUT_MS,
   createApiClient,
   mayRetry,
+  partialImageResult,
   type ApiClientOptions,
 } from './client';
 import { partialStreamResult } from './chat-stream';
@@ -1337,5 +1339,161 @@ describe('outcome unknown', () => {
       expect(outcome).toBeInstanceOf(Error);
       expect(isOutcomeUnknown(outcome), String(outcome)).toBe(false);
     }
+  });
+});
+
+describe('money: in-flight marks, answers that may have billed, timeouts', () => {
+  const failure = (promise: Promise<unknown>): Promise<unknown> =>
+    promise.then(
+      () => {
+        throw new Error('expected a failure');
+      },
+      (e: unknown) => e,
+    );
+  const video = { model: 'x-ai/grok-imagine-video', prompt: 'p' };
+  const decision = jevRequest as Parameters<ReturnType<typeof createApiClient>['decide']>[0];
+  const errorBody = (code: string): Record<string, unknown> => ({
+    error: { code, message: 'The provider failed.' },
+  });
+
+  it('marks each request in flight before it leaves, and ends the mark once its outcome is known', async () => {
+    const seen: number[] = [];
+    let s: Setup | null = null;
+    const answer = (res: Response) => () => {
+      seen.push(s!.run.inFlight);
+      return res;
+    };
+    s = setup([
+      answer(json(chatRecorded)),
+      answer(json(error400Model, 400)),
+      answer(sse(chatStreamText)),
+    ]);
+    await s.client.chat(chatBody, { run: s.run });
+    await failure(s.client.chat(chatBody, { run: s.run }));
+    await s.client.chatStream(chatBody, { run: s.run, onEvent: () => undefined });
+    expect(seen).toEqual([1, 1, 1]);
+    expect(s.run.sent).toBe(3);
+    expect(s.run.inFlight).toBe(0);
+
+    const lost = setup([new TypeError('fetch failed')]);
+    await failure(lost.client.videos.submit(video, { run: lost.run }));
+    expect([lost.run.sent, lost.run.inFlight]).toEqual([1, 0]);
+  });
+
+  it('books an answered 408 or 5xx (not 503) on a paid POST as an unknown cost', async () => {
+    for (const status of [408, 500, 502, 524, 529]) {
+      const s = setup([json(error502, status)]);
+      const error = await failure(s.client.videos.submit(video, { run: s.run }));
+      expect(isOutcomeUnknown(error), String(status)).toBe(true);
+      expect(s.run.usages, String(status)).toEqual([
+        expect.objectContaining({ costUsd: 0, costUnknown: true }),
+      ]);
+    }
+    const chat = setup([json(error502, 502)]);
+    await failure(chat.client.chat(chatBody, { run: chat.run }));
+    expect(chat.run.usages).toEqual([expect.objectContaining({ costUnknown: true })]);
+
+    // An answer that says what it cost is booked as that, once.
+    const priced = setup([json({ ...error502, usage: { cost: 0.002 } }, 502)]);
+    await failure(priced.client.chat(chatBody, { run: priced.run }));
+    expect(priced.run.usages).toEqual([expect.objectContaining({ costUsd: 0.002 })]);
+    expect(priced.run.usages[0]?.costUnknown).toBeUndefined();
+
+    // 503: no provider was routed to; a free request cannot cost anything.
+    const none = setup([json(error502, 503)]);
+    await failure(none.client.decide(decision, { run: none.run, retry: false }));
+    expect(none.run.usages).toEqual([]);
+    const free = setup([json(error502, 502)]);
+    await failure(
+      free.client.chat({ ...chatBody, model: 'liquid/lfm-2.5-2.6b:free' }, { run: free.run }),
+    );
+    expect(free.run.usages).toEqual([]);
+  });
+
+  it('books nothing and flags nothing for a failed image generation (documented as not billed)', async () => {
+    const answered = setup([json(error502, 502)]);
+    const error = await failure(
+      answered.client.images({ model: 'm/img', prompt: 'x' }, { run: answered.run }),
+    );
+    expect(isOutcomeUnknown(error)).toBe(false);
+    expect(answered.run.usages).toEqual([]);
+
+    const inBody = setup([json(errorBody('server_error')), imageOk()]);
+    const failed = await failure(
+      inBody.client.images({ model: 'm/img', prompt: 'x' }, { run: inBody.run }),
+    );
+    expect(isOutcomeUnknown(failed)).toBe(false);
+    expect(inBody.fetch).toHaveBeenCalledOnce();
+    expect(inBody.run.usages).toEqual([]);
+  });
+
+  it('never retries an error inside a 200 body of a paid POST, and books it as unknown', async () => {
+    const codes = ['failed_to_generate', 'content_moderated', 'corporate_policy', 'rate_limited'];
+    for (const code of codes) {
+      const s = setup([json(errorBody(code)), json(jev)]);
+      const error = await failure(s.client.decide(decision, { run: s.run }));
+      expect(s.fetch, code).toHaveBeenCalledOnce();
+      expect(isOutcomeUnknown(error), code).toBe(true);
+      expect(s.run.usages, code).toEqual([expect.objectContaining({ costUnknown: true })]);
+    }
+  });
+
+  it('gives up a status read that does not answer in time, and reads again', async () => {
+    vi.useFakeTimers();
+    try {
+      const hang = (_input: string, init: RequestInit): Promise<Response> =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError')),
+          );
+        });
+      const fetch = vi
+        .fn<(input: string, init: RequestInit) => Promise<Response>>()
+        .mockImplementationOnce(hang)
+        .mockImplementationOnce(() => Promise.resolve(json(videoPending)));
+      const s = setup([], { options: { fetch } });
+      const read = s.client.videos.status(videoPending.id, { keyId: 'key-1' });
+      await vi.advanceTimersByTimeAsync(STATUS_TIMEOUT_MS - 1);
+      expect(fetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(5000);
+      await expect(read).resolves.toMatchObject({ status: 'pending' });
+      expect(fetch).toHaveBeenCalledTimes(2);
+
+      // Every attempt hangs: the read fails as a network error, never as a Stop.
+      const stuck = setup([], { options: { fetch: vi.fn(hang) } });
+      const never = failure(stuck.client.videos.status('job', { keyId: 'key-1' }));
+      await vi.advanceTimersByTimeAsync(4 * STATUS_TIMEOUT_MS);
+      const error = await never;
+      expect(error).toBeInstanceOf(NetworkError);
+      expect(isAbortError(error)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the completed, billed images of a stopped stream and books the rest as unknown', async () => {
+    const completed = `data: {"type":"image_generation.completed","b64_json":"${PNG_B64}","media_type":"image/png","usage":{"cost":0.011}}\n\n`;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(completed)); // then nothing: a second image is coming
+      },
+    });
+    const s = setup([
+      new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    ]);
+    const stop = new AbortController();
+    const pending = failure(
+      s.client.images(
+        { model: 'openai/gpt-image-2', prompt: 'x', n: 2, stream: true },
+        { run: s.run, signal: stop.signal },
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    stop.abort();
+    const error = await pending;
+    expect(isAbortError(error)).toBe(true);
+    expect(partialImageResult(error)?.images).toHaveLength(1);
+    expect(s.run.usages).toEqual([expect.objectContaining({ costUsd: 0.011, costUnknown: true })]);
+    expect(partialImageResult(new Error('other'))).toBeNull();
   });
 });

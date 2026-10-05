@@ -1,11 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import chatStream from '../../../tests/fixtures/openrouter/chat-stream.recorded.sse.txt?raw';
 import jsonSchemaStream from '../../../tests/fixtures/openrouter/chat-stream-json-schema.recorded.sse.txt?raw';
 import imagesStream from '../../../tests/fixtures/openrouter/images-stream.recorded.sse.txt?raw';
 import lyriaPro from '../../../tests/fixtures/openrouter/music-lyria-pro.recorded.sse.txt?raw';
 import documented from '../../../tests/fixtures/openrouter/chat-stream.documented.json';
 import { isAbortError, NetworkError } from '../errors';
-import { readSse, SseParser, type SseEvent } from './sse';
+import { readSse, SseParser, STREAM_IDLE_MS, type SseEvent } from './sse';
 
 const encoder = new TextEncoder();
 
@@ -155,6 +155,52 @@ describe('readSse', () => {
     const expected = parseText(jsonSchemaStream);
     for (const seed of [1, 2, 3]) {
       expect(await readAll(splitBytes(bytes, seed, 97))).toEqual(expected);
+    }
+  });
+
+  it('gives up a stream that sends nothing for STREAM_IDLE_MS, but not one that keeps sending comments', async () => {
+    vi.useFakeTimers();
+    try {
+      let cancelled = false;
+      const silent = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"a":1}\n\n'));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const events: string[] = [];
+      const read = readSse(silent, (event) => {
+        events.push(event.data);
+      }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(STREAM_IDLE_MS + 1);
+      const error = await read;
+      expect(error).toBeInstanceOf(NetworkError);
+      expect((error as Error).message).toBe(
+        'Nothing arrived for 5 minutes, so the connection was closed.',
+      );
+      expect(events).toEqual(['{"a":1}']);
+      expect(cancelled).toBe(true);
+
+      // Keep-alive comments every 4 minutes for 20 minutes: slow, but alive.
+      let push: ((text: string) => void) | null = null;
+      let close: (() => void) | null = null;
+      const slow = new ReadableStream<Uint8Array>({
+        start(controller) {
+          push = (text) => controller.enqueue(encoder.encode(text));
+          close = () => controller.close();
+        },
+      });
+      const done = readSse(slow, () => undefined);
+      for (let sent = 0; sent < 5; sent++) {
+        await vi.advanceTimersByTimeAsync(4 * 60_000);
+        push!(': OPENROUTER PROCESSING\n\n');
+      }
+      close!();
+      await expect(done).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
     }
   });
 

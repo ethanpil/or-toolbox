@@ -129,6 +129,21 @@ describe('bodyError / statusFromCode', () => {
     expect(statusFromCode('429')).toBe(429);
     expect(statusFromCode('server_error')).toBe(500);
     expect(statusFromCode('rate_limit_exceeded')).toBe(429);
+    expect(statusFromCode('provider_overloaded')).toBe(529);
     expect(statusFromCode(undefined)).toBe(502);
+  });
+
+  it('matches string codes exactly: no rate limit read into a word that merely contains "rate"', () => {
+    for (const code of [
+      'failed_to_generate',
+      'content_moderated',
+      'corporate_policy',
+      'integrate_failed',
+      'moderated',
+      'my_server_thing',
+    ]) {
+      expect(statusFromCode(code), code).toBe(502);
+    }
+    expect(statusFromCode('constructor')).toBe(502);
   });
 });

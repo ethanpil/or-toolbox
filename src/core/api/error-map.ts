@@ -54,14 +54,33 @@ function retryAfterMs(metadata: Record<string, unknown> | undefined): number | u
   return undefined;
 }
 
+/**
+ * String codes mapped to a status, matched exactly (lowercased): a pattern such as /rate/ would also catch
+ * `failed_to_generate`, `content_moderated` or `corporate_policy`. The names are OpenRouter's `error_type` values
+ * (§12.2) and the `code` strings its streams carry (`server_error`, §3.4).
+ */
+const CODE_STATUS: Readonly<Record<string, number>> = {
+  rate_limit_exceeded: 429,
+  rate_limited: 429,
+  server_error: 500,
+  server: 500,
+  internal_error: 500,
+  internal_server_error: 500,
+  timeout: 408,
+  provider_overloaded: 529,
+  provider_unavailable: 502,
+};
+
 /** HTTP status for an error code found inside a 200 body or SSE chunk (numeric, or strings like `server_error`). */
 export function statusFromCode(code: unknown, fallback = 502): number {
   if (typeof code === 'number' && code >= 400 && code < 600) return code;
   if (typeof code === 'string') {
     const numeric = Number(code);
     if (Number.isInteger(numeric) && numeric >= 400 && numeric < 600) return numeric;
-    if (/rate/i.test(code)) return 429;
-    if (/server|internal/i.test(code)) return 500;
+    const known = Object.hasOwn(CODE_STATUS, code.toLowerCase())
+      ? CODE_STATUS[code.toLowerCase()]
+      : undefined;
+    if (known !== undefined) return known;
   }
   return fallback;
 }

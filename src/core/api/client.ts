@@ -15,13 +15,21 @@
  *   (§0, §2.9). `/images` and `/videos` do not accept the field.
  * - Usage: every billed response reports usage to the run. TTS bytes carry no cost, so it is estimated from the
  *   priciest endpoint (`costEstimated`). When a paid request may have reached a provider but no cost is known
- *   (connection lost, aborted, stream without a usage chunk), the usage is reported with `costUnknown`, so the
- *   run books its reservation: unknown is never recorded as free. Video cost arrives only on the completed
- *   status read, which has no run: `VideoJobStatus.costUsd` is returned for the tool to add.
- * - A paid or chat POST (not all-free) that fails where a provider may have run it (lost after sending, 408, a
- *   5xx other than 503) throws with `outcomeUnknown` set (`markOutcome`), so the UI never offers a plain Retry.
+ *   (connection lost, aborted, stream without a usage chunk, or an answer that may have billed: 408, a 5xx other
+ *   than 503, an error inside a 2xx body), the usage is reported with `costUnknown`, so the run books its
+ *   reservation: unknown is never recorded as free. `/images` is the exception for answers: a failed generation
+ *   is documented as not billed (§3.4). Video cost arrives only on the completed status read, which has no run:
+ *   `VideoJobStatus.costUsd` is returned for the tool to add.
+ * - In flight: before each request leaves, the run stores that it is in flight (`RunHandle.sending`, awaited); the
+ *   mark ends once the outcome is reported. An orphaned run with a request in flight books its reservation.
+ * - A paid or chat POST (not all-free) that fails where a provider may have run it (lost after sending, or an
+ *   answer that may have billed, as above) throws with `outcomeUnknown` set (`markOutcome`), so the UI never
+ *   offers a plain Retry. An error inside a 2xx body is never retried (the provider had started).
  * - JSON success bodies are shape-checked; an `error` inside a 2xx body or a missing result field is an
- *   ApiError, never a TypeError from deep inside a tool.
+ *   ApiError, never a TypeError from deep inside a tool. String error codes map to a status only by exact name.
+ * - Timeouts: a stream that sends no bytes for `STREAM_IDLE_MS` (5 min, sse.ts) fails as a dropped connection;
+ *   a video status read gives up after `STATUS_TIMEOUT_MS` (60 s) and is retried like a network failure.
+ * - A Stop during an image stream keeps the completed (billed) images: `partialImageResult(error)`.
  *
  * Services are read from `core` at call time only, so the composition root can wire circular dependencies.
  */
@@ -54,10 +62,14 @@ import { DEFAULT_RETRY_POLICY, retryDelay, type RetryPolicy } from './retry';
 import { readSse } from './sse';
 import { FreeModelThrottle } from './throttle';
 import type {
+  ChatRequest,
   ChatResponse,
+  ChatStreamEvent,
+  ChatStreamResult,
   CreditsResponse,
   DecisionResponse,
   GeneratedImage,
+  ImageRequest,
   ImageResult,
   KeyStatusResponse,
   ProviderPreferences,
@@ -113,18 +125,39 @@ export const TOOL_CATEGORIES: Partial<Record<ToolId, string>> = {
  */
 export type RetryRule = 'read' | 'paid' | 'chat' | 'never';
 
+/** Errors read from the body of a 2xx answer: the provider had started (§2.2). */
+const afterStart = new WeakSet<ApiError>();
+
 /**
- * Marks `failure` as `outcomeUnknown` when it ends a non-idempotent POST (`paid`, `chat`) that is not all-free and
- * that a provider may have run without an answer saying so: lost after it was `sent`, or answered 408 or a 5xx
- * other than 503 (no provider was routed to). An error event inside a stream is an answer, so it is not marked.
+ * Whether an error answer to a non-idempotent POST (`paid`, `chat`) that is not all-free may have been billed:
+ * an error inside a 2xx body (the provider had started), or 408 or a 5xx other than 503 (no provider was routed
+ * to), unless the endpoint documents that a failed request is not billed (`/images`, §3.4: "a failed or cancelled
+ * generation returns an error and is not billed"). An error event inside a stream is an answer the stream's own
+ * usage accounts for, so it is not counted here.
+ */
+function answerMayHaveBilled(spec: Spec, failure: ApiError): boolean {
+  if ((spec.rule !== 'paid' && spec.rule !== 'chat') || !spec.bill || spec.bill.allFree) {
+    return false;
+  }
+  if (spec.unbilledErrors) return false;
+  if (afterStart.has(failure)) return true;
+  return (
+    !failure.detail.midStream &&
+    (failure.status === 408 || (failure.status >= 500 && failure.status !== 503))
+  );
+}
+
+/**
+ * Marks `failure` as `outcomeUnknown` when it ends a non-idempotent POST that a provider may have run without an
+ * answer saying what it cost: lost after it was `sent` (not all-free), or an answer that may have billed
+ * (`answerMayHaveBilled`).
  */
 function markOutcome(spec: Spec, failure: unknown, sent: boolean): void {
   if ((spec.rule !== 'paid' && spec.rule !== 'chat') || !spec.bill || spec.bill.allFree) return;
   if (!(failure instanceof OrError)) return;
   const unknown =
     failure instanceof ApiError
-      ? !failure.detail.midStream &&
-        (failure.status === 408 || (failure.status >= 500 && failure.status !== 503))
+      ? answerMayHaveBilled(spec, failure)
       : failure instanceof NetworkError && sent;
   if (unknown) failure.outcomeUnknown = true;
 }
@@ -185,13 +218,30 @@ interface Spec {
   bill?: { model: string; allFree: boolean };
   /** `CallOptions.onSend`: right before each fetch. */
   onSend?: ((attempt: number) => void) | undefined;
+  /** The endpoint documents that an error answer is not billed (`/images`, §3.4). */
+  unbilledErrors?: boolean;
+  /** Each attempt (request and body) fails as a NetworkError after this long (`STATUS_TIMEOUT_MS`). */
+  timeoutMs?: number;
 }
 
 interface Delivered<T> {
   value: T;
   res: Response;
   startedAt: number;
+  /**
+   * Ends the run's in-flight mark (`RunHandle.sending`). Call it right after the response's usage is reported (or
+   * once it is clear it has none); idempotent.
+   */
+  settle: () => void;
 }
+
+/**
+ * A video status read that has not answered after this long is abandoned and retried (as a network failure), so a
+ * hung request never holds a job's poll lock forever. Status reads are small JSON answers.
+ */
+export const STATUS_TIMEOUT_MS = 60_000;
+
+const noop = (): void => undefined;
 
 const VIDEO_STATES: readonly VideoJobState[] = [
   'pending',
@@ -214,6 +264,21 @@ function combineSignals(
   if (!a || a === b) return b;
   if (!b) return a;
   return AbortSignal.any([a, b]);
+}
+
+const partialImages = new WeakMap<object, ImageResult>();
+
+function withPartialImages<E extends object>(error: E, result: ImageResult): E {
+  partialImages.set(error, result);
+  return error;
+}
+
+/**
+ * The images an `images` call had completed (and been billed for) when it was stopped (Stop aborts the stream), or
+ * null for any other error. The abort is still the outcome: this lets a tool show and keep what was paid for.
+ */
+export function partialImageResult(error: unknown): ImageResult | null {
+  return typeof error === 'object' && error !== null ? (partialImages.get(error) ?? null) : null;
 }
 
 /** JSON of a body or SSE payload (prototype-safe), or undefined when it is not JSON. */
@@ -249,25 +314,34 @@ function asFailure(error: unknown, signal: AbortSignal | undefined, message: str
  * (a provider that failed after the headers, §2.2), else "unexpected response". (`error` is checked only for
  * invalid bodies: a failed video job's status legitimately carries an `error` string.) Read failures propagate
  * as they are (callers map them with `asFailure`).
+ *
+ * `started` (POSTs): the error is the provider's, after it started the work. It is then never retried
+ * (`midStream`), and `answerMayHaveBilled` counts it as possibly billed. Reads (`started` false) may be retried.
  */
 async function readJson<T>(
   res: Response,
   isValid: (body: Record<string, unknown>) => boolean,
+  started: boolean,
 ): Promise<T> {
   const body = parseJson(await res.text());
   if (isRecord(body) && isValid(body)) return body as T;
   const error = bodyError(body);
-  if (error) {
-    throw apiErrorFromBody(
-      statusFromCode(error['code']),
-      { error },
-      {
-        generationId: res.headers.get('X-Generation-Id'),
-        providerName: res.headers.get('X-Provider-Name'),
-      },
-    );
-  }
-  throw new ApiError('OpenRouter returned an unexpected response.', 502, detailFor(res));
+  const failure = error
+    ? apiErrorFromBody(
+        statusFromCode(error['code']),
+        { error },
+        {
+          generationId: res.headers.get('X-Generation-Id'),
+          providerName: res.headers.get('X-Provider-Name'),
+          midStream: started,
+        },
+      )
+    : new ApiError('OpenRouter returned an unexpected response.', 502, {
+        ...detailFor(res),
+        ...(started ? { midStream: true } : {}),
+      });
+  if (started) afterStart.add(failure);
+  throw failure;
 }
 
 const hasChoices = (body: Record<string, unknown>): boolean => {
@@ -313,8 +387,12 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
   /**
    * Sends with throttling and the retry rules. For non-streaming calls `read` runs inside the loop, so a body
    * that fails to download is a NetworkError like a failed fetch. For streams (`read` null) the caller reads the
-   * body after this resolves, and nothing is retried once the response started. When a paid request may have
-   * reached a provider and fails without an answer (network, abort), its usage is booked as unknown.
+   * body after this resolves, and nothing is retried once the response started.
+   *
+   * Money: before each attempt leaves, the run stores that a request is in flight (`RunHandle.sending`); the mark
+   * ends when the attempt fails here, or through `Delivered.settle` once the caller reported the usage. A paid
+   * request that may have reached a provider and fails without a known cost (network, abort, an answer that may
+   * have billed: `answerMayHaveBilled`) books its usage as unknown, so the run books its reservation.
    */
   async function send<T>(
     spec: Spec,
@@ -330,11 +408,19 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
       } catch (error) {
         console.error(error); // a caller's timing hook must never stop the request
       }
+      // Stored before the request leaves: a page that dies with it in flight books it as unknown.
+      const settle = spec.run && spec.bill ? await spec.run.sending() : noop;
       const startedAt = Date.now();
       /** True while OpenRouter may have accepted the request without answering it. */
       let reached = false;
+      /** The answer carried usage, now reported. */
+      let reported = false;
       let failure: unknown;
+      const timer = spec.timeoutMs ? new AbortController() : null;
+      const timeout = timer ? setTimeout(() => timer.abort(), spec.timeoutMs) : null;
+      const signal = combineSignals(spec.signal, timer?.signal);
       try {
+        throwIfAborted(spec.signal);
         let res: Response;
         try {
           reached = true;
@@ -342,17 +428,18 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
             method: spec.method,
             headers,
             body: spec.json === undefined ? undefined : JSON.stringify(spec.json),
-            signal: spec.signal ?? null,
+            signal: signal ?? null,
             credentials: 'omit',
           });
         } catch (error) {
-          throw asFailure(error, spec.signal, 'Could not reach OpenRouter. Check your connection.');
+          throw asFailure(error, signal, 'Could not reach OpenRouter. Check your connection.');
         }
         if (!res.ok) {
-          // An error answer: nothing was billed unless the body says so.
+          // An error answer: billed only when the body says so, or when it may have been (see below).
           reached = false;
           const body = parseJson(await res.text().catch(() => ''));
           if (spec.run && spec.bill && isRecord(body) && isRecord(body['usage'])) {
+            reported = true;
             await reportUsage(spec.run, {
               model: spec.bill.model,
               usage: body['usage'],
@@ -366,37 +453,51 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
             providerName: res.headers.get('X-Provider-Name'),
           });
         }
-        if (!read) return { value: null, res, startedAt };
+        if (!read) return { value: null, res, startedAt, settle };
         try {
           const value = await read(res);
-          return { value, res, startedAt };
+          return { value, res, startedAt, settle };
         } catch (error) {
           if (error instanceof ApiError) reached = false; // an answer, even if a failed one
           throw asFailure(
             error,
-            spec.signal,
+            signal,
             'The connection dropped while the response was downloading.',
           );
         }
       } catch (error) {
         failure = error;
+      } finally {
+        if (timeout) clearTimeout(timeout);
       }
-      if (isAbortError(failure) || spec.signal?.aborted) {
-        if (reached) bookUnknown(spec, startedAt);
-        throw abortError();
+      if (timer?.signal.aborted && !spec.signal?.aborted) {
+        failure = new NetworkError('OpenRouter did not answer in time.');
       }
-      const delay =
-        spec.retry && mayRetry(failure, spec.rule)
-          ? retryDelay(
-              attempt,
-              policy,
-              failure instanceof ApiError ? failure.detail.retryAfterMs : undefined,
-            )
-          : null;
-      if (delay === null) {
-        if (reached && failure instanceof NetworkError) bookUnknown(spec, startedAt);
-        markOutcome(spec, failure, reached);
-        throw failure;
+      let delay: number | null;
+      try {
+        if (isAbortError(failure) || spec.signal?.aborted) {
+          if (reached) bookUnknown(spec, startedAt);
+          throw abortError();
+        }
+        delay =
+          spec.retry && mayRetry(failure, spec.rule)
+            ? retryDelay(
+                attempt,
+                policy,
+                failure instanceof ApiError ? failure.detail.retryAfterMs : undefined,
+              )
+            : null;
+        if (delay === null) {
+          const answeredMaybeBilled =
+            failure instanceof ApiError && !reported && answerMayHaveBilled(spec, failure);
+          if ((reached && failure instanceof NetworkError) || answeredMaybeBilled) {
+            bookUnknown(spec, startedAt);
+          }
+          markOutcome(spec, failure, reached);
+          throw failure;
+        }
+      } finally {
+        settle();
       }
       await sleep(delay, spec.signal);
     }
@@ -439,6 +540,8 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
       latencyMs: number;
       generationId: string | null | undefined;
       allFree: boolean;
+      /** More may be billed than `usage` says (a stream cut short): the cost is unknown beyond it. */
+      unknown?: boolean;
     },
   ): Promise<void> {
     const usage = input.usage;
@@ -469,7 +572,7 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
       costEstimated,
       latencyMs: input.latencyMs,
     };
-    if (costUsd === null) entry.costUnknown = true;
+    if (costUsd === null || (input.unknown && !input.allFree)) entry.costUnknown = true;
     if (isFiniteNumber(reasoningTokens)) entry.reasoningTokens = reasoningTokens;
     if (input.generationId) entry.generationId = input.generationId;
     run.addUsage(entry);
@@ -573,68 +676,111 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
     spec: Spec,
     isValid: (body: Record<string, unknown>) => boolean,
   ): Promise<T> {
-    const { value } = await send(spec, (res) => readJson<T>(res, isValid));
+    const { value, settle } = await send(spec, (res) => readJson<T>(res, isValid, false));
+    settle();
     return value as T;
   }
 
+  /** The caller reports the answer's usage, then calls `settle`. */
   async function postJson<T>(
     spec: Spec,
     isValid: (body: Record<string, unknown>) => boolean,
   ): Promise<Delivered<T>> {
-    return (await send(spec, (res) => readJson<T>(res, isValid))) as Delivered<T>;
+    return (await send(spec, (res) => readJson<T>(res, isValid, true))) as Delivered<T>;
   }
 
-  return {
-    async chat(body, opts) {
-      const models = [body.model, ...(body.models ?? [])];
-      const wire = withNoRetention({ ...body, stream: false }, opts.run.keyId, models);
-      const spec = callSpec(opts, `${API_BASE}/chat/completions`, wire, 'chat', models);
-      const { value, res, startedAt } = await postJson<ChatResponse>(spec, hasChoices);
-      await reportUsage(opts.run, {
-        model: usageModel(body, value.model),
-        usage: value.usage,
-        latencyMs: Date.now() - startedAt,
-        generationId: res.headers.get('X-Generation-Id') ?? value.id,
-        allFree: spec.bill.allFree,
-      });
-      return value;
-    },
-
-    async chatStream(body, opts) {
-      const models = [body.model, ...(body.models ?? [])];
-      const wire = withNoRetention({ ...body, stream: true }, opts.run.keyId, models);
-      const spec = callSpec(opts, `${API_BASE}/chat/completions`, wire, 'chat', models);
-      const { res, startedAt } = await send(spec, null);
-      const generationId = res.headers.get('X-Generation-Id');
-      const assembler = new ChatStreamAssembler(opts.onEvent, generationId);
-      let done = false;
-      let failure: Error | null = null;
-      try {
-        if (!isEventStream(res)) {
-          // A provider that cannot stream may answer with one JSON body; replay it as events.
-          const json = await readJson<ChatResponse>(res, hasChoices);
-          const choice = json.choices[0];
-          assembler.push({
-            id: json.id,
-            model: json.model,
-            provider: json.provider,
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  content: choice?.message.content ?? '',
-                  reasoning: choice?.message.reasoning ?? undefined,
-                  images: choice?.message.images,
-                  audio: choice?.message.audio,
-                  annotations: choice?.message.annotations,
-                },
-                finish_reason: choice?.finish_reason ?? null,
+  /** Reads a chat stream (or one JSON body a provider sent instead), reporting usage in every outcome. */
+  async function readChatStream(
+    spec: Spec & { run: RunHandle; bill: NonNullable<Spec['bill']> },
+    body: ChatRequest,
+    opts: CallOptions & { onEvent: (event: ChatStreamEvent) => void },
+    res: Response,
+    startedAt: number,
+  ): Promise<ChatStreamResult> {
+    const generationId = res.headers.get('X-Generation-Id');
+    const assembler = new ChatStreamAssembler(opts.onEvent, generationId);
+    let done = false;
+    let failure: Error | null = null;
+    try {
+      if (!isEventStream(res)) {
+        // A provider that cannot stream may answer with one JSON body; replay it as events.
+        const json = await readJson<ChatResponse>(res, hasChoices, true);
+        const choice = json.choices[0];
+        assembler.push({
+          id: json.id,
+          model: json.model,
+          provider: json.provider,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                content: choice?.message.content ?? '',
+                reasoning: choice?.message.reasoning ?? undefined,
+                images: choice?.message.images,
+                audio: choice?.message.audio,
+                annotations: choice?.message.annotations,
               },
-            ],
-            usage: json.usage,
-          });
-          done = true;
-        } else if (res.body) {
+              finish_reason: choice?.finish_reason ?? null,
+            },
+          ],
+          usage: json.usage,
+        });
+        done = true;
+      } else if (res.body) {
+        await readSse(
+          res.body,
+          (event) => {
+            if (event.data === '[DONE]') {
+              done = true;
+              return 'stop';
+            }
+            const chunk = parseJson(event.data);
+            if (chunk !== undefined) assembler.push(chunk);
+            return undefined;
+          },
+          spec.signal,
+        );
+      }
+      // Ended without [DONE] and without the terminal usage chunk: the connection was cut.
+      if (!done && !(assembler.finished && assembler.lastUsage)) {
+        throw new NetworkError('The connection dropped before the answer was complete.');
+      }
+    } catch (error) {
+      failure = asFailure(error, spec.signal, 'The connection dropped while the answer streamed.');
+      markOutcome(spec, failure, true);
+    }
+    const result = assembler.result();
+    // Once the response started the provider may bill, so usage is reported in every outcome.
+    await reportUsage(opts.run, {
+      model: usageModel(body, result.model || undefined),
+      usage: assembler.lastUsage,
+      latencyMs: Date.now() - startedAt,
+      generationId: generationId ?? (result.id || null),
+      allFree: spec.bill.allFree,
+    });
+    // The error is the outcome; what arrived before it stays readable through `partialStreamResult`.
+    if (failure) throw withPartialResult(failure, result);
+    return result;
+  }
+
+  /** Reads an /images answer (JSON, or a stream of partial and completed images). */
+  async function readImages(
+    spec: Spec & { run: RunHandle; bill: NonNullable<Spec['bill']> },
+    body: ImageRequest,
+    opts: CallOptions & { onPartial?: (image: GeneratedImage) => void },
+    res: Response,
+    startedAt: number,
+  ): Promise<ImageResult> {
+    const generationId = res.headers.get('X-Generation-Id');
+    const images: GeneratedImage[] = [];
+    const usages: WireUsage[] = [];
+    let created = 0;
+    let done = false;
+    let failure: Error | null = null;
+
+    try {
+      if (isEventStream(res)) {
+        if (res.body) {
           await readSse(
             res.body,
             (event) => {
@@ -642,119 +788,117 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
                 done = true;
                 return 'stop';
               }
-              const chunk = parseJson(event.data);
-              if (chunk !== undefined) assembler.push(chunk);
+              const data = parseJson(event.data);
+              if (!isRecord(data)) return undefined;
+              const error = bodyError(data);
+              if (data['type'] === 'error' || error) {
+                throw apiErrorFromBody(
+                  statusFromCode(error?.['code']),
+                  { error },
+                  { midStream: true, generationId },
+                );
+              }
+              const b64 = data['b64_json'];
+              const type = data['media_type'];
+              if (data['type'] === 'image_generation.partial_image' && isString(b64) && b64) {
+                const decoded = base64ToBlob(b64, isString(type) && type ? type : undefined);
+                opts.onPartial?.({ blob: decoded.blob, mediaType: decoded.mediaType });
+              } else if (data['type'] === 'image_generation.completed') {
+                images.push(...decodeImages([data]));
+                if (isFiniteNumber(data['created'])) created = data['created'];
+                if (isRecord(data['usage'])) usages.push(data['usage']);
+              }
               return undefined;
             },
             spec.signal,
           );
         }
-        // Ended without [DONE] and without the terminal usage chunk: the connection was cut.
-        if (!done && !(assembler.finished && assembler.lastUsage)) {
-          throw new NetworkError('The connection dropped before the answer was complete.');
+        if (!done && images.length === 0) {
+          throw new NetworkError('The connection dropped before the image was ready.');
         }
-      } catch (error) {
-        failure = asFailure(
-          error,
-          spec.signal,
-          'The connection dropped while the answer streamed.',
-        );
-        markOutcome(spec, failure, true);
+      } else {
+        const json = await readJson<Record<string, unknown>>(res, hasData, true);
+        images.push(...decodeImages(json['data']));
+        if (isFiniteNumber(json['created'])) created = json['created'];
+        if (isRecord(json['usage'])) usages.push(json['usage']);
+        done = true;
       }
-      const result = assembler.result();
-      // Once the response started the provider may bill, so usage is reported in every outcome.
+    } catch (error) {
+      failure = asFailure(error, spec.signal, 'The connection dropped while the image streamed.');
+      markOutcome(spec, failure, true);
+    }
+
+    const usage = mergeUsage(usages);
+    // Completed images are billed and reported even if a later event failed. A generation that failed (an error
+    // answer) is not billed (§3.4). A stream cut short (dropped, Stop) bills what the provider completes, also
+    // after the disconnect: beyond the images that arrived, its cost is unknown.
+    if (usage || !(failure instanceof ApiError)) {
       await reportUsage(opts.run, {
-        model: usageModel(body, result.model || undefined),
-        usage: assembler.lastUsage,
+        model: body.model,
+        usage,
         latencyMs: Date.now() - startedAt,
-        generationId: generationId ?? (result.id || null),
+        generationId,
         allFree: spec.bill.allFree,
+        unknown: failure !== null && !(failure instanceof ApiError) && !done,
       });
-      // The error is the outcome; what arrived before it stays readable through `partialStreamResult`.
-      if (failure) throw withPartialResult(failure, result);
-      return result;
+    }
+    const result: ImageResult = { created, images, usage, generationId };
+    // A Stop keeps the images that completed (billed) readable through `partialImageResult`.
+    if (failure && isAbortError(failure)) {
+      throw images.length > 0 ? withPartialImages(failure, result) : failure;
+    }
+    if (failure && images.length === 0) throw failure;
+    if (images.length === 0) {
+      throw new ApiError('The model returned no image.', 502, detailFor(res));
+    }
+    if (failure instanceof OrError) result.error = failure;
+    return result;
+  }
+
+  return {
+    async chat(body, opts) {
+      const models = [body.model, ...(body.models ?? [])];
+      const wire = withNoRetention({ ...body, stream: false }, opts.run.keyId, models);
+      const spec = callSpec(opts, `${API_BASE}/chat/completions`, wire, 'chat', models);
+      const { value, res, startedAt, settle } = await postJson<ChatResponse>(spec, hasChoices);
+      try {
+        await reportUsage(opts.run, {
+          model: usageModel(body, value.model),
+          usage: value.usage,
+          latencyMs: Date.now() - startedAt,
+          generationId: res.headers.get('X-Generation-Id') ?? value.id,
+          allFree: spec.bill.allFree,
+        });
+      } finally {
+        settle();
+      }
+      return value;
+    },
+
+    async chatStream(body, opts) {
+      const models = [body.model, ...(body.models ?? [])];
+      const wire = withNoRetention({ ...body, stream: true }, opts.run.keyId, models);
+      const spec = callSpec(opts, `${API_BASE}/chat/completions`, wire, 'chat', models);
+      const { res, startedAt, settle } = await send(spec, null);
+      try {
+        return await readChatStream(spec, body, opts, res, startedAt);
+      } finally {
+        settle();
+      }
     },
 
     async images(body, opts) {
-      const spec = callSpec(opts, `${API_BASE}/images`, body, 'paid', [body.model]);
-      const { res, startedAt } = await send(spec, null);
-      const generationId = res.headers.get('X-Generation-Id');
-      const images: GeneratedImage[] = [];
-      const usages: WireUsage[] = [];
-      let created = 0;
-      let done = false;
-      let failure: Error | null = null;
-
+      const spec: Spec & { run: RunHandle; bill: NonNullable<Spec['bill']> } = {
+        ...callSpec(opts, `${API_BASE}/images`, body, 'paid', [body.model]),
+        unbilledErrors: true, // §3.4: a failed or cancelled generation is not billed
+      };
+      const { res, startedAt, settle } = await send(spec, null);
       try {
-        if (isEventStream(res)) {
-          if (res.body) {
-            await readSse(
-              res.body,
-              (event) => {
-                if (event.data === '[DONE]') {
-                  done = true;
-                  return 'stop';
-                }
-                const data = parseJson(event.data);
-                if (!isRecord(data)) return undefined;
-                const error = bodyError(data);
-                if (data['type'] === 'error' || error) {
-                  throw apiErrorFromBody(
-                    statusFromCode(error?.['code']),
-                    { error },
-                    { midStream: true, generationId },
-                  );
-                }
-                const b64 = data['b64_json'];
-                const type = data['media_type'];
-                if (data['type'] === 'image_generation.partial_image' && isString(b64) && b64) {
-                  const decoded = base64ToBlob(b64, isString(type) && type ? type : undefined);
-                  opts.onPartial?.({ blob: decoded.blob, mediaType: decoded.mediaType });
-                } else if (data['type'] === 'image_generation.completed') {
-                  images.push(...decodeImages([data]));
-                  if (isFiniteNumber(data['created'])) created = data['created'];
-                  if (isRecord(data['usage'])) usages.push(data['usage']);
-                }
-                return undefined;
-              },
-              spec.signal,
-            );
-          }
-          if (!done && images.length === 0) {
-            throw new NetworkError('The connection dropped before the image was ready.');
-          }
-        } else {
-          const json = await readJson<Record<string, unknown>>(res, hasData);
-          images.push(...decodeImages(json['data']));
-          if (isFiniteNumber(json['created'])) created = json['created'];
-          if (isRecord(json['usage'])) usages.push(json['usage']);
-        }
-      } catch (error) {
-        failure = asFailure(error, spec.signal, 'The connection dropped while the image streamed.');
-        markOutcome(spec, failure, true);
+        return await readImages(spec, body, opts, res, startedAt);
+      } finally {
+        settle();
       }
-
-      const usage = mergeUsage(usages);
-      // Completed images are billed and reported even if a later event failed. A generation that failed
-      // (an error answer) is not billed (§3.4); anything else without usage (dropped, aborted) is unknown.
-      if (usage || !(failure instanceof ApiError)) {
-        await reportUsage(opts.run, {
-          model: body.model,
-          usage,
-          latencyMs: Date.now() - startedAt,
-          generationId,
-          allFree: spec.bill.allFree,
-        });
-      }
-      if (failure && (isAbortError(failure) || images.length === 0)) throw failure;
-      if (images.length === 0) {
-        throw new ApiError('The model returned no image.', 502, detailFor(res));
-      }
-      const result: ImageResult = { created, images, usage, generationId };
-      if (failure instanceof OrError) result.error = failure;
-      return result;
     },
-
     async speech(body, opts) {
       const format = body.response_format ?? defaultSpeechFormat(body.model);
       const wire = withNoRetention({ ...body, response_format: format }, opts.run.keyId, [
@@ -765,6 +909,7 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
         value: bytes,
         res,
         startedAt,
+        settle,
       } = (await send(spec, (r) => r.arrayBuffer())) as Delivered<ArrayBuffer>;
       const contentType = parseContentType(res.headers.get('Content-Type'));
       const mimeType = contentType.type || (format === 'pcm' ? 'audio/pcm' : 'audio/mpeg');
@@ -772,28 +917,32 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
       const channels = Number(contentType.params['channels']);
       const generationId = res.headers.get('X-Generation-Id');
 
-      // Raw bytes carry no cost (§4.3): estimate from the most expensive endpoint, or book it as unknown.
-      const estimate = spec.bill.allFree
-        ? 0
-        : await core.models
-            .estimate({
-              kind: 'speech',
-              model: body.model,
-              characters: [...body.input].length,
-              bytes: new TextEncoder().encode(body.input).length,
-            })
-            .catch(() => null);
-      const usage: Usage = {
-        model: body.model,
-        promptTokens: 0,
-        completionTokens: 0,
-        costUsd: estimate ?? 0,
-        costEstimated: estimate !== null && !spec.bill.allFree,
-        latencyMs: Date.now() - startedAt,
-      };
-      if (estimate === null) usage.costUnknown = true;
-      if (generationId) usage.generationId = generationId;
-      opts.run.addUsage(usage);
+      try {
+        // Raw bytes carry no cost (§4.3): estimate from the most expensive endpoint, or book it as unknown.
+        const estimate = spec.bill.allFree
+          ? 0
+          : await core.models
+              .estimate({
+                kind: 'speech',
+                model: body.model,
+                characters: [...body.input].length,
+                bytes: new TextEncoder().encode(body.input).length,
+              })
+              .catch(() => null);
+        const usage: Usage = {
+          model: body.model,
+          promptTokens: 0,
+          completionTokens: 0,
+          costUsd: estimate ?? 0,
+          costEstimated: estimate !== null && !spec.bill.allFree,
+          latencyMs: Date.now() - startedAt,
+        };
+        if (estimate === null) usage.costUnknown = true;
+        if (generationId) usage.generationId = generationId;
+        opts.run.addUsage(usage);
+      } finally {
+        settle();
+      }
 
       const result: SpeechResult = {
         blob: new Blob([bytes], { type: mimeType }),
@@ -833,33 +982,41 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
         [body.model],
       );
       const spec = callSpec(opts, `${API_BASE}/audio/transcriptions`, wire, 'paid', [body.model]);
-      const { value, res, startedAt } = await postJson<Record<string, unknown>>(spec, (b) =>
+      const { value, res, startedAt, settle } = await postJson<Record<string, unknown>>(spec, (b) =>
         isString(b['text']),
       );
       const usage = isRecord(value['usage']) ? (value['usage'] as WireUsage) : null;
-      await reportUsage(opts.run, {
-        model: body.model,
-        usage,
-        latencyMs: Date.now() - startedAt,
-        generationId: res.headers.get('X-Generation-Id'),
-        allFree: spec.bill.allFree,
-      });
+      try {
+        await reportUsage(opts.run, {
+          model: body.model,
+          usage,
+          latencyMs: Date.now() - startedAt,
+          generationId: res.headers.get('X-Generation-Id'),
+          allFree: spec.bill.allFree,
+        });
+      } finally {
+        settle();
+      }
       return normalizeTranscription(value, usage);
     },
 
     async decide(body, opts) {
       const wire = withNoRetention(body, opts.run.keyId, [body.model]);
       const spec = callSpec(opts, DECISIONS_URL, wire, 'paid', [body.model]);
-      const { value, res, startedAt } = await postJson<DecisionResponse>(spec, (b) =>
+      const { value, res, startedAt, settle } = await postJson<DecisionResponse>(spec, (b) =>
         isRecord(b['answers']),
       );
-      await reportUsage(opts.run, {
-        model: body.model,
-        usage: value.usage,
-        latencyMs: Date.now() - startedAt,
-        generationId: res.headers.get('X-Generation-Id') ?? value.id,
-        allFree: spec.bill.allFree,
-      });
+      try {
+        await reportUsage(opts.run, {
+          model: body.model,
+          usage: value.usage,
+          latencyMs: Date.now() - startedAt,
+          generationId: res.headers.get('X-Generation-Id') ?? value.id,
+          allFree: spec.bill.allFree,
+        });
+      } finally {
+        settle();
+      }
       return value;
     },
 
@@ -880,17 +1037,21 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
         }
         // No usage yet: the cost arrives with the completed status (VideoJobStatus.costUsd).
         const spec = callSpec(opts, `${API_BASE}/videos`, body, 'paid', [body.model]);
-        const { value } = await postJson<Record<string, unknown>>(spec, isVideoBody);
+        const { value, settle } = await postJson<Record<string, unknown>>(spec, isVideoBody);
+        settle(); // accepted (202): the tool hands the run off to the job right away
         return normalizeVideo(value);
       },
 
       async status(jobId, opts) {
         const value = await getJson<Record<string, unknown>>(
-          getSpec(
-            `${API_BASE}/videos/${encodeURIComponent(jobId)}`,
-            { keyId: opts.keyId },
-            opts.signal,
-          ),
+          {
+            ...getSpec(
+              `${API_BASE}/videos/${encodeURIComponent(jobId)}`,
+              { keyId: opts.keyId },
+              opts.signal,
+            ),
+            timeoutMs: STATUS_TIMEOUT_MS,
+          },
           isVideoBody,
         );
         return normalizeVideo(value);
@@ -904,10 +1065,11 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
           { keyId: opts.keyId },
           opts.signal,
         );
-        const { value } = (await send(spec, async (res) => {
+        const { value, settle } = (await send(spec, async (res) => {
           const type = parseContentType(res.headers.get('Content-Type')).type || 'video/mp4';
           return new Blob([await res.arrayBuffer()], { type });
         })) as Delivered<Blob>;
+        settle();
         return value;
       },
     },
