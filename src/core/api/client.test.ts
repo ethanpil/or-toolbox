@@ -370,6 +370,56 @@ describe('retries', () => {
   });
 });
 
+describe('onSend', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('fires right before each fetch: after the free-model wait and after a retry backoff', async () => {
+    const s = setup([json(error429Plain, 429), json(chatRecorded)], {
+      options: { retry: { random: () => 0.5 } },
+    });
+    let freeSlot!: () => void;
+    s.throttle.acquire.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (freeSlot = resolve)),
+    );
+    const sent: { attempt: number; at: number; fetched: number }[] = [];
+    const done = s.client.chat(
+      { ...chatBody, model: 'liquid/lfm-2.5-2.6b:free' },
+      {
+        run: s.run,
+        onSend: (attempt) =>
+          sent.push({ attempt, at: Date.now(), fetched: s.fetch.mock.calls.length }),
+      },
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sent).toEqual([]); // still queued for a free-model slot
+    const start = Date.now();
+    freeSlot();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([{ attempt: 1, at: start, fetched: 0 }]);
+    await vi.advanceTimersByTimeAsync(499); // the 429's backoff (500 ms)
+    expect(sent).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sent[1]).toEqual({ attempt: 2, at: start + 500, fetched: 1 });
+    await expect(done).resolves.toMatchObject({ id: chatRecorded.id });
+  });
+
+  it('fires for streams too, and not at all when the call is stopped before sending', async () => {
+    const stream = setup([sse(chatStreamText)]);
+    const onSend = vi.fn();
+    await stream.client.chatStream(chatBody, { run: stream.run, onSend, onEvent: () => undefined });
+    expect(onSend).toHaveBeenCalledWith(1);
+
+    const stopped = setup([json(chatRecorded)]);
+    const never = vi.fn();
+    stopped.run.abort();
+    await expect(
+      stopped.client.chat(chatBody, { run: stopped.run, onSend: never }),
+    ).rejects.toThrow();
+    expect(never).not.toHaveBeenCalled();
+  });
+});
+
 describe('free-model throttle', () => {
   it('throttles requests that may hit a :free model, once per attempt', async () => {
     const s = setup([json(chatRecorded), json(chatRecorded), json(chatRecorded)]);

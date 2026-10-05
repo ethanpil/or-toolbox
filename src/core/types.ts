@@ -579,6 +579,11 @@ export interface CallOptions {
   signal?: AbortSignal;
   /** Retries on 429/5xx/network with backoff, honouring `error.metadata.retry_after_seconds`. Default true (never after a stream's first byte). */
   retry?: boolean;
+  /**
+   * Called right before each attempt is actually sent (each fetch), after the `:free` throttle's wait and after a
+   * retry's backoff; `attempt` counts from 1. Time "first token" and "total" from it, not from the call.
+   */
+  onSend?: (attempt: number) => void;
 }
 
 /**
