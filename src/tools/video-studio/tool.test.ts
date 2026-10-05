@@ -382,8 +382,9 @@ describe('Video studio', () => {
     await t.runners[0]!.trigger();
     tool.applyState({ prompt: '', settings: oneStepSequence() });
     await t.runners[0]!.trigger();
-    await vi.waitFor(async () =>
-      expect(await t.core.jobs.list({ tool: 'video-studio' })).toHaveLength(3),
+    await vi.waitFor(
+      async () => expect(await t.core.jobs.list({ tool: 'video-studio' })).toHaveLength(3),
+      { timeout: 5000 }, // the sequence's step starts after trigger() returns
     );
     const jobs = await t.core.jobs.list({ tool: 'video-studio' });
     const notify = (sequence: boolean) =>
@@ -396,6 +397,12 @@ describe('Video studio', () => {
         .map((job) => job.notify);
     expect(notify(false)).toEqual([false, true]);
     expect(notify(true)).toEqual([false]);
+    // Let the sequence finish: a late write of it would land in the next test's database as one under way.
+    await vi.waitFor(
+      async () =>
+        expect((await t.ctx.state.get<{ status: string }>(SEQUENCE_KEY))?.status).toBe('done'),
+      { timeout: 10_000 },
+    );
   });
 
   it.each([
@@ -422,11 +429,56 @@ describe('Video studio', () => {
     });
     tool.applyState({ prompt: '', settings: oneStepSequence() });
     await t.runners[0]!.trigger();
+    // The step starts after trigger() returns; a loaded machine can take more than the default second.
+    await vi.waitFor(
+      async () => {
+        const [job] = await t.core.jobs.list({ tool: 'video-studio' });
+        expect(job?.failureKind).toBe(kind);
+        const stored = await t.ctx.state.get<{ slots: { status: string }[] }>(SEQUENCE_KEY);
+        expect(stored?.slots[0]).toMatchObject({ status: 'failed', spentUsd, spentEstimated });
+      },
+      { timeout: 5000 },
+    );
+  });
+
+  it("writes only this tab's edits over a stored run: a cap lowered elsewhere stays, and the form follows it", async () => {
+    const { createRun } = await import('./sequence');
+    const { SEQUENCE_KEY } = await import('./store');
+    const tool = await mount();
+    const stored = {
+      ...createRun({
+        id: 'seq',
+        spec: {
+          ...DEFAULT_SETTINGS.sequence,
+          capUsd: 0.5,
+          steps: [{ id: 'a', prompt: 'One', imageRole: 'references' as const }],
+        },
+        model: GROK,
+        format: DEFAULT_SETTINGS.format,
+        sourceClipId: null,
+        now: 1,
+      }),
+      status: 'paused' as const,
+    };
+    await t.ctx.state.set(SEQUENCE_KEY, stored);
+    await vi.waitFor(() =>
+      expect((tool.getState().settings['sequence'] as { capUsd: number }).capUsd).toBe(0.5),
+    );
+    // Another tab lowers the cap; this tab's form follows.
+    await t.ctx.state.set(SEQUENCE_KEY, { ...stored, spec: { ...stored.spec, capUsd: 0.1 } });
+    await vi.waitFor(() =>
+      expect((tool.getState().settings['sequence'] as { capUsd: number }).capUsd).toBe(0.1),
+    );
+    // This tab edits a prompt: only the prompt is written.
+    const prompt = $<HTMLTextAreaElement>('seq-step-prompt');
+    prompt.value = 'One, better';
+    prompt.dispatchEvent(new Event('input'));
     await vi.waitFor(async () => {
-      const [job] = await t.core.jobs.list({ tool: 'video-studio' });
-      expect(job?.failureKind).toBe(kind);
-      const stored = await t.ctx.state.get<{ slots: { status: string }[] }>(SEQUENCE_KEY);
-      expect(stored?.slots[0]).toMatchObject({ status: 'failed', spentUsd, spentEstimated });
+      const now = await t.ctx.state.get<{ spec: { capUsd: number; steps: { prompt: string }[] } }>(
+        SEQUENCE_KEY,
+      );
+      expect(now?.spec.steps[0]?.prompt).toBe('One, better');
+      expect(now?.spec.capUsd).toBe(0.1);
     });
   });
 
@@ -469,56 +521,17 @@ describe('Video studio', () => {
     });
     expect(t.status()).toBe('Not started: nothing was sent.');
     expect(submits).toEqual([]);
-    expect(await t.ctx.state.get(SEQUENCE_KEY)).toBeUndefined();
+    // (Earlier tests' tool instances keep running into this database, so look for this sequence by its steps.)
+    const stored = await t.ctx.state.get<{ spec: { steps: { id: string }[] } }>(SEQUENCE_KEY);
+    expect(stored?.spec.steps.map((step) => step.id)).not.toEqual(['s0', 's1', 's2']);
     expect(await t.core.history.query({ tool: 'video-studio' })).toEqual([]);
 
     confirm.mockClear();
     confirm.mockResolvedValue(true);
     await t.runners[0]!.trigger();
-    await vi.waitFor(() => expect(submits).toHaveLength(3));
+    await vi.waitFor(() => expect(submits).toHaveLength(3), { timeout: 5000 });
     expect(confirm).toHaveBeenCalledOnce(); // the Start question; no step asked
     const runs = await t.core.history.query({ tool: 'video-studio' });
     expect(runs.map((run) => run.reservedUsd)).toEqual([0.05, 0.05, 0.05]);
-  });
-
-  it("writes only this tab's edits over a stored run: a cap lowered elsewhere stays, and the form follows it", async () => {
-    const { createRun } = await import('./sequence');
-    const { SEQUENCE_KEY } = await import('./store');
-    const tool = await mount();
-    const stored = {
-      ...createRun({
-        id: 'seq',
-        spec: {
-          ...DEFAULT_SETTINGS.sequence,
-          capUsd: 0.5,
-          steps: [{ id: 'a', prompt: 'One', imageRole: 'references' as const }],
-        },
-        model: GROK,
-        format: DEFAULT_SETTINGS.format,
-        sourceClipId: null,
-        now: 1,
-      }),
-      status: 'paused' as const,
-    };
-    await t.ctx.state.set(SEQUENCE_KEY, stored);
-    await vi.waitFor(() =>
-      expect((tool.getState().settings['sequence'] as { capUsd: number }).capUsd).toBe(0.5),
-    );
-    // Another tab lowers the cap; this tab's form follows.
-    await t.ctx.state.set(SEQUENCE_KEY, { ...stored, spec: { ...stored.spec, capUsd: 0.1 } });
-    await vi.waitFor(() =>
-      expect((tool.getState().settings['sequence'] as { capUsd: number }).capUsd).toBe(0.1),
-    );
-    // This tab edits a prompt: only the prompt is written.
-    const prompt = $<HTMLTextAreaElement>('seq-step-prompt');
-    prompt.value = 'One, better';
-    prompt.dispatchEvent(new Event('input'));
-    await vi.waitFor(async () => {
-      const now = await t.ctx.state.get<{ spec: { capUsd: number; steps: { prompt: string }[] } }>(
-        SEQUENCE_KEY,
-      );
-      expect(now?.spec.steps[0]?.prompt).toBe('One, better');
-      expect(now?.spec.capUsd).toBe(0.1);
-    });
   });
 });
