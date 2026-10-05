@@ -27,7 +27,7 @@ import type {
 } from '../types';
 import { ApiError, InvalidInputError, KeyLockedError, OrError, userMessage } from '../errors';
 import { getDb } from '../storage/db';
-import { MAX_TIMEOUT_MS, isFiniteNumber, sleep } from '../util';
+import { MAX_TIMEOUT_MS, isFiniteNumber, sleep, webLocks } from '../util';
 import { getTool } from '../../tools/registry';
 
 export const DEFAULT_POLL_MS = 5000;
@@ -64,14 +64,8 @@ function isPermanent(error: unknown): boolean {
   );
 }
 
-/** The Web Locks API, or null where it is missing or refused. */
-export function webLocks(): LockManager | null {
-  try {
-    return typeof navigator !== 'undefined' && navigator.locks ? navigator.locks : null;
-  } catch {
-    return null;
-  }
-}
+/** Moved to util.ts; re-exported for the modules that import it from here. */
+export { webLocks };
 
 /** Records stored before `failureKind` existed read as null. */
 const normalize = (job: JobRecord): JobRecord => ({ ...job, failureKind: job.failureKind ?? null });

@@ -3,19 +3,25 @@
  * messages with their attachments as content parts, replies as text), trimmed from the oldest end when they would
  * not fit the model's context window, plus the sampling, reasoning, fallback and PDF options.
  *
- * Token counts come from the shared approximation (src/core/attachments/request.ts): deliberately high, they
- * decide trimming, the `max_tokens` clamp and the cost estimate, never billing.
+ * Token counts and the context fit come from the shared module (src/core/tokens.ts, attachments from
+ * src/core/attachments/request.ts): deliberately high, they decide trimming, the `max_tokens` clamp and the cost
+ * estimate, never billing.
  */
 import type { ChatMessage, ChatRequest, ContentPart } from '../../core/api/types';
 import { type AttachmentRef, toContentPart } from '../../core/attachments/attachments';
 import {
-  approxTokens,
   attachmentTokens,
-  MESSAGE_OVERHEAD,
   type Modality,
   neededInput,
   needsParser,
 } from '../../core/attachments/request';
+import {
+  approxTokens,
+  type ContextLimits,
+  fitContext,
+  MESSAGE_OVERHEAD,
+  promptBudget,
+} from '../../core/tokens';
 import type { ChatNode } from './thread';
 
 export interface RequestOptions {
@@ -52,9 +58,6 @@ export interface BuiltRequest {
   /** The message being answered does not fit the context window even on its own: do not send. */
   tooLong: boolean;
 }
-
-/** Output assumed by estimates and kept free in the context when Max tokens is not set. */
-export const DEFAULT_OUTPUT_TOKENS = 4096;
 
 /** Tokens per message, counted again only when its text or a PDF's parser text changed. */
 const tokenCache = new WeakMap<ChatNode, { stamp: string; tokens: number }>();
@@ -151,33 +154,20 @@ export function buildRequest(
   const system = options.system.trim();
   const systemTokens = system ? approxTokens(system) + MESSAGE_OVERHEAD : 0;
   const tokens = turns.map(nodeTokens);
-  const outputCap =
-    options.maxCompletionTokens && options.maxCompletionTokens > 0
-      ? options.maxCompletionTokens
-      : Number.POSITIVE_INFINITY;
-  let maxTokens = options.maxTokens === null ? null : Math.min(options.maxTokens, outputCap);
-  const wanted = maxTokens ?? Math.min(outputCap, DEFAULT_OUTPUT_TOKENS);
-
-  let trimmed = 0;
-  let tooLong = false;
-  let completionTokens = wanted;
-  const context = options.contextLength;
-  if (context && context > 0) {
-    // Leave room for the answer and a margin for the approximation.
-    const budget =
-      Math.floor(context * 0.95) - Math.min(wanted, Math.floor(context / 2)) - systemTokens;
-    trimmed = trimToBudget(
-      tokens,
-      turns.map((node) => node.role),
-      budget,
-    );
-    const kept = tokens.slice(trimmed).reduce((sum, value) => sum + value, 0);
-    tooLong = kept > budget;
-    // The prompt and the answer together must fit the window.
-    const room = Math.max(1, context - systemTokens - kept);
-    if (maxTokens !== null) maxTokens = Math.min(maxTokens, room);
-    completionTokens = Math.min(wanted, room);
-  }
+  const limits: ContextLimits = {
+    context: options.contextLength,
+    maxTokens: options.maxTokens,
+    maxCompletionTokens: options.maxCompletionTokens ?? null,
+    fixed: systemTokens,
+  };
+  // Oldest messages go first until the rest fits, with room for the answer and a margin for the approximation.
+  const trimmed = trimToBudget(
+    tokens,
+    turns.map((node) => node.role),
+    promptBudget(limits),
+  );
+  const keptTokens = tokens.slice(trimmed).reduce((sum, value) => sum + value, 0);
+  const { tooLong, completionTokens, maxTokens } = fitContext({ ...limits, prompt: keptTokens });
   const kept = turns.slice(trimmed);
   const modalities = options.inputModalities;
   const takes = (modality: string): boolean => !modalities || modalities.includes(modality);
@@ -213,7 +203,7 @@ export function buildRequest(
   return {
     body,
     trimmed,
-    promptTokens: systemTokens + tokens.slice(trimmed).reduce((sum, value) => sum + value, 0),
+    promptTokens: systemTokens + keptTokens,
     completionTokens,
     tooLong,
   };

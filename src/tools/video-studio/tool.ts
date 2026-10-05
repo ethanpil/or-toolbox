@@ -13,27 +13,24 @@
  * - **Persisted state** (`ctx.state`, JSON only): the timeline and the sequence run, written under one Web Lock
  *   (store.ts). Form edits reach a stored run field by field (only what this tab's user changed), and every change
  *   of the stored run, here or in another tab, is read back into the form.
- * - **Sequences:** sequence.ts holds the rules, sequence-runner.ts runs them. Start asks ONE budget question for
- *   the whole sequence (its total estimate, with the cap); its steps then begin their runs without a dialog of
- *   their own (each still reserves its estimate). A Re-run asks for itself.
+ * - **Sequences:** sequence.ts holds the rules, sequence-runner.ts runs them. Start approves the whole sequence
+ *   once (`runs.approveGroup`: ONE budget question for its total estimate, with the cap); its steps then begin
+ *   under that approval without a dialog of their own (each still reserves its estimate). A Re-run asks for itself.
  * - **Leave guard:** generated clips and joined videos are session results; running jobs and a running sequence
  *   are held work.
  */
 import type { RawVideoModel, VideoRequest } from '../../core/api/types';
 import {
-  BudgetBlockedError,
-  FreeOnlyError,
   InvalidInputError,
   isOutcomeUnknown,
-  KeyLockedError,
-  NoKeyError,
   OrError,
+  RunCancelledError,
   userMessage,
 } from '../../core/errors';
 import { isFinalState, webLocks } from '../../core/jobs';
 import { toDataUrl } from '../../core/media/image';
 import { captureFrame, getVideoMetadata } from '../../core/media/video';
-import type { BudgetCheck, JobRecord, RunHandle, Usage } from '../../core/types';
+import type { JobRecord, RunHandle, Usage } from '../../core/types';
 import { bindJobList, jobList } from '../../ui/components/job-list';
 import type { ReferenceInput } from '../../ui/components/reference-picker';
 import { switchField } from '../../ui/components/switch-field';
@@ -46,7 +43,6 @@ import { isStop, presentError } from '../../ui/feedback/errors';
 import { formatBytes, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
-import { budgetConfirm } from '../../ui/shell/budget-confirm';
 import type { SendItem, ToolContext, ToolInstance } from '../../ui/tool/types';
 import { clipPanel, VIDEO_TYPES } from './clip-panel';
 import { type ClipMedia, createClipMedia } from './clip-media';
@@ -470,51 +466,6 @@ export function setup(ctx: ToolContext): ToolInstance {
     runningJobs = open.length;
     syncHold();
   };
-
-  // --- budgets: one question for a whole sequence ------------------------------------------------------------
-  /** Sequences whose steps are beginning their runs now under the Start confirmation (by run id). */
-  const preApproved = new Map<string, number>();
-  ctx.runs.setConfirmHandler((check, spec) =>
-    spec.groupId && (preApproved.get(spec.groupId) ?? 0) > 0
-      ? Promise.resolve(true)
-      : budgetConfirm(check, spec),
-  );
-  /** The Start confirmation: every rule the total crosses, the total, the cap. */
-  const confirmSequence = (
-    check: BudgetCheck,
-    total: number | null,
-    count: number,
-    cap: number | null,
-  ): Promise<boolean> =>
-    confirmDialog({
-      title: 'Start this sequence?',
-      tone: 'warning',
-      icon: 'piggy-bank',
-      confirmLabel: 'Start sequence',
-      testId: 'seq-budget-confirm',
-      message: [
-        h('p', null, 'This sequence goes over a limit you set:'),
-        h(
-          'ul',
-          { class: 'mb-3' },
-          check.reasons.map((reason) => h('li', null, reason.message)),
-        ),
-        h(
-          'p',
-          { class: 'mb-1', 'data-testid': 'seq-budget-total' },
-          total === null
-            ? `${plural(count, 'clip')}; the cost cannot be estimated.`
-            : `About ${formatUsd(total)} for ${plural(count, 'clip')}, asked once for the whole sequence.`,
-        ),
-        h(
-          'p',
-          { class: 'mb-0 small text-body-secondary' },
-          cap === null
-            ? 'No spend cap: it runs every step.'
-            : `Spend cap ${formatUsd(cap)}: it stops before a step would pass it.`,
-        ),
-      ],
-    });
 
   // --- input zone -----------------------------------------------------------------------------------------
   const tabName = uid('video-tab');
@@ -1516,36 +1467,26 @@ export function setup(ctx: ToolContext): ToolInstance {
       dataUrls: (stepId) =>
         sequenceForm.images(stepId)?.dataUrls(IMAGE_ENCODING) ?? Promise.resolve([]),
     },
-    beginRun: async (input, signal) => {
-      // A step under the Start confirmation begins without a dialog of its own; a Re-run asks for itself.
-      if (input.preApproved)
-        preApproved.set(input.run.id, (preApproved.get(input.run.id) ?? 0) + 1);
-      try {
-        return await ctx.beginRun(
-          {
-            model: input.run.model,
-            title: input.title,
-            prompt: '',
-            // History reopens the sequence as it was started.
-            settings: settingsJson({
-              ...DEFAULT_SETTINGS,
-              tab: 'sequence',
-              format: input.run.format,
-              sequence: input.run.spec,
-            }),
-            estimateUsd: input.estimateUsd,
-            groupId: input.run.id,
-          },
-          signal,
-        );
-      } finally {
-        if (input.preApproved) {
-          const left = (preApproved.get(input.run.id) ?? 1) - 1;
-          if (left > 0) preApproved.set(input.run.id, left);
-          else preApproved.delete(input.run.id);
-        }
-      }
-    },
+    // A step begins under the sequence's approval (no dialog of its own); a Re-run asks for itself.
+    beginRun: (input, signal) =>
+      ctx.beginRun(
+        {
+          model: input.run.model,
+          title: input.title,
+          prompt: '',
+          // History reopens the sequence as it was started.
+          settings: settingsJson({
+            ...DEFAULT_SETTINGS,
+            tab: 'sequence',
+            format: input.run.format,
+            sequence: input.run.spec,
+          }),
+          estimateUsd: input.estimateUsd,
+          groupId: input.run.id,
+          useGroupApproval: input.preApproved,
+        },
+        signal,
+      ),
     submit: submitJob,
     claimAlive: async (slot) => {
       if (!slot.claimedBy) return false;
@@ -1586,6 +1527,8 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     await flushEdits();
     const stored = await store.sequence();
+    /** A finished sequence this one replaces. */
+    const previousId = stored?.id ?? null;
     if (isActive(stored)) {
       runChanged(stored);
       ui.status(
@@ -1637,18 +1580,22 @@ export function setup(ctx: ToolContext): ToolInstance {
       now: Date.now(),
     });
 
-    // One budget question for the whole sequence; its steps then run without dialogs of their own.
-    const key = ctx.keys.resolve(tool);
-    if (!key) throw new NoKeyError();
-    if (!ctx.keys.lock.unlocked()) throw new KeyLockedError();
-    if (ctx.settings.get().freeOnly && !ctx.models.isFree(model)) throw new FreeOnlyError([model]);
-    const total = await sequenceTotal(model, spec);
-    const check = await ctx.budgets.check({ keyId: key.id, estimateUsd: total });
-    if (check.verdict === 'block') throw new BudgetBlockedError(check);
-    if (
-      check.verdict === 'confirm' &&
-      !(await confirmSequence(check, total, created.slots.length, spec.capUsd))
-    ) {
+    // One budget question for the whole sequence; its steps then begin under the approval, without dialogs.
+    try {
+      await ctx.runs.approveGroup({
+        tool,
+        groupId: created.id,
+        label: `Video sequence: ${plural(created.slots.length, 'clip')}`,
+        models: [model],
+        runs: created.slots.length,
+        estimateUsd: await sequenceTotal(model, spec),
+        note:
+          spec.capUsd === null
+            ? 'No spend cap: it runs every step.'
+            : `Spend cap ${formatUsd(spec.capUsd)}: it stops before a step would pass it.`,
+      });
+    } catch (error) {
+      if (!(error instanceof RunCancelledError)) throw error;
       ui.status('Not started: nothing was sent.');
       return;
     }
@@ -1660,10 +1607,13 @@ export function setup(ctx: ToolContext): ToolInstance {
       return created;
     });
     if (!saved) {
+      await ctx.runs.releaseGroup(created.id);
       runChanged(await store.sequence());
       ui.status('Another tab started a sequence meanwhile; nothing was started here.');
       return;
     }
+    // The finished sequence this one replaces no longer needs its approval.
+    if (previousId) void ctx.runs.releaseGroup(previousId).catch(() => undefined);
     pending = {};
     runChanged(saved);
     ui.status(`Sequence started: ${plural(saved.slots.length, 'step')}.`);
@@ -1715,7 +1665,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       if (!sure) return;
     }
     pending = {};
+    const cleared = run?.id;
     await saveSequence(() => null);
+    // Steps not sent yet are dropped: nothing more begins under the old approval.
+    if (cleared) void ctx.runs.releaseGroup(cleared).catch(() => undefined);
     ui.status('Ready for a new sequence.');
   };
 

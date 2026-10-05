@@ -126,7 +126,10 @@ export interface RunnerDeps {
     problem(stepId: string): string | null;
     dataUrls(stepId: string): Promise<string[]>;
   };
-  /** `ctx.beginRun` for a step; `preApproved`: the Start confirmation covered it (no dialog of its own). */
+  /**
+   * `ctx.beginRun` for a step; `preApproved`: the sequence's approval at Start covers it (it begins with
+   * `useGroupApproval`, no dialog of its own). A Re-run is not covered: it asks for itself.
+   */
   beginRun(
     input: {
       run: SequenceRun;

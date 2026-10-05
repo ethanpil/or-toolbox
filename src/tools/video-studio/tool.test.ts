@@ -382,8 +382,9 @@ describe('Video studio', () => {
     await t.runners[0]!.trigger();
     tool.applyState({ prompt: '', settings: oneStepSequence() });
     await t.runners[0]!.trigger();
-    await vi.waitFor(async () =>
-      expect(await t.core.jobs.list({ tool: 'video-studio' })).toHaveLength(3),
+    await vi.waitFor(
+      async () => expect(await t.core.jobs.list({ tool: 'video-studio' })).toHaveLength(3),
+      { timeout: 5000 }, // the sequence's step starts after trigger() returns
     );
     const jobs = await t.core.jobs.list({ tool: 'video-studio' });
     const notify = (sequence: boolean) =>
@@ -396,6 +397,12 @@ describe('Video studio', () => {
         .map((job) => job.notify);
     expect(notify(false)).toEqual([false, true]);
     expect(notify(true)).toEqual([false]);
+    // Let the sequence finish: a late write of it would land in the next test's database as one under way.
+    await vi.waitFor(
+      async () =>
+        expect((await t.ctx.state.get<{ status: string }>(SEQUENCE_KEY))?.status).toBe('done'),
+      { timeout: 10_000 },
+    );
   });
 
   it.each([
@@ -422,12 +429,16 @@ describe('Video studio', () => {
     });
     tool.applyState({ prompt: '', settings: oneStepSequence() });
     await t.runners[0]!.trigger();
-    await vi.waitFor(async () => {
-      const [job] = await t.core.jobs.list({ tool: 'video-studio' });
-      expect(job?.failureKind).toBe(kind);
-      const stored = await t.ctx.state.get<{ slots: { status: string }[] }>(SEQUENCE_KEY);
-      expect(stored?.slots[0]).toMatchObject({ status: 'failed', spentUsd, spentEstimated });
-    });
+    // The step starts after trigger() returns; a loaded machine can take more than the default second.
+    await vi.waitFor(
+      async () => {
+        const [job] = await t.core.jobs.list({ tool: 'video-studio' });
+        expect(job?.failureKind).toBe(kind);
+        const stored = await t.ctx.state.get<{ slots: { status: string }[] }>(SEQUENCE_KEY);
+        expect(stored?.slots[0]).toMatchObject({ status: 'failed', spentUsd, spentEstimated });
+      },
+      { timeout: 5000 },
+    );
   });
 
   it("writes only this tab's edits over a stored run: a cap lowered elsewhere stays, and the form follows it", async () => {
@@ -469,5 +480,58 @@ describe('Video studio', () => {
       expect(now?.spec.steps[0]?.prompt).toBe('One, better');
       expect(now?.spec.capUsd).toBe(0.1);
     });
+  });
+
+  it('asks ONE budget question at Start for the whole sequence; a declined Start sends nothing, steps ask nothing', async () => {
+    const tool = await mount();
+    // Each 1 s step ($0.05) is over the per-run threshold: only the sequence's approval keeps them quiet.
+    t.core.settings.update((draft) => {
+      draft.budgets = { ...draft.budgets, mode: 'warn', perRunUsd: 0.04 };
+    });
+    const confirm = vi.fn().mockResolvedValue(false);
+    t.core.runs.setConfirmHandler(confirm);
+    tool.applyState({
+      prompt: '',
+      settings: settingsJson({
+        ...DEFAULT_SETTINGS,
+        tab: 'sequence',
+        format: { ...DEFAULT_SETTINGS.format, duration: 1 },
+        sequence: {
+          ...DEFAULT_SETTINGS.sequence,
+          mode: 'independent',
+          steps: ['One', 'Two', 'Three'].map((prompt, i) => ({
+            id: `s${i}`,
+            prompt,
+            imageRole: 'references' as const,
+          })),
+        },
+      }),
+    });
+
+    await t.runners[0]!.trigger();
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm.mock.calls[0]![1]).toMatchObject({
+      kind: 'group',
+      group: {
+        label: 'Video sequence: 3 clips',
+        models: [GROK],
+        runs: 3,
+        note: 'No spend cap: it runs every step.',
+      },
+    });
+    expect(t.status()).toBe('Not started: nothing was sent.');
+    expect(submits).toEqual([]);
+    // (Earlier tests' tool instances keep running into this database, so look for this sequence by its steps.)
+    const stored = await t.ctx.state.get<{ spec: { steps: { id: string }[] } }>(SEQUENCE_KEY);
+    expect(stored?.spec.steps.map((step) => step.id)).not.toEqual(['s0', 's1', 's2']);
+    expect(await t.core.history.query({ tool: 'video-studio' })).toEqual([]);
+
+    confirm.mockClear();
+    confirm.mockResolvedValue(true);
+    await t.runners[0]!.trigger();
+    await vi.waitFor(() => expect(submits).toHaveLength(3), { timeout: 5000 });
+    expect(confirm).toHaveBeenCalledOnce(); // the Start question; no step asked
+    const runs = await t.core.history.query({ tool: 'video-studio' });
+    expect(runs.map((run) => run.reservedUsd)).toEqual([0.05, 0.05, 0.05]);
   });
 });

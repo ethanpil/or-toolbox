@@ -385,20 +385,21 @@ test.describe('Video studio', () => {
 
     // Declined: nothing is stored or sent.
     await page.getByTestId('seq-start').click();
-    const dialog = page.getByTestId('seq-budget-confirm');
+    const dialog = page.getByTestId('budget-dialog');
     await expect(dialog).toBeVisible();
-    await expect(dialog.getByTestId('seq-budget-total')).toHaveText(
-      'About $0.45 for 3 clips, asked once for the whole sequence.',
+    await expect(dialog.getByTestId('budget-group')).toContainText('Video sequence: 3 clips');
+    await expect(dialog.getByTestId('budget-estimate')).toHaveText('≈ $0.45');
+    await expect(dialog.getByTestId('budget-note')).toHaveText(
+      'Spend cap $2.00: it stops before a step would pass it.',
     );
-    await expect(dialog).toContainText('Spend cap $2.00');
-    await dialog.getByTestId('dialog-cancel').click();
+    await dialog.getByTestId('budget-cancel').click();
     await expect(page.getByTestId('tool-status')).toHaveText('Not started: nothing was sent.');
     await expect(page.getByTestId('seq-progress')).toBeHidden();
     expect(jobs.submits()).toEqual([]);
 
     // Accepted: three steps, no per-step dialog.
     await page.getByTestId('seq-start').click();
-    await page.getByTestId('seq-budget-confirm').getByTestId('dialog-confirm').click();
+    await page.getByTestId('budget-dialog').getByTestId('budget-confirm').click();
     await expect(page.locator('[data-testid="seq-slot"][data-status="done"]')).toHaveCount(3, {
       timeout: 120_000,
     });

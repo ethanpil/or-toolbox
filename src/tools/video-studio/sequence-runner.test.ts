@@ -29,7 +29,7 @@ const SEEDANCE = { ...GROK, id: 'seedance', name: 'Seedance', lastFrame: true };
 
 function memoryState(): ToolStateStore {
   const data = new Map<string, unknown>();
-  return {
+  const store: ToolStateStore = {
     get: <T>(key: string) => Promise.resolve(structuredClone(data.get(key)) as T | undefined),
     set: (key, value) => {
       data.set(key, JSON.parse(JSON.stringify(value)));
@@ -40,7 +40,16 @@ function memoryState(): ToolStateStore {
       return Promise.resolve();
     },
     keys: () => Promise.resolve([...data.keys()]),
+    update: async <T>(key: string, fn: (current: T | undefined) => unknown) => {
+      const current = await store.get<T>(key);
+      const next = (await fn(current)) as T | undefined;
+      if (next === current) return current;
+      if (next === undefined) await store.delete(key);
+      else await store.set(key, next);
+      return next;
+    },
   };
+  return store;
 }
 
 const spec = (patch: Partial<SequenceSpec> = {}): SequenceSpec => ({

@@ -8,7 +8,8 @@
  * - Retries follow `RETRY RULES` below: a retry must never make the user pay twice. At most 3 attempts, with
  *   full-jitter backoff, or exactly `error.metadata.retry_after_seconds` when given (`Retry-After` is unreadable,
  *   §12.3). Streams are never retried once their response started.
- * - `:free` models are throttled client-side to 20 requests per rolling minute (queued, not failed).
+ * - `:free` models are throttled client-side to 20 requests per rolling minute (queued, not failed). A call's
+ *   `onSend` fires right before each fetch, after that wait and after any retry backoff (timing starts there).
  * - Keys with `noRetention` add `provider.data_collection: "deny"` to chat, decisions, TTS and STT unless every
  *   model of the request is free: free endpoints are training-allowed, so `deny` turns a free request into a 404
  *   (§0, §2.9). `/images` and `/videos` do not accept the field.
@@ -182,6 +183,8 @@ interface Spec {
   free: boolean;
   /** For runs: the model usage is booked to, and whether every model is free (then nothing can cost). */
   bill?: { model: string; allFree: boolean };
+  /** `CallOptions.onSend`: right before each fetch. */
+  onSend?: ((attempt: number) => void) | undefined;
 }
 
 interface Delivered<T> {
@@ -322,6 +325,11 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
       throwIfAborted(spec.signal);
       if (spec.free) await throttle.acquire(spec.signal);
       throwIfAborted(spec.signal);
+      try {
+        spec.onSend?.(attempt);
+      } catch (error) {
+        console.error(error); // a caller's timing hook must never stop the request
+      }
       const startedAt = Date.now();
       /** True while OpenRouter may have accepted the request without answering it. */
       let reached = false;
@@ -504,6 +512,7 @@ export function createApiClient(core: CoreServices, options: ApiClientOptions = 
       retry: opts.retry !== false,
       free: models.some(isFreeModelId),
       bill: { model: models[0] ?? '', allFree: models.every(isFreeModelId) },
+      onSend: opts.onSend,
     };
   }
 
