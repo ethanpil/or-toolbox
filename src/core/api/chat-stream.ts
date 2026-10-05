@@ -8,6 +8,8 @@
  *   are kept as-is (never concatenated here) so a 6 MB chunk is not copied.
  * - An `error` object on a chunk is a mid-stream failure: `push` throws an ApiError with `detail.midStream`.
  * - `delta.annotations` (the PDF parser's text, citations) are collected for the result, not emitted as events.
+ * - `delta.refusal` (the model declines) is streamed as `text` and named in `result.refusal`; a reply that ends
+ *   with `finish_reason` `content_filter` or `error` and no content gets a `refusal` sentence (never `text`).
  */
 
 import type { ApiError } from '../errors';
@@ -42,6 +44,7 @@ export class ChatStreamAssembler {
   private provider: string | undefined;
   private metaSent = false;
   private text: string[] = [];
+  private refusal: string[] = [];
   private reasoning: string[] = [];
   private images: string[] = [];
   private audioChunks: string[] = [];
@@ -118,6 +121,7 @@ export class ChatStreamAssembler {
   }
 
   result(): ChatStreamResult {
+    const refusal = this.refusalText();
     return {
       id: this.id,
       model: this.model,
@@ -130,7 +134,20 @@ export class ChatStreamAssembler {
       finishReason: this.finishReason,
       usage: this.usage,
       ...(this.annotations.length > 0 ? { annotations: [...this.annotations] } : {}),
+      ...(refusal ? { refusal } : {}),
     };
+  }
+
+  private refusalText(): string | null {
+    if (this.refusal.length > 0) return this.refusal.join('');
+    const empty =
+      this.text.length === 0 && this.images.length === 0 && this.audioChunks.length === 0;
+    if (!empty) return null;
+    if (this.finishReason === 'content_filter') {
+      return 'The provider’s content filter blocked this reply.';
+    }
+    if (this.finishReason === 'error') return 'The model stopped with an error before answering.';
+    return null;
   }
 
   private delta(delta: Record<string, unknown>): void {
@@ -143,6 +160,12 @@ export class ChatStreamAssembler {
     if (isString(content) && content) {
       this.text.push(content);
       this.onEvent({ type: 'text', text: content });
+    }
+    const refusal = delta['refusal'];
+    if (isString(refusal) && refusal) {
+      this.refusal.push(refusal);
+      this.text.push(refusal);
+      this.onEvent({ type: 'text', text: refusal });
     }
     const images = delta['images'];
     if (Array.isArray(images)) {
