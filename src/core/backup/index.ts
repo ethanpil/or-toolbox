@@ -43,7 +43,7 @@ import { getDb, type KvEntry, type StoredStatsRow } from '../storage/db';
 import { deepMerge, jsonCopy } from '../settings/merge';
 import { migrateSettings, normalizeSettings } from '../settings/schema';
 import { statsKey } from '../stats';
-import { TOOL_STATE_PREFIX, prefixRange } from '../tool-state';
+import { TOOL_STATE_PREFIX, announceToolState, prefixRange } from '../tool-state';
 import { isFinalState } from '../jobs';
 import { isFiniteNumber, isPlainObject, isString, parseJsonSafe, stripUnsafeKeys } from '../util';
 import { version as APP_VERSION } from '../../../package.json';
@@ -848,6 +848,8 @@ export function createBackupService(core: CoreServices): BackupService {
           ...puts.jobs.map((j) => j.id),
         ]);
         for (const id of touched) core.bus.emit({ type: 'jobs-changed', id });
+        // Open tools read their state again, or an idle tab would later write its old state over the import.
+        announceToolState(core.bus, [...(replace ? toolKeys : []), ...puts.kv.map((e) => e.key)]);
       }
     };
 

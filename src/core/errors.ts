@@ -24,6 +24,7 @@ export type ErrorCode =
   | 'backup'
   | 'storage-full'
   | 'not-json-safe'
+  | 'state-reset'
   | 'invalid-input';
 
 /** Base class: `message` is always safe to show to the user. */
@@ -205,6 +206,19 @@ export class NotJsonSafeError extends OrError {
   override readonly name = 'NotJsonSafeError';
   constructor(message: string) {
     super('not-json-safe', message);
+  }
+}
+
+/**
+ * All data was reset (here or in another tab) and this page tried to store tool state it held from before: refused,
+ * so a reset is never undone by a page left open. Reloading the page starts from the reset state.
+ */
+export class StateResetError extends OrError {
+  override readonly name = 'StateResetError';
+  constructor(
+    message = 'All data was reset, and this page still holds data from before. It was not saved: reload the page to go on.',
+  ) {
+    super('state-reset', message);
   }
 }
 

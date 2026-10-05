@@ -560,6 +560,24 @@ describe('import modes', () => {
     );
   });
 
+  it('tells open tools about every tool state key it wrote or removed, so they read it again', async () => {
+    await core.toolState('chat').set('thread:local', { messages: [] });
+    const changed: string[] = [];
+    core.bus.on('tool-state-changed', ({ tool, key }) => changed.push(`${tool} ${key}`));
+    const toolState = [
+      { key: 'tool:video-studio:sequence', value: { steps: [] }, updatedAt: 5 },
+      { key: 'tool:chat:thread:a', value: { messages: ['hi'] }, updatedAt: 5 },
+    ];
+    await core.backup.import(backupBlob({ toolState }), { mode: 'merge' });
+    expect(changed.sort()).toEqual(['chat thread:a', 'video-studio sequence']);
+
+    changed.length = 0;
+    await core.backup.import(backupBlob({ toolState: toolState.slice(0, 1) }), {
+      mode: 'replace',
+    });
+    expect(changed.sort()).toEqual(['chat thread:a', 'chat thread:local', 'video-studio sequence']);
+  });
+
   it('stamps the format header', async () => {
     const file = await parse(await core.backup.export({ scope: 'settings', includeKeys: false }));
     expect(file).toMatchObject({

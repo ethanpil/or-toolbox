@@ -1,10 +1,60 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { NotJsonSafeError, createToolStateStore } from '.';
+import { createBus } from '../bus';
+import { StateResetError } from '../errors';
 import { getDb } from '../storage/db';
-import { resetDb } from '../testing/state-fakes';
+import { isolateChannels, resetDb, settle } from '../testing/state-fakes';
 
-beforeEach(resetDb);
+beforeEach(async () => {
+  isolateChannels();
+  await resetDb();
+});
+
+describe('after a data reset', () => {
+  it('refuses to store what the page held from before it, until the page reads the key again', async () => {
+    const bus = createBus();
+    const store = createToolStateStore('bot-to-bot', bus);
+    await store.set('conversation', { turns: 3 });
+    bus.emit({ type: 'data-reset' });
+
+    // An abort the reset caused writes its conversation back: refused.
+    await expect(store.set('conversation', { turns: 4 })).rejects.toBeInstanceOf(StateResetError);
+    await expect(store.update('conversation', () => ({ turns: 5 }))).resolves.toEqual({
+      turns: 5,
+    }); // update reads first
+
+    // Deletes always go through; a key the page never knew is new data.
+    await store.delete('draft');
+    await store.set('fresh', { new: true });
+    expect(await store.get('fresh')).toEqual({ new: true });
+  });
+
+  it('a read after the reset lets the key be written again, but never an object from before it', async () => {
+    const bus = createBus();
+    const store = createToolStateStore('chat', bus);
+    const thread = { id: 't1', messages: ['hi'] };
+    await store.set('thread:t1', thread);
+    await (await getDb()).clear('kv'); // what the reset does before it tells the pages
+    bus.emit({ type: 'data-reset' });
+
+    expect(await store.get('thread:t1')).toBeUndefined(); // e.g. a merge read before writing
+    thread.messages.push('a reply that was streaming');
+    await expect(store.set('thread:t1', thread)).rejects.toBeInstanceOf(StateResetError);
+    await expect(store.update('thread:t1', () => thread)).rejects.toBeInstanceOf(StateResetError);
+    await store.set('thread:t1', { id: 't1', messages: ['a new chat'] });
+    expect(await store.get('thread:t1')).toEqual({ id: 't1', messages: ['a new chat'] });
+  });
+
+  it('applies to resets made in another tab', async () => {
+    const store = createToolStateStore('data-extractor', createBus());
+    await store.get('schemas');
+    createBus().emit({ type: 'data-reset' }); // another tab
+    await settle(2);
+    await expect(store.set('schemas', [{ name: 'old' }])).rejects.toBeInstanceOf(StateResetError);
+    expect(await (await getDb()).get('kv', 'tool:data-extractor:schemas')).toBeUndefined();
+  });
+});
 
 describe('tool state store', () => {
   it('stores JSON values under tool:<id>:<key>', async () => {

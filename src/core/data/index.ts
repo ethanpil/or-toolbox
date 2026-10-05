@@ -7,7 +7,7 @@
 import type { CoreServices, DataService } from '../types';
 import { getDb } from '../storage/db';
 import { LS_KEYS, SS_KEYS, local, removeItem, session } from '../storage/local';
-import { TOOL_STATE_PREFIX, prefixRange } from '../tool-state';
+import { TOOL_STATE_PREFIX, announceToolState, prefixRange } from '../tool-state';
 
 export function createDataService(core: CoreServices): DataService {
   return {
@@ -31,6 +31,7 @@ export function createDataService(core: CoreServices): DataService {
       const db = await getDb();
       const tx = db.transaction(['runs', 'prompts', 'jobs', 'kv'], 'readwrite');
       const jobIds = await tx.objectStore('jobs').getAllKeys();
+      const stateKeys = await tx.objectStore('kv').getAllKeys(prefixRange(TOOL_STATE_PREFIX));
       await Promise.all([
         tx.objectStore('runs').clear(),
         tx.objectStore('prompts').clear(),
@@ -41,12 +42,14 @@ export function createDataService(core: CoreServices): DataService {
       core.bus.emit({ type: 'history-changed' });
       core.bus.emit({ type: 'prompts-changed', tool: 'all' });
       for (const id of jobIds) core.bus.emit({ type: 'jobs-changed', id });
+      announceToolState(core.bus, stateKeys); // open tools read their state again and show it gone
     },
 
     async resetEverything() {
       const db = await getDb();
       const tx = db.transaction(['runs', 'prompts', 'jobs', 'stats', 'kv'], 'readwrite');
       const jobIds = await tx.objectStore('jobs').getAllKeys();
+      const stateKeys = await tx.objectStore('kv').getAllKeys(prefixRange(TOOL_STATE_PREFIX));
       await Promise.all([
         tx.objectStore('runs').clear(),
         tx.objectStore('prompts').clear(),
@@ -63,8 +66,11 @@ export function createDataService(core: CoreServices): DataService {
       }
       core.bus.emit({ type: 'settings-changed' });
       for (const id of jobIds) core.bus.emit({ type: 'jobs-changed', id });
-      // Every service (here and in other tabs) drops its live work: runs abort without booking, polling stops.
+      // Every service (here and in other tabs) drops its live work: runs abort without booking, polling stops, and
+      // tool state stores refuse what their pages held from before.
       core.bus.emit({ type: 'data-reset' });
+      // Then open tools read their state again (after the reset, so that read counts as a fresh one).
+      announceToolState(core.bus, stateKeys);
     },
   };
 }

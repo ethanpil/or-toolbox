@@ -116,6 +116,21 @@ describe('deletion', () => {
     expect(events).toEqual(['keys-changed', 'settings-changed', 'jobs-changed', 'data-reset']);
   });
 
+  it('tells open pages which tool state was removed (after the reset itself), so they show it', async () => {
+    await core.toolState('video-studio').set('sequence', { id: 's1' });
+    const seen: string[] = [];
+    core.bus.on('data-reset', () => seen.push('data-reset'));
+    core.bus.on('tool-state-changed', ({ tool, key }) => seen.push(`${tool} ${key}`));
+
+    await core.data.deleteAllPromptsAndHistory();
+    expect(seen.sort()).toEqual(['chat thread', 'video-studio sequence']);
+
+    await core.toolState('chat').set('thread', { messages: [] });
+    seen.length = 0;
+    await core.data.resetEverything();
+    expect(seen).toEqual(['data-reset', 'chat thread']);
+  });
+
   it('stops live work: running runs abort without booking, polling stops, jobs report removal', async () => {
     core.settings.update((d) => {
       d.freeOnly = false;
