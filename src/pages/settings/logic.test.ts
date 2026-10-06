@@ -5,11 +5,14 @@ import type { ApiClient, Settings } from '../../core/types';
 import { tools } from '../../tools/registry';
 import { CAPABILITIES } from '../../tools/types';
 import {
+  appliedChanges,
   backupFilename,
+  deletionKeptNote,
   capabilityDefault,
   freeOnlyImpact,
   freeOnlyModel,
   isDestructiveChange,
+  keptNote,
   parseUsd,
   parseWhole,
   passphraseStrength,
@@ -128,6 +131,12 @@ describe('spendMeter', () => {
       reached: true,
       text: '$7.50 of $5.00 · limit reached',
     });
+  });
+
+  it('marks a spend that includes estimates with ≈, like Stats', () => {
+    expect(spendMeter(1.2, 5, 0.3)).toMatchObject({ text: '≈ $1.20 of $5.00 · $3.80 left' });
+    expect(spendMeter(5, 5, 5)).toMatchObject({ text: '≈ $5.00 of $5.00 · limit reached' });
+    expect(spendMeter(1.2, 5, 0)?.text).toBe('$1.20 of $5.00 · $3.80 left');
   });
 
   it('treats a zero limit as reached', () => {
@@ -272,9 +281,44 @@ describe('isDestructiveChange', () => {
       'Change 2 settings: budgets.mode, freeOnly',
       'Skip keys (enter the backup passphrase to import them)',
       'Turn on the backup’s passphrase lock',
+      'Keep 1 run and 2 jobs in progress, and the saved state of 1 tool',
     ]) {
       expect(isDestructiveChange(line), line).toBe(false);
     }
+  });
+});
+
+describe('deletionKeptNote', () => {
+  it('names the runs and the tools whose saved work stayed', () => {
+    expect(deletionKeptNote(0, [])).toBe('');
+    expect(deletionKeptNote(1, ['Video studio'])).toBe(
+      ' Kept because work is still in progress: 1 run, and the saved work of Video studio.',
+    );
+    expect(deletionKeptNote(2, ['Chat', 'Video studio', 'OCR'])).toBe(
+      ' Kept because work is still in progress: 2 runs, and the saved work of Chat, Video studio and OCR.',
+    );
+    // A job still open without a running run.
+    expect(deletionKeptNote(0, ['Video studio'])).toBe(
+      ' Kept because work is still in progress: the saved work of Video studio.',
+    );
+  });
+});
+
+describe('what Replace kept', () => {
+  const lines = [
+    'Replace 4 runs with 2 from the backup',
+    'Skip 1 job (invalid records)',
+    'Keep 1 run in progress',
+    'Settings unchanged',
+  ];
+
+  it('says what was kept after the restore', () => {
+    expect(keptNote(lines)).toBe(' Kept 1 run in progress.');
+    expect(keptNote(['Add 2 runs'])).toBe('');
+  });
+
+  it('does not count skips, kept work or unchanged settings as applied changes', () => {
+    expect(appliedChanges(lines)).toBe(1);
   });
 });
 

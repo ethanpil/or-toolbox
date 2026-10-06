@@ -21,7 +21,7 @@ import { presentError } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
 import { formatBytes, formatDateTime, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
-import { backupFilename, isDestructiveChange } from './logic';
+import { appliedChanges, backupFilename, isDestructiveChange, keptNote } from './logic';
 import {
   busy,
   card,
@@ -399,7 +399,7 @@ export function backupSection(core: CoreServices): SectionView {
             h(
               'li',
               null,
-              'Replace deletes runs and jobs that are not in the backup, even newer ones, and replaces the spending stats your budgets count.',
+              'Replace deletes runs and jobs that are not in the backup, even newer ones, and replaces the spending stats your budgets count. Work still in progress is kept.',
             ),
           preview.keysIncluded && options.passphrase !== undefined
             ? h('li', null, 'Your keys are replaced by the backup’s.')
@@ -431,7 +431,7 @@ export function backupSection(core: CoreServices): SectionView {
         const result = await core.backup.import(chosen.file, chosen.options);
         clearImport();
         toast({
-          message: `Backup restored: ${plural(result.changes.filter((line) => !line.startsWith('Skip') && line !== 'Settings unchanged').length, 'change')} applied.`,
+          message: `Backup restored: ${plural(appliedChanges(result.changes), 'change')} applied.${keptNote(result.changes)}`,
           variant: 'success',
           testId: 'backup-restored',
         });

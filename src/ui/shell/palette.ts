@@ -10,7 +10,7 @@
 import type { CoreServices, ModelInfo } from '../../core/types';
 import { url } from '../../core/paths';
 import { debounce } from '../../core/util';
-import { getTool, tools } from '../../tools/registry';
+import { findTool, tools } from '../../tools/registry';
 import { h, replace } from '../dom';
 import { presentError } from '../feedback/errors';
 import { modalOpen, openModal, type ModalHandle } from '../feedback/modal';
@@ -270,16 +270,24 @@ function showPalette(core: CoreServices): ModalHandle {
     const runs = core.history
       .query({ ...(query ? { text: query } : {}), limit: 5 })
       .then((records) =>
-        records.map((run): PaletteItem => ({
-          id: `run:${run.id}`,
-          group: 'Recent runs',
-          // Already matched by History (prompt, output and model too), so the label always "matches".
-          label: run.title,
-          detail: `${getTool(run.tool).name} · ${formatRelativeTime(run.startedAt)}`,
-          keywords: query,
-          icon: getTool(run.tool).icon,
-          href: toolUrl(run.tool, { run: run.id }),
-        })),
+        // A run of a tool this build lacks (an old backup) has nowhere to open: left out.
+        records.flatMap((run): PaletteItem[] => {
+          const tool = findTool(run.tool);
+          return tool
+            ? [
+                {
+                  id: `run:${run.id}`,
+                  group: 'Recent runs',
+                  // Already matched by History (prompt, output and model too), so the label always "matches".
+                  label: run.title,
+                  detail: `${tool.name} · ${formatRelativeTime(run.startedAt)}`,
+                  keywords: query,
+                  icon: tool.icon,
+                  href: toolUrl(run.tool, { run: run.id }),
+                },
+              ]
+            : [];
+        }),
       )
       .catch(() => [] as PaletteItem[]);
     const models =

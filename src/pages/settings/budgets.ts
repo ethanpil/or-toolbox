@@ -1,10 +1,11 @@
 /**
  * Settings → Budgets: the mode (Disabled / Warn / Hard stop), the per-run threshold, the app-wide monthly limit
- * and per-key monthly limits, each limit with this month's spend so far (local stats ledger, current UTC month;
- * the same numbers the budget checks read, minus runs still in progress).
+ * and per-key monthly limits, each limit with this month's spend so far: `budgets.monthSpend()`, the numbers the
+ * budget checks read (local stats ledger, current UTC month, plus what runs in progress hold), read once for the
+ * total and every key. A figure with an estimate in it reads "≈", as on Stats.
  */
 import { MAX_MONTHLY_USD, MAX_PER_RUN_USD } from '../../core/settings/schema';
-import type { BudgetMode, CoreServices, KeyInfo } from '../../core/types';
+import type { BudgetMode, CoreServices, KeyInfo, MonthSpend } from '../../core/types';
 import { keyDot } from '../../ui/components/key-picker';
 import { meter } from '../../ui/components/meter';
 import { type Child, h } from '../../ui/dom';
@@ -12,6 +13,7 @@ import { announce } from '../../ui/feedback/announce';
 import { formatUsd } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { saveSettings } from '../../ui/settings-actions';
+import { markEstimate } from '../stats-logic';
 import { parseUsd, spendMeter, usdFieldValue } from './logic';
 import {
   card,
@@ -29,13 +31,8 @@ const MODE_LABELS: Record<BudgetMode, string> = {
   hard: 'Hard stop',
 };
 
-interface Spend {
-  total: number;
-  byKey: Map<string, number>;
-}
-
 export function budgetsSection(core: CoreServices): SectionView {
-  let spend: Spend | null = null;
+  let spend: MonthSpend | null = null;
   let spendError = false;
 
   const mode = radioCards<BudgetMode>({
@@ -119,14 +116,14 @@ export function budgetsSection(core: CoreServices): SectionView {
   const keyMeters = new Map<string, HTMLElement>();
 
   const meterFor = (
-    spent: number | undefined,
+    spent: { usd: number; estimatedUsd: number } | undefined,
     limit: number | null,
     label: string,
     testId: string,
   ): Child => {
     if (limit === null) return null;
     if (spend === null) return spendError ? null : loadingLine('Reading this month’s spend…');
-    const m = spendMeter(spent ?? 0, limit)!;
+    const m = spendMeter(spent?.usd ?? 0, limit, spent?.estimatedUsd ?? 0)!;
     return meter({ percent: m.percent, tone: m.tone, label, text: m.text, testId });
   };
 
@@ -162,7 +159,7 @@ export function budgetsSection(core: CoreServices): SectionView {
     rerender(
       monthlyMeter,
       meterFor(
-        spend?.total,
+        spend ? { usd: spend.usd, estimatedUsd: spend.estimatedUsd } : undefined,
         budgets.monthlyUsd,
         'Spent of the monthly limit',
         'budget-monthly-meter',
@@ -188,8 +185,12 @@ export function budgetsSection(core: CoreServices): SectionView {
           ? [loadingLine('Reading this month’s spend…')]
           : [
               'Spent this month: ',
-              h('strong', { 'data-testid': 'budget-month-spend-value' }, formatUsd(spend.total)),
-              ' (runs finished in this browser; the month follows UTC).',
+              h(
+                'strong',
+                { 'data-testid': 'budget-month-spend-value' },
+                markEstimate(formatUsd(spend.usd), spend.estimatedUsd),
+              ),
+              ` (runs in this browser; the month follows UTC${spend.estimatedUsd > 0 ? '; includes estimated costs' : ''}${spend.heldUsd > 0 ? `, and ${formatUsd(spend.heldUsd)} held for runs in progress` : ''}).`,
             ]),
     );
   };
@@ -231,23 +232,24 @@ export function budgetsSection(core: CoreServices): SectionView {
     renderMeters();
   };
 
+  let loads = 0;
   const loadSpend = (): void => {
-    const keys = core.keys.list();
-    Promise.all([
-      core.stats.monthSpend(),
-      ...keys.map((key) => core.stats.monthSpend({ keyId: key.id })),
-    ])
-      .then(([total, ...perKey]) => {
-        spend = {
-          total: total ?? 0,
-          byKey: new Map(keys.map((key, i) => [key.id, perKey[i] ?? 0])),
-        };
+    // One read of the month, for the total and every key. A newer load supersedes an older one.
+    const mine = ++loads;
+    core.budgets
+      .monthSpend()
+      .then((month) => {
+        if (mine !== loads) return;
+        spend = month;
         spendError = false;
       })
       .catch(() => {
+        if (mine !== loads) return;
         spendError = true;
       })
-      .finally(renderMeters);
+      .finally(() => {
+        if (mine === loads) renderMeters();
+      });
   };
 
   const sync = (): void => {
@@ -306,6 +308,10 @@ export function budgetsSection(core: CoreServices): SectionView {
     if (shown) loadSpend();
   });
   core.stats.subscribe(() => {
+    if (shown) loadSpend();
+  });
+  // A run that starts holds its estimate at once: the meters follow before it has spent anything.
+  core.history.subscribe(() => {
     if (shown) loadSpend();
   });
   renderKeys();

@@ -366,3 +366,33 @@ test('on a phone, toasts float above the Run bar instead of covering Run and Sto
   const runnerBox = (await runner.boundingBox())!;
   expect(toastBox.y + toastBox.height).toBeLessThanOrEqual(runnerBox.y + 1);
 });
+
+test.describe('a browser that blocks saving', () => {
+  test.beforeEach(async ({ context }) => {
+    await seedApp(context);
+    await context.addInitScript(() => {
+      // Web Storage refuses every write, as in a browser with site data blocked.
+      const refuse = (): never => {
+        throw new DOMException('Access denied', 'SecurityError');
+      };
+      Storage.prototype.setItem = refuse;
+    });
+  });
+
+  test('says so once at page start, and keeps saying what to do until closed', async ({ page }) => {
+    await page.goto('');
+    const notice = page.getByTestId('storage-notice');
+    await expect(notice).toContainText('This browser blocks saving');
+    await expect(notice).toContainText('Allow site data for this site');
+    await expect(page.getByTestId('storage-notice')).toHaveCount(1);
+    await page.waitForTimeout(6000); // longer than a plain toast lives
+    await expect(notice).toBeVisible();
+  });
+
+  test('a setting that cannot be saved says why instead of looking saved', async ({ page }) => {
+    await page.goto('settings/#appearance');
+    await page.getByTestId('storage-notice').locator('.btn-close').click();
+    await page.getByTestId('theme-option-dark').check();
+    await expect(page.getByTestId('error-toast')).toContainText('This browser blocks saving');
+  });
+});

@@ -18,7 +18,13 @@ import { announce } from '../ui/feedback/announce';
 import { presentError } from '../ui/feedback/errors';
 import { openModal } from '../ui/feedback/modal';
 import { toast } from '../ui/feedback/toast';
-import { formatContext, formatRelativeTime, formatDateTime, plural } from '../ui/format';
+import {
+  formatContext,
+  formatRelativeTime,
+  formatDateTime,
+  isoDateTime,
+  plural,
+} from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
 import { saveSettings, toggleFavoriteModel } from '../ui/settings-actions';
@@ -552,7 +558,7 @@ class ModelsPage {
             'Updated ',
             h(
               'time',
-              { dateTime: new Date(at).toISOString(), title: formatDateTime(at) },
+              { dateTime: isoDateTime(at), title: formatDateTime(at) },
               formatRelativeTime(at),
             ),
           ),

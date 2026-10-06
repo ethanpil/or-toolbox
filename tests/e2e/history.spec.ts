@@ -152,6 +152,51 @@ test('Home’s recent runs word their cost as History does: estimated with ≈, 
   await expect(recent('Summarise invoice')).toContainText('$0.022');
 });
 
+test.describe('records this build cannot draw', () => {
+  // A restored backup or an older build can leave a run with a time no Date holds, or a tool that no longer exists.
+  const ODD: RunRecord[] = [
+    makeRun('run-odd-time', 1, { title: 'Odd time', startedAt: 1e20, finishedAt: null }),
+    makeRun('run-gone-tool', 2, { title: 'Gone tool', tool: 'removed-tool' as RunRecord['tool'] }),
+    makeRun('run-fine', 3, { title: 'Fine run' }),
+  ];
+
+  test('History lists every run, and Home shows the ones it can open', async ({ page }) => {
+    const problems = await watchForProblems(page);
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await openHistory(page, ODD);
+    await expect(rows(page)).toHaveCount(3);
+    await expect(row(page, 'run-gone-tool')).toContainText('removed-tool');
+    await row(page, 'run-odd-time').getByTestId('run-open').click();
+    await expectDrawerOpen(page);
+    await expect(page.getByTestId('run-reopen')).toBeVisible();
+    await closeDrawer(page);
+    await row(page, 'run-gone-tool').getByTestId('run-open').click();
+    await expectDrawerOpen(page);
+    await expect(page.getByTestId('run-reopen')).toHaveCount(0);
+    await closeDrawer(page);
+
+    await page.goto('./');
+    const recent = page.getByTestId('recent-run');
+    await expect(recent.filter({ hasText: 'Fine run' })).toHaveCount(1);
+    await expect(recent.filter({ hasText: 'Odd time' })).toHaveCount(1);
+    await expect(recent.filter({ hasText: 'Gone tool' })).toHaveCount(0);
+    expect(errors).toEqual([]);
+    expect(problems).toEqual([]);
+  });
+
+  test('the palette skips a recent run of a removed tool', async ({ page }) => {
+    await openHistory(page, ODD);
+    await page.goto('./');
+    await page.keyboard.press('Control+k');
+    await expect(page.getByRole('dialog')).toBeVisible();
+    const options = page.getByRole('option');
+    await expect(options.filter({ hasText: 'Fine run' })).toHaveCount(1);
+    await expect(options.filter({ hasText: 'Odd time' })).toHaveCount(1);
+    await expect(options.filter({ hasText: 'Gone tool' })).toHaveCount(0);
+  });
+});
+
 test('an empty history says so', async ({ page }) => {
   await openHistory(page, []);
   await expect(page.getByTestId('history-empty')).toContainText('No runs yet');

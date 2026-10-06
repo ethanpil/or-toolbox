@@ -9,6 +9,7 @@ import type { Capability, Settings, ToolManifest } from '../../core/types';
 import { getTool } from '../../tools/registry';
 import { formatBytes, formatInt, formatUsd } from '../../ui/format';
 import { SETTINGS_SECTIONS, type SettingsSection } from '../../ui/shell/links';
+import { markEstimate } from '../stats-logic';
 
 /** The section a URL hash names (`#budgets`), or null. */
 export function sectionFromHash(hash: string): SettingsSection | null {
@@ -96,8 +97,12 @@ export interface SpendMeter {
   text: string;
 }
 
-/** Spend against a limit; null when there is no limit. Warns from 80 %. */
-export function spendMeter(spent: number, limit: number | null): SpendMeter | null {
+/** Spend against a limit; null when there is no limit. Warns from 80 %. `estimatedUsd`: part of `spent` is a guess (≈). */
+export function spendMeter(
+  spent: number,
+  limit: number | null,
+  estimatedUsd = 0,
+): SpendMeter | null {
   if (limit === null) return null;
   const ratio = limit > 0 ? spent / limit : 1;
   const reached = spent >= limit;
@@ -105,7 +110,7 @@ export function spendMeter(spent: number, limit: number | null): SpendMeter | nu
     percent: Math.min(100, Math.max(0, Math.round(ratio * 100))),
     tone: reached ? 'danger' : ratio >= 0.8 ? 'warning' : 'success',
     reached,
-    text: `${formatUsd(spent)} of ${formatUsd(limit)} · ${
+    text: `${markEstimate(formatUsd(spent), estimatedUsd)} of ${formatUsd(limit)} · ${
       reached ? 'limit reached' : `${formatUsd(limit - spent)} left`
     }`,
   };
@@ -216,6 +221,41 @@ export function passphraseStrength(text: string): PassphraseStrength {
  */
 export function isDestructiveChange(line: string): boolean {
   return /^(Delete|Replace|Turn off|Use the backup)/.test(line) || /removed:|cleared/.test(line);
+}
+
+/**
+ * What a deletion says it kept (`DataDeletion`): work still in progress is never deleted, and its tool keeps its
+ * saved work. " Kept because work is still in progress: 1 run, and the saved work of Video studio.", or ''.
+ */
+export function deletionKeptNote(keptRuns: number, keptToolNames: readonly string[]): string {
+  const parts = [
+    keptRuns > 0 ? `${formatInt(keptRuns)} ${keptRuns === 1 ? 'run' : 'runs'}` : null,
+    keptToolNames.length > 0 ? `the saved work of ${listNames(keptToolNames)}` : null,
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0
+    ? ` Kept because work is still in progress: ${parts.join(', and ')}.`
+    : '';
+}
+
+/** "A", "A and B", "A, B and C". */
+function listNames(names: readonly string[]): string {
+  return names.length <= 1
+    ? (names[0] ?? '')
+    : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/** How many of an import's change lines changed something (not skips, nothing, or work Replace kept). */
+export function appliedChanges(changes: readonly string[]): number {
+  return changes.filter(
+    (line) =>
+      !line.startsWith('Skip') && !line.startsWith('Keep ') && line !== 'Settings unchanged',
+  ).length;
+}
+
+/** " Kept 1 run in progress." for Replace's "Keep …" line, or ''. */
+export function keptNote(changes: readonly string[]): string {
+  const line = changes.find((change) => change.startsWith('Keep '));
+  return line ? ` Kept ${line.slice('Keep '.length)}.` : '';
 }
 
 /** `ortoolbox-2026-10-03.ortoolbox.json`, dated in the user's time zone. */

@@ -11,7 +11,7 @@ import { downloadBlob } from '../core/files';
 import { url } from '../core/paths';
 import type { CoreServices, RunRecord, RunStatus } from '../core/types';
 import { debounce, SEARCH_DEBOUNCE_MS } from '../core/util';
-import { getTool, tools } from '../tools/registry';
+import { findTool, tools } from '../tools/registry';
 import type { ToolId } from '../tools/types';
 import { Offcanvas, showOffcanvas } from '../ui/bootstrap';
 import { copyWithToast } from '../ui/clipboard';
@@ -32,6 +32,7 @@ import {
   formatMs,
   formatRelativeTime,
   formatUsd,
+  isoDateTime,
   plural,
 } from '../ui/format';
 import { icon } from '../ui/icon';
@@ -69,6 +70,17 @@ const EVERYTHING = Number.MAX_SAFE_INTEGER;
 const MODEL_SCAN_PAGE = 200;
 const MODEL_SCAN_MAX_PAGES = 500;
 const STATUSES: RunStatus[] = ['ok', 'error', 'aborted', 'running'];
+
+/**
+ * A run's tool as History draws it. A run can name a tool this build lacks (an older backup, a removed tool); it is
+ * still listed, so it can be exported or deleted, but there is nothing to reopen it in.
+ */
+function toolOf(run: RunRecord): { name: string; icon: string; known: boolean } {
+  const tool = findTool(run.tool);
+  return tool
+    ? { name: tool.name, icon: tool.icon, known: true }
+    : { name: run.tool, icon: 'question-circle', known: false };
+}
 
 const fileStem = (text: string): string =>
   text
@@ -756,7 +768,7 @@ class HistoryPage {
   }
 
   private row(run: RunRecord): HTMLElement {
-    const tool = getTool(run.tool);
+    const tool = toolOf(run);
     const facts = [tokenText(run), latencyText(run)].filter(
       (text): text is string => text !== null,
     );
@@ -802,7 +814,7 @@ class HistoryPage {
             h(
               'time',
               {
-                dateTime: new Date(run.startedAt).toISOString(),
+                dateTime: isoDateTime(run.startedAt),
                 title: formatDateTime(run.startedAt),
               },
               formatRelativeTime(run.startedAt),
@@ -1026,7 +1038,7 @@ class HistoryPage {
 
   private renderDetail(run: RunRecord): void {
     const generation = ++this.detailGeneration;
-    const tool = getTool(run.tool);
+    const tool = toolOf(run);
     this.drawerTitle.textContent = run.title;
     this.drawerSub.replaceChildren(
       icon(tool.icon, 'me-1'),
@@ -1036,7 +1048,7 @@ class HistoryPage {
       ' · ',
       h(
         'time',
-        { dateTime: new Date(run.startedAt).toISOString(), title: formatDateTime(run.startedAt) },
+        { dateTime: isoDateTime(run.startedAt), title: formatDateTime(run.startedAt) },
         formatRelativeTime(run.startedAt),
       ),
     );
@@ -1057,23 +1069,27 @@ class HistoryPage {
     const actions = h(
       'div',
       { class: 'd-flex flex-wrap gap-2 mb-4', role: 'group', 'aria-label': 'Run actions' },
-      h(
-        'a',
-        {
-          class: 'btn btn-primary btn-sm d-inline-flex align-items-center gap-2',
-          href: toolUrl(run.tool, { run: run.id }),
-          'data-focus-key': 'run-reopen',
-          'data-testid': 'run-reopen',
-        },
-        icon('box-arrow-up-right'),
-        `Reopen in ${tool.name}`,
-      ),
-      this.actionButton(
-        'Re-run with another model',
-        'arrow-repeat',
-        'run-rerun',
-        () => void this.rerun(run),
-      ),
+      tool.known
+        ? h(
+            'a',
+            {
+              class: 'btn btn-primary btn-sm d-inline-flex align-items-center gap-2',
+              href: toolUrl(run.tool, { run: run.id }),
+              'data-focus-key': 'run-reopen',
+              'data-testid': 'run-reopen',
+            },
+            icon('box-arrow-up-right'),
+            `Reopen in ${tool.name}`,
+          )
+        : null,
+      tool.known
+        ? this.actionButton(
+            'Re-run with another model',
+            'arrow-repeat',
+            'run-rerun',
+            () => void this.rerun(run),
+          )
+        : null,
       this.actionButton(
         run.starred ? 'Starred' : 'Star',
         run.starred ? 'star-fill' : 'star',
@@ -1208,7 +1224,7 @@ class HistoryPage {
   // --- run actions --------------------------------------------------------------------------------------
 
   private async rerun(run: RunRecord): Promise<void> {
-    const capability = getTool(run.tool).capabilities[0];
+    const capability = findTool(run.tool)?.capabilities[0];
     if (!capability) return;
     const model = await modelPicker(this.core, {
       capability,
@@ -1229,7 +1245,7 @@ class HistoryPage {
   private async deleteOne(run: RunRecord): Promise<void> {
     const ok = await confirmDialog({
       title: 'Delete this run?',
-      message: `“${run.title}” will be removed from your history. You can undo this for a few seconds. Spending stats are not affected.`,
+      message: `“${run.title}” will be removed from your history. You can undo this right after. Spending stats are not affected.`,
       confirmLabel: 'Delete',
       tone: 'danger',
       testId: 'delete-run-dialog',
@@ -1248,7 +1264,7 @@ class HistoryPage {
     await this.deleteRuns([latest]);
   }
 
-  /** Removes runs and offers Undo (`history.restore`) for a few seconds. */
+  /** Removes runs and offers Undo (`history.restore`) in a toast that stays until it is used or closed. */
   private async deleteRuns(runs: RunRecord[]): Promise<void> {
     try {
       await this.core.history.remove(runs.map((run) => run.id));
@@ -1259,7 +1275,6 @@ class HistoryPage {
     toast({
       message: `Deleted ${plural(runs.length, 'run')}.`,
       variant: 'success',
-      timeoutMs: 10_000,
       action: {
         label: 'Undo',
         testId: 'toast-undo',
@@ -1339,7 +1354,7 @@ class HistoryPage {
         all
           ? `All ${plural(runs.length, 'run')} will be removed from your history`
           : `The ${plural(runs.length, 'run')} matching the current filters will be removed from your history`,
-        `. Starred runs are included and spending stats are not affected.${kept} Export first if you want a copy; you can also undo for a few seconds.`,
+        `. Starred runs are included and spending stats are not affected.${kept} Export first if you want a copy; you can also undo right after.`,
       ),
       phrase: 'delete',
       confirmLabel: all ? 'Delete everything' : `Delete ${plural(runs.length, 'run')}`,

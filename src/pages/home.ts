@@ -4,14 +4,20 @@
  * a "Free" badge when its primary capability currently resolves to a free model.
  */
 import type { RunRecord, Settings } from '../core/types';
-import { getTool, tools } from '../tools/registry';
+import { findTool, getTool, tools } from '../tools/registry';
 import { TOOL_CATEGORIES, type ToolId, type ToolManifest } from '../tools/types';
 import { emptyState } from '../ui/components/empty-state';
 import { listSkeleton, loadInto } from '../ui/components/load-into';
 import { starButton } from '../ui/components/star-button';
 import { type Child, h, replace } from '../ui/dom';
 import { announce } from '../ui/feedback/announce';
-import { describeRunCost, formatDateTime, formatRelativeTime, plural } from '../ui/format';
+import {
+  describeRunCost,
+  formatDateTime,
+  formatRelativeTime,
+  isoDateTime,
+  plural,
+} from '../ui/format';
 import { icon } from '../ui/icon';
 import { uid } from '../ui/id';
 import { toggleFavoriteTool } from '../ui/settings-actions';
@@ -171,8 +177,8 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     );
   };
 
-  const runRow = (run: RunRecord): HTMLElement => {
-    const tool = getTool(run.tool);
+  /** A row for a run of a tool this build has; a run of a removed tool (old backup) has nowhere to reopen. */
+  const runRow = (run: RunRecord, tool: ToolManifest): HTMLElement => {
     // The one cost rule (`describeRunCost`): "Free" only on free models, "≈" for an estimate, never a number for an
     // unknown cost.
     const allFree = run.models.length > 0 && run.models.every((model) => core.models.isFree(model));
@@ -203,7 +209,7 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
           h(
             'time',
             {
-              dateTime: new Date(run.startedAt).toISOString(),
+              dateTime: isoDateTime(run.startedAt),
               title: formatDateTime(run.startedAt),
             },
             formatRelativeTime(run.startedAt),
@@ -222,9 +228,16 @@ mountPage({ title: 'ORtoolbox', nav: 'home', header: false }, ({ core, main, nav
     void loadInto(
       recentList,
       async () => {
-        const runs = await core.history.query({ limit: 5 });
+        const runs = (await core.history.query({ limit: 5 })).flatMap((run) => {
+          const tool = findTool(run.tool);
+          return tool ? [{ run, tool }] : [];
+        });
         return runs.length > 0
-          ? h('div', { class: 'list-group shadow-sm' }, runs.map(runRow))
+          ? h(
+              'div',
+              { class: 'list-group shadow-sm' },
+              runs.map(({ run, tool }) => runRow(run, tool)),
+            )
           : emptyState({
               icon: 'clock-history',
               title: 'No runs yet',
