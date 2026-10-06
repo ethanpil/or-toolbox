@@ -318,8 +318,9 @@ test.describe('Music generation', () => {
     expect(mock.calls('/api/v1/chat/completions')).toHaveLength(3);
     await expect(page.getByTestId('tool-status')).toHaveText(/^Variation [12] ready$/);
 
-    // Removing a card leaves focus on its neighbour.
+    // Removing a card (a paid song not downloaded: it asks first) leaves focus on its neighbour.
     await cards.nth(0).getByTestId('music-remove').click();
+    await page.getByTestId('music-remove-confirm').getByTestId('dialog-confirm').click();
     await expect(cards).toHaveCount(1);
     await expect(cards.nth(0).getByTestId('music-remove')).toBeFocused();
 
