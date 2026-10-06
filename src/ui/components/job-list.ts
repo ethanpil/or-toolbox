@@ -18,8 +18,10 @@ import { emptyState } from './empty-state';
 export interface JobListOptions {
   /** The job's display name; default its type and remote id. */
   label?: (job: JobRecord) => string;
-  /** Shows a Cancel button on unfinished jobs. */
+  /** Shows a button on unfinished jobs that calls this. */
   onCancel?: (job: JobRecord) => void;
+  /** What that button does, for its accessible name (`<label> for <job>`); without it, `Cancel <job>`. */
+  cancelLabel?: string;
   emptyText?: string;
   testId?: string;
 }
@@ -49,6 +51,8 @@ export function jobList(options: JobListOptions = {}): JobList {
     const percent =
       job.progress !== null ? Math.round(Math.min(1, Math.max(0, job.progress)) * 100) : null;
     const running = !isFinal(job.state);
+    // "Cancel Clip 1", or with a label of the tool's own "Stop waiting for Clip 1".
+    const cancel = options.cancelLabel ? `${options.cancelLabel} for ${name}` : `Cancel ${name}`;
     return h(
       'li',
       { class: 'list-group-item py-3', 'data-testid': `job-${job.id}` },
@@ -63,7 +67,7 @@ export function jobList(options: JobListOptions = {}): JobList {
               {
                 type: 'button',
                 class: 'btn btn-sm btn-outline-secondary',
-                'aria-label': `Cancel ${name}`,
+                'aria-label': cancel,
                 'data-focus-key': `cancel:${job.id}`,
                 onclick: () => options.onCancel?.(job),
               },

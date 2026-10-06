@@ -285,6 +285,7 @@ test.describe('Video studio', () => {
 
     // Three in flight, the fourth waits.
     await expect.poll(() => jobs.submits().length).toBe(3);
+    // A fourth submit that must not happen can only be ruled out over time (a poll cycle is well under this).
     await page.waitForTimeout(1500);
     expect(jobs.submits()).toHaveLength(3);
     expect(jobs.submits().map((body) => body.prompt)).toEqual(

@@ -27,6 +27,7 @@
  * `toBlobURL` recipe, which exists for cores hosted on a CDN.
  */
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
+import { NetworkError } from '../errors';
 import { url } from '../paths';
 
 export interface FfmpegDownloadProgress {
@@ -199,7 +200,12 @@ async function download(
   onProgress: LoadFfmpegOptions['onProgress'],
 ): Promise<Blob> {
   const response = await fetch(href);
-  if (!response.ok) throw new Error(`Could not download ${href}: HTTP ${response.status}`);
+  if (!response.ok) {
+    throw new NetworkError(
+      'Could not download the audio and video engine. Check your connection and reload the page.',
+      { cause: new Error(`${href}: HTTP ${response.status}`) },
+    );
+  }
 
   const type = 'application/wasm';
   if (!response.body) return new Blob([await response.arrayBuffer()], { type });

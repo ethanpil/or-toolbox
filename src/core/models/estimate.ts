@@ -308,3 +308,12 @@ function videoCost(
   if (minimum) total = Math.max(total, minimum.value / 100);
   return total;
 }
+
+/**
+ * Input tokens of one page image whose longest side is `maxSide` px, for an A4-shaped page (sides 1 : √2): its
+ * pixels / 750, the usual rule of thumb for vision models (deliberately on the high side; most downscale). The
+ * document tools (OCR, Data extractor, Table extractor) price their page images with it.
+ */
+export function imageTokens(maxSide: number): number {
+  return Math.ceil((maxSide * Math.round(maxSide / Math.SQRT2)) / 750);
+}

@@ -38,6 +38,7 @@ import {
   userMessage,
 } from '../../core/errors';
 import { excerpt } from '../../core/runs/index';
+import { bookedCost } from '../../core/stats/index';
 import type { ModelInfo, RunHandle, Usage } from '../../core/types';
 import {
   debounce,
@@ -70,7 +71,9 @@ import { composing } from '../../ui/shell/shortcuts';
 import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
 import {
   type BotRecord,
+  closeRun,
   type Conversation,
+  countSpend,
   createConversation,
   dropFailedEmpty,
   editEntry,
@@ -79,8 +82,10 @@ import {
   isSpoken,
   newId,
   nextSpeaker,
+  openRun,
   opener,
   parseConversation,
+  settleOpenRun,
   type Speaker,
   SPEAKERS,
   type StopReason,
@@ -419,6 +424,65 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     if (event.tool !== ctx.manifest.id || event.key !== STATE_KEY) return;
     followStore().catch(() => undefined);
   });
+
+  /**
+   * A run a reload cut off never counted its last turn: its page was gone before the turn's usage reached
+   * `spentUsd`, so the cost cap would undercount. The page-start sweep books that turn in the ledger (an unknown
+   * cost books the run's reservation), and this adds the difference to the conversation from the run's record.
+   * A record still `running` is not settled yet (another tab, or the sweep has not reached it): the history
+   * subscription below tries again when it changes. A record that is gone leaves the total marked approximate.
+   * Changes `conv` only; the caller stores it.
+   */
+  async function settleCutRuns(conv: Conversation): Promise<boolean> {
+    let changed = false;
+    for (const open of [...(conv.openRuns ?? [])]) {
+      let record;
+      try {
+        record = await ctx.history.get(open.id);
+      } catch {
+        continue; // unreadable now: try again later, never "gone"
+      }
+      if (record?.status === 'running') continue;
+      const approx = record ? record.usage.costUnknown || record.usage.costEstimated : true;
+      const settled = settleOpenRun(
+        conv,
+        open.id,
+        record ? { usd: bookedCost(record), approx } : null,
+      );
+      changed = changed || settled;
+    }
+    return changed;
+  }
+
+  let settling = false;
+  /** Settles what a reload cut off, under the tool's lock (another tab running the conversation settles later). */
+  async function settleStored(): Promise<void> {
+    if (settling || runState.busy || !conversation?.openRuns?.length) return;
+    settling = true;
+    try {
+      const release = await lockConversation();
+      if (!release) return;
+      try {
+        await writes;
+        const stored = await readStored();
+        if (!sameVersion(stored, conversation)) {
+          adopt(stored); // another tab changed it (it may have settled first)
+          return;
+        }
+        const conv = conversation;
+        if (!conv || !(await settleCutRuns(conv))) return;
+        touch(conv);
+        persist();
+        renderStats();
+        void ui.refreshEstimate();
+        await writes;
+      } finally {
+        release();
+      }
+    } finally {
+      settling = false;
+    }
+  }
 
   /**
    * Changes the conversation (a moderator message, an edit, New conversation, an Undo) only while no other tab
@@ -1688,6 +1752,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         );
         return;
       }
+      if (conversation) await settleCutRuns(conversation);
       const creating = conversation === null;
       const draft =
         conversation ??
@@ -1721,6 +1786,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       // The run is on: only now does the conversation change.
       if (creating) conversation = draft;
       const conv = draft;
+      openRun(conv, run.id);
       conv.first = first;
       conv.bots = bots;
       dropFailedEmpty(conv);
@@ -1860,7 +1926,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         const usage = turnUsage(usages, estimate);
         if (usage) {
           entry.usage = usage;
-          conv.spentUsd += usage.costUsd;
+          countSpend(conv, run.id, usage.costUsd);
           if (usage.costEstimated || usage.costUnknown) conv.spentApprox = true;
         }
         conv.elapsedMs = elapsedOf(conv);
@@ -1914,6 +1980,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       failure !== null && isStop(failure.error) && signal.aborted
         ? 'stopped'
         : (end?.reason ?? null);
+    // This page saw the run through: everything it cost is counted, nothing is left to settle.
+    closeRun(conv, run.id);
     const lastSpoken = conv.entries.filter(isSpoken).at(-1);
     const ending = reason
       ? endText(reason, {
@@ -2030,6 +2098,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   renderParams();
   renderAll();
   loadCatalog();
+  // A run a reload cut off settles once its record is final (the page-start sweep may still be at it).
+  void settleStored();
+  ctx.history.subscribe(() => void settleStored());
   runner.subscribe(({ busy }) => {
     runState = { busy };
     // A Pause asked for during a run that ended (or never began) does not carry over to the next one.

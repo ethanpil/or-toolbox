@@ -3,6 +3,7 @@
  * parser), the combined Markdown, and the token estimate. tool.ts draws the page and runs these.
  */
 import type { ChatRequest, ContentPart } from '../../core/api/types';
+import { imageTokens } from '../../core/models/estimate';
 import type { PdfEngineId } from '../../core/models/pdf-engines';
 import { outputCap } from '../../core/tokens';
 import type { FailureText } from '../../ui/feedback/errors';
@@ -154,14 +155,6 @@ export const TEXT_HINT_TOKENS = Math.ceil(TEXT_HINT_CHARS / 4);
 export const PARSED_PAGE_TOKENS = 1000;
 /** A dense page of small print, out. */
 export const PER_PAGE_COMPLETION_TOKENS = 1500;
-
-/**
- * Input tokens of one page image whose longest side is `maxSide` px, for an A4-shaped page (sides 1 : √2): its
- * pixels / 750, the usual rule of thumb for vision models (deliberately on the high side; most downscale).
- */
-export function imageTokens(maxSide: number): number {
-  return Math.ceil((maxSide * Math.round(maxSide / Math.SQRT2)) / 750);
-}
 
 /** Tokens for a plan: pages sent as images (`hintPages` of them with their PDF text), and pages the parser reads. */
 export function estimateTokens(plan: {

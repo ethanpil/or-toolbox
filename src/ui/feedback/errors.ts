@@ -22,7 +22,13 @@
  * Each error is shown once: one already presented (or marked by `markPresented`, as `outputPanel.fail` does
  * when it shows an error inline) is ignored.
  */
-import { ApiError, errorCode, isOutcomeUnknown, userMessage } from '../../core/errors';
+import {
+  ApiError,
+  errorCode,
+  FreeOnlyError,
+  isOutcomeUnknown,
+  userMessage,
+} from '../../core/errors';
 import { connectKey } from '../components/connect-key';
 import { h } from '../dom';
 import { settingsUrl } from '../shell/links';
@@ -175,6 +181,16 @@ export function failureText(error: unknown, options: { blind?: boolean } = {}): 
   };
 }
 
+/** What to do about free-only mode: the refusal was a paid model, a paid add-on (a PDF parser), or both. */
+function freeOnlyAdvice(error: unknown): string {
+  const addons = error instanceof FreeOnlyError ? error.addons : [];
+  if (addons.length === 0) return 'Pick a free model, or turn free-only mode off.';
+  const off = `switch ${addons.join(' and ')} to a free option in this tool’s settings, or turn free-only mode off.`;
+  return error instanceof FreeOnlyError && error.models.length > 0
+    ? `Pick a free model and ${off}`
+    : `${off.charAt(0).toUpperCase()}${off.slice(1)}`;
+}
+
 export async function presentError(
   error: unknown,
   options: PresentErrorOptions = {},
@@ -217,7 +233,7 @@ export async function presentError(
       toast({
         variant: 'warning',
         title: 'Free-only mode is on',
-        message: `${userMessage(error)} Pick a free model, or turn free-only mode off.`,
+        message: `${userMessage(error)} ${freeOnlyAdvice(error)}`,
         action: { label: 'Model settings', href: settingsUrl('models') },
         testId: 'error-toast',
       });

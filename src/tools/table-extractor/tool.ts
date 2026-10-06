@@ -5,6 +5,13 @@
  * an Excel workbook with a sheet per table, Markdown, and TSV for pasting into a spreadsheet. One run per
  * Run press; its output is the tables as Markdown.
  */
+import {
+  fallbackMode,
+  isUnsupportedStrict,
+  type OutputMode,
+  outputMode,
+  responseRefusal,
+} from '../../core/api/structured-output';
 import type { ChatResponse } from '../../core/api/types';
 import { InvalidInputError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import type { RunHandle } from '../../core/types';
@@ -39,14 +46,9 @@ import {
   describeTables,
   estimateTokens,
   type ExtractedTable,
-  fallbackMode,
-  isUnsupportedStrict,
   mergeTables,
-  type OutputMode,
-  outputMode,
   pageRequest,
   parseTables,
-  responseRefusal,
   toTable,
 } from './tables';
 import { progressBar } from '../../ui/components/progress-bar';

@@ -3,8 +3,9 @@
  * makes (cells, rows, columns, headers, merging a table that continues on the next page). Edits that change the
  * shape return a new table; the grid swaps it in.
  */
-import type { ChatRequest, ChatResponse } from '../../core/api/types';
-import { ApiError } from '../../core/errors';
+import type { OutputMode } from '../../core/api/structured-output';
+import type { ChatRequest } from '../../core/api/types';
+import { imageTokens } from '../../core/models/estimate';
 import { outputCap } from '../../core/tokens';
 import { isRecord, parseJsonSafe } from '../../core/util';
 
@@ -38,57 +39,10 @@ export interface RawTable {
   notes: string;
 }
 
-export type OutputMode = 'schema' | 'json' | 'prompt';
-
-export function outputMode(supportedParameters: readonly string[]): OutputMode {
-  if (supportedParameters.includes('structured_outputs')) return 'schema';
-  if (supportedParameters.includes('response_format')) return 'json';
-  return 'prompt';
-}
-
-/**
- * A strict structured-output request that no provider can serve: OpenRouter answers 404 "No endpoints found that
- * can handle the requested parameters" (or a 400 naming the response format) when the routing constraint leaves
- * nothing. The batch then carries on in JSON mode instead of failing every page.
- */
-export function isUnsupportedStrict(error: unknown): boolean {
-  if (!(error instanceof ApiError) || (error.status !== 400 && error.status !== 404)) return false;
-  return /no endpoints|response_format|json_schema|structured output/i.test(error.message);
-}
-
-/** The mode after strict outputs were refused: JSON mode when the model takes `response_format`, else the prompt. */
-export function fallbackMode(supportedParameters: readonly string[]): OutputMode {
-  return supportedParameters.includes('response_format') ? 'json' : 'prompt';
-}
-
-/**
- * Why a non-streamed answer holds no usable tables: the model's own refusal (`message.refusal`), or a reply that
- * ended with `finish_reason` `content_filter` or `error` before any content. Null for a normal answer.
- */
-export function responseRefusal(response: ChatResponse): string | null {
-  const choice = response.choices[0];
-  const refusal = choice?.message['refusal'];
-  if (typeof refusal === 'string' && refusal.trim()) return refusal.trim();
-  if ((choice?.message.content ?? '').trim()) return null;
-  if (choice?.finish_reason === 'content_filter') {
-    return 'The provider’s content filter blocked this reply.';
-  }
-  if (choice?.finish_reason === 'error') return 'The model stopped with an error before answering.';
-  return null;
-}
-
 /** The longest text layer sent per page, in characters. */
 export const TEXT_HINT_CHARS = 6000;
 /** The answer's cap: a big table is many tokens. */
 export const MAX_ANSWER_TOKENS = 16_000;
-
-/**
- * Input tokens of one page image whose longest side is `maxSide` px, for an A4-shaped page: its pixels / 750,
- * deliberately on the high side (most models downscale). The same rule as OCR's `imageTokens`.
- */
-export function imageTokens(maxSide: number): number {
-  return Math.ceil((maxSide * Math.round(maxSide / Math.SQRT2)) / 750);
-}
 
 /**
  * Tokens for `pages` page images at `maxSide` px, `hintPages` of them with their PDF text, and a long answer each:

@@ -142,6 +142,89 @@ test.describe('Image generation', () => {
     expect(problems).toEqual([]);
   });
 
+  test('Stop keeps the image that was ready, and Retry makes only the rest', async ({
+    page,
+    context,
+    mock,
+  }) => {
+    await seedApp(context, { key: true });
+    mockImageCatalog(mock);
+    // The mock serves a stream in one piece, so a Stop cannot land inside it. The first request is held open from
+    // inside the page instead: one image completes (and is billed), then nothing until the request is aborted.
+    // Later requests (the Retry) go on to the mock.
+    await page.addInitScript((completed: string) => {
+      const original = window.fetch.bind(window);
+      let held = false;
+      window.fetch = (input, init) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (held || !url.endsWith('/api/v1/images') || init?.method !== 'POST') {
+          return original(input, init);
+        }
+        held = true;
+        const encoder = new TextEncoder();
+        const event = {
+          type: 'image_generation.completed',
+          b64_json: completed,
+          media_type: 'image/jpeg',
+          created: 1790983685,
+          usage: { prompt_tokens: 16, completion_tokens: 272, total_tokens: 288, cost: 0.003006 },
+        };
+        let sent = false;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            init.signal?.addEventListener('abort', () =>
+              controller.error(new DOMException('The operation was aborted.', 'AbortError')),
+            );
+          },
+          // The reader asks again once it has the event: that is when the image counts as received.
+          pull(controller) {
+            if (!sent) {
+              sent = true;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            } else {
+              (window as unknown as { imageReceived: boolean }).imageReceived = true;
+            }
+          },
+        });
+        return Promise.resolve(
+          new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+        );
+      };
+    }, GENERATED_JPG.toString('base64'));
+    mock.respond('POST', '/api/v1/images', () => imagesJson(EDITED_JPG));
+    const problems = await watchForProblems(page, STREAM_CANCELS);
+    await page.goto(`tools/image-generation/?model=${encodeURIComponent(GPT_MINI)}`);
+    await expect(page.getByTestId('imagegen-aspect-3-2')).toHaveCount(1);
+    await page.getByTestId('tool-prompt').fill('Two paper cranes');
+    await page.getByTestId('imagegen-count').selectOption('2');
+    await page.getByTestId('run-button').click();
+
+    // One of the two has arrived (a request shows its images when it ends); the other is still being made.
+    await page.waitForFunction(
+      () => (window as unknown as { imageReceived?: boolean }).imageReceived === true,
+    );
+    await expect(page.getByTestId('imagegen-waiting')).toHaveCount(1);
+    await expect(page.getByTestId('stop-button')).toBeVisible();
+    await page.getByTestId('stop-button').click();
+
+    // The ready image stays (it was paid for), the other is a stopped card, and nothing is reported as an error.
+    await expect(page.getByTestId('stop-button')).toBeHidden();
+    await expect(page.getByTestId('imagegen-image')).toHaveCount(1);
+    await expect(page.getByTestId('imagegen-failed')).toHaveCount(1);
+    await expect(page.getByTestId('imagegen-error')).toHaveText('Stopped before it was ready.');
+    await expect(page.getByTestId('error-toast')).toHaveCount(0);
+
+    // Retry asks for the one that is missing, not for both again.
+    await page.getByTestId('imagegen-retry').click();
+    await expect(page.getByTestId('imagegen-image')).toHaveCount(2);
+    await expect(page.getByTestId('imagegen-failed')).toHaveCount(0);
+    const retries = mock.calls('/api/v1/images', 'POST').map((call) => call.body as ImagesBody);
+    expect(retries).toHaveLength(1);
+    expect(retries[0]!.n).toBeUndefined();
+    expect(problems).toEqual([]);
+  });
+
   test('variations use a new seed; Edit sends the image to Image editor', async ({
     page,
     context,

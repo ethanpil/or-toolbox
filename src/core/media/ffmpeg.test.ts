@@ -107,6 +107,21 @@ describe('loadFfmpeg', () => {
     });
   });
 
+  it('says what to do when the engine cannot be downloaded (a user error, not a bare Error)', async () => {
+    const { loadFfmpeg } = await freshModule();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response('', { status: 404 }))),
+    );
+    // (The module is a fresh copy, so its error classes are too: judge the error by what it carries.)
+    const error = (await loadFfmpeg().catch((caught: unknown) => caught)) as Error & {
+      code?: string;
+    };
+    expect(error).toMatchObject({ name: 'NetworkError', code: 'network' });
+    expect(error.message).toMatch(/audio and video engine.*connection.*reload/i);
+    expect(error.message).not.toContain('HTTP');
+  });
+
   it('never hands out an instance that was terminated', async () => {
     const { loadFfmpeg } = await freshModule();
     const first = await loadFfmpeg();

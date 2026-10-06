@@ -363,7 +363,8 @@ test('a recording from the microphone, paused and resumed, is transcribed', asyn
   await page.getByTestId('stt-record-pause').click();
   await expect(page.getByTestId('stt-record-pause')).toHaveText('Resume');
   await expect(page.getByTestId('run-button')).toHaveAttribute('aria-disabled', 'true');
-  // Paused: the timer stands still and the level meter is at rest (its loop is stopped).
+  // Paused: the timer stands still and the level meter is at rest (its loop is stopped). That nothing moves can
+  // only be seen over time: 1.5 s is several ticks of the timer, which runs at four a second.
   const paused = await recordedSeconds(page);
   await page.waitForTimeout(1500);
   expect(await recordedSeconds(page)).toBe(paused);
@@ -583,12 +584,26 @@ test('a time in the transcript of a recording plays from there', async ({
   const landed = async (): Promise<number> =>
     Number((await audio.getAttribute('data-seeked-at')) ?? Number.NaN);
   await expect.poll(async () => Math.abs((await landed()) - 1.5) < 0.1).toBe(true);
-  // Nothing rewinds it afterwards: a second later it plays on from there.
-  await page.waitForTimeout(1000);
-  expect(Math.abs((await landed()) - 1.5)).toBeLessThan(0.1);
-  expect(
-    await audio.evaluate((element: HTMLAudioElement) => element.currentTime),
-  ).toBeGreaterThanOrEqual(1.4);
+  // Nothing rewinds it afterwards: it plays on from there. Judged by where playback is, not by how long it has
+  // been: a loaded machine starts late, a fast one runs past the segment. Playback is held as soon as it has
+  // moved a little past the landing, so the segment check below does not depend on speed either.
+  await audio.evaluate(
+    (element: HTMLAudioElement) =>
+      new Promise<void>((resolve) => {
+        const hold = (): void => {
+          if (element.currentTime < 1.6) return;
+          element.removeEventListener('timeupdate', hold);
+          element.pause();
+          resolve();
+        };
+        element.addEventListener('timeupdate', hold);
+        hold();
+      }),
+  );
+  expect(Math.abs((await landed()) - 1.5)).toBeLessThan(0.1); // no later seek moved it
+  const playedTo = await audio.evaluate((element: HTMLAudioElement) => element.currentTime);
+  expect(playedTo).toBeGreaterThanOrEqual(1.6);
+  expect(playedTo).toBeLessThan(2.4); // still inside the segment it was started from
   await expect(page.getByTestId('stt-segment').nth(1)).toHaveAttribute('aria-current', 'true');
   expect(problems).toEqual([]);
 });

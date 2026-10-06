@@ -27,7 +27,7 @@
 import type * as PdfJs from 'pdfjs-dist';
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import { InvalidInputError } from '../errors';
+import { InvalidInputError, NetworkError } from '../errors';
 import { type EncodeOptions, toBlob } from './image';
 
 export interface PdfPageImageOptions extends EncodeOptions {
@@ -87,7 +87,12 @@ export class BundledDataFactory {
     const href = DATA_FILES[`/node_modules/pdfjs-dist/${DATA_FOLDERS[kind]}/${filename}`];
     if (!href) throw new Error(`pdf.js asked for ${filename}, which is not bundled.`);
     const response = await fetch(href);
-    if (!response.ok) throw new Error(`Could not load ${filename}: HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new NetworkError(
+        'Could not load a part of the PDF reader (fonts or decoders). Check your connection and reload the page.',
+        { cause: new Error(`${filename}: HTTP ${response.status}`) },
+      );
+    }
     return new Uint8Array(await response.arrayBuffer());
   }
 }

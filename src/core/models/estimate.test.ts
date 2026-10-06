@@ -12,6 +12,7 @@ import {
   estimateTokens,
   estimateTranscription,
   estimateVideo,
+  imageTokens,
 } from './estimate';
 import { normalizeModel } from './normalize';
 
@@ -321,5 +322,14 @@ describe('music', () => {
       estimateMusic({ id: lyriaEndpoints.data.id, description: lyriaEndpoints.data.description }),
     ).toBe(0.08);
     expect(estimateMusic({ id: 'other/model', description: '' })).toBeNull();
+  });
+});
+
+describe('imageTokens', () => {
+  it('prices an A4-shaped page image by its pixels / 750, on the high side', () => {
+    // 1,600 × 1,131 pixels / 750.
+    expect(imageTokens(1600)).toBe(2413);
+    expect(imageTokens(1024)).toBeLessThan(imageTokens(1600));
+    expect(imageTokens(2048)).toBeGreaterThan(imageTokens(1600));
   });
 });

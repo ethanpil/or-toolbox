@@ -69,6 +69,16 @@ export interface BotRecord {
   persona: string;
 }
 
+/**
+ * A run that spoke in this conversation and has not ended in this page yet, with the part of its cost already in
+ * `spentUsd`. A reload cuts a run off mid-turn: that turn's cost never reached `spentUsd`, but the page-start sweep
+ * books it in the ledger, and `settleOpenRun` then adds the difference (see `Conversation.openRuns`).
+ */
+export interface OpenRun {
+  id: string;
+  countedUsd: number;
+}
+
 export interface Conversation {
   version: number;
   id: string;
@@ -90,6 +100,54 @@ export interface Conversation {
   spentUsd: number;
   /** Some of `spentUsd` is an estimate. */
   spentApprox: boolean;
+  /**
+   * Runs that began on this conversation and did not end in the page (a reload cut them off). A run is listed from
+   * its start until its page ends it; one still listed on a later load is settled against its run record.
+   */
+  openRuns?: OpenRun[];
+}
+
+/** Notes that a run began on `conversation` (it has counted nothing yet). */
+export function openRun(conversation: Conversation, id: string): void {
+  const open = (conversation.openRuns ??= []);
+  if (!open.some((run) => run.id === id)) open.push({ id, countedUsd: 0 });
+}
+
+/** Adds a turn's cost to the conversation's total and to the run it belongs to. */
+export function countSpend(conversation: Conversation, runId: string, usd: number): void {
+  conversation.spentUsd += usd;
+  const open = conversation.openRuns?.find((run) => run.id === runId);
+  if (open) open.countedUsd += usd;
+}
+
+/** The run ended in the page, which counted everything itself: nothing is left to settle. */
+export function closeRun(conversation: Conversation, id: string): void {
+  if (!conversation.openRuns) return;
+  conversation.openRuns = conversation.openRuns.filter((run) => run.id !== id);
+  if (conversation.openRuns.length === 0) delete conversation.openRuns;
+}
+
+/**
+ * Settles a run the page did not end against what the ledger booked for it (`booked`, null when its record is gone,
+ * then the cost is unknown and the total is marked approximate). Adds what the ledger has beyond what was counted;
+ * never lowers the total. True when anything changed.
+ */
+export function settleOpenRun(
+  conversation: Conversation,
+  id: string,
+  booked: { usd: number; approx: boolean } | null,
+): boolean {
+  const open = conversation.openRuns?.find((run) => run.id === id);
+  if (!open) return false;
+  closeRun(conversation, id);
+  if (!booked) {
+    conversation.spentApprox = true;
+    return true;
+  }
+  const extra = booked.usd - open.countedUsd;
+  if (extra > 0) conversation.spentUsd += extra;
+  if (booked.approx) conversation.spentApprox = true;
+  return true;
 }
 
 export const newId = (): string => crypto.randomUUID();
@@ -269,6 +327,17 @@ function parseBot(value: unknown, fallback: string): BotRecord {
   };
 }
 
+function parseOpenRuns(value: unknown): OpenRun[] {
+  if (!Array.isArray(value)) return [];
+  const runs: OpenRun[] = [];
+  for (const item of value.slice(0, 20) as unknown[]) {
+    if (!isPlainObject(item) || !isString(item['id']) || !item['id']) continue;
+    if (runs.some((run) => run.id === item['id'])) continue;
+    runs.push({ id: item['id'], countedUsd: count(item['countedUsd']) });
+  }
+  return runs;
+}
+
 /**
  * A stored conversation, validated and repaired, or null when it cannot be used (missing, another version, no
  * opener). A turn left `streaming` (the page closed while it spoke) keeps its text as `stopped`, or goes when it had
@@ -293,6 +362,7 @@ export function parseConversation(value: unknown): Conversation | null {
   }
   if (entries[0]?.kind !== 'opener') return null;
   const bots = isPlainObject(value['bots']) ? value['bots'] : {};
+  const openRuns = parseOpenRuns(value['openRuns']);
   return {
     version: CONVERSATION_VERSION,
     id,
@@ -306,5 +376,6 @@ export function parseConversation(value: unknown): Conversation | null {
     elapsedMs: count(value['elapsedMs']),
     spentUsd: count(value['spentUsd']),
     spentApprox: value['spentApprox'] === true,
+    ...(openRuns.length > 0 ? { openRuns } : {}),
   };
 }

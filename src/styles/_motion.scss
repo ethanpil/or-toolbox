@@ -1,6 +1,9 @@
 // Motion: short (150–250 ms), transform and opacity only, and off under the OS "reduce motion" preference or
 // Settings → Appearance → Reduced motion (`data-reduced-motion` on <html>, set before first paint by
-// public/theme-init.js and kept current by src/ui/shell/appearance.ts).
+// public/theme-init.js and kept current by src/ui/shell/appearance.ts). Colour, border, shadow and size changes
+// are instant: a hover or drag-over state is not worth a repaint every frame. The one exception is Bootstrap's own
+// stock transitions (collapse height, progress bar width, `src/styles/_variables.scss`), which are left as they are
+// (rule 6) and stop under the same two switches. A fill that needs to grow smoothly uses `transform: scaleX`.
 
 @keyframes or-fade-in {
   from {

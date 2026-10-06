@@ -40,7 +40,7 @@ import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
 import { isStop, presentError } from '../../ui/feedback/errors';
-import { formatBytes, formatUsd, plural } from '../../ui/format';
+import { formatBytes, formatUsd, plural, shorten, stemFrom } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import type { SendItem, ToolContext, ToolInstance } from '../../ui/tool/types';
@@ -117,21 +117,6 @@ const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 const EDIT_DELAY_MS = 300;
 /** Without Web Locks, a claim older than this belongs to a page that is gone. */
 const CLAIM_STALE_MS = 2 * 60_000;
-
-/** A short file stem from a prompt: `fishing-boat-leaves-a-quiet`. */
-export function stemFrom(prompt: string): string {
-  const words = prompt
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 5);
-  return words.join('-').slice(0, 48) || 'clip';
-}
-
-const shorten = (text: string, max: number): string =>
-  text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
 /**
  * A one-clip job's name in the Jobs list: "Continue clip 2: the camera rises", or "Extend the linked video" when
@@ -702,6 +687,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   const jobs = jobList({
     label: (job) => parsePayload(job.payload)?.label ?? 'Video clip',
     onCancel: (job) => void stopWaiting(job),
+    cancelLabel: 'Stop waiting',
     emptyText:
       'Clips being made appear here. If you leave, OpenRouter keeps going and the clip joins the timeline when you open Video studio again.',
     testId: 'video-jobs',
@@ -1314,7 +1300,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     const { costUsd } = parseResult(job.result);
     const draft: TimelineClip = {
       id: uid('clip'),
-      name: `${stemFrom(payload.prompt)}-${(job.remoteId ?? job.id).slice(-6)}.mp4`,
+      name: `${stemFrom(payload.prompt, 'clip')}-${(job.remoteId ?? job.id).slice(-6)}.mp4`,
       source: 'generated',
       jobId: job.id,
       remoteId: job.remoteId,
@@ -1849,7 +1835,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   const addExport = (blob: Blob, clipIds: readonly string[]): void => {
     exportCount++;
     const first = clipById(clipIds[0] ?? null);
-    const name = `${stemFrom(first?.prompt || first?.name || 'video')}-joined-${exportCount}.mp4`;
+    const name = `${stemFrom(first?.prompt || first?.name || 'video', 'clip')}-joined-${exportCount}.mp4`;
     // Downloading the joined video also counts its generated clips as saved.
     const clipResults = clipIds.flatMap((id) => {
       const result = media.result(id);
