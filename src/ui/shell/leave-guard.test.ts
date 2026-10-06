@@ -116,5 +116,29 @@ describe('installLeaveGuard', () => {
     expect(dialog?.querySelector('[data-testid="leave-guard-list"]')?.textContent).toBe(
       '1 images not downloaded1 run in progress',
     );
+    core = fakeCore(0, 0); // this guard's window listener stays for the next test
+  });
+
+  it('asks the browser to confirm a reload or close while a run of this page is going', () => {
+    let core = fakeCore(0, 0, 1);
+    installLeaveGuard({
+      get results() {
+        return core.results;
+      },
+      get runs() {
+        return core.runs;
+      },
+    });
+    const unload = (): Event => {
+      const event = new Event('beforeunload', { cancelable: true });
+      window.dispatchEvent(event);
+      return event;
+    };
+    // Only a handed-off run: the job finishes it without this page.
+    expect(unload().defaultPrevented).toBe(false);
+    core = fakeCore(0, 1);
+    expect(unload().defaultPrevented).toBe(true);
+    core = fakeCore(0, 0);
+    expect(unload().defaultPrevented).toBe(false);
   });
 });

@@ -210,6 +210,27 @@ describe('outputPanel', () => {
     expect(wasPresented(failure)).toBe(true);
   });
 
+  it('words an error that may have been billed with the caution and a link to the activity page', async () => {
+    const panel = outputPanel({ format: 'text' });
+    panel.start();
+    const unknown = Object.assign(new ApiError('Bad gateway', 502), { outcomeUnknown: true });
+    panel.fail(unknown);
+    await vi.waitFor(() =>
+      expect($(panel.element, 'output-error')?.textContent).toMatch(
+        /check your OpenRouter activity before sending it again/,
+      ),
+    );
+    expect($<HTMLAnchorElement>(panel.element, 'output-activity')?.getAttribute('href')).toBe(
+      'https://openrouter.ai/activity',
+    );
+    expect(wasPresented(unknown)).toBe(true);
+  });
+
+  it('announces its status once, through the announcer only (the line is not a live region)', () => {
+    const panel = outputPanel({ format: 'text' });
+    expect($(panel.element, 'output-status')!.getAttribute('role')).toBeNull();
+  });
+
   it('offers Send to… with the text', () => {
     const sendTo = vi.fn();
     const panel = outputPanel({ format: 'markdown', sendTo, filename: 'answer' });

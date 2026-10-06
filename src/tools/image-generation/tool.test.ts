@@ -119,8 +119,8 @@ beforeEach(async () => {
   await resetDb();
   localStorage.clear();
 });
-afterEach(() => {
-  t.cleanup();
+afterEach(async () => {
+  await t.cleanup();
   for (const result of t.core.results.pending()) t.core.results.remove(result.id);
 });
 
@@ -387,7 +387,7 @@ describe('Image generation', () => {
     expect(wasPresented(locked)).toBe(false);
   });
 
-  it('offers an SVG result as it is: no conversions, no Edit, no Use as reference', async () => {
+  it('offers an SVG result as PNG or a sanitized SVG: no Edit, no Use as reference', async () => {
     const images: ApiClient['images'] = (body) => {
       calls.push(body);
       return Promise.resolve({
@@ -404,9 +404,10 @@ describe('Image generation', () => {
     $<HTMLTextAreaElement>('tool-prompt').dispatchEvent(new Event('input'));
     await t.runners[0]!.trigger();
     const card = t.zones.output.querySelector('[data-testid="imagegen-result"]')!;
-    expect(card.querySelector('[data-testid="imagegen-download"]')?.textContent).toBe(
-      'Download .svg',
-    );
+    expect([...card.querySelectorAll('.dropdown-item')].map((item) => item.textContent)).toEqual([
+      'PNG.png',
+      'SVG.svg',
+    ]);
     expect(card.querySelector('[data-testid="imagegen-vary"]')).not.toBeNull();
     expect(card.querySelector('[data-testid="imagegen-edit"]')).toBeNull();
     expect(card.querySelector('[data-testid="imagegen-use-reference"]')).toBeNull();

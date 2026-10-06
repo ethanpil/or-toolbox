@@ -9,7 +9,7 @@
 import { InvalidInputError } from '../../core/errors';
 import { tools } from '../../tools/registry';
 import type { ToolId, ToolManifest } from '../../tools/types';
-import { fileMime, mimeMatches } from '../components/file-types';
+import { acceptsFile, fileMime, mimeMatches } from '../components/file-types';
 import { toolUrl } from '../shell/links';
 import type { SendItem } from './types';
 
@@ -46,7 +46,11 @@ export function acceptedItems(
   tool: Pick<ToolManifest, 'accepts'>,
   items: readonly SendItem[],
 ): SendItem[] {
-  return items.filter((item) => mimeMatches(itemMime(item), tool.accepts));
+  return items.filter((item) =>
+    item.kind === 'text'
+      ? mimeMatches(itemMime(item), tool.accepts)
+      : acceptsFile({ type: item.blob.type, name: item.name }, tool.accepts),
+  );
 }
 
 /** Tools (other than `exclude`) that accept at least one of the items. */

@@ -14,8 +14,8 @@ beforeEach(async () => {
   await resetDb();
   localStorage.clear();
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 
@@ -139,6 +139,47 @@ describe('createToolTestContext', () => {
     expect((await (await getDb()).get('runs', run.id))?.reservedUsd).toBe(2);
     expect(checks).toEqual([1]);
     await run.finish();
+  });
+
+  it('cleanup stops the run, waits for queued state writes and leaves the bus, so nothing lands later', async () => {
+    t = createToolTestContext(getTool('chat'));
+    const heard: string[] = [];
+    let writes = 0;
+    await t.mount((ctx) => {
+      ctx.bus.on('tool-state-changed', () => heard.push('changed'));
+      // A write queue like Chat's: each write waits for the one before.
+      let queue = Promise.resolve();
+      const write = (): void => {
+        queue = queue
+          .then(() => new Promise((resolve) => setTimeout(resolve, 15)))
+          .then(() => ctx.state.set('thread', { n: ++writes }));
+      };
+      ctx.ui.runner({
+        run: (signal) =>
+          new Promise<void>((_, reject) => {
+            write();
+            signal.addEventListener('abort', () => {
+              write(); // the stopped reply is written, as Chat does
+              write();
+              reject(signal.reason as Error);
+            });
+          }),
+      });
+      return tinyTool(ctx);
+    });
+    void t.runners[0]!.trigger();
+    const context = t;
+    t = null;
+    await context.cleanup();
+    expect(context.runners[0]!.busy).toBe(false);
+    expect(writes).toBe(3);
+    const stored = await (await getDb()).getAll('kv');
+    heard.length = 0;
+    // Nothing more arrives after cleanup: no write, no listener.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(await (await getDb()).getAll('kv')).toEqual(stored);
+    context.core.bus.emit({ type: 'tool-state-changed', tool: 'chat', key: 'thread' });
+    expect(heard).toEqual([]);
   });
 
   it('applies the header model only to the primary capability', () => {

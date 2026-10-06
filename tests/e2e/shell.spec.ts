@@ -275,4 +275,94 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
   }
   expect(checked).toBeGreaterThan(3);
   await expect(runner).toBeVisible();
+
+  // Back up with Shift+Tab: the sticky navbar never covers the focused control either.
+  let above = 0;
+  for (let step = 0; step < 30; step++) {
+    await page.keyboard.press('Shift+Tab');
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => {
+          let last = scrollY;
+          let still = 0;
+          const tick = (): void => {
+            still = scrollY === last ? still + 1 : 0;
+            last = scrollY;
+            if (still >= 8) resolve();
+            else requestAnimationFrame(tick);
+          };
+          setTimeout(() => requestAnimationFrame(tick), 'onscrollend' in window ? 0 : 750);
+        }),
+    );
+    const state = await page.evaluate(() => {
+      const active = document.activeElement as HTMLElement | null;
+      const input = document.querySelector('[data-testid="tool-input"]');
+      const nav = document.querySelector<HTMLElement>('.or-navbar');
+      if (!active || !input?.contains(active) || !nav) return null;
+      const a = active.getBoundingClientRect();
+      const n = nav.getBoundingClientRect();
+      return {
+        name: `${active.textContent?.trim().slice(0, 30)} a=${a.top},${a.bottom} nav=${n.top},${n.bottom}`,
+        covered: a.top < n.bottom - 1 && a.bottom > n.top,
+      };
+    });
+    if (!state) continue;
+    above++;
+    expect(state.covered, state.name).toBe(false);
+  }
+  expect(above).toBeGreaterThan(3);
+});
+
+test('a tool page does not shift while the tool sets itself up (CLS)', async ({
+  page,
+  context,
+  browserName,
+}) => {
+  test.skip(browserName !== 'chromium', 'layout-shift entries are Chromium only');
+  await seedApp(context, { key: true });
+  await page.addInitScript(() => {
+    const shifts: number[] = [];
+    (window as unknown as { __shifts: number[] }).__shifts = shifts;
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries() as (PerformanceEntry & {
+        value: number;
+        hadRecentInput: boolean;
+      })[]) {
+        if (!entry.hadRecentInput) shifts.push(entry.value);
+      }
+    }).observe({ type: 'layout-shift', buffered: true });
+  });
+  for (const tool of ['chat', 'data-extractor', 'image-generation']) {
+    await page.goto(`tools/${tool}/`);
+    await expect(page.getByTestId('tool-prompt')).toBeVisible();
+    await page.waitForTimeout(1500); // the chips and the estimate arrive after setup
+    const total = await page.evaluate(() =>
+      (window as unknown as { __shifts: number[] }).__shifts.reduce((sum, value) => sum + value, 0),
+    );
+    expect(total, tool).toBeLessThan(0.1); // "good" CLS
+  }
+});
+
+test('on a phone, toasts float above the Run bar instead of covering Run and Stop', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context, { key: true });
+  await page.setViewportSize({ width: 375, height: 700 });
+  await page.goto('tools/data-extractor/');
+  await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
+  // A dropped file the tool does not take: the page says so in a toast.
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.items.add(new File(['x'], 'archive.zip', { type: 'application/zip' }));
+    window.dispatchEvent(
+      new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }),
+    );
+  });
+  const toastEl = page.getByTestId('toast').last();
+  await expect(toastEl).toContainText('Skipped 1 file');
+  const runner = page.getByTestId('runner');
+  const toastBox = (await toastEl.boundingBox())!;
+  const runnerBox = (await runner.boundingBox())!;
+  expect(toastBox.y + toastBox.height).toBeLessThanOrEqual(runnerBox.y + 1);
 });

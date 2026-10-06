@@ -7,11 +7,13 @@
  * Downloads: the image itself is always offered as it is (its format is `name`'s extension, else its type);
  * every entry of `formats` that differs from it is converted through a canvas when chosen (JPEG is flattened
  * onto white, since it has no transparency). A PNG with `formats: ['png', 'jpg', 'webp']` offers PNG (as it
- * is), JPG and WEBP (converted). An SVG is offered as it is only. A conversion checks what the browser actually
+ * is), JPG and WEBP (converted). An SVG is offered as PNG and as a sanitized SVG (`sanitizeSvg`: no scripts,
+ * no `foreignObject`, no external links), never as the model sent it. A conversion checks what the browser actually
  * wrote: one that cannot encode a format (Safari writes PNG when asked for WebP) saves nothing, says so, and
  * that format leaves the menu of every image card on the page (and of cards made later).
  *
- * Remove asks `beforeRemove` (if given), then drops the result (`handle.remove()`), disposes the viewer,
+ * Remove (`resultRemoval()`, shared with the audio and video cards) asks `beforeRemove`, by default a confirmation
+ * while the image is not downloaded, then drops the result (`handle.remove()`), disposes the viewer,
  * detaches the card, announces it and calls `onRemove`. Then, unless `onRemove` moved focus itself, focus goes
  * to the Remove button of the next image card on the page (else the previous one), else to `focusFallback()`,
  * asked only now so it can return what `onRemove` showed (an empty state). `remove()` drops the card from code,
@@ -37,9 +39,7 @@
 import { InvalidInputError } from '../../core/errors';
 import { extensionForMime } from '../../core/files';
 import { loadImage, toBlob } from '../../core/media/image';
-import { disposeBootstrap } from '../bootstrap';
-import { type Child, focusKey, h } from '../dom';
-import { announce } from '../feedback/announce';
+import { type Child, h } from '../dom';
 import { markPresented } from '../feedback/errors';
 import { toast } from '../feedback/toast';
 import { icon } from '../icon';
@@ -47,6 +47,8 @@ import { uid } from '../id';
 import type { ResultHandle, ToolUi } from '../tool/types';
 import { type ExportFormat, exportMenu } from './export-menu';
 import { type ImageViewer, imageViewer } from './image-viewer';
+import { resultRemoval } from './result-removal';
+import { sanitizeSvg } from './sanitize-svg';
 
 export type ImageFormat = 'png' | 'jpg' | 'webp';
 
@@ -83,7 +85,10 @@ export interface ImageResultCardOptions {
   onRemove: () => void;
   /** The tool's own buttons, after Send to… (Variations, Use as reference, Edit…). */
   actions?: readonly ImageResultAction[];
-  /** Asked before Remove removes anything; false keeps the card. */
+  /**
+   * Asked before Remove removes anything; false keeps the card. Default: while the image is not downloaded, a
+   * confirmation naming it (`confirmUndownloaded`); `() => true` removes without asking.
+   */
   beforeRemove?: () => boolean | Promise<boolean>;
   /** Where focus goes after a removal when no other image card is left on the page. */
   focusFallback?: () => HTMLElement | null | undefined;
@@ -116,17 +121,10 @@ export interface ImageResultCard {
 
 /** Marks image cards on the page, so a card that goes can hand focus to a neighbour. */
 const CARD_CLASS = 'or-image-result';
-/** Each live card: its Remove button key, and how it redraws its Download menu. */
-const liveCards = new WeakMap<Element, { removeKey: string; refreshFormats: () => void }>();
+/** Each live card: how it redraws its Download menu. */
+const liveCards = new WeakMap<Element, { refreshFormats: () => void }>();
 /** Formats this browser turned out not to encode (Safari writes PNG for WebP); no card offers them again. */
 const unencodable = new Set<ImageFormat>();
-
-/** The other image cards on the page: the following ones nearest first, then the preceding ones nearest first. */
-function neighbours(card: Element): Element[] {
-  const cards = [...document.querySelectorAll(`.${CARD_CLASS}`)];
-  const at = cards.indexOf(card);
-  return at < 0 ? [] : [...cards.slice(at + 1), ...cards.slice(0, at).reverse()];
-}
 
 /** Focus fell to the page (its element was removed, or nothing has it). */
 function focusLost(): boolean {
@@ -181,14 +179,23 @@ export function imageResultCard(options: ImageResultCardOptions): ImageResultCar
       : imageViewer({ blob, alt: options.alt ?? title, testId: `${testId}-viewer` });
 
   const own = ownFormat(name, blob.type);
-  // A canvas would rasterise an SVG at whatever size the browser guesses: SVGs are saved as they are only.
+  // An SVG opened from disk runs its scripts and loads its links: it is offered as a PNG first, and as an SVG
+  // only once sanitized. The registered result becomes the clean file as soon as it is ready, so the leave
+  // guard's "Download all" saves that one too.
   const svg = own === 'svg' || blob.type === 'image/svg+xml';
+  const clean: Promise<Blob> | null = svg
+    ? sanitizeSvg(blob).then((safe) => {
+        handle.result.blob = safe;
+        return safe;
+      })
+    : null;
+  clean?.catch(() => undefined); // a failure is reported when the user downloads
   const stem = /\.[a-z0-9]+$/i.test(name) ? name.replace(/\.[a-z0-9]+$/i, '') : name;
 
   /** A conversion; one the browser cannot encode says so once and leaves every card's menu. */
   const convert = async (to: ImageFormat): Promise<Blob> => {
     try {
-      return await convertImage(blob, to);
+      return await convertImage(clean ? await clean : blob, to);
     } catch (error) {
       if (!unencodable.has(to)) throw error;
       toast({ variant: 'warning', message: cannotEncode(to).message });
@@ -201,9 +208,12 @@ export function imageResultCard(options: ImageResultCardOptions): ImageResultCar
     }
   };
   const downloads = (): ExportFormat[] => {
-    /** `to: null` is the file as it is. */
+    /** `to: null` is the file as it is (an SVG: sanitized). */
     const choices: { extension: string; to: ImageFormat | null }[] = svg
-      ? []
+      ? [
+          ...(unencodable.has('png') ? [] : [{ extension: 'png', to: 'png' as const }]),
+          { extension: 'svg', to: null },
+        ]
       : options.formats
           .filter((to) => to === own || !unencodable.has(to))
           .map((to) => ({ extension: to, to: to === own ? null : to }));
@@ -213,7 +223,7 @@ export function imageResultCard(options: ImageResultCardOptions): ImageResultCar
       label: extension.toUpperCase(),
       extension,
       icon: 'file-earmark-image',
-      build: () => (to ? convert(to) : blob),
+      build: () => (to ? convert(to) : (clean ?? blob)),
     }));
   };
   const menu = exportMenu({
@@ -310,48 +320,25 @@ export function imageResultCard(options: ImageResultCardOptions): ImageResultCar
       ),
     ),
   );
-  liveCards.set(element, { removeKey, refreshFormats: () => refreshFormats() });
+  liveCards.set(element, { refreshFormats: () => refreshFormats() });
 
-  let removed = false;
-  /** Drops the card; returns the Remove keys of the cards that may take focus next, nearest first. */
-  const detach = (): string[] => {
-    removed = true;
-    const next = neighbours(element).flatMap((card) => liveCards.get(card)?.removeKey ?? []);
-    handle.remove();
-    viewer?.dispose();
-    disposeBootstrap(element);
-    liveCards.delete(element);
-    element.remove();
-    return next;
-  };
-  const moveFocus = (next: readonly string[]): void => {
-    for (const key of next) if (focusKey(document, key)) return;
-    options.focusFallback?.()?.focus();
-  };
+  const removal = resultRemoval({
+    element,
+    cardClass: CARD_CLASS,
+    removeKey,
+    handle,
+    title,
+    noun: 'image',
+    testId,
+    beforeRemove: options.beforeRemove,
+    onRemove: options.onRemove,
+    focusFallback: options.focusFallback,
+    dispose: () => {
+      viewer?.dispose();
+      liveCards.delete(element);
+    },
+  });
+  const removeByUser = (): Promise<void> => removal.removeByUser();
 
-  let asking = false;
-  const removeByUser = async (): Promise<void> => {
-    if (asking || removed) return;
-    asking = true;
-    try {
-      if (options.beforeRemove && !(await options.beforeRemove())) return;
-    } finally {
-      asking = false;
-    }
-    if (removed) return;
-    const next = detach();
-    announce(`Removed ${title}.`);
-    options.onRemove();
-    // After onRemove, so the fallback can be what it showed; a place onRemove focused itself is kept.
-    if (focusLost()) moveFocus(next);
-  };
-
-  const remove = (): void => {
-    if (removed) return;
-    const hadFocus = element.contains(document.activeElement);
-    const next = detach();
-    if (hadFocus) moveFocus(next);
-  };
-
-  return { element, handle, viewer, remove };
+  return { element, handle, viewer, remove: () => removal.remove() };
 }

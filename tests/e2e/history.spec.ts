@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import type { Page } from '@playwright/test';
 import type { RunRecord } from '../../src/core/types';
 import { expect, test } from '../mock/index.ts';
-import { seedApp } from './app.ts';
+import { seedApp, testKeysFile } from './app.ts';
 import { makeRun, makeStats, makeUsage, seedDb, utcDayAgo } from './seed.ts';
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 
@@ -140,6 +140,18 @@ test('groups runs by day, and each row shows tool, title, model, status, cost, t
   expect(problems).toEqual([]);
 });
 
+test('Home’s recent runs word their cost as History does: estimated with ≈, unknown never as a number', async ({
+  page,
+}) => {
+  await openHistory(page);
+  await page.goto('./');
+  const recent = (title: string) =>
+    page.getByTestId('recent-run').filter({ has: page.getByText(title, { exact: true }) });
+  await expect(recent('Read aloud')).toContainText('≈ $0.002');
+  await expect(recent('Poster')).toContainText('Cost unknown');
+  await expect(recent('Summarise invoice')).toContainText('$0.022');
+});
+
 test('an empty history says so', async ({ page }) => {
   await openHistory(page, []);
   await expect(page.getByTestId('history-empty')).toContainText('No runs yet');
@@ -185,6 +197,46 @@ test.describe('search and filters', () => {
     await page.goto('history/?tool=nope');
     await expect(page.getByTestId('history-tool')).toHaveValue('');
     await expect(rows(page)).toHaveCount(RUNS.length);
+  });
+
+  test('filtering by a key that is then removed shows every run again, as the select says', async ({
+    page,
+  }) => {
+    const second = {
+      ...(testKeysFile().keys as Record<string, unknown>[])[0],
+      id: 'key-two',
+      name: 'Second key',
+    };
+    const keysFile = { ...testKeysFile(), keys: [...(testKeysFile().keys as unknown[]), second] };
+    await page.goto('privacy/');
+    await page.evaluate(
+      (file) => localStorage.setItem('ortoolbox:keys', JSON.stringify(file)),
+      keysFile,
+    );
+    await openHistory(page, [
+      makeRun('run-first-key', 5, { title: 'First key run' }),
+      makeRun('run-second-key', 6, {
+        title: 'Second key run',
+        keyId: 'key-two',
+        keyName: 'Second key',
+      }),
+    ]);
+    await page.getByTestId('history-key').selectOption('key-two');
+    await expect(rows(page)).toHaveCount(1);
+
+    // Another tab removes that key.
+    await page.evaluate(() => {
+      const file = JSON.parse(localStorage.getItem('ortoolbox:keys')!) as {
+        keys: { id: string }[];
+      };
+      file.keys = file.keys.filter((key) => key.id !== 'key-two');
+      localStorage.setItem('ortoolbox:keys', JSON.stringify(file));
+      const bus = new BroadcastChannel('ortoolbox');
+      bus.postMessage({ type: 'keys-changed' });
+      bus.close();
+    });
+    await expect(page.getByTestId('history-key')).toHaveValue('');
+    await expect(rows(page)).toHaveCount(2);
   });
 
   const routed = makeRun('run-routed', 15, {

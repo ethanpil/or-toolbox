@@ -70,6 +70,7 @@ All notable changes to this project are documented here. The format follows
 - Stage 7 review, shared UI: `runner.setLabel()`, `runner.addAction()` and `RunnerOptions.hideWhileBusy` for multi-action run bars, `stopOnEscape()` and `composing()` (4a7cacb); `createMarkdownCache()`, `attachmentIntake()` and the `.or-icon-action` button class (cdb6f5f); `describeRunCost()`, `formatRunCost()` and `usageLine()` (6c3967a); `failureText()` with a blind mode for the arena whose failures all read alike (276d460, 2fe9023); manifest field `ownModels` (7200c1b).
 - v1 README and user guide (`docs/user-guide.md`: first steps, every tool, platform pages, troubleshooting), with screenshots in `docs/images/` (e29928a).
 - `ChatStreamResult.refusal` names a model's refusal or a reply cut by the content filter or an error (f566153); `EstimateInput` tokens take `audio: { input, output }` (1f43772); `isoDateTime()` in `format.ts` (eeece28); `StorageUnavailableError` (46725c8); OAuth's `KeyNotSavedError` with `save()` (03f3b6b).
+- Stage 8 framework: `retryGate().retryFailed(error, keys)` (asks before resending a request that may have been billed), `failureLine()`, `ItemOutcome.failure`, `pendingOnly(isDone, allKeys)` for plain-run replays (13f0060); `resultRemoval()`/`confirmUndownloaded()` and `sanitizeSvg()` (fd0aca4); `ui.confirmDiscard()`, `RunnerOptions.stopOnEscape`, Alt+Shift+N to reach a toast's action (b60be68); `ToolTestContext.settle()` (1457b54).
 
 ### Changed
 
@@ -93,6 +94,9 @@ All notable changes to this project are documented here. The format follows
 - Video estimates take an `images` count and add per-image input prices (`cents_per_image_input`) (e7aaee5).
 - Video studio uses the framework's job cost (`usage`), `run.cancel()` for "Stop waiting" (History shows it stopped at once), opt-in job notifications (one per sequence), `outcomeUnknown` (no Retry toast) and `videoResultCard`; a sequence step the provider failed no longer counts against the spend cap (9fb1171).
 - Image pipeline: opt-in `adaptThreshold` (threshold kept below the picture's own background and noise) and `despeckle` (background filled on the picture and small light specks removed before the product box); `IsolateResult.threshold` (fdb6368).
+- The primary runner stops on Escape by default; image and audio result cards ask before removing a result not downloaded, like video (13f0060, fd0aca4).
+- `createToolTestContext().cleanup()` is async: it stops runs, waits for tool-state writes and leaves the bus (1457b54).
+- The palette lists every tool and page while the search is empty (b4cd175).
 
 - Stage 0 review fixes: COEP `require-corp` only, isolation reload limited to pages that need threads, manifest-based offline shell, hardened `h()` and Markdown sanitising, dev-server CSP and isolation, TypeScript 6, single gated CI pipeline (cb1cc69).
 - Errors share one `OrError` base with codes; shared helpers moved to `util.ts` (6b469ef).
@@ -131,6 +135,17 @@ All notable changes to this project are documented here. The format follows
 - A Stop during an image stream keeps the completed, billed images (`partialImageResult`) (04e84a9).
 - Deleting history or tool data keeps runs and jobs in progress, so their spend is still booked; a per-tool delete also removes the tool's saved state (4e53b56).
 - `beginRun({ model })` books that model's estimate, so the per-run limit applies (c382456).
+- A batch where every item failed and one may have been billed now shows the runner's caution instead of staying quiet; inline failures and the output panel keep that caution (13f0060).
+- The error toast's Retry after a failure part-way can skip finished items of a plain run, and says why when it cannot start (13f0060).
+- OpenRouter's specific 402 and 429 messages are no longer replaced by generic ones; the rate-limit toast no longer talks only about free models (13f0060).
+- Reloading or closing a tab during a run asks first (13f0060).
+- The same status line is announced once, not three times (13f0060).
+- Removing the last audio take no longer loses focus (fd0aca4).
+- SVG results are saved sanitized (no scripts, no external links) or as PNG (fd0aca4).
+- Tool pages no longer shift while the tool sets itself up; the Run bar no longer scrolls controls beside it or in dialogs; Shift+Tab never leaves focus under the navbar; toasts no longer cover Run and Stop on phones; `.tsx`, `.vue` and `.kt` files dropped on Chat are no longer skipped (b60be68).
+- History stops filtering by a key that was removed; Home words estimated costs with ≈; the Budgets help explains group totals; Enter that confirms an IME composition no longer acts in the palette or Home's search; revealing a document page respects reduced motion (b4cd175).
+- Tool unit tests no longer write into the next test's database (1457b54).
+
 - The sticky Run bar no longer covers a control focused by Tab when the page scrolls smoothly to it: the framework checks again once the scroll ends (d8e6d0c).
 - The first-visit isolation reload no longer happens once the user has started using the page, keeps the parameters the tool already consumed, and never happens on a Send to page (942ff57).
 - After a deploy, a page whose lazy chunk is gone offers a reload; pages served from the cache find their lazy chunks precached (942ff57, a2622e3).

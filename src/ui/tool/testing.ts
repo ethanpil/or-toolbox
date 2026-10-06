@@ -11,7 +11,7 @@
  * const state = { prompt: 'Extract the totals', settings: { mode: 'math' } };
  * tool.applyState(state);
  * expect(tool.getState()).toEqual(state); // the round trip Prompts and History rely on
- * t.cleanup();
+ * await t.cleanup();                         // in afterEach: stops runs, waits for writes, leaves the bus
  * ```
  *
  * The context is built by the same `createToolContext` as the real page, so `beginRun`, `model()`, estimates
@@ -23,6 +23,7 @@ import { createTestCore, type KeyState } from '../../core/testing/state-fakes';
 import type { ApiClient, CoreServices, ToolManifest } from '../../core/types';
 import { h } from '../dom';
 import { createToolContext } from './context';
+import { confirmDiscard } from './discard';
 import { badgeValue, createEstimateTracker } from './estimate';
 import { resultHandle } from './results';
 import { createRunner, type RunnerInternals } from './runner';
@@ -54,8 +55,17 @@ export interface ToolTestContext {
   status(): string;
   /** Runs `setup(ctx)` and remembers the instance (beginRun and estimates read it). */
   mount(setup: ToolSetup): Promise<ToolInstance>;
-  /** Removes the zones from the page. */
-  cleanup(): void;
+  /**
+   * Waits, without stopping anything, until no run is going and the tool's tool-state reads and writes have landed
+   * (a write queue's next write included). For a test that checks what was stored, or opens a second "tab".
+   */
+  settle(): Promise<void>;
+  /**
+   * Ends the test's tool: stops every runner, then `settle()`, then removes every bus listener added through this context
+   * and the runners' Escape handlers, then removes the zones. Await it in `afterEach`, before the next test resets
+   * the database, so nothing of this test lands in the next one.
+   */
+  cleanup(): Promise<void>;
 }
 
 export function createToolTestContext(
@@ -92,6 +102,37 @@ export function createToolTestContext(
     ...options.api,
   };
   core.models = createModelsService(core);
+
+  // What `cleanup` waits for and undoes: tool-state calls still in flight, and every bus listener added from here.
+  const inFlight = new Set<Promise<unknown>>();
+  const track = (value: unknown): unknown => {
+    if (value instanceof Promise) {
+      inFlight.add(value);
+      value.then(
+        () => inFlight.delete(value),
+        () => inFlight.delete(value),
+      );
+    }
+    return value;
+  };
+  const rawToolState = core.toolState.bind(core);
+  core.toolState = (tool) =>
+    new Proxy(rawToolState(tool), {
+      get(target, prop, receiver) {
+        const value: unknown = Reflect.get(target, prop, receiver);
+        return typeof value === 'function'
+          ? (...args: unknown[]) =>
+              track((value as (...a: unknown[]) => unknown).apply(target, args))
+          : value;
+      },
+    });
+  const listeners: (() => void)[] = [];
+  const rawOn = core.bus.on.bind(core.bus);
+  core.bus.on = (type, fn) => {
+    const off = rawOn(type, fn);
+    listeners.push(off);
+    return off;
+  };
 
   const input = h('div', { 'data-testid': 'tool-input' });
   const output = h('div', { 'data-testid': 'tool-output' });
@@ -138,6 +179,7 @@ export function createToolTestContext(
       statusText = text;
     },
     holdWork: (description) => core.results.hold(description),
+    confirmDiscard,
     addResult: (result) => resultHandle(core, core.results.add({ tool: manifest.id, ...result })),
     sendTo: (items) => {
       sent.push(items);
@@ -155,6 +197,22 @@ export function createToolTestContext(
     instance: () => instance,
   });
 
+  /**
+   * Settled once no runner was busy and no tool-state call was in flight for two checks in a row (a write queue
+   * starts its next write a moment after the one before ends); 5 s at most.
+   */
+  const settle = async (): Promise<void> => {
+    const deadline = Date.now() + 5000;
+    for (let quiet = 0; quiet < 2 && Date.now() < deadline;) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (inFlight.size > 0) {
+        await Promise.allSettled([...inFlight]);
+        quiet = 0;
+      } else if (runners.some((runner) => runner.busy)) quiet = 0;
+      else quiet++;
+    }
+  };
+
   return {
     ctx,
     core,
@@ -169,7 +227,12 @@ export function createToolTestContext(
       await estimates.refresh();
       return instance;
     },
-    cleanup() {
+    settle,
+    async cleanup() {
+      for (const runner of runners) runner.stop();
+      await settle();
+      for (const off of listeners.splice(0)) off();
+      for (const runner of runners) runner.dispose();
       root.remove();
     },
   };

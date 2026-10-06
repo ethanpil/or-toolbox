@@ -35,8 +35,8 @@ beforeEach(async () => {
   localStorage.clear();
   document.querySelectorAll('[data-testid="toasts"]').forEach((node) => node.remove());
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 
@@ -683,7 +683,7 @@ describe('the cost estimate', () => {
     expect(estimate).toBeGreaterThan(0);
     // 32,000 tokens would cost $0.00134 at Jev's price; this request is a small fraction of that.
     expect(estimate).toBeLessThan(0.0005);
-    paid.t.cleanup();
+    await paid.t.cleanup();
 
     const free = await mount(decideWith(mercuryResponse), {
       modelOverride: 'inception/mercury-decide:free',

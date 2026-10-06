@@ -2,10 +2,13 @@
  * Leave-page guard for in-app navigation. While this page holds results that were not downloaded
  * (`results.pending()`) or runs in progress (`runs.active()`), a click on a link to another page of the site is
  * intercepted and a dialog lists what would be lost, with Download all / Leave anyway / Stay. Reloads, closing
- * the tab and typed URLs are covered by the native `beforeunload` prompt the results service adds.
+ * the tab and typed URLs get the browser's own `beforeunload` prompt instead: the results service adds one while
+ * results are not downloaded or work is held, and this guard adds one while a run of this page is going (not a
+ * run handed off to a job). Browsers show that prompt only after the user has interacted with the page, and
+ * never with our text.
  *
- * "Leave anyway" discards the pending results first, so the native prompt does not ask a second time; runs are
- * aborted by the runs service when the page goes away.
+ * "Leave anyway" discards the pending results first, so the native prompt does not ask about them a second time;
+ * runs are aborted by the runs service when the page goes away.
  *
  * Code that navigates by script (the palette, Home's search) calls `navigate()` so it is guarded too.
  */
@@ -58,12 +61,14 @@ export function atStake(core: Pick<CoreServices, 'results' | 'runs'>): string[] 
   if (summary) lines.push(summary);
   lines.push(...core.results.holds());
   // A run handed off to a job (video) is finished by the job, also after this page is gone.
-  const running = core.runs.active().filter((run) => run.jobId === null).length;
+  const running = liveRuns(core);
   if (running > 0) lines.push(`${plural(running, 'run')} in progress`);
   return lines;
 }
 
 let dialogOpen = false;
+/** The user already chose to leave in our dialog: the native prompt must not ask again. */
+let leaving = false;
 
 /**
  * Goes to `href` in this tab, asking first when something would be lost. Resolves false when the user stayed.
@@ -83,6 +88,7 @@ export async function guardedNavigate(
     if (!leave) return false;
     for (const result of core.results.pending()) core.results.remove(result.id);
     core.results.releaseHolds();
+    leaving = true;
     location.assign(href);
     return true;
   } finally {
@@ -170,8 +176,26 @@ function askToLeave(core: Pick<CoreServices, 'results' | 'runs'>): Promise<boole
   return modal.closed.then(() => leave);
 }
 
-/** Intercepts in-app link clicks on this page while something is at stake. */
+/** Runs of this page that end with it (a run handed off to a job does not). */
+const liveRuns = (core: Pick<CoreServices, 'runs'>): number =>
+  core.runs.active().filter((run) => run.jobId === null).length;
+
+/**
+ * Intercepts in-app link clicks on this page while something is at stake, and asks the browser to confirm a
+ * reload, a close or a typed URL while a run of this page is going (results and holds have the results service's
+ * own `beforeunload`).
+ */
 export function installLeaveGuard(core: Pick<CoreServices, 'results' | 'runs'>): void {
+  window.addEventListener('beforeunload', (event) => {
+    if (leaving || liveRuns(core) === 0) return;
+    event.preventDefault();
+    // Older Safari and Chromium show the prompt only when returnValue is set.
+    event.returnValue = '';
+  });
+  // Back from the back/forward cache: guard again.
+  window.addEventListener('pageshow', () => {
+    leaving = false;
+  });
   document.addEventListener('click', (event) => {
     const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
     if (!(anchor instanceof HTMLAnchorElement)) return;

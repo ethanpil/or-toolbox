@@ -171,7 +171,7 @@ afterEach(async () => {
   if (t) {
     const runner = t.runners[0];
     await vi.waitFor(() => expect(runner?.busy ?? false).toBe(false), { timeout: 5000 });
-    t.cleanup();
+    await t.cleanup();
   }
   t = null;
   document.body.replaceChildren();
@@ -547,7 +547,7 @@ describe('review fixes', () => {
     const maybeBilled = byText('may still have done the work')!;
     expect(maybeBilled.querySelector('a[href="https://openrouter.ai/activity"]')).not.toBeNull();
     expect($$('panel-retry', maybeBilled)).toHaveLength(0);
-    const credits = byText('Not enough credits')!;
+    const credits = byText('Insufficient credits for delta/four.')!; // OpenRouter's own 402 text is kept
     expect(credits.querySelector('a[href="https://openrouter.ai/activity"]')).toBeNull();
     expect($$('panel-retry', credits)).toHaveLength(1);
   });
@@ -757,7 +757,7 @@ describe('re-run with another model (?model=)', () => {
     await first.t.runners[0]!.trigger();
     const runs = await first.t.core.history.query({ tool: 'model-arena' });
     const opened = runs.find((run) => run.model === 'beta/two:free')!;
-    first.t.cleanup();
+    await first.t.cleanup();
     t = null;
     document.body.replaceChildren();
 

@@ -1,12 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../../core/errors';
 import { h } from '../dom';
 import * as announcer from '../feedback/announce';
 import { BUSY_REASON, retryGate } from './retry-gate';
 import { createRunner } from './runner';
 
+const hoisted = vi.hoisted(() => ({ confirm: vi.fn(() => Promise.resolve(true)) }));
+vi.mock('../feedback/dialogs', () => ({ confirmDialog: hoisted.confirm }));
+
 afterEach(() => {
   document.body.replaceChildren();
   vi.restoreAllMocks();
+  hoisted.confirm.mockReset();
+  hoisted.confirm.mockImplementation(() => Promise.resolve(true));
 });
 
 function setup() {
@@ -61,6 +67,34 @@ describe('retryGate', () => {
     await vi.waitFor(() => expect(runner.busy).toBe(false));
     runner.setDisabled(null);
     expect(runs).toEqual([['page-2']]);
+  });
+
+  it('retryFailed retries an ordinary failure at once', async () => {
+    const { runner, runs } = setup();
+    const gate = retryGate(runner);
+    await expect(gate.retryFailed(new ApiError('Bad request', 400), ['page-1'])).resolves.toBe(
+      true,
+    );
+    expect(hoisted.confirm).not.toHaveBeenCalled();
+    expect(runs).toEqual([['page-1']]);
+  });
+
+  it('retryFailed asks first when the failed request may have been billed', async () => {
+    const { runner, runs, finish } = setup();
+    const gate = retryGate(runner);
+    const unknown = Object.assign(new ApiError('Bad gateway', 502), { outcomeUnknown: true });
+
+    hoisted.confirm.mockImplementation(() => Promise.resolve(false));
+    await expect(gate.retryFailed(unknown, ['page-1'])).resolves.toBe(false);
+    expect(runs).toEqual([]); // declined: nothing sent
+
+    hoisted.confirm.mockImplementation(() => Promise.resolve(true));
+    await expect(gate.retryFailed(unknown, ['page-1'])).resolves.toBe(true);
+    expect(runs).toEqual([['page-1']]);
+    expect(hoisted.confirm).toHaveBeenLastCalledWith(
+      expect.objectContaining({ confirmLabel: 'Retry anyway', testId: 'retry-unknown-confirm' }),
+    );
+    finish();
   });
 
   it('moves focus to the fallback when a focused Retry button disappears', async () => {

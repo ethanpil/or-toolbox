@@ -8,10 +8,11 @@
  * with `formats: ['mp3', 'wav']` offers MP3 (as it is) and WAV (converted); a WebM recording with `['wav']`
  * offers WEBM and WAV.
  *
- * Remove asks `beforeRemove` (if given), then drops the result (`handle.remove()`), disposes the player,
- * detaches the card, announces it and calls `onRemove`. Focus goes to the Remove button of the next audio card
- * on the page (else the previous one), else to `focusFallback()`. `remove()` does the same from code, without
- * asking, announcing or calling `onRemove`, and moves focus only when it was inside the card.
+ * Remove follows `resultRemoval()` (result-removal.ts), like the image and video cards: it asks `beforeRemove`, by
+ * default a confirmation while the audio is not downloaded, then drops the result, disposes the player, detaches
+ * the card, announces it and calls `onRemove`. Then, unless `onRemove` moved focus, focus goes to the Remove button
+ * of the next audio card (else the previous one), else to `focusFallback()`, asked only now. `remove()` does it
+ * from code, without asking, announcing or calling `onRemove`, and moves focus only when it was inside the card.
  *
  * ```ts
  * const card = audioResultCard({
@@ -29,15 +30,14 @@
  */
 import { extensionForMime } from '../../core/files';
 import { transcode, type TranscodeFormat } from '../../core/media/transcode';
-import { disposeBootstrap } from '../bootstrap';
-import { type Child, focusKey, h } from '../dom';
-import { announce } from '../feedback/announce';
+import { type Child, h } from '../dom';
 import { formatDuration } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
 import type { ResultHandle, ToolUi } from '../tool/types';
 import { type AudioPlayer, audioPlayer } from './audio-player';
 import { type ExportFormat, exportMenu } from './export-menu';
+import { resultRemoval } from './result-removal';
 
 export interface AudioResultCardOptions {
   /** `ctx.ui` (or just these two members): the file is registered with `addResult`; Send to… opens `sendTo`. */
@@ -55,7 +55,10 @@ export interface AudioResultCardOptions {
   formats: readonly TranscodeFormat[];
   /** Called after the user removed the card with its Remove button (not after `remove()` from code). */
   onRemove: () => void;
-  /** Asked before Remove removes anything; false keeps the card (e.g. a "not downloaded yet" confirmation). */
+  /**
+   * Asked before Remove removes anything; false keeps the card. Default: while the audio is not downloaded, a
+   * confirmation naming it (`confirmUndownloaded`); `() => true` removes without asking.
+   */
   beforeRemove?: () => boolean | Promise<boolean>;
   /** Where focus goes after a removal when no other audio card is left on the page. */
   focusFallback?: () => HTMLElement | null | undefined;
@@ -80,15 +83,6 @@ export interface AudioResultCard {
 
 /** Marks audio cards on the page, so a card that goes can hand focus to a neighbour. */
 const CARD_CLASS = 'or-audio-result';
-/** Each live card's Remove button key. */
-const removeKeys = new WeakMap<Element, string>();
-
-/** The other audio cards on the page: the following ones nearest first, then the preceding ones nearest first. */
-function neighbours(card: Element): Element[] {
-  const cards = [...document.querySelectorAll(`.${CARD_CLASS}`)];
-  const at = cards.indexOf(card);
-  return at < 0 ? [] : [...cards.slice(at + 1), ...cards.slice(0, at).reverse()];
-}
 
 export function audioResultCard(options: AudioResultCardOptions): AudioResultCard {
   const { ui, blob, name, seconds } = options;
@@ -185,42 +179,20 @@ export function audioResultCard(options: AudioResultCardOptions): AudioResultCar
       ),
     ),
   );
-  removeKeys.set(element, removeKey);
+  const removal = resultRemoval({
+    element,
+    cardClass: CARD_CLASS,
+    removeKey,
+    handle,
+    title: options.title ?? name,
+    noun: 'audio',
+    testId,
+    beforeRemove: options.beforeRemove,
+    onRemove: options.onRemove,
+    focusFallback: options.focusFallback,
+    dispose: () => player.dispose(),
+  });
+  const removeByUser = (): Promise<void> => removal.removeByUser();
 
-  let removed = false;
-  /** Drops the card; `moveFocus` false leaves focus alone unless it was inside the card. */
-  const drop = (moveFocus: boolean): void => {
-    if (removed) return;
-    removed = true;
-    const hadFocus = element.contains(document.activeElement);
-    const next = neighbours(element);
-    handle.remove();
-    player.dispose();
-    disposeBootstrap(element);
-    removeKeys.delete(element);
-    element.remove();
-    if (!moveFocus && !hadFocus) return;
-    for (const card of next) {
-      const key = removeKeys.get(card);
-      if (key !== undefined && focusKey(card, key)) return;
-    }
-    options.focusFallback?.()?.focus();
-  };
-
-  let asking = false;
-  const removeByUser = async (): Promise<void> => {
-    if (asking || removed) return;
-    asking = true;
-    try {
-      if (options.beforeRemove && !(await options.beforeRemove())) return;
-    } finally {
-      asking = false;
-    }
-    if (removed) return;
-    drop(true);
-    announce(`Removed ${name}.`);
-    options.onRemove();
-  };
-
-  return { element, handle, player, remove: () => drop(false) };
+  return { element, handle, player, remove: () => removal.remove() };
 }

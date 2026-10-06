@@ -50,10 +50,14 @@ body {
   min-width: 0;
 }
 
-// Keep anchored sections clear of the sticky navbar.
+// Keep anchored sections, and anything scrolled into view (focus included), clear of the sticky navbar.
+:root {
+  scroll-padding-top: 4.5rem;
+}
+
 section,
 [id] {
-  scroll-margin-top: 5rem;
+  scroll-margin-top: 0.5rem; // on top of the padding: 5rem in all, as before
 }
 
 .empty-hidden:empty {
@@ -263,6 +267,7 @@ section,
 
 .or-toasts {
   z-index: 1090;
+  bottom: 0; // raised above a tool's Run bar on narrow screens (_tool.scss)
 }
 
 .or-toast {

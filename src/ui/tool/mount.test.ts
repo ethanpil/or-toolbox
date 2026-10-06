@@ -121,6 +121,30 @@ describe('the tool page header', () => {
   });
 });
 
+describe('layout shift', () => {
+  it('keeps the zones laid out but invisible until setup has filled them', async () => {
+    const t = createToolTestContext(getTool('chat'));
+    page.core = t.core;
+    page.main = h('main');
+    document.body.append(page.main);
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mountTool(getTool('chat'), async (): Promise<ToolInstance> => {
+      await ready; // Chat reads IndexedDB before it can draw
+      return { getState: () => ({ prompt: '', settings: {} }), applyState: () => undefined };
+    });
+    await vi.waitFor(() => expect(document.querySelector('.or-tool-zones')).not.toBeNull());
+    const zones = document.querySelector('.or-tool-zones')!;
+    expect(zones.classList.contains('or-tool-pending')).toBe(true);
+    expect($('tool-chips')?.classList.contains('or-tool-chips')).toBe(true);
+    release();
+    await page.built;
+    expect(zones.classList.contains('or-tool-pending')).toBe(false);
+  });
+});
+
 describe('Ctrl/Cmd+Enter', () => {
   it('runs the first runner with no argument', async () => {
     const { runs } = await mount(getTool('chat'));

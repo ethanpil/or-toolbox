@@ -130,8 +130,8 @@ beforeEach(async () => {
   HTMLMediaElement.prototype.pause = pause;
   HTMLCanvasElement.prototype.getContext = () => null;
 });
-afterEach(() => {
-  t?.cleanup();
+afterEach(async () => {
+  await t?.cleanup();
   t = null;
 });
 
@@ -409,12 +409,14 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
     expect(record).toMatchObject({ title: 'Retry: variation 2', prompt: '', status: 'ok' });
     expect(t.status()).toBe('Variation 2 ready');
 
-    // Removing a card moves focus to its neighbour, and the last one to the empty state.
+    // Removing a card moves focus to its neighbour, and the last one to the empty state. (Downloaded first: an
+    // undownloaded song asks before it goes.)
+    for (const result of t.core.results.pending()) t.core.results.markDownloaded(result.id);
     const cards = $$(t.zones.output, 'music-variation');
     $(cards[0]!, 'music-remove')!.click();
-    expect(document.activeElement).toBe($(cards[1]!, 'music-remove'));
+    await vi.waitFor(() => expect(document.activeElement).toBe($(cards[1]!, 'music-remove')));
     $(cards[1]!, 'music-remove')!.click();
-    expect(document.activeElement).toBe($(t.zones.output, 'music-empty'));
+    await vi.waitFor(() => expect(document.activeElement).toBe($(t!.zones.output, 'music-empty')));
     expect(t.core.results.pending()).toHaveLength(0);
   });
 

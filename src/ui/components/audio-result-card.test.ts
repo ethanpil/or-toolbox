@@ -9,8 +9,10 @@ const hoisted = vi.hoisted(() => ({
   transcode: vi.fn((_blob: Blob, format: string) =>
     Promise.resolve(new Blob([`converted to ${format}`])),
   ),
+  confirm: vi.fn(() => Promise.resolve(true)),
 }));
 vi.mock('../../core/media/transcode', () => ({ transcode: hoisted.transcode }));
+vi.mock('../feedback/dialogs', () => ({ confirmDialog: hoisted.confirm }));
 
 const $ = <T extends HTMLElement = HTMLElement>(root: ParentNode, id: string): T | null =>
   root.querySelector<T>(`[data-testid="${id}"]`);
@@ -52,6 +54,8 @@ afterEach(() => {
   sent.length = 0;
   saved.length = 0;
   hoisted.transcode.mockClear();
+  hoisted.confirm.mockReset();
+  hoisted.confirm.mockImplementation(() => Promise.resolve(true));
   document.body.replaceChildren();
 });
 
@@ -155,6 +159,42 @@ describe('audioResultCard', () => {
     remove(b).click();
     await vi.waitFor(() => expect(b!.onRemove).toHaveBeenCalledOnce());
     expect(document.activeElement).toBe(fallback);
+  });
+
+  it('asks focusFallback only after onRemove, so removing the last take lands on what onRemove showed', async () => {
+    const empty = document.createElement('p');
+    empty.tabIndex = -1;
+    empty.hidden = true;
+    const item = card({
+      onRemove: () => {
+        empty.hidden = false;
+      },
+      focusFallback: () => (empty.hidden ? null : empty),
+    });
+    document.body.append(item.element, empty);
+    $<HTMLButtonElement>(item.element, 'tts-remove')!.focus();
+    $<HTMLButtonElement>(item.element, 'tts-remove')!.click();
+    await vi.waitFor(() => expect(item.element.isConnected).toBe(false));
+    expect(document.activeElement).toBe(empty);
+  });
+
+  it('asks before removing audio that was not downloaded, by default', async () => {
+    hoisted.confirm.mockImplementation(() => Promise.resolve(false));
+    const item = card();
+    document.body.append(item.element);
+    $<HTMLButtonElement>(item.element, 'tts-remove')!.click();
+    await vi.waitFor(() => expect(hoisted.confirm).toHaveBeenCalledOnce());
+    expect(hoisted.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Remove the audio?', testId: 'tts-remove-confirm' }),
+    );
+    await Promise.resolve();
+    expect(item.element.isConnected).toBe(true);
+
+    // Downloaded: no question.
+    item.handle.download();
+    $<HTMLButtonElement>(item.element, 'tts-remove')!.click();
+    await vi.waitFor(() => expect(item.onRemove).toHaveBeenCalledOnce());
+    expect(hoisted.confirm).toHaveBeenCalledOnce();
   });
 
   it('keeps the card when beforeRemove says no', async () => {

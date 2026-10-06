@@ -17,6 +17,8 @@ import type {
   ToolStateStore,
 } from '../../core/types';
 import type { ToastAction } from '../feedback/toast';
+import type { DiscardOptions } from './discard';
+import type { StopOnEscapeOptions } from './stop-on-escape';
 
 /** What the Prompts panel saves and restores, and what History reopens. Must round-trip exactly. */
 export interface ToolSnapshot {
@@ -88,8 +90,9 @@ export interface RunnerOptions<A = unknown> {
   run: (signal: AbortSignal, arg?: A) => Promise<void>;
   /**
    * What the error toast's Retry replays, from the argument of the run that failed. Narrow it to the items still
-   * without a result (`pendingOnly(isDone)`), so a Retry after a fatal error part-way never pays for finished
-   * items again. Return null when nothing is left: Retry then does nothing and says so. Default: the same argument.
+   * without a result (`pendingOnly(isDone, allKeys)`; with `allKeys` a plain run's replay covers only them too),
+   * so a Retry after a fatal error part-way never pays for finished items again. Return null when nothing is
+   * left: Retry then does nothing and says so. Default: the same argument.
    */
   replayArg?: (arg: A | undefined) => A | undefined | null;
   /**
@@ -108,6 +111,12 @@ export interface RunnerOptions<A = unknown> {
    * `addAction` buttons with `when: 'busy'` (Pause) and Stop.
    */
   hideWhileBusy?: boolean;
+  /**
+   * Escape stops the run that is going (`stopOnEscape`, src/ui/tool/stop-on-escape.ts), on by default for the
+   * primary runner. Pass `{ allowIn: [field] }` for a field where Escape should stop it too (Chat's composer), or
+   * `false` for a tool where Escape must not stop.
+   */
+  stopOnEscape?: false | StopOnEscapeOptions;
   /** Text after the button (e.g. a reason it is disabled); also its description. */
   hint?: string;
   /** Where the bar goes; default the end of `ui.input`. */
@@ -232,6 +241,11 @@ export interface ToolUi {
    * saved or discarded (safe to call twice). Downloadable results use `addResult` instead.
    */
   holdWork: (description: string) => () => void;
+  /**
+   * Asks before a run, a load or a new file replaces unsaved work (an edited transcript, corrected values); resolves
+   * true to go ahead, at once when `isDirty()` is false. Call it before `ctx.beginRun`. See src/ui/tool/discard.ts.
+   */
+  confirmDiscard: (options: DiscardOptions) => Promise<boolean>;
   /** Registers a binary result with the leave guard and returns download helpers. */
   addResult: (input: { kind: ResultKind; name: string; blob: Blob }) => ResultHandle;
   /** Opens the "Send to…" chooser for these items (tools whose `accepts` match). */

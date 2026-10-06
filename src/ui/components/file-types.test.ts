@@ -16,6 +16,17 @@ describe('fileMime', () => {
     expect(acceptsFile({ type: '', name: 'main.py' }, ['text/*'])).toBe(true);
     expect(acceptsFile({ type: '', name: 'main.py' }, ['text/plain'])).toBe(false);
   });
+
+  it('reads as text every file Chat reads as text (one classifier), whatever type the browser reports', () => {
+    const chat = ['text/*', 'application/json', 'image/png', 'audio/*'];
+    for (const name of ['App.tsx', 'Card.vue', 'Main.kt', 'build.gradle.kts', 'Widget.svelte']) {
+      expect(acceptsFile({ type: '', name }, chat), name).toBe(true);
+      expect(acceptsFile({ type: '', name }, ['text/plain', 'text/markdown']), name).toBe(false);
+    }
+    // Windows reports .ts as an MPEG transport stream: a text tool takes it, and so does a video tool.
+    expect(acceptsFile({ type: 'video/mp2t', name: 'index.ts' }, chat)).toBe(true);
+    expect(acceptsFile({ type: 'video/mp2t', name: 'clip.ts' }, ['video/*'])).toBe(true);
+  });
 });
 
 describe('mimeMatches', () => {

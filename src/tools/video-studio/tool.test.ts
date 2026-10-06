@@ -125,8 +125,8 @@ describe('file names', () => {
 });
 
 describe('Video studio', () => {
-  afterEach(() => {
-    t.cleanup();
+  afterEach(async () => {
+    await t.cleanup();
   });
 
   it('round-trips its state exactly', async () => {

@@ -1,7 +1,9 @@
 /**
  * Matching files against a tool's `accepts` list (`image/png`, `image/*`, …). Browsers leave `File.type` empty
- * for some files (Markdown, subtitles, some audio), so the extension is the fallback.
+ * for some files (Markdown, subtitles, some audio) and get others wrong, so the extension counts too. Which
+ * extensions are text is Chat's `classifyFile` (one classifier for the drop, the paste, Send to… and Chat).
  */
+import { classifyFile } from '../../core/attachments/attachments';
 
 const BY_EXTENSION: Readonly<Record<string, string>> = {
   png: 'image/png',
@@ -53,11 +55,31 @@ const BY_EXTENSION: Readonly<Record<string, string>> = {
   log: 'text/x-log',
 };
 
+/**
+ * The type a file's extension says. Text is decided by the one text classifier, Chat's `classifyFile`
+ * (src/core/attachments): an extension it reads as text (`.tsx`, `.vue`, `.kt`…) that has no entry above
+ * becomes `text/x-<extension>`, so `text/*` tools take it and `text/plain` ones (read aloud) do not.
+ */
+function extensionMime(name: string): string {
+  const extension = /\.([a-z0-9]+)$/i.exec(name)?.[1]?.toLowerCase();
+  if (!extension) return '';
+  const known = BY_EXTENSION[extension];
+  if (known) return known;
+  return classifyFile({ name, type: '' }) === 'text' ? `text/x-${extension}` : '';
+}
+
 /** The file's MIME type, from `type` or else its extension; '' when unknown. */
 export function fileMime(file: { type: string; name?: string }): string {
   if (file.type) return file.type.toLowerCase();
-  const extension = /\.([a-z0-9]+)$/i.exec(file.name ?? '')?.[1]?.toLowerCase();
-  return (extension && BY_EXTENSION[extension]) || '';
+  return extensionMime(file.name ?? '');
+}
+
+/**
+ * Every type a file can count as: the browser's and its extension's. Browsers report some text files wrongly
+ * (Windows calls `.ts` an MPEG transport stream, `.csv` an Excel sheet), so a match on either is a match.
+ */
+export function fileMimes(file: { type: string; name?: string }): string[] {
+  return [...new Set([file.type.toLowerCase(), extensionMime(file.name ?? '')].filter(Boolean))];
 }
 
 /** True when `mime` matches an entry of `accept` (`type/subtype`, `type/*` or `*\/*`). */
@@ -75,7 +97,7 @@ export function acceptsFile(
   file: { type: string; name?: string },
   accept: readonly string[],
 ): boolean {
-  return mimeMatches(fileMime(file), accept);
+  return fileMimes(file).some((mime) => mimeMatches(mime, accept));
 }
 
 /** Splits files into the ones `accept` takes and the rest. */
