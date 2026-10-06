@@ -32,7 +32,8 @@ import {
   keepParsed,
 } from '../../core/attachments/attachments';
 import { missingInput, needsParser, parserAddons } from '../../core/attachments/request';
-import { FreeOnlyError, InvalidInputError } from '../../core/errors';
+import { FreeOnlyError, InvalidInputError, OrError } from '../../core/errors';
+import { excerpt } from '../../core/runs/index';
 import { isPdfEngineId, PDF_ENGINES, pdfEngine } from '../../core/models/pdf-engines';
 import { paidAddons } from '../../core/runs/addons';
 import type { ModelInfo, RunAddon, RunHandle } from '../../core/types';
@@ -900,6 +901,18 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         entry.text = answer.text;
         md?.set(answer.text);
       }
+      // The model declined, or the provider's filter blocked the reply: that panel's outcome, instead of an
+      // answer. It was billed like any reply (its usage is on the run); its words are the reason.
+      if (answer.refusal) {
+        entry.text = '';
+        md?.set('');
+        throw new OrError(
+          'api',
+          answer.text.trim()
+            ? `This model declined to answer: ${excerpt(answer.refusal, 300)}`
+            : answer.refusal,
+        );
+      }
       entry.finishReason = answer.finishReason;
       entry.status = 'done';
       entry.usage = usageOf(run, seen.usage ?? answer.usage);
@@ -1135,10 +1148,15 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   }
 
   async function resetTally(): Promise<void> {
-    const before = tally;
-    if (isEmptyTally(before)) return;
+    if (isEmptyTally(tally)) return;
+    // What Undo puts back is the tally as stored at the moment of the reset (another tab may have voted since this
+    // page last read it), not this page's copy.
+    let before = emptyTally();
     try {
-      tally = await changeTally(() => emptyTally());
+      tally = await changeTally((stored) => {
+        before = stored;
+        return emptyTally();
+      });
     } catch (error) {
       void presentError(error);
       return;

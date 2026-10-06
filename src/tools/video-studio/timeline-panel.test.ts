@@ -110,4 +110,11 @@ describe('timeline panel', () => {
     ]);
     expect(firstDown?.getAttribute('aria-label')).toBe('Move a.mp4 down');
   });
+
+  it('turns Continue, Extend and Frames off for a clip that is not ready', () => {
+    panel([clip('a')]); // the stand-in state is "missing"
+    for (const id of ['video-clip-continue', 'video-clip-extend', 'video-clip-frames']) {
+      expect(($$(id)[0] as HTMLButtonElement).disabled).toBe(true);
+    }
+  });
 });

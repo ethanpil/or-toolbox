@@ -9,6 +9,7 @@ import {
   newDeciderId,
   readDecider,
   removeDecider,
+  renameDecider,
   type SavedDecider,
   saveDecider,
   sortDeciders,
@@ -82,6 +83,26 @@ describe('saved deciders', () => {
     const list = await loadDeciders(store);
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({ id: original.id, name: 'Renamed' });
+  });
+
+  it('renames what is stored now, so a save from another tab is not overwritten', async () => {
+    const store = createToolStateStore('decision');
+    const stale = decider();
+    await saveDecider(store, stale);
+    // Another tab saved new questions under the same id after this one read it.
+    const fresh = { ...stale, questions: templateQuestions('ticket-triage')!.slice(0, 1) };
+    await saveDecider(store, fresh);
+    expect(await renameDecider(store, stale.id, 'Renamed')).toMatchObject({ name: 'Renamed' });
+    const [stored] = await loadDeciders(store);
+    expect(stored).toMatchObject({ id: stale.id, name: 'Renamed' });
+    expect(stored!.questions).toHaveLength(1);
+  });
+
+  it('does not bring back a decider another tab deleted when it is renamed', async () => {
+    const store = createToolStateStore('decision');
+    const gone = decider();
+    expect(await renameDecider(store, gone.id, 'Renamed')).toBeNull();
+    expect(await loadDeciders(store)).toEqual([]);
   });
 
   it('keeps each decider under a key of its own, apart from other state of the tool', async () => {

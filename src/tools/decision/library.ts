@@ -25,6 +25,7 @@ import {
   lossOnLoad,
   newDeciderId,
   removeDecider,
+  renameDecider,
   type SavedDecider,
   saveDecider,
 } from './saved';
@@ -35,6 +36,8 @@ export interface LibraryOptions {
   store: ToolStateStore;
   bus: Pick<Bus, 'on'>;
   tool: string;
+  /** The starting threshold from the drawer: a loaded template starts its questions there. */
+  defaultThreshold(): number;
   /** The form as it is now. */
   questions(): QuestionDef[];
   state(): StateDef;
@@ -256,7 +259,7 @@ export function libraryBar(options: LibraryOptions): Library {
       : template
         ? {
             name: template.name,
-            questions: templateQuestions(template.id) ?? [],
+            questions: templateQuestions(template.id, options.defaultThreshold()) ?? [],
             state: null,
           }
         : null;
@@ -343,8 +346,21 @@ export function libraryBar(options: LibraryOptions): Library {
       toast({ variant: 'warning', message: `There is already a decider called “${clash.name}”.` });
       return;
     }
-    if (!(await write({ ...decider, name }))) return;
+    // Only the name changes, in what is stored now (a save from another tab since the list was read stays).
+    let renamed: SavedDecider | null;
+    try {
+      renamed = await renameDecider(options.store, decider.id, name);
+    } catch (error) {
+      void presentError(error);
+      return;
+    }
     await reload();
+    if (!renamed) {
+      select.value = '';
+      renderState();
+      toast({ variant: 'warning', message: `“${decider.name}” was deleted in another tab.` });
+      return;
+    }
     select.value = `saved:${decider.id}`;
     renderState();
     announce(`Renamed to ${name}.`);

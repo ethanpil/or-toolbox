@@ -572,6 +572,20 @@ describe('persistence', () => {
     expect(turnTexts()).toEqual(['Half a th']);
   });
 
+  it('stores the text of a turn while it streams, so a reload keeps it', async () => {
+    const { chatStream } = heldStream();
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    const done = t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect(turnTexts()).toEqual(['Partial']));
+    // Still speaking: what a page opened now would read already holds the words so far.
+    await eventually(async () => {
+      expect((await stored())?.entries.at(-1)).toMatchObject({ content: 'Partial' });
+    });
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    await done;
+  });
+
   it('follows a conversation another tab stored', async () => {
     await mount();
     const conversation = createConversation({
@@ -699,6 +713,44 @@ describe('review fixes: turns that fail', () => {
     await eventually(async () =>
       expect((await stored())?.entries.at(-1)?.outcomeUnknown).toBe(true),
     );
+  });
+
+  it('A6: a refusal is the outcome of the turn, shown on the turn, billed once and never retried by itself', async () => {
+    const bodies: ChatRequest[] = [];
+    const chatStream = vi.fn(
+      (body: ChatRequest, opts: StreamOptions): Promise<ChatStreamResult> => {
+        bodies.push(body);
+        opts.onEvent({ type: 'text', text: 'I cannot help with that.' });
+        return Promise.resolve({
+          ...result('I cannot help with that.', body.model),
+          refusal: 'I cannot help with that.',
+        });
+      },
+    );
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger();
+    expect(bodies).toHaveLength(1);
+    await vi.waitFor(() => expect($('turn-error')?.textContent).toContain('declined to answer'));
+    expect($('turn-error').textContent).toContain('I cannot help with that.');
+    expect(turns()[0]?.dataset['status']).toBe('error');
+    expect(t!.status()).toMatch(/^Bot A's turn failed: Bot A declined to answer/);
+    expect($('bots-state').textContent).toBe('Paused');
+  });
+
+  it('A6: a reply the provider filter blocked says so on the turn', async () => {
+    const chatStream = vi.fn((body: ChatRequest): Promise<ChatStreamResult> =>
+      Promise.resolve({
+        ...result('', body.model),
+        finishReason: 'content_filter',
+        refusal: 'The provider’s content filter blocked this reply.',
+      }),
+    );
+    const tool = await mount({ chatStream });
+    configure(tool, {});
+    await t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect($('turn-error')?.textContent).toContain('content filter'));
+    expect($('turn-error').textContent).not.toContain('sent no text');
   });
 
   it('B8: a conversation too long for the model is refused before the run', async () => {

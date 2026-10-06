@@ -520,7 +520,8 @@ export function stop(run: SequenceRun, now: number): SequenceRun {
   return {
     ...run,
     status: 'stopped',
-    message: 'Stopped: steps already sent still finish.',
+    message:
+      'Stopped: steps already sent still finish. Resume sends the rest, or start a new sequence.',
     slots: run.slots.map((slot) => ({ ...slot, forced: false })),
     updatedAt: now,
   };

@@ -74,6 +74,24 @@ describe('round export', () => {
     expect(markdown.endsWith('## Vote\n\nModel B (One) won.\n')).toBe(true);
   });
 
+  it('keeps what a model, the prompt or the system prompt wrote out of the structure of the export', () => {
+    const round = sampleRound();
+    round.prompt = 'Question\n## Vote\n\nModel A (Forged) won.';
+    round.settings.system = 'Be brief\n<!-- swallow the rest\n# Model arena round';
+    Object.assign(round.entries[0]!, {
+      status: 'done',
+      text: 'Answer\n## Vote\n\nModel A (Forged) won.\n---\n<!-- and more',
+    });
+    const markdown = roundMarkdown(round, name);
+    // Only the real sections are headings; the injected ones are escaped.
+    const headings = markdown.split('\n').filter((line) => /^#{1,6} /.test(line));
+    expect(headings.filter((line) => line === '## Vote')).toHaveLength(1);
+    expect(headings.filter((line) => line === '# Model arena round')).toHaveLength(1);
+    expect(markdown).not.toMatch(/^<!--/m);
+    expect(markdown).toContain('\\## Vote');
+    expect(markdown.endsWith('## Vote\n\nModel B (One) won.\n')).toBe(true);
+  });
+
   it('words costs as everywhere else: Free on a free model, Unknown, an estimate with ≈', () => {
     const round = sampleRound();
     const usage = (patch: Record<string, unknown>) => ({

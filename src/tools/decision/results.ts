@@ -234,6 +234,11 @@ export function verdictOf(confidence: number | null, thresholdPercent: number): 
   return tenthsOf(confidence) >= Math.ceil(thresholdPercent * 10 - NOISE) ? 'clear' : 'review';
 }
 
+/** How many answers need review, in words: "all clear", "1 needs review", "2 need review" (one wording everywhere). */
+export function reviewCount(review: number): string {
+  return review === 0 ? 'all clear' : `${review} ${review === 1 ? 'needs' : 'need'} review`;
+}
+
 export function resultVerdict(result: QuestionResult, thresholdPercent: number): Verdict {
   return result.kind === 'none' ? 'review' : verdictOf(result.confidence, thresholdPercent);
 }

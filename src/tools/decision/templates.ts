@@ -165,8 +165,14 @@ export function templateById(id: string): Template | undefined {
   return TEMPLATES.find((template) => template.id === id);
 }
 
-/** A copy of a template's questions that the form may edit freely. */
-export function templateQuestions(id: string): QuestionDef[] | null {
+/**
+ * A copy of a template's questions that the form may edit freely; with `threshold` (the starting threshold from
+ * the drawer) each question starts there instead of at the template's own.
+ */
+export function templateQuestions(id: string, threshold?: number): QuestionDef[] | null {
   const template = templateById(id);
-  return template ? (JSON.parse(JSON.stringify(template.questions)) as QuestionDef[]) : null;
+  if (!template) return null;
+  const copy = JSON.parse(JSON.stringify(template.questions)) as QuestionDef[];
+  if (threshold !== undefined) for (const question of copy) question.threshold = threshold;
+  return copy;
 }

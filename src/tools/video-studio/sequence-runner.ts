@@ -6,7 +6,9 @@
  * images encoding, the run beginning). After each one the stored run is read again, and the slot goes back to
  * pending without anything sent when the sequence was paused or stopped meanwhile, when another tab took it over,
  * or when the spend cap no longer allows it (then the sequence stops with the cap's message). Pause and Stop also
- * abort a start in progress here (`abortStarts`), budget dialog included.
+ * abort a start in progress here (`abortStarts`), budget dialog included, but only up to its last check: once that
+ * passes the start is committed, and the paid request in flight finishes and its job is tracked (the steps "already
+ * sent" that Pause and Stop say still finish).
  *
  * A chained step whose clip to continue is gone (removed, an upload lost in a reload, expired on OpenRouter) is
  * never sent from its prompt alone: the sequence pauses with a `source-missing` blocker. A step that had images the
@@ -158,7 +160,10 @@ export interface RunnerDeps {
 export interface SequenceRunner {
   /** Starts whatever the plan allows now (after any change that may let a step start). */
   advance(): Promise<void>;
-  /** Pause or Stop: aborts this page's starts in progress (they go back to pending, nothing sent). */
+  /**
+   * Pause or Stop: aborts this page's starts in progress that have not passed their last check (they go back to
+   * pending, nothing sent). A start past it is never aborted: its request is sent and its job tracked.
+   */
   abortStarts(): void;
   /** Settles slots left `starting` by a tab that is gone (page load, other tabs' changes, visibility). */
   recover(jobs: readonly JobRecord[]): Promise<void>;
@@ -168,6 +173,8 @@ export function createSequenceRunner(deps: RunnerDeps): SequenceRunner {
   const { store } = deps;
   /** This page's starts in progress, by slot key, with their abort controllers. */
   const starts = new Map<string, AbortController>();
+  /** Starts past their last check: `abortStarts` leaves them alone. */
+  const committed = new Set<string>();
 
   const write = async (
     runId: string,
@@ -255,6 +262,8 @@ export function createSequenceRunner(deps: RunnerDeps): SequenceRunner {
     const others = committedUsd(run) - (slot.estimateUsd ?? 0);
     const cap = capProblem(run, key, others, slot.estimateUsd);
     if (cap) return { go: false, stopWith: cap };
+    // An abort that landed while the run was read (it already aborted a begun run) wins.
+    if (signal.aborted) return { go: false };
     return { go: true, run, slot };
   };
 
@@ -422,6 +431,9 @@ export function createSequenceRunner(deps: RunnerDeps): SequenceRunner {
         );
         return giveBack(runId, key, check.stopWith);
       }
+      // Past the last check: from here on the request is sent whatever Pause or Stop do meanwhile (aborting it
+      // could leave a paid request that nothing tracks).
+      committed.add(key);
       const label = `Sequence step ${number}${step?.prompt.trim() ? `: ${step.prompt.trim().slice(0, 50)}` : ''}`;
       try {
         const job = await deps.submit(handle, prepared.body, {
@@ -458,6 +470,7 @@ export function createSequenceRunner(deps: RunnerDeps): SequenceRunner {
       console.error(error);
     } finally {
       if (starts.get(key) === controller) starts.delete(key);
+      committed.delete(key);
     }
     void advance();
   };
@@ -497,7 +510,9 @@ export function createSequenceRunner(deps: RunnerDeps): SequenceRunner {
   return {
     advance,
     abortStarts() {
-      for (const controller of starts.values()) controller.abort(abortError('Paused.'));
+      for (const [key, controller] of starts) {
+        if (!committed.has(key)) controller.abort(abortError('Paused.'));
+      }
     },
     recover,
   };

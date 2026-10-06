@@ -115,6 +115,8 @@ export function clipPanel(host: ClipPanelHost): ClipPanel {
     const created = referencePicker({
       ui: host.ui,
       max,
+      // Shown only in the modes that need them, so none of them is optional.
+      min: 1,
       label,
       accepts: IMAGE_TYPES,
       hint,

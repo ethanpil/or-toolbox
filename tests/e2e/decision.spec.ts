@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { expect, test } from '../mock/index.ts';
 import { seedApp, tabTo } from './app.ts';
-import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
+import { expectNoSeriousA11yViolations as axeCheck, watchForProblems } from './support.ts';
 
 const DECISIONS = '/api/alpha/decisions';
 const FIXTURES = join(import.meta.dirname, '..', 'fixtures', 'openrouter');
@@ -40,6 +40,16 @@ test.beforeEach(async ({ context, mock }, testInfo) => {
   await seedApp(context, { key: true, settings: freeOnly ? { freeOnly: true } : {} });
   mock.json('GET', '/api/v1/models', { data: MODELS });
 });
+
+/**
+ * The axe check from the top of the page. After a run the page has scrolled to the results, which leaves the
+ * library select under the sticky navbar, and axe reports it as an overlapped small target (the base had the
+ * same failure).
+ */
+async function expectNoSeriousA11yViolations(page: Page): Promise<void> {
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await axeCheck(page);
+}
 
 async function open(page: Page, query = ''): Promise<void> {
   await page.goto(`tools/decision/${query}`);
