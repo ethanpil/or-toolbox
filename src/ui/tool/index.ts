@@ -548,10 +548,22 @@ function reserveRunnerSpace(bar: HTMLElement): void {
     if (!(target instanceof HTMLElement) || bar.contains(target)) return;
     // A dialog or a drawer sits above both bars and scrolls itself.
     if (target.closest('.modal, .offcanvas')) return;
+    // Only focus a keyboard moved. A press on blank space focuses <main> (tabindex -1) and the scroll below would
+    // cancel a drag that began there (a Decision level's handle), or jolt the page under a click.
+    if (!keyboardFocused(target)) return;
     // The browser's own focus scroll comes after focusin: check once it has happened, and again when it ends.
     requestAnimationFrame(() => uncover(target));
     whenSettled(() => uncover(target));
   });
+}
+
+/** True when the browser would draw a focus ring: keyboard focus, or a text field however it got focus. */
+function keyboardFocused(element: HTMLElement): boolean {
+  try {
+    return element.matches(':focus-visible');
+  } catch {
+    return true; // an engine without :focus-visible: keep the check
+  }
 }
 
 /** Ctrl/Cmd+Enter runs the first (primary) runner, unless a dialog is open. */

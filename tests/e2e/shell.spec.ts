@@ -237,41 +237,34 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
   await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
   const runner = page.getByTestId('runner');
   await page.getByTestId('tool-prompt').focus();
+
+  /**
+   * Whether a bar covers the focused control of the input zone, or null when focus is elsewhere. The browser
+   * scrolls the focused control into view (smoothly unless motion is reduced) and the page corrects what a bar
+   * still covers once that scroll ends, so the invariant is polled: it must hold once the page has settled.
+   */
+  const covered = (bar: 'runner' | 'navbar') => (): Promise<boolean | null> =>
+    page.evaluate((which) => {
+      const active = document.activeElement as HTMLElement | null;
+      const input = document.querySelector('[data-testid="tool-input"]');
+      const element =
+        which === 'runner'
+          ? document.querySelector<HTMLElement>('[data-testid="runner"]')
+          : document.querySelector<HTMLElement>('.or-navbar');
+      if (!active || !input?.contains(active) || !element || element.contains(active)) return null;
+      const a = active.getBoundingClientRect();
+      const b = element.getBoundingClientRect();
+      return which === 'runner'
+        ? a.bottom > b.top + 1 && a.top < b.bottom
+        : a.top < b.bottom - 1 && a.bottom > b.top;
+    }, bar);
+
   let checked = 0;
   for (let step = 0; step < 40; step++) {
     await page.keyboard.press('Tab');
-    // The browser scrolls the focused control into view (smoothly unless motion is reduced), and the page
-    // corrects what the bar still covers once that scroll ends: judge what the user sees when it has settled.
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) => {
-          let last = scrollY;
-          let still = 0;
-          const tick = (): void => {
-            still = scrollY === last ? still + 1 : 0;
-            last = scrollY;
-            if (still >= 8) resolve();
-            else requestAnimationFrame(tick);
-          };
-          // Without `scrollend` the page re-checks on a 700 ms timer instead.
-          setTimeout(() => requestAnimationFrame(tick), 'onscrollend' in window ? 0 : 750);
-        }),
-    );
-    const state = await page.evaluate(() => {
-      const active = document.activeElement as HTMLElement | null;
-      const input = document.querySelector('[data-testid="tool-input"]');
-      const bar = document.querySelector<HTMLElement>('[data-testid="runner"]');
-      if (!active || !input?.contains(active) || !bar || bar.contains(active)) return null;
-      const a = active.getBoundingClientRect();
-      const b = bar.getBoundingClientRect();
-      return {
-        name: `${active.textContent?.trim().slice(0, 30)} a=${a.top},${a.bottom} b=${b.top},${b.bottom} y=${scrollY} max=${document.documentElement.scrollHeight - innerHeight}`,
-        covered: a.bottom > b.top + 1 && a.top < b.bottom,
-      };
-    });
-    if (!state) continue;
+    if ((await covered('runner')()) === null) continue;
     checked++;
-    expect(state.covered, state.name).toBe(false);
+    await expect.poll(covered('runner'), { message: `Tab ${step}` }).toBe(false);
   }
   expect(checked).toBeGreaterThan(3);
   await expect(runner).toBeVisible();
@@ -280,37 +273,34 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
   let above = 0;
   for (let step = 0; step < 30; step++) {
     await page.keyboard.press('Shift+Tab');
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) => {
-          let last = scrollY;
-          let still = 0;
-          const tick = (): void => {
-            still = scrollY === last ? still + 1 : 0;
-            last = scrollY;
-            if (still >= 8) resolve();
-            else requestAnimationFrame(tick);
-          };
-          setTimeout(() => requestAnimationFrame(tick), 'onscrollend' in window ? 0 : 750);
-        }),
-    );
-    const state = await page.evaluate(() => {
-      const active = document.activeElement as HTMLElement | null;
-      const input = document.querySelector('[data-testid="tool-input"]');
-      const nav = document.querySelector<HTMLElement>('.or-navbar');
-      if (!active || !input?.contains(active) || !nav) return null;
-      const a = active.getBoundingClientRect();
-      const n = nav.getBoundingClientRect();
-      return {
-        name: `${active.textContent?.trim().slice(0, 30)} a=${a.top},${a.bottom} nav=${n.top},${n.bottom}`,
-        covered: a.top < n.bottom - 1 && a.bottom > n.top,
-      };
-    });
-    if (!state) continue;
+    if ((await covered('navbar')()) === null) continue;
     above++;
-    expect(state.covered, state.name).toBe(false);
+    await expect.poll(covered('navbar'), { message: `Shift+Tab ${step}` }).toBe(false);
   }
   expect(above).toBeGreaterThan(3);
+});
+
+test('pressing blank space on a tool page does not scroll it (a drag that starts there must survive)', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context, { key: true });
+  await page.setViewportSize({ width: 1000, height: 720 });
+  await page.goto('tools/data-extractor/');
+  await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
+  // At the end of the page <main> ends above the window's bottom edge, which is where the scroll once happened.
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  const scrolled = (): Promise<number> => page.evaluate(() => scrollY);
+  const before = await scrolled();
+  expect(before).toBeGreaterThan(0);
+  // A press on blank space focuses <main> (tabindex -1); the "keep the focused control uncovered" scroll must
+  // leave that alone. The press is held, as in the first moment of a drag.
+  const main = (await page.locator('main').boundingBox())!;
+  await page.mouse.move(main.x + 4, 300);
+  await page.mouse.down();
+  await expect(page.locator('main')).toBeFocused();
+  await expect.poll(scrolled, { timeout: 1500 }).toBe(before);
+  await page.mouse.up();
 });
 
 test('a tool page does not shift while the tool sets itself up (CLS)', async ({
@@ -335,7 +325,9 @@ test('a tool page does not shift while the tool sets itself up (CLS)', async ({
   for (const tool of ['chat', 'data-extractor', 'image-generation']) {
     await page.goto(`tools/${tool}/`);
     await expect(page.getByTestId('tool-prompt')).toBeVisible();
-    await page.waitForTimeout(1500); // the chips and the estimate arrive after setup
+    // The chips and the estimate arrive after setup: the page has shifted as much as it will once they are there.
+    await expect(page.getByTestId('model-chip-name')).not.toBeEmpty();
+    await expect(page.getByTestId('cost-estimate-value')).not.toBeEmpty();
     const total = await page.evaluate(() =>
       (window as unknown as { __shifts: number[] }).__shifts.reduce((sum, value) => sum + value, 0),
     );
@@ -380,12 +372,14 @@ test.describe('a browser that blocks saving', () => {
   });
 
   test('says so once at page start, and keeps saying what to do until closed', async ({ page }) => {
+    // A fake clock, so "longer than a plain toast lives" is a fast-forward and not a wait.
+    await page.clock.install();
     await page.goto('');
     const notice = page.getByTestId('storage-notice');
     await expect(notice).toContainText('This browser blocks saving');
     await expect(notice).toContainText('Allow site data for this site');
     await expect(page.getByTestId('storage-notice')).toHaveCount(1);
-    await page.waitForTimeout(6000); // longer than a plain toast lives
+    await page.clock.fastForward(6000); // longer than a plain toast lives
     await expect(notice).toBeVisible();
   });
 
