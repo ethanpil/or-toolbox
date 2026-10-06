@@ -2,7 +2,9 @@ node_modules/
 dist/
 coverage/
 test-results/
+test-results-dev/
 playwright-report/
+playwright-report-dev/
 blob-report/
 .vite/
 *.local

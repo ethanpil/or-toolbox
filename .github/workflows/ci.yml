@@ -103,9 +103,13 @@ jobs:
         run: npx playwright test --project=${{ matrix.browser }} --project=sw-${{ matrix.browser }}
 
       # Browser-only core modules (media, export) and shell states that need the page's core (tests/e2e/dev)
-      # are exercised through the dev server, which serves /src.
+      # are exercised through the dev server, which serves /src. Runs even when the step above failed, so one
+      # run reports both suites (the job still fails), into folders of its own so the first report is kept.
       - name: E2E dev-server specs
-        run: npx playwright test --config playwright.dev.config.ts tests/e2e/media tests/e2e/dev --project=${{ matrix.browser }}
+        if: ${{ !cancelled() }}
+        env:
+          PLAYWRIGHT_HTML_OUTPUT_DIR: playwright-report-dev
+        run: npx playwright test --config playwright.dev.config.ts tests/e2e/media tests/e2e/dev --project=${{ matrix.browser }} --output test-results-dev
 
       - name: Upload Playwright report
         if: failure()
@@ -115,6 +119,8 @@ jobs:
           path: |
             playwright-report/
             test-results/
+            playwright-report-dev/
+            test-results-dev/
           retention-days: 7
 
   deploy:
