@@ -118,6 +118,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Video studio: Pause, Stop and a failed step no longer abort a paid request already past its last check; a spend cap of 0 or less is refused instead of lifting the cap; failed store writes, a clip that cannot be placed and a missing run record are shown; system pauses and blockers are announced; frame pickers are not "(optional)"; Extend is off for a clip that is not ready; a dropped video no longer changes the hidden One clip mode (f51c2be).
+- Decision: a failed write of a paid answer no longer turns it into "Failed" with a Retry; renaming a saved decider keeps another tab's save; templates start at the starting threshold; one wording for the review count (f51c2be).
+- Bot-to-bot: a streaming turn is stored as it speaks, and a refusal is shown as the turn's outcome (f51c2be).
+- Model arena: exports keep model text out of their structure (shared `safeBlock`); tally Reset and Undo use the stored tally; a refusal fails its panel; a stopped contender has Retry; "All bad" is in the tally (f51c2be).
 - Backup merge keeps the newer saved and recent prompts (`usedAt`) and tool state (`updatedAt`) instead of always taking the backup's, merges favorites saved under the old British names, and skips records with times no date can hold (eeece28).
 - An older tab never writes over a keys file of another version or with an unreadable lock, and keeps key entries it cannot parse (83a06e4).
 - "Connect with OpenRouter" keeps a new key it could not save (locked meanwhile, storage full) and offers to save it, instead of losing it (03f3b6b).
