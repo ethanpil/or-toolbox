@@ -216,7 +216,6 @@
   height: 100%;
   background-color: var(--or-viz-1);
   border-radius: 0.25rem;
-  transition: width 0.2s ease;
 
   &[data-severity='warning'] {
     background-color: var(--bs-warning);
