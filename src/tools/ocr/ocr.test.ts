@@ -3,7 +3,6 @@ import {
   combineMarkdown,
   combinePlainText,
   estimateTokens,
-  imageTokens,
   inlineMarkdown,
   pageRequest,
   type PageResult,
@@ -111,10 +110,6 @@ describe('prompts and requests', () => {
   });
 
   it('estimates from the image size, the text hint and parsed pages', () => {
-    // An A4-shaped page at 1,600 px: 1,600 × 1,131 pixels / 750.
-    expect(imageTokens(1600)).toBe(2413);
-    expect(imageTokens(1024)).toBeLessThan(imageTokens(1600));
-    expect(imageTokens(2048)).toBeGreaterThan(imageTokens(1600));
     const small = estimateTokens({ imagePages: 20, hintPages: 0, parsedPages: 0, maxSide: 1024 });
     const large = estimateTokens({ imagePages: 20, hintPages: 0, parsedPages: 0, maxSide: 2048 });
     expect(large.promptTokens).toBeGreaterThan(small.promptTokens);

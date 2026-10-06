@@ -8,7 +8,6 @@ import {
   type ExtractedTable,
   mergeTables,
   numericColumns,
-  outputMode,
   pageRequest,
   parseTables,
   rectangular,
@@ -69,8 +68,6 @@ describe('requests', () => {
     expect(json.messages[0]!.content).toMatch(/Ignore charts/);
     expect(json.messages[0]!.content).toMatch(/"additionalProperties":false/);
     expect(json.messages[0]!.content).toMatch(/Only 2025$/);
-    expect(outputMode(['structured_outputs'])).toBe('schema');
-    expect(outputMode([])).toBe('prompt');
   });
 });
 

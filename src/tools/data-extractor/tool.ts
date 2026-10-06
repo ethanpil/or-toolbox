@@ -5,6 +5,13 @@
  * answers land in a review grid where they can be corrected; exports read the corrected values. One run per
  * batch, its output the JSON of the results (checkpointed as documents finish).
  */
+import {
+  fallbackMode,
+  isUnsupportedStrict,
+  type OutputMode,
+  outputMode,
+  responseRefusal,
+} from '../../core/api/structured-output';
 import type { ChatRequest, ChatResponse } from '../../core/api/types';
 import { InvalidInputError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import { toJsonBlob } from '../../core/export/table';
@@ -35,14 +42,9 @@ import { schemaBuilder } from './builder';
 import {
   buildRequest,
   estimateDocumentTokens,
-  fallbackMode,
-  isUnsupportedStrict,
   MAX_PAGES_PER_REQUEST,
-  type OutputMode,
-  outputMode,
   parseAnswer,
   repairRequest,
-  responseRefusal,
 } from './extract';
 import {
   type DocResult,

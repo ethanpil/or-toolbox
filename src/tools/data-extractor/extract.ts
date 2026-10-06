@@ -2,8 +2,9 @@
  * One extraction request: the prompt, the page images, the structured-output mode the model supports, parsing
  * the answer and the one repair request when it was not usable JSON.
  */
-import type { ChatRequest, ChatResponse, ContentPart } from '../../core/api/types';
-import { ApiError } from '../../core/errors';
+import type { OutputMode } from '../../core/api/structured-output';
+import type { ChatRequest, ContentPart } from '../../core/api/types';
+import { imageTokens } from '../../core/models/estimate';
 import { outputCap } from '../../core/tokens';
 import { isRecord } from '../../core/util';
 import {
@@ -14,18 +15,6 @@ import {
   toJsonSchema,
   TYPE_LABELS,
 } from './schema';
-
-/**
- * `schema`: `response_format: json_schema` (strict) where the model supports structured outputs; `json`: JSON mode
- * (`json_object`) with the schema in the prompt; `prompt`: the schema in the prompt only.
- */
-export type OutputMode = 'schema' | 'json' | 'prompt';
-
-export function outputMode(supportedParameters: readonly string[]): OutputMode {
-  if (supportedParameters.includes('structured_outputs')) return 'schema';
-  if (supportedParameters.includes('response_format')) return 'json';
-  return 'prompt';
-}
 
 export interface PageContent {
   pageNumber: number;
@@ -143,38 +132,6 @@ export function buildRequest(
 /** Output cap of one answer: a long invoice with many line items fits. */
 export const MAX_ANSWER_TOKENS = 8192;
 
-/**
- * A strict structured-output request that no provider can serve: OpenRouter answers 404 "No endpoints found that
- * can handle the requested parameters" (or a 400 naming the response format) when the routing constraint leaves
- * nothing. The batch then carries on in JSON mode instead of failing every document.
- */
-export function isUnsupportedStrict(error: unknown): boolean {
-  if (!(error instanceof ApiError) || (error.status !== 400 && error.status !== 404)) return false;
-  return /no endpoints|response_format|json_schema|structured output/i.test(error.message);
-}
-
-/** The mode after strict outputs were refused: JSON mode when the model takes `response_format`, else the prompt. */
-export function fallbackMode(supportedParameters: readonly string[]): OutputMode {
-  return supportedParameters.includes('response_format') ? 'json' : 'prompt';
-}
-
-/**
- * Why a non-streamed answer holds no usable data: the model's own refusal (`message.refusal`), or a reply that ended
- * with `finish_reason` `content_filter` or `error` before any content. Null for a normal answer. A refusal is not
- * parsed and never repaired (another request would only pay for the same refusal).
- */
-export function responseRefusal(response: ChatResponse): string | null {
-  const choice = response.choices[0];
-  const refusal = choice?.message['refusal'];
-  if (typeof refusal === 'string' && refusal.trim()) return refusal.trim();
-  if ((choice?.message.content ?? '').trim()) return null;
-  if (choice?.finish_reason === 'content_filter') {
-    return 'The provider’s content filter blocked this reply.';
-  }
-  if (choice?.finish_reason === 'error') return 'The model stopped with an error before answering.';
-  return null;
-}
-
 /** The follow-up request after an answer that was not usable JSON: same conversation, plus what went wrong. */
 export function repairRequest(original: ChatRequest, answer: string, problem: string): ChatRequest {
   return {
@@ -210,14 +167,6 @@ export function parseAnswer(fields: readonly FieldDef[], text: string): Parsed {
     };
   }
   return { ok: true, result: normalizeRecord(fields, data) };
-}
-
-/**
- * Input tokens of one page image whose longest side is `maxSide` px, for an A4-shaped page: its pixels / 750,
- * deliberately on the high side (most models downscale). The same rule as OCR's `imageTokens`.
- */
-export function imageTokens(maxSide: number): number {
-  return Math.ceil((maxSide * Math.round(maxSide / Math.SQRT2)) / 750);
 }
 
 /** A PDF text layer sent as a hint, at most `TEXT_HINT_CHARS` (about four characters per token). */
