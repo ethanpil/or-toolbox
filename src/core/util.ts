@@ -62,6 +62,29 @@ export function debounce<A extends unknown[]>(fn: (...args: A) => void, ms: numb
   return debounced;
 }
 
+/** A once-a-second timer for "Generating… 12 s" status lines; `start` replaces a running one. */
+export interface Ticker {
+  /** Calls `onTick(whole seconds since `started`)` every `intervalMs`, first after one interval. */
+  start(onTick: (seconds: number) => void, started?: number): void;
+  /** Idempotent. */
+  stop(): void;
+}
+
+export function createTicker(intervalMs = 1000): Ticker {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  const stop = (): void => {
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+  return {
+    start(onTick, started = Date.now()) {
+      stop();
+      timer = setInterval(() => onTick(Math.round((Date.now() - started) / 1000)), intervalMs);
+    },
+    stop,
+  };
+}
+
 // --- Web Locks -------------------------------------------------------------------------------------
 
 /** The Web Locks API, or null where it is missing or refused. */
