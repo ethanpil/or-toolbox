@@ -2,8 +2,9 @@
  * Stage 3 gate, Data extractor: ten synthetic receipts (drawn on a canvas in the page) through the Invoice /
  * receipt preset with mocked strict structured answers, one cell corrected in the review grid, and the XLSX
  * export opened and checked as OOXML: content types, workbook, two sheets, shared strings, numbers as numbers,
- * dates as dates, the correction present. (Python's openpyxl is not installed on the development machine, so
- * the workbook is checked here by unzipping it; the parts are also parsed as XML in the browser.)
+ * dates as dates, the correction present. (The workbook is checked here by unzipping it; the parts are also
+ * parsed as XML in the browser. CI separately opens a sample from the same writer with openpyxl: see
+ * scripts/check-xlsx.py.)
  */
 import { readFileSync } from 'node:fs';
 import type { Page } from '@playwright/test';
@@ -426,4 +427,64 @@ test('Extract again asks before it replaces corrected values, and leaving asks u
   await page.getByTestId('history-link').click();
   await expect(page).toHaveURL(/\/history\//);
   expect(problems).toEqual([]);
+});
+
+test('one document that cannot be read is marked, the others arrive, and Retry failed sends only that one', async ({
+  page,
+  context,
+  mock,
+}) => {
+  await seedApp(context, {
+    key: true,
+    settings: { tools: { 'data-extractor': { model: 'test/vision' } } },
+  });
+  mock.json('GET', '/api/v1/models', { data: [MODEL] });
+  let brokenReads = 0;
+  mock.respond('POST', '/api/v1/chat/completions', (call) => {
+    const file = fileOf(call);
+    const n = Number(/receipt-(\d+)/.exec(file)?.[1]);
+    // The second document is refused by the model's provider the first time (a 400: this document, not every one).
+    if (n === 2 && brokenReads++ === 0) {
+      return {
+        status: 400,
+        body: { error: { code: 400, message: 'This image could not be read.' } },
+      };
+    }
+    return {
+      body: {
+        id: `gen-${n}`,
+        model: 'test/vision',
+        choices: [
+          {
+            index: 0,
+            finish_reason: 'stop',
+            message: { role: 'assistant', content: JSON.stringify(receipt(n)) },
+          },
+        ],
+        usage: { prompt_tokens: 2000, completion_tokens: 200, total_tokens: 2200, cost: 0.0024 },
+      },
+    };
+  });
+  const problems = await watchForProblems(page);
+  await page.goto('tools/data-extractor/');
+  await addReceipts(page);
+  await page.getByTestId('run-button').click();
+
+  // Nine arrive and one is marked, with its reason on its row; nothing else is stopped.
+  await expect(page.getByTestId('de-summary')).toContainText('9 of 10 documents extracted');
+  await expect(page.getByTestId('de-summary')).toContainText('1 failed');
+  await expect(page.getByTestId('de-row')).toHaveCount(10);
+  await expect(page.getByTestId('de-retry-failed')).toBeVisible();
+  expect(mock.calls('/api/v1/chat/completions')).toHaveLength(10);
+
+  // Retry failed asks again for that document only, and the grid is complete.
+  await page.getByTestId('de-retry-failed').click();
+  await expect(page.getByTestId('de-summary')).toContainText('10 of 10 documents extracted');
+  await expect(page.getByTestId('de-retry-failed')).toBeHidden();
+  const calls = mock.calls('/api/v1/chat/completions');
+  expect(calls).toHaveLength(11);
+  expect(fileOf(calls[10]!)).toBe('receipt-02.png');
+  // Only the 400 this test asked for: the browser logs a failed request, and so does the page's own report.
+  expect(problems.filter((problem) => !/400/.test(problem))).toEqual([]);
+  expect(problems.filter((problem) => /400/.test(problem))).toHaveLength(2);
 });
