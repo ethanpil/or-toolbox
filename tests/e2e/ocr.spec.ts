@@ -105,7 +105,10 @@ test('a 20-page PDF: 20 page results in order, exports, a failed page retried', 
   await addPdf(page);
   await page.getByTestId('run-button').click();
 
-  await expect(page.getByTestId('output-status')).toHaveText('Done · 19 of 20 pages; 1 failed');
+  // Twenty pages rendered by pdf.js and read: longer than an expectation's default 5 s on a busy CI runner.
+  await expect(page.getByTestId('output-status')).toHaveText('Done · 19 of 20 pages; 1 failed', {
+    timeout: 30_000,
+  });
   expect(mock.calls('/api/v1/chat/completions')).toHaveLength(20);
   // Every page was sent as an image, with the PDF's own text as a hint.
   const third = mock.calls('/api/v1/chat/completions').find((call) => pageOf(call) === 3)!;

@@ -900,8 +900,10 @@ test.describe('review fixes', () => {
       'Enter an amount in dollars',
     );
     await perRun.press('Tab');
-    // Another change re-syncs the section; the field the user is fixing keeps their text and its error.
-    await page.getByTestId('budget-mode-hard').check();
+    // Another change re-syncs the section; the field the user is fixing keeps their text and its error. (A click,
+    // not check(): the re-sync can replace the radio while check() still reads the one it clicked.)
+    await page.getByTestId('budget-mode-hard').click();
+    await expect(page.getByTestId('budget-mode-hard')).toBeChecked();
     await expect(perRun).toHaveValue('a lot');
     await expect(perRun).toHaveClass(/is-invalid/);
     await perRun.fill('0,25');
