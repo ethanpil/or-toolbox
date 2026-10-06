@@ -75,6 +75,8 @@ All notable changes to this project are documented here. The format follows
 
 - Streams fail after 5 minutes without a byte; a video status read times out after 60 s and is retried (04e84a9).
 - Budget checks and the orphan sweep read small per-run holds instead of running records; History search and its model filter no longer rescan or copy whole outputs (84ca07d, 4e53b56).
+- Faster first paint: icon font and stylesheet cut to the icons used (134 to 16 KB), Bootstrap without unused components, tool styles loaded per tool page, icon font preloaded; shell CSS 53 to 36 KB gzipped. `npm run icon-subset` regenerates the icons (7352f30).
+- Every page has a meta description, from the tool manifest or a page table; the OAuth return page is `noindex` (7352f30).
 - `npm run budgets` checks the built JS budgets (shell at most 150 KB gzipped, each tool at most 80 KB more); CI runs it after the build.
 - US spelling "Favorites" everywhere (text, test ids, code and the settings fields `favoriteTools` and `models.favorites`); settings saved under the old field names are still read.
 - `trimOldest()` in `src/core/tokens.ts` replaces Chat's `trimToBudget` and Bot-to-bot's `trimCount` (94c14cf).

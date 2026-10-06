@@ -32,6 +32,9 @@ export default defineConfig({
         // warnings that originate inside node_modules only; warnings and
         // errors in our own Sass still surface.
         quietDeps: true,
+        // src/styles/_bootstrap-subset.scss has to @import the Bootstrap partials it keeps (they cannot be
+        // @use'd one by one); that is the only @import of our own.
+        silenceDeprecations: ['import'],
       },
     },
   },
