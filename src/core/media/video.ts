@@ -120,10 +120,51 @@ export function clampSeekTime(time: number, duration: number, fps?: number): num
   return Math.min(wanted, lastFrameTime(duration, fps));
 }
 
+/** Whether drawing `source` onto a canvas shows anything (a 16 x 16 copy with a pixel that is not transparent). */
+function drawsSomething(source: CanvasImageSource): boolean {
+  const canvas = document.createElement('canvas');
+  canvas.width = 16;
+  canvas.height = 16;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) return true; // nothing to check with: draw as usual
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+  const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+  for (let i = 3; i < data.length; i += 4) if (data[i] !== 0) return true;
+  return false;
+}
+
+/** WebCodecs' `VideoFrame` of the video's current frame, or null where the browser cannot make one. */
+function videoFrameOf(video: HTMLVideoElement): VideoFrame | null {
+  try {
+    return new VideoFrame(video);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What to draw for the video's current frame. Video frames are opaque, yet some browsers draw a `<video>` onto a
+ * canvas as fully transparent pixels while WebCodecs' `VideoFrame` of it holds the picture (Playwright's WebKit on
+ * Linux, measured in CI); then the `VideoFrame` is drawn. When neither gives a picture this throws: sent on
+ * (Continue), a blank picture would start a paid clip from nothing. (A WebM frame that is wholly transparent is
+ * refused too; there is nothing to continue from there.) Call `close()` when done.
+ */
+function currentFrame(video: HTMLVideoElement): { image: CanvasImageSource; close: () => void } {
+  if (drawsSomething(video)) return { image: video, close: () => undefined };
+  if (typeof VideoFrame === 'function') {
+    const frame = videoFrameOf(video);
+    if (frame && drawsSomething(frame)) return { image: frame, close: () => frame.close() };
+    frame?.close();
+  }
+  throw new InvalidInputError(
+    'This browser could not read the frames of this video. Try another browser.',
+  );
+}
+
 /**
  * Takes one frame of a video as a full-size PNG. `at` is a time in seconds
  * (see `clampSeekTime`: a time at or past the end gives the final frame),
- * `'first'` or `'last'`.
+ * `'first'` or `'last'`. Rejects when the browser cannot read the frame (`currentFrame`).
  */
 export async function captureFrame(
   blob: Blob,
@@ -141,7 +182,12 @@ export async function captureFrame(
       options.fps,
       options.signal,
     );
-    return await toBlob(video, { type: 'image/png' });
+    const frame = currentFrame(video);
+    try {
+      return await toBlob(frame.image, { type: 'image/png' });
+    } finally {
+      frame.close();
+    }
   } finally {
     dispose();
   }

@@ -69,7 +69,19 @@ function frameDistances(page: Page, frame: string): Promise<{ toLast: number; to
         canvas.height = 64;
         const context = canvas.getContext('2d')!;
         context.drawImage(source, 0, 0, 64, 64);
-        return context.getImageData(0, 0, 64, 64).data;
+        const data = context.getImageData(0, 0, 64, 64).data;
+        // WebKit on Linux draws a <video> as transparent pixels; its WebCodecs VideoFrame holds the picture (the
+        // app's captureFrame reads frames the same way there).
+        if (
+          source instanceof HTMLVideoElement &&
+          data.every((value, i) => i % 4 !== 3 || value === 0)
+        ) {
+          const frame = new VideoFrame(source);
+          context.drawImage(frame, 0, 0, 64, 64);
+          frame.close();
+          return context.getImageData(0, 0, 64, 64).data;
+        }
+        return data;
       };
       const at = async (time: number): Promise<Uint8ClampedArray> => {
         const seeked = new Promise((resolve) =>
