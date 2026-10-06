@@ -195,3 +195,40 @@ test('two tables on a page: edit, export XLSX, a ZIP of CSVs, one CSV, and copy 
 
   expect(problems).toEqual([]);
 });
+
+test('pages read with no table say so, instead of the hint for a first run', async ({
+  page,
+  context,
+  mock,
+}) => {
+  await seedApp(context, {
+    key: true,
+    settings: { tools: { 'table-extractor': { model: 'test/vision' } } },
+  });
+  mock.json('GET', '/api/v1/models', { data: [MODEL] });
+  mock.json('POST', '/api/v1/chat/completions', {
+    id: 'gen-1',
+    model: 'test/vision',
+    choices: [
+      {
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: JSON.stringify({ tables: [] }) },
+      },
+    ],
+    usage: { prompt_tokens: 2000, completion_tokens: 20, total_tokens: 2020, cost: 0.002 },
+  });
+  const problems = await watchForProblems(page);
+  await page.goto('tools/table-extractor/');
+  await expect(page.getByTestId('te-empty')).toBeVisible();
+  await page
+    .getByTestId('doc-drop-zone')
+    .locator('input[type=file]')
+    .setInputFiles(join(MEDIA_FIXTURES_DIR, 'generated-image.jpg'));
+  await expect(page.getByTestId('doc-count')).toHaveText('1 file · 1 page');
+  await page.getByTestId('run-button').click();
+  await expect(page.getByTestId('te-none')).toBeVisible();
+  await expect(page.getByTestId('te-none')).toContainText('No tables found');
+  await expect(page.getByTestId('te-empty')).toBeHidden();
+  expect(problems).toEqual([]);
+});
