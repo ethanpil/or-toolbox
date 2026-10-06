@@ -398,6 +398,12 @@ test.describe('Image editor', () => {
     await paint(page, [0.3, 0.5], [0.7, 0.5]);
     await page.getByTestId('tool-prompt').fill('A green stripe');
     await page.getByTestId('run-button').click();
+    // Three references at 4096 tokens each put the estimate (about $0.18) over the $0.10 per-run threshold, and
+    // from the press of Edit the picture waits for the answer to that question.
+    const budget = page.getByTestId('budget-dialog');
+    await expect(budget).toBeVisible();
+    await expect(page.getByTestId('editor-tool-brush')).toBeDisabled();
+    await budget.getByTestId('budget-confirm').click();
     await expect(page.getByTestId('editor-version-result-meta')).toContainText(
       'Inpaint · 4579 × 3663 · outside kept',
       { timeout: 120_000 },

@@ -145,6 +145,14 @@ All notable changes to this project are documented here. The format follows
 - Tool pages no longer shift while the tool sets itself up; the Run bar no longer scrolls controls beside it or in dialogs; Shift+Tab never leaves focus under the navbar; toasts no longer cover Run and Stop on phones; `.tsx`, `.vue` and `.kt` files dropped on Chat are no longer skipped (b60be68).
 - History stops filtering by a key that was removed; Home words estimated costs with ≈; the Budgets help explains group totals; Enter that confirms an IME composition no longer acts in the palette or Home's search; revealing a document page respects reduced motion (b4cd175).
 - Tool unit tests no longer write into the next test's database (1457b54).
+- Speech-to-text, Text-to-speech, Music, Image generation and Isolated image: a retry after a request that may have been billed shows the caution and the activity link and asks first (cbfe677, a879315, 0b0e232, d5598bf, 57b4fcb).
+- Speech-to-text and Music: the error toast's Retry sends only the parts or variations without a result (cbfe677, 0b0e232).
+- Speech-to-text: transcribing again asks before replacing an edited transcript, holds edits as unsaved work, and keeps the last transcript if the recording cannot be decoded; a retry uses the options of its transcript; unknown-length recordings are checked against the budget with their real length (cbfe677).
+- Text-to-speech: parts made from unchanged words, model, voice and speed are reused, and paid parts that would be dropped are asked about first; a retry joins in the format chosen now (a879315).
+- Music: an answer without audio is billed and no longer offers Retry; an empty form is not sent; a target longer than the song is said; file names use local time (0b0e232).
+- Image generation: an exact size matches however it is spaced and is reported when the model does not list it; a Stop keeps the images already made (d5598bf).
+- Image editor: loading, versions and painting wait from the press of Edit; a paid picture is never lost to a later failure; a Stop keeps the picture already made; removing a version asks; the soft-edge help and the Undo and Redo labels fit the mode and platform (74011e0).
+- Isolated image: a result that fails after the paid answer is finished again without a new request; a Stop keeps the answer already made; buttons are named by their visible text (57b4fcb).
 
 - The sticky Run bar no longer covers a control focused by Tab when the page scrolls smoothly to it: the framework checks again once the scroll ends (d8e6d0c).
 - The first-visit isolation reload no longer happens once the user has started using the page, keeps the parameters the tool already consumed, and never happens on a Send to page (942ff57).

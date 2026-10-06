@@ -51,8 +51,8 @@ test.describe('Image generation', () => {
       .setInputFiles(GENERATED_PATH);
     await expect(page.getByTestId('imagegen-reference')).toHaveCount(1);
     await expect(page.getByTestId('imagegen-reference-count')).toHaveText('1 of 4');
-    // Two images, one reference each: the estimate doubles and adds the references.
-    await expect(page.getByTestId('cost-estimate-value')).toHaveText(/≈ \$0\.0[23]/);
+    // Two requests, each an image (4175 tokens) plus its reference (priced high, 4096 tokens): about $0.057.
+    await expect(page.getByTestId('cost-estimate-value')).toHaveText(/≈ \$0\.05[67]/);
 
     await page.getByTestId('run-button').click();
     await expect(page.getByTestId('imagegen-result')).toHaveCount(2, { timeout: 60_000 });
