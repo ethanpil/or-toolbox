@@ -5,45 +5,18 @@
 // Light and dark come from Bootstrap's colour modes: `data-bs-theme` on
 // <html>, set before first paint by public/theme-init.js.
 
-@use 'variables' as v;
+@use 'bootstrap-subset';
 
-@use 'bootstrap/scss/bootstrap' with (
-  $primary: v.$primary,
-  $font-family-sans-serif: v.$font-family-sans-serif,
-  $border-radius-sm: v.$border-radius-sm,
-  $border-radius: v.$border-radius,
-  $border-radius-lg: v.$border-radius-lg,
-  $transition-fade: v.$transition-fade,
-  $transition-collapse: v.$transition-collapse,
-  $modal-transition: v.$modal-transition,
-  $offcanvas-transition-duration: v.$offcanvas-transition-duration,
-  $progress-bar-transition: v.$progress-bar-transition
-);
-
-// Self-hosted icon font. Vite bundles the font file next to the CSS; nothing
-// is loaded from a CDN. Usage: <i class="bi bi-gear" aria-hidden="true"></i>
-//
-// The font URL is spelled out here because the package builds its own from
-// Sass variables, which Vite cannot resolve to a file. WOFF2 only: every
-// supported browser has it.
-@use 'bootstrap-icons/font/bootstrap-icons' with (
-  $bootstrap-icons-font-src: url('bootstrap-icons/font/fonts/bootstrap-icons.woff2') format('woff2')
-);
+// Bootstrap Icons, cut down to the icons the code uses and self-hosted (generated: npm run icon-subset).
+@use 'icons';
 
 // The few rules Bootstrap lacks, one partial per concern. They use Bootstrap's CSS custom properties only, so
-// they follow light/dark and the accent colour automatically.
+// they follow light/dark and the accent colour automatically. The rules of a single tool are not here: they are
+// in tools/<tool id>.scss, which vite-plugins/html-head.ts links from that tool's page only.
 @use 'shell';
 @use 'components';
 @use 'tool';
 @use 'documents';
-@use 'chat';
-@use 'stt';
-@use 'images';
-@use 'isolated';
-@use 'video';
-@use 'arena';
-@use 'decision';
-@use 'bots';
 @use 'settings';
 @use 'pages';
 @use 'accent';
