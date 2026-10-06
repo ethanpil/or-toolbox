@@ -13,8 +13,9 @@
  *   History keeps the transcript text (checkpointed as parts finish). Recordings stay in memory as session
  *   results (the leave guard asks before they are lost).
  */
+import { diarizationRoute } from '../../core/api/client';
 import type { TranscriptionResult } from '../../core/api/types';
-import { NetworkError, userMessage } from '../../core/errors';
+import { isOutcomeUnknown, NetworkError } from '../../core/errors';
 import { toSrt, toVtt } from '../../core/export/subtitles';
 import { toJsonBlob } from '../../core/export/table';
 import { formatBytes, formatDuration } from '../../core/files';
@@ -22,17 +23,19 @@ import { copyWithToast } from '../../ui/clipboard';
 import { type AudioPlayer, audioPlayer } from '../../ui/components/audio-player';
 import { dropZone } from '../../ui/components/drop-zone';
 import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
+import { failureLine } from '../../ui/components/failure-line';
 import { progressBar } from '../../ui/components/progress-bar';
 import { focusedKey, focusKey, h, replace, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
-import { isStop, presentError } from '../../ui/feedback/errors';
+import { type FailureText, isStop, presentError } from '../../ui/feedback/errors';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { motionReduced } from '../../ui/shell/appearance';
 import { batchSummary, type ItemStatus, runItems } from '../../ui/tool/batch';
 import { type RetryGate, retryGate } from '../../ui/tool/retry-gate';
+import { pendingOnly } from '../../ui/tool/runner';
 import type {
   ResultHandle,
   RunnerState,
@@ -66,7 +69,10 @@ import {
 
 interface PartState extends AudioPart {
   status: ItemStatus;
-  error: string | null;
+  /** Why it failed, worded for the part's row (a request that may have been billed says so). */
+  failure: FailureText | null;
+  /** The error behind `failure`: its Retry asks first when the request may have been billed. */
+  cause: unknown;
   result: TranscriptionResult | null;
   /** How it was transcribed (set when done): a retry may use another model or other options. */
   meta: PartMeta | null;
@@ -148,6 +154,16 @@ export function setup(ctx: ToolContext): ToolInstance {
   /** True while a run transcribes (the runner's own flag is still set while its `run` returns). */
   let transcribing = false;
   let runnerState: RunnerState = { busy: false, disabledReason: null };
+  /**
+   * What the transcript on screen was asked with: a retry of one of its parts goes out the same way (the form
+   * may have changed since), so the parts of one transcript do not differ in language or timestamps.
+   */
+  let runOptions: {
+    language: string;
+    timestamps: boolean;
+    diarize: boolean;
+    keyterms: string[];
+  } | null = null;
 
   // --- drawer -----------------------------------------------------------------------------------------------
   const language = h(
@@ -344,8 +360,32 @@ export function setup(ctx: ToolContext): ToolInstance {
         .then(() => audio.play())
         .catch(() => undefined);
     },
-    onChange: () => updateActions(),
+    onChange: () => {
+      unsaved = true;
+      syncWork();
+      updateActions();
+    },
   });
+
+  /**
+   * Edited text and speaker names live only here: leaving asks while they are not saved (copied, downloaded or
+   * sent), and so does transcribing again.
+   */
+  let unsaved = false;
+  let releaseWork: (() => void) | null = null;
+  const edited = (): boolean => editor.edits.size > 0 || Object.keys(editor.names).length > 0;
+  function syncWork(): void {
+    const hold = unsaved && edited();
+    if (hold && !releaseWork) releaseWork = ui.holdWork('Your edited transcript');
+    else if (!hold && releaseWork) {
+      releaseWork();
+      releaseWork = null;
+    }
+  }
+  const markSaved = (): void => {
+    unsaved = false;
+    syncWork();
+  };
 
   const stem = (): string =>
     `${(transcriptOf?.name ?? 'recording').replace(/\.[^.]+$/, '')}-transcript`;
@@ -361,7 +401,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       label: 'Text',
       extension: 'txt',
       icon: 'file-earmark-text',
-      build: () => new Blob([editor.text()], { type: 'text/plain' }),
+      build: () => {
+        markSaved();
+        return new Blob([editor.text()], { type: 'text/plain' });
+      },
     },
     ...(current().timed
       ? [
@@ -369,17 +412,23 @@ export function setup(ctx: ToolContext): ToolInstance {
             label: 'Subtitles (SRT)',
             extension: 'srt',
             icon: 'badge-cc',
-            build: () =>
-              new Blob([toSrt(subtitleSegments(current(), editor.names))], {
+            build: () => {
+              markSaved();
+              return new Blob([toSrt(subtitleSegments(current(), editor.names))], {
                 type: 'application/x-subrip',
-              }),
+              });
+            },
           },
           {
             label: 'Subtitles (WebVTT)',
             extension: 'vtt',
             icon: 'badge-cc',
-            build: () =>
-              new Blob([toVtt(subtitleSegments(current(), editor.names))], { type: 'text/vtt' }),
+            build: () => {
+              markSaved();
+              return new Blob([toVtt(subtitleSegments(current(), editor.names))], {
+                type: 'text/vtt',
+              });
+            },
           },
         ]
       : []),
@@ -387,16 +436,21 @@ export function setup(ctx: ToolContext): ToolInstance {
       label: 'JSON (segments and words)',
       extension: 'json',
       icon: 'filetype-json',
-      build: () => toJsonBlob(transcriptJson(current(), editor.names, jsonMeta())),
+      build: () => {
+        markSaved();
+        return toJsonBlob(transcriptJson(current(), editor.names, jsonMeta()));
+      },
     },
     {
       label: 'Word document',
       extension: 'docx',
       icon: 'file-earmark-word',
-      build: async () =>
-        (await import('../../core/export/docx')).toDocx(
+      build: async () => {
+        markSaved();
+        return (await import('../../core/export/docx')).toDocx(
           transcriptMarkdown(current(), editor.names),
-        ),
+        );
+      },
     },
   ];
   const downloads = exportMenu({
@@ -412,7 +466,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
       disabled: true,
       'data-testid': 'stt-copy',
-      onclick: () => void copyWithToast(editor.text(), 'Copied to the clipboard.'),
+      onclick: () => {
+        markSaved();
+        void copyWithToast(editor.text(), 'Copied to the clipboard.');
+      },
     },
     icon('clipboard'),
     'Copy',
@@ -424,10 +481,12 @@ export function setup(ctx: ToolContext): ToolInstance {
       class: 'btn btn-sm btn-outline-secondary d-inline-flex align-items-center gap-1',
       disabled: true,
       'data-testid': 'stt-send',
-      onclick: () =>
+      onclick: () => {
+        markSaved();
         ui.sendTo([
           { kind: 'text', text: editor.text(), type: 'text/plain', name: `${stem()}.txt` },
-        ]),
+        ]);
+      },
     },
     icon('send'),
     'Send to…',
@@ -512,7 +571,12 @@ export function setup(ctx: ToolContext): ToolInstance {
       announce(problem);
       return;
     }
-    gate?.retry(indexes, 'This cannot start now.');
+    // A part whose request may have been billed asks before it is sent again.
+    const cause = parts
+      .filter((part) => indexes.includes(part.index))
+      .map((part) => part.cause)
+      .find(isOutcomeUnknown);
+    void gate?.retryFailed(cause, indexes, 'This cannot start now.');
   };
   const retryButton = (
     attributes: Record<string, string>,
@@ -557,7 +621,12 @@ export function setup(ctx: ToolContext): ToolInstance {
             'Retry',
           )
         : null,
-      part.error ? h('span', { class: 'w-100 text-danger-emphasis' }, part.error) : null,
+      part.failure
+        ? failureLine(part.failure, {
+            className: 'w-100 small text-danger-emphasis',
+            testId: 'stt-part-error',
+          })
+        : null,
     );
     partItems.set(part.index, item);
     return item;
@@ -676,7 +745,9 @@ export function setup(ctx: ToolContext): ToolInstance {
     diarize.show(support.diarization);
     diarize.note.textContent = support.diarization
       ? 'Names who speaks when. The model numbers speakers per request, so a long recording is labeled per part.'
-      : 'Speaker labels can be requested from Deepgram and MAI-Transcribe models only. Choose one of those to turn them on.';
+      : model && !support.timestamps && diarizationRoute(model)
+        ? 'Speaker labels need timestamps, and this model returns text without them. Choose another model to turn them on.'
+        : 'Speaker labels can be requested from Deepgram and MAI-Transcribe models that return timestamps. Choose one of those to turn them on.';
     vocabularyNote.textContent = support.keyterms
       ? 'Sent to the model as key terms, so they are spelled as you write them here.'
       : 'This model does not take a vocabulary list, so it is not sent. Deepgram and AssemblyAI models do.';
@@ -685,12 +756,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     renderParts();
   };
 
-  const confirmReplace = async (): Promise<boolean> => {
+  const confirmReplace = async (verb: 'Replace' | 'Remove' = 'Replace'): Promise<boolean> => {
     if (!recording || recording.result.downloaded) return true;
     return confirmDialog({
-      title: 'Replace the recording?',
-      message: 'Your recording has not been downloaded. Once replaced it is gone.',
-      confirmLabel: 'Replace',
+      title: `${verb} the recording?`,
+      message: `Your recording has not been downloaded. Once ${verb === 'Replace' ? 'replaced' : 'removed'} it is gone.`,
+      confirmLabel: verb,
       tone: 'warning',
       testId: 'stt-replace-dialog',
     });
@@ -871,7 +942,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       announce('Wait until the transcription ends, or press Stop.');
       return;
     }
-    if (!(await confirmReplace())) return;
+    if (!(await confirmReplace('Remove'))) return;
     setSource(null);
     ui.status('Removed.');
     // The card (and its Remove button) is gone: the drop zone's button takes focus.
@@ -881,6 +952,36 @@ export function setup(ctx: ToolContext): ToolInstance {
   // --- running ------------------------------------------------------------------------------------------------
   const estimateSeconds = (model: string, seconds: number, count: number) =>
     ctx.models.estimate({ kind: 'transcription', model, seconds: Math.ceil(seconds) + count });
+
+  /** Cuts the source into the requests' audio (or finds the cut kept from an earlier run). */
+  const ensurePrepared = async (
+    input: AudioSource,
+    seconds: number,
+    pcmWavOnly: boolean,
+    signal: AbortSignal,
+  ): Promise<AudioPart[]> => {
+    if (
+      prepared &&
+      prepared.sourceId === input.id &&
+      prepared.seconds === seconds &&
+      prepared.pcmWavOnly === pcmWavOnly
+    ) {
+      return prepared.parts;
+    }
+    prepared = null;
+    const cut = await prepareParts(input, {
+      partSeconds: seconds,
+      pcmWavOnly,
+      signal,
+      onStatus: (text) => ui.status(text),
+      onProgress: (text) => ui.progress(text),
+    });
+    prepared = { sourceId: input.id, seconds, pcmWavOnly, parts: cut };
+    return cut;
+  };
+
+  const totalSeconds = (list: readonly AudioPart[]): number =>
+    list.reduce((sum, part) => sum + part.duration, 0);
 
   const run = async (signal: AbortSignal, retryIndexes?: number[]): Promise<void> => {
     const input = source;
@@ -904,37 +1005,58 @@ export function setup(ctx: ToolContext): ToolInstance {
         announce(problem);
         return;
       }
+    } else if (
+      !(await ui.confirmDiscard({
+        what: 'your edited transcript and speaker names',
+        isDirty: () => unsaved && edited(),
+        testId: 'stt-discard-dialog',
+      }))
+    ) {
+      return;
     }
+
+    // A recording whose length the browser could not read has no estimate: cut it first (nothing is sent or
+    // booked yet), so the run, the budget question and the reservation use its real length.
+    const cutFirst =
+      !retryParts && input.duration === null
+        ? await ensurePrepared(input, seconds, support.pcmWavOnly, signal)
+        : null;
+    const known = retryParts ?? cutFirst;
 
     // Refused here (no key, locked, free-only, budget, Cancel): nothing on the page changes.
     const runHandle = await ctx.beginRun(
       {
         title: retryParts ? `Retry: ${input.name}` : input.name,
-        ...(retryParts
-          ? {
-              estimateUsd: await estimateSeconds(
-                model,
-                retryParts.reduce((sum, part) => sum + part.duration, 0),
-                retryParts.length,
-              ),
-            }
+        ...(known
+          ? { estimateUsd: await estimateSeconds(model, totalSeconds(known), known.length) }
           : {}),
       },
       signal,
     );
     transcribing = true;
+    // A retry goes out like the run it belongs to; a new run reads the form.
+    const options =
+      retryParts && runOptions
+        ? runOptions
+        : {
+            language: language.value,
+            timestamps: timestamps.wanted,
+            diarize: diarize.wanted,
+            keyterms: parseKeyterms(vocabulary.value),
+          };
     const request = {
-      language: language.value,
-      timestamps: timestamps.wanted && support.timestamps,
-      diarize: diarize.wanted && support.diarization,
-      keyterms: support.keyterms ? parseKeyterms(vocabulary.value) : [],
+      language: options.language,
+      timestamps: options.timestamps && support.timestamps,
+      diarize: options.diarize && support.diarization,
+      keyterms: support.keyterms ? options.keyterms : [],
     };
     try {
       let work: PartState[];
       if (retryParts) {
         for (const part of retryParts) {
           part.status = 'queued';
-          part.error = null;
+          part.failure = null;
+          part.cause = null;
           part.result = null;
           part.meta = null;
           for (const id of [...editor.edits.keys()]) {
@@ -944,36 +1066,24 @@ export function setup(ctx: ToolContext): ToolInstance {
         work = retryParts;
         renderParts();
       } else {
-        // A new transcript: the last one goes only now that the run is on.
+        // The audio is cut BEFORE the last transcript goes: a recording that cannot be decoded fails here and
+        // leaves the transcript (and its edits) where they were.
+        const cut =
+          cutFirst ?? (await ensurePrepared(input, seconds, support.pcmWavOnly, runHandle.signal));
         editor.reset();
+        markSaved();
         parts = [];
+        runOptions = options;
         transcriptOf = { sourceId: input.id, name: input.name, duration: input.duration };
         editor.set(EMPTY_TRANSCRIPT);
         updateActions();
-        renderParts();
-        updateProgress();
-        if (
-          !prepared ||
-          prepared.sourceId !== input.id ||
-          prepared.seconds !== seconds ||
-          prepared.pcmWavOnly !== support.pcmWavOnly
-        ) {
-          prepared = null;
-          const cut = await prepareParts(input, {
-            partSeconds: seconds,
-            pcmWavOnly: support.pcmWavOnly,
-            signal: runHandle.signal,
-            onStatus: (text) => ui.status(text),
-            onProgress: (text) => ui.progress(text),
-          });
-          prepared = { sourceId: input.id, seconds, pcmWavOnly: support.pcmWavOnly, parts: cut };
-        }
-        const last = prepared.parts.at(-1);
-        if (last && transcriptOf) transcriptOf.duration = last.start + last.duration;
-        parts = prepared.parts.map((part) => ({
+        const last = cut.at(-1);
+        if (last) transcriptOf.duration = last.start + last.duration;
+        parts = cut.map((part) => ({
           ...part,
           status: 'queued',
-          error: null,
+          failure: null,
+          cause: null,
           result: null,
           meta: null,
         }));
@@ -1019,8 +1129,14 @@ export function setup(ctx: ToolContext): ToolInstance {
         onItem: (outcome) => {
           const part = outcome.item;
           part.status = outcome.status;
-          if (outcome.status === 'running') part.error = null;
-          if (outcome.status === 'failed') part.error = userMessage(outcome.error);
+          if (outcome.status === 'running') {
+            part.failure = null;
+            part.cause = null;
+          }
+          if (outcome.status === 'failed') {
+            part.failure = outcome.failure ?? null;
+            part.cause = outcome.error;
+          }
           updatePart(part);
           updateProgress();
           if (outcome.status !== 'done') return;
@@ -1059,7 +1175,21 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner = ui.runner<number[]>({ label: 'Transcribe', icon: 'mic', run });
+  // A replayed run (the error toast's Retry) sends only the parts still without a result; with no transcript
+  // yet, or one for another recording, it is the plain run it was.
+  const pending = pendingOnly<number>(
+    (index) => parts.some((part) => part.index === index && part.status === 'done'),
+    () => parts.map((part) => part.index),
+  );
+  const runner = ui.runner<number[]>({
+    label: 'Transcribe',
+    icon: 'mic',
+    run,
+    replayArg: (arg) =>
+      parts.length === 0 || (arg === undefined && transcriptOf?.sourceId !== source?.id)
+        ? arg
+        : pending(arg),
+  });
   gate = retryGate(runner);
   // After the gate's own subscription: a part that cannot be retried keeps saying why.
   runner.subscribe((state) => {
