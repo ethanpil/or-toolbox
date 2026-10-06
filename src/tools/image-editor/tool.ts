@@ -19,8 +19,10 @@
  * edited further, downloaded or removed. Versions are session results (leave guard); History keeps the
  * instruction and settings only.
  */
+import { partialImageResult } from '../../core/api/client';
+import type { GeneratedImage } from '../../core/api/types';
 import type { ImageModelControls } from '../../core/models/image-params';
-import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
+import { InvalidInputError, userMessage } from '../../core/errors';
 import {
   fitWithin,
   imageSize,
@@ -38,17 +40,18 @@ import {
   maskToRasterAsync,
 } from '../../core/media/image-async';
 import type { ImageControlsResult } from '../../core/types';
-import { debounce } from '../../core/util';
+import { createTicker, debounce } from '../../core/util';
 import { type CompareSlider, compareSlider } from '../../ui/components/compare-slider';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
 import { type ImageResultCard, imageResultCard } from '../../ui/components/image-result-card';
+import { confirmUndownloaded } from '../../ui/components/result-removal';
 import { switchField } from '../../ui/components/switch-field';
 import { h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
 import { isStop, presentError } from '../../ui/feedback/errors';
-import { formatBytes, plural } from '../../ui/format';
+import { formatBytes, plural, shorten } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import type { ToolContext, ToolInstance } from '../../ui/tool/index';
@@ -115,9 +118,6 @@ const PLACEHOLDER: Record<EditMode, string> = {
   outpaint: 'For example: more of the beach and the evening sky',
   whole: 'For example: make it look like a winter evening',
 };
-
-const shorten = (text: string, max: number): string =>
-  text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
 /** A file stem without its extension. */
 const stemOf = (name: string): string =>
@@ -340,7 +340,11 @@ export function setup(ctx: ToolContext): ToolInstance {
   });
   const modelNote = h(
     'div',
-    { class: 'alert alert-info small mb-0 d-flex gap-2', role: 'note' },
+    {
+      class: 'alert alert-info small mb-0 d-flex gap-2',
+      role: 'note',
+      'data-testid': 'editor-model-note',
+    },
     icon('info-circle'),
     h(
       'div',
@@ -385,6 +389,11 @@ export function setup(ctx: ToolContext): ToolInstance {
     settings.feather = Number(feather.value);
     featherValue.textContent = `${settings.feather} px`;
   });
+  const featherHelp = h('div', {
+    id: ids.featherHelp,
+    class: 'form-text',
+    'data-testid': 'editor-feather-help',
+  });
   ui.drawer.append(
     h(
       'div',
@@ -396,11 +405,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         featherValue,
       ),
       feather,
-      h(
-        'div',
-        { id: ids.featherHelp, class: 'form-text' },
-        'With “Keep outside the mask”: how many pixels inside the mask blend the result into your picture. 0 is a hard edge.',
-      ),
+      featherHelp,
     ),
   );
 
@@ -800,6 +805,15 @@ export function setup(ctx: ToolContext): ToolInstance {
     instructionLabel.textContent = INSTRUCTION_LABEL[settings.mode];
     instruction.placeholder = PLACEHOLDER[settings.mode];
     keepOutside.element.hidden = settings.mode === 'whole';
+    // The note is about a mask; a whole-image edit has none.
+    modelNote.hidden = settings.mode === 'whole';
+    // Outpaint blends on the picture's side of the seam (the new area is all result); inpaint inside the mask.
+    featherHelp.textContent =
+      settings.mode === 'outpaint'
+        ? 'With “Keep outside the mask”: how many pixels at the edge of your picture blend into the new area. 0 is a hard edge.'
+        : settings.mode === 'whole'
+          ? 'Only used by Inpaint and Outpaint, which keep your picture outside the new area.'
+          : 'With “Keep outside the mask”: how many pixels inside the mask blend the result into your picture. 0 is a hard edge.';
     editor.setPainting(
       settings.mode === 'inpaint' && !editing,
       editing
@@ -991,70 +1005,72 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     const keep = settings.keepOutside && mode !== 'whole';
 
-    // Everything is encoded before the run starts: a picture that cannot be read costs nothing.
-    let prepared: Prepared;
-    try {
-      prepared = await prepare(model, state.controls, roles);
-    } catch (error) {
-      throw new InvalidInputError(`The picture could not be prepared (${userMessage(error)}).`);
-    }
-    const { body } = prepared;
-    const maskRevision = editor.revision();
-
-    // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
-    const handle = await ctx.beginRun(
-      {
-        title: `${MODE_LABEL[mode]}: ${shorten(instruction.value.trim() || 'extend the picture', 70)}`,
-      },
-      signal,
-    );
-    // From here until the version is shown, the picture, the version and the mask stay as they were sent.
+    // From here until the version is shown (or the run is refused or fails) the picture, the version and the mask
+    // stay as they are: loading, switching versions and painting wait, also while the pictures are prepared and
+    // the budget question is open.
     editing = true;
     modeChanged();
-    const started = Date.now();
-    ui.status(`${MODE_LABEL[mode]}…`);
-    const ticker = setInterval(() => {
-      ui.progress(`${MODE_LABEL[mode]}… ${Math.round((Date.now() - started) / 1000)} s`);
-    }, 1000);
+    const ticker = createTicker();
     try {
-      const result = await ctx.api.images(body, { run: handle });
-      const image = result.images[0]!;
-      let blob = image.blob;
-      let fitted = false;
-      /** The answer is paid for: if keeping the outside fails, the model's own picture becomes the version. */
-      let keepFailed: string | null = null;
-      if (keep) {
-        try {
-          ({ blob, fitted } = await compositeKeepingOutside(prepared, image.blob));
-        } catch (error) {
-          if (isAbortError(error)) throw error;
-          keepFailed = `The outside of the mask could not be kept (${userMessage(error).replace(/\.$/, '')}): this is the model's own picture.`;
-        }
+      // Everything is encoded before the run starts: a picture that cannot be read costs nothing.
+      let prepared: Prepared;
+      try {
+        prepared = await prepare(model, state.controls, roles);
+      } catch (error) {
+        throw new InvalidInputError(`The picture could not be prepared (${userMessage(error)}).`);
       }
-      const size = await readImageSize(blob);
-      const extension =
-        blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/webp' ? 'webp' : 'png';
-      const version = versions.add({
-        blob,
-        name: '',
-        width: size.width,
-        height: size.height,
-        parentId: working.id,
-        mode,
-        instruction: instruction.value.trim(),
-        model,
-      });
-      version.name = `${stemOf(originalName)}-v${version.number}.${extension}`;
-      const fitNote = fitted
-        ? 'The model answered in another shape than the picture: its result was fitted inside and centered, not stretched; check the edges.'
-        : keepFailed;
-      cards.set(
-        version.id,
-        imageResultCard({
+      const { body } = prepared;
+      const maskRevision = editor.revision();
+
+      // Refused before anything was sent (no key, locked, free-only, budget, Cancel): nothing changes.
+      const handle = await ctx.beginRun(
+        {
+          title: `${MODE_LABEL[mode]}: ${shorten(instruction.value.trim() || 'extend the picture', 70)}`,
+        },
+        signal,
+      );
+      ui.status(`${MODE_LABEL[mode]}…`);
+      ticker.start((seconds) => ui.progress(`${MODE_LABEL[mode]}… ${seconds} s`));
+
+      /**
+       * The model's picture as the next version. It is paid for, so nothing below may lose it: keeping the outside
+       * falls back to the model's own picture, an unreadable size to the canvas's, and a version that cannot be
+       * drawn stays in the strip with its card (and the error is shown) instead of vanishing.
+       */
+      const makeVersion = async (image: GeneratedImage) => {
+        let blob = image.blob;
+        let fitted = false;
+        let keepFailed: string | null = null;
+        if (keep) {
+          try {
+            ({ blob, fitted } = await compositeKeepingOutside(prepared, image.blob));
+          } catch (error) {
+            keepFailed = `The outside of the mask could not be kept (${userMessage(error).replace(/\.$/, '')}): this is the model's own picture.`;
+          }
+        }
+        const size = await readImageSize(blob).catch(() => prepared.canvas);
+        const extension =
+          blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/webp' ? 'webp' : 'png';
+        const version = versions.add({
+          blob,
+          name: '',
+          width: size.width,
+          height: size.height,
+          parentId: working.id,
+          mode,
+          instruction: instruction.value.trim(),
+          model,
+        });
+        version.name = `${stemOf(originalName)}-v${version.number}.${extension}`;
+        const fitNote = fitted
+          ? 'The model answered in another shape than the picture: its result was fitted inside and centered, not stretched; check the edges.'
+          : keepFailed;
+        const title = versionLabel(version);
+        const card: ImageResultCard = imageResultCard({
           ui,
           blob,
           name: version.name,
-          title: versionLabel(version),
+          title,
           headingLevel: 4,
           viewer: false,
           meta: [
@@ -1082,37 +1098,71 @@ export function setup(ctx: ToolContext): ToolInstance {
                 )
               : null,
           ),
-          beforeRemove: () => !busyEditing('removing a version'),
+          // An edit in flight keeps the versions; an undownloaded one asks before it goes.
+          beforeRemove: () =>
+            !busyEditing('removing a version') &&
+            confirmUndownloaded(card.handle, title, 'image', 'editor-version'),
           onRemove: () => void removeVersion(version.id),
           testId: 'editor-version',
-        }),
-      );
-      clearInterval(ticker);
-      // The mask the user painted for this edit is cleared (one undoable step) only if it is still that one.
-      const maskUntouched = editor.revision() === maskRevision;
-      editing = false;
-      await showVersion(version, true);
-      if (mode === 'inpaint' && maskUntouched) editor.clearMask();
-      const summary = `${versionLabel(version)} ready: ${MODE_LABEL[mode].toLowerCase()}, ${size.width} × ${size.height}`;
-      ui.status(fitNote ? `${summary}. ${fitNote}` : summary);
-      await handle.finish({
-        output: `${summary}${keep ? ', outside the mask kept' : ''}.\nInstruction sent:\n${body.prompt}`,
-        meta: {
-          mode,
-          width: size.width,
-          height: size.height,
-          keepOutside: keep,
-          fitted,
-          version: version.number,
-        },
-      });
-    } catch (error) {
-      clearInterval(ticker);
-      ui.status(isStop(error) ? 'Stopped' : 'Failed');
-      await handle.fail(error);
-      throw error;
+        });
+        cards.set(version.id, card);
+        ticker.stop();
+        // The mask the user painted for this edit is cleared (one undoable step) only if it is still that one.
+        const maskUntouched = editor.revision() === maskRevision;
+        editing = false;
+        let shownError: unknown = null;
+        try {
+          await showVersion(version, true);
+          if (mode === 'inpaint' && maskUntouched) editor.clearMask();
+        } catch (error) {
+          shownError = error;
+          renderVersions();
+          modeChanged();
+        }
+        return { version, size, fitNote, fitted, shownError };
+      };
+
+      try {
+        let answer: GeneratedImage | undefined;
+        try {
+          answer = (await ctx.api.images(body, { run: handle })).images[0];
+        } catch (error) {
+          // A Stop keeps a picture that was already made (paid for): it becomes a version, then the Stop goes on.
+          const kept = partialImageResult(error)?.images[0];
+          if (kept) {
+            const { version } = await makeVersion(kept);
+            announce(`Stopped: ${versionLabel(version)} was already made and is kept.`);
+          }
+          throw error;
+        }
+        if (!answer) throw new InvalidInputError('The model answered without a picture.');
+        const { version, size, fitNote, fitted, shownError } = await makeVersion(answer);
+        const summary = `${versionLabel(version)} ready: ${MODE_LABEL[mode].toLowerCase()}, ${size.width} × ${size.height}`;
+        ui.status(fitNote ? `${summary}. ${fitNote}` : summary);
+        if (shownError) {
+          // The version is kept (its card has Download); only drawing it failed.
+          ui.status(`${versionLabel(version)} is kept, but it could not be shown.`);
+          void presentError(shownError);
+        }
+        await handle.finish({
+          output: `${summary}${keep ? ', outside the mask kept' : ''}.\nInstruction sent:\n${body.prompt}`,
+          meta: {
+            mode,
+            width: size.width,
+            height: size.height,
+            keepOutside: keep,
+            fitted,
+            version: version.number,
+          },
+        });
+      } catch (error) {
+        ticker.stop();
+        ui.status(isStop(error) ? 'Stopped' : 'Failed');
+        await handle.fail(error);
+        throw error;
+      }
     } finally {
-      clearInterval(ticker);
+      ticker.stop();
       if (editing) {
         editing = false;
         modeChanged();
