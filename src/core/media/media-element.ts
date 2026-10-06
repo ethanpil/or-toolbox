@@ -123,12 +123,18 @@ export async function openMedia<K extends 'audio' | 'video'>(
 /**
  * Seeks far past the end so the browser works out the real length, then rewinds. For an element whose
  * `duration` is Infinity (a MediaRecorder WebM): until then it cannot be seeked. Resolves either way (at most
- * about 10 s).
+ * about 10 s). Firefox does not seek such a file at all (no event follows): after 1 s without one this gives up
+ * and the length stays unknown, for the caller's fallback (the 10 s held every Firefox recording at "Reading the
+ * file…", measured in CI).
  */
 export async function resolveDuration(element: HTMLMediaElement): Promise<void> {
   const known = (): boolean => Number.isFinite(element.duration);
+  const started = waitForEvent(element, ['seeking', 'durationchange', 'timeupdate'], 1000).catch(
+    () => '',
+  );
   const settled = waitForEvent(element, ['durationchange', 'timeupdate'], 5000).catch(() => '');
   element.currentTime = 1e101;
+  if ((await started) === '') return;
   await settled;
   if (!known()) await waitForEvent(element, ['durationchange', 'timeupdate'], 5000).catch(() => '');
   element.currentTime = 0;
