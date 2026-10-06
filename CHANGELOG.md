@@ -110,6 +110,9 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 
 - The sticky Run bar no longer covers a control focused by Tab when the page scrolls smoothly to it: the framework checks again once the scroll ends (d8e6d0c).
+- The first-visit isolation reload no longer happens once the user has started using the page, keeps the parameters the tool already consumed, and never happens on a Send to page (942ff57).
+- After a deploy, a page whose lazy chunk is gone offers a reload; pages served from the cache find their lazy chunks precached (942ff57, a2622e3).
+- The service worker no longer re-writes whole cache entries (the 32 MB ffmpeg core included) to record their last use (a2622e3).
 - Reset everything can no longer be undone by a tool-state write already on its way: the guard runs inside each write's transaction against a reset generation that Reset bumps while it wipes; Bot-to-bot's extra delete is gone (2271fcd).
 - Model arena: a round asks one budget question for its total and starts all or none (`beginAll`; a declined dialog sends nothing); first token and total are timed from `onSend`; blind errors use `failureText` (no 402/429 or name differences); costs through `formatRunCost`; files through `attachmentIntake`; context fit from `src/core/tokens.ts`; the tally through `ctx.state.update` (3bbe92e).
 - Decision: a badge now agrees with the number beside it (Yes/No confidence float noise; no "100%" for 0.9999999995), an id typed with a trailing space finds its answer, a list you emptied stays empty, and the context check no longer refuses long prose that fits (2bdff81).
@@ -144,3 +147,11 @@ All notable changes to this project are documented here. The format follows
 
 - `write-excel-file` dependency; XLSX is written directly (472888c).
 - Stage 0 placeholder frame `src/ui/stub.ts` (39fd198).
+
+### Security
+
+- Model Markdown keeps only an attribute allowlist: no classes, `data-*`, ARIA, `hidden`, `tabindex`, `for` or `popovertarget`, which let output draw fake dialogs, hide copied text or drive page controls (e4d1520).
+- The service worker verifies every cached file against a SHA-256 from the build at install, fill and serve, so another site on the shared host cannot plant code in its caches (a2622e3).
+- CSP as a real header on documents (`frame-ancestors 'none'`) and worker scripts; framed pages are hidden (a2622e3, 9567822).
+- CI pins actions to commit SHAs, keeps no checkout credentials, installs without scripts for the deployed build; Dependabot added (de4c835).
+- Third-party notices (`licenses.txt` in the site, `THIRD-PARTY-NOTICES.txt` in the repository), with the source of the GPL ffmpeg.wasm cores (44ac59e).

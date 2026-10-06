@@ -1,8 +1,13 @@
 /**
- * The Content Security Policy, injected as a <meta> tag into every page by
- * html-head.ts. GitHub Pages cannot send headers, so a meta tag is the only
- * option; that means `frame-ancestors`, `report-uri` and `sandbox` are
- * unavailable (browsers ignore them in a meta policy).
+ * The Content Security Policy. Three consumers, one table:
+ *
+ * - html-head.ts injects it as a <meta> tag into every page. That covers the
+ *   first visit, before the service worker controls the page, but a meta
+ *   policy cannot carry `frame-ancestors` and does not reach workers.
+ * - The service worker (src/sw/) adds it as a real header to the documents it
+ *   serves, plus `frame-ancestors 'none'` (`documentHeaderPolicy`), and to
+ *   worker scripts (`workerPolicy`), so pdf.js, ffmpeg and the image worker
+ *   run under it too. GitHub Pages cannot send headers itself.
  *
  * One table serves both the build and the dev server. The dev policy adds
  * only what Vite's hot reload needs, so CSP violations show up in
@@ -55,9 +60,35 @@ const DIRECTIVES: Record<string, string[]> = {
   'form-action': ["'self'"],
 };
 
-/** The production policy as a single header-style string. */
+/** The production policy as a single header-style string (the <meta> tag). */
 export function contentSecurityPolicy(): string {
   return serialise(DIRECTIVES);
+}
+
+/**
+ * The header the service worker adds to every HTML document it serves: the
+ * meta policy plus `frame-ancestors 'none'`, which only works as a header.
+ * Nothing frames this site (a framed page could be clickjacked into a paid
+ * run through `?prompt=`/`?model=`).
+ */
+export function documentHeaderPolicy(): string {
+  return serialise({ ...DIRECTIVES, 'frame-ancestors': ["'none'"] });
+}
+
+/**
+ * The header the service worker adds to worker scripts (pdf.js, ffmpeg's
+ * class and pthread workers, the image worker). A worker does not inherit the
+ * page's meta policy; it takes its policy from its own script's response.
+ * Same table, minus the directives that only mean something in a document.
+ * The workers need exactly what the pages need: same-origin scripts and
+ * nested workers, wasm compilation ('wasm-unsafe-eval'), and fetch() of
+ * blob:/data: URLs (the ffmpeg core arrives as a blob: URL).
+ */
+export function workerPolicy(): string {
+  const documentOnly = new Set(['base-uri', 'form-action', 'frame-src']);
+  return serialise(
+    Object.fromEntries(Object.entries(DIRECTIVES).filter(([name]) => !documentOnly.has(name))),
+  );
 }
 
 /**

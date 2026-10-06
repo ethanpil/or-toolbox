@@ -39,7 +39,33 @@ test('the single-threaded core can still be chosen; lazy files are cached on fir
         expect.stringMatching(/^assets\/worker-[\w-]+\.js$/),
       ]),
     );
-  // None of these were part of the offline shell.
-  expect(before.filter((url) => /\/vendor\/|\/assets\/worker-/.test(url))).toEqual([]);
+  // The cores were not part of the offline shell (ffmpeg's small worker chunk is).
+  expect(before.filter((url) => /\/vendor\//.test(url))).toEqual([]);
   expect(problems).toEqual([]);
+});
+
+test('worker scripts and documents carry the policy headers', async ({ page }) => {
+  const policies = new Map<string, string | undefined>();
+  page.on('response', (response) => {
+    const path = new URL(response.url()).pathname;
+    if (/\/assets\/worker-[\w-]+\.js$|\/ffmpeg-core\.worker\.js$|\/diagnostics\/$/.test(path)) {
+      policies.set(
+        path.replace(/.*\/(assets|diagnostics|vendor)\//, '$1/'),
+        response.headers()['content-security-policy'],
+      );
+    }
+  });
+  await page.goto('diagnostics/');
+  await waitUntilIsolated(page);
+  expect(await runFfmpegSmokeTest(page, 'diag-ffmpeg-run')).toBe('multi-threaded');
+
+  const entries = [...policies.entries()];
+  const document = entries.find(([path]) => path.startsWith('diagnostics'))?.[1] ?? '';
+  expect(document).toContain("frame-ancestors 'none'");
+  const workers = entries.filter(([path]) => !path.startsWith('diagnostics'));
+  expect(workers.length).toBeGreaterThan(0);
+  for (const [path, policy] of workers) {
+    expect(policy, path).toContain("script-src 'self' 'wasm-unsafe-eval'");
+    expect(policy, path).not.toContain('frame-ancestors');
+  }
 });
