@@ -22,19 +22,20 @@ Every model call is paid for with your own OpenRouter key, so you need one befor
 
 Tip: use a key with a **credit limit**. Create one at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and paste it; if it ever leaks, it can only spend that much. A key made by "Connect with OpenRouter" can be given a limit afterwards in the same key list.
 
-You can keep several keys ("Work", "Free sandbox"). Settings → Keys shows each one masked (`sk-or-…a1b2`) with its balance at OpenRouter, and lets you **Rename** it, give it a color, **Make default**, or **Remove** it (an Undo toast follows). The first key you add is the default. A tool can pin its own key (see [Tool bindings](#settings)); with more than one key, a key chip in every tool's header lets you switch.
+You can keep several keys ("Work", "Free sandbox"). Settings → Keys shows each one masked (`sk-or-…a1b2`) with its balance at OpenRouter, and lets you **Rename** it, give it a color, **Make default**, or **Remove** it (an Undo toast follows; it stays until you dismiss it). The first key you add is the default. A tool can pin its own key (see [Tool bindings](#settings)); with more than one key, a key chip in every tool's header lets you switch.
 
 Each key has the switch "Prefer providers that do not retain data". With it on, requests made with that key ask OpenRouter to use only providers that do not store or train on your data. It is not applied to free models (they would fail) or to image and video generation.
 
 ### 2. Optional: lock your keys with a passphrase
 
-By default your keys sit in this browser's storage unencrypted. **Settings → Passphrase lock → Turn on the lock** encrypts them with a passphrase you choose (AES-GCM, with the key derived by PBKDF2 at 600,000 rounds). You unlock once per tab; closing the tab, **Lock now**, or **Auto-lock after** (15 minutes by default, 0 for never, at most 1,440) locks them again.
+By default your keys sit in this browser's storage unencrypted. **Settings → Passphrase lock → Turn on the lock** encrypts them with a passphrase you choose (AES-GCM, with the key derived by PBKDF2 at 600,000 rounds). You unlock once per tab; **Lock now** or **Auto-lock after** (15 minutes by default, 0 for never, at most 1,440) locks them again. Closing the tab may not: browsers can bring a tab's unlocked key back when they reopen a closed tab or restore your last session, so keep auto-lock on (with 0, such a tab comes back unlocked).
 
+- Use at least 8 characters; 16 or more, or four unrelated words, is much safer (the strength hint says so). The passphrase is Unicode-normalized (NFC), so the same accented characters typed in another form still match.
 - A forgotten passphrase cannot be recovered. You would remove your keys and add them again (they keep working on OpenRouter).
-- The lock encrypts keys only. History, prompts and settings stay unencrypted.
+- The lock encrypts keys only. History, prompts, settings and Chat conversations stay unencrypted.
 - When locked, a tool that needs a key asks you to unlock first. The navbar has a lock button (**Lock keys now** / **Unlock keys**).
 
-On `ethanpil.github.io`, every project site shares one origin, so another page on that address could read what ORtoolbox stores. The lock keeps keys encrypted there. See [Privacy](#privacy).
+On `ethanpil.github.io`, every project site shares one origin, so another page on that address could read what ORtoolbox stores. The lock keeps keys encrypted there, but a page that copies them can try passphrases offline, so a long passphrase matters. See [Privacy](#privacy).
 
 ### 3. Optional: free-only mode
 
@@ -63,7 +64,7 @@ The default is **Warn** with a **per-run threshold** of $0.10 (set it to 0 to be
 
 When a run needs your approval, a dialog ("Confirm this run") shows the estimate, the limit and the model, with **Run anyway**, Cancel and a link to **Change your budgets**. Several runs started with one action (a Model arena round, a Video studio sequence) ask once, for their total.
 
-Budgets count what you spent in this browser (the local ledger written when runs finish), not OpenRouter's balance, which lags. A run whose cost could not be read counts at its reserved estimate. Runs on free models are not checked.
+Budgets count what you spent in this browser (the local ledger written when runs finish), not OpenRouter's balance, which lags, plus what runs still in progress have reserved. A run whose cost could not be read counts at its reserved estimate. Runs on free models are not checked.
 
 ### 5. Try a tool
 
@@ -75,13 +76,15 @@ All 14 tools share one layout.
 
 - **Header.** The tool's name, then **Prompts**, **Settings** and **History** buttons. Below: the **model chip** (click it to pick another model; it shows the price, or "Free"), a **key chip** when you have more than one key, and the **cost estimate** pill. A model you pick here is remembered for that tool.
 - **Input** on the left, **Output** on the right (they stack on narrow screens). The **Settings** button opens a side drawer with the tool's options. Some tools add a collapsed accordion section at its end, titled for its purpose (for example "Long recordings").
-- **Run button.** Sticky at the bottom of the input zone. Press **Ctrl+Enter** (**Cmd+Enter** on a Mac) from anywhere on the page. While a run is going the button reads "Running…" and a red **Stop** appears. Chat and Bot-to-bot chat also stop on **Esc**.
+- **Run button.** Sticky at the bottom of the input zone. Press **Ctrl+Enter** (**Cmd+Enter** on a Mac) from anywhere on the page. While a run is going the button reads "Running…" and a red **Stop** appears. **Esc** stops the run too, unless focus is in a text field, a dialog or an open drawer or menu (in Chat it also works from the message box). A Retry in the error toast repeats only what is not finished yet.
 - **Files.** Drag files onto any tool, or paste them. A tool takes only the types it supports and tells you what it skipped. Many tools have a drop zone with a "Choose a file" button too.
 - **Sample.** Opening a tool with `?sample=1` in the address fills an example without running it.
 
 ### Results and the leave warning
 
-Text results (replies, transcripts, extracted JSON) go to [History](#history). **Images, audio, video and uploaded files are never stored.** They live in memory while the page is open. If you try to leave with results you have not downloaded, a dialog lists what you would lose and offers **Download all** (a ZIP), **Stay** or **Leave anyway**. Reloading or closing the tab triggers the browser's own prompt. Download what you want to keep.
+Text results (replies, transcripts, extracted JSON) go to [History](#history). **Images, audio, video and uploaded files are never stored.** They live in memory while the page is open. If you try to leave with results you have not downloaded, with edits you have not saved (a corrected transcript or grid, say) or with a run in progress, a dialog lists what you would lose and offers **Download all** (a ZIP), **Stay** or **Leave anyway**. Reloading or closing the tab triggers the browser's own prompt in the same cases. Download what you want to keep.
+
+**Remove** on an image, audio or video result card asks first when the result has not been downloaded.
 
 ### Send to…
 
@@ -93,7 +96,7 @@ The **Prompts** button opens a panel with two tabs.
 
 - **Recent** fills automatically from your runs in that tool.
 - **Saved** holds what you chose to keep. **Save current** stores the prompt together with the tool's current settings (voice and format for Text-to-speech, aspect ratio for images, and so on). **Use** restores both.
-- Per prompt: **Use**, **Save** (from Recent), **Rename**, **Copy**, **Delete**. A menu offers **Clear recent**, **Clear saved** and **Clear all for this tool**. Deletes ask first and offer Undo.
+- Per prompt: **Use**, **Save** (from Recent), **Rename**, **Copy**, **Delete**. A menu offers **Clear recent**, **Clear saved** and **Clear all for this tool**. Deletes ask first and offer Undo; an Undo toast stays until you dismiss it, but it does not survive leaving the page.
 - Saved prompts never expire. Recent ones follow your history retention. **Settings → Data → Record recent prompts** turns auto-recording off.
 
 ### When something is refused
@@ -104,16 +107,20 @@ You do not handle most problems by hand: the tool shows what is needed.
 - Keys locked: the unlock dialog.
 - Free-only mode with a paid model: a message to pick a free model or turn the mode off.
 - A hard budget block: a message naming the limit, with a link to Settings → Budgets.
-- A paid request that **may have been billed** (connection lost after sending, an error such as 5xx): the toast "This may have gone through" with a link to [OpenRouter activity](https://openrouter.ai/activity) instead of a plain Retry. Check there before sending again.
+- A paid request that **may have been billed** (connection lost after sending, no bytes for 5 minutes on a stream, an error such as 5xx): the toast "This may have gone through" with a link to [OpenRouter activity](https://openrouter.ai/activity) instead of a plain Retry. Check there before sending again. A failed page, part, photo or variation shows the same note and link inline, and its Retry first asks "Retry anyway?".
+- A model that **declines to answer** (or whose reply a provider's filter cuts): the tool shows the model's words as the failure instead of an empty result. It was billed like any reply, and Retry is yours to press.
+- A browser that **blocks saving** (a private window, site data blocked): a notice "This browser blocks saving" once per page. ORtoolbox still works for that visit, but settings, keys and history are not kept.
+- After an update of the site, a page that cannot load part of itself offers **Reload**.
 
 ### Keyboard
 
 | Keys | Does |
 | --- | --- |
-| Ctrl/Cmd+K | Opens the command palette: jump to a tool, page, settings section, recent run or model, switch theme, lock keys |
+| Ctrl/Cmd+K | Opens the command palette: jump to a tool, page, settings section, recent run or model, switch theme, lock keys (every tool and page is listed until you type) |
 | `/` | On Home, focuses the tool search |
 | Ctrl/Cmd+Enter | Runs the tool |
-| Esc | Stops a run in Chat and Bot-to-bot chat (and closes dialogs) |
+| Esc | Stops the run that is going (when focus is not in a text field; Chat also from its message box), and closes dialogs |
+| Alt+Shift+N (Option+Shift+N on a Mac) | Moves focus to the newest notification that has a button, such as Undo |
 
 Everything is reachable with the keyboard, focus is always visible, and status changes are announced to screen readers. Animations and page transitions switch off with your system's reduced-motion setting or **Settings → Appearance → Reduce motion**.
 
@@ -141,7 +148,7 @@ Talk to any text model. Attach files and images, branch a conversation by editin
 
 **Branches**
 - **Edit** on one of your messages opens an editor; **Save and send** sends it as a new branch and keeps the original. Regenerate on a reply does the same for the answer. Use the arrows with "n/m" to move between versions. What you see, send and export is the branch you are on.
-- **Delete this and what follows** asks first and offers Undo.
+- **Delete this and what follows** asks first and offers Undo (the toast stays until you dismiss it; Undo waits for a reply in progress to finish).
 - The **Threads** panel lists your chats with **New chat**, a search box ("Search titles and messages"), rename and delete. Chats are saved in this browser (text only) and stay in step across tabs.
 
 **Settings drawer**
@@ -154,12 +161,13 @@ Talk to any text model. Attach files and images, branch a conversation by editin
 **Output**
 - **Copy** puts the whole conversation on the clipboard as Markdown. **Export** downloads **Markdown** or **JSON** of the branch you are on. Attachments appear by name; their contents are not exported.
 - Each message has Copy, and code blocks have their own "Copy code".
-- A failed reply shows **Retry** and **Retry with another model**. If it may have been billed, it links to OpenRouter activity instead of Retry.
+- A failed reply shows **Retry** and **Retry with another model**. If it may have been billed, it links to OpenRouter activity instead of Retry, and that stays after a reload. A model that declines to answer shows its words as a failed reply.
 - History gets one entry per send, edit or regenerate (text only).
 
 **Limits and tips**
-- Images, PDFs and audio are kept in memory only. After a reload, earlier messages show "Attachment not kept after reload" and the model gets a one-line note instead. Text files, and the text of a PDF that was already read, survive.
+- Images, PDFs and audio are kept in memory only. After a reload, earlier messages show "Attachment not kept after reload" and the model gets a one-line note instead. Text files, and the text of a PDF that was already read, survive: they are saved with the conversation in this browser (and in full backups).
 - A PDF is read once: the first turn runs the PDF reader, later turns send the extracted text.
+- A reply you stop, or that is cut by a reload or a crash, keeps the text that had arrived (it was billed): it stays in the conversation, marked "Stopped", and in History.
 - If a message does not fit the model's context window it is refused; in a long chat, the oldest messages are left out and the reply says so.
 - In free-only mode a chat whose model is not free is refused until you pick a free one ("Use the default").
 
@@ -183,10 +191,11 @@ Turn images and PDFs into text, including handwriting and math.
 **Output**
 - Press **Read**. Text streams in. Switch the **View** between "Combined" and "By page"; each page shows its own status and a **Retry** when it failed or was not read.
 - **Copy**, **Download** as Markdown, Plain text or Word document, and **Send to…** (Chat, Model arena, Decision, Text-to-speech).
-- A failed page never stops the others. "N pages not read" offers one Retry for all of them; a retry is a new run with its own estimate.
+- A failed page never stops the others (a model that declines a page fails just that page, with its words as the reason). "N pages not read" offers one **Retry them** for all of them; a retry is a new run for just those pages, with its own estimate. A Retry after a page that may have been billed asks first.
 
 **Limits and tips**
-- A page answer is cut at 4,096 tokens (a whole-PDF answer at 32,000). The page is then flagged "cut off".
+- A page answer is cut at 4,096 tokens (a whole-PDF answer at 32,000), or at the model's own limit if that is lower. The page is then flagged "cut off".
+- Each Read press uses the settings and instructions as they were when you pressed it, so changing the parser while it runs cannot bill pages you did not see in the estimate.
 - Mistral OCR is billed per page by OpenRouter, even with a free model, at about $2.20 per 1,000 pages; the estimate counts every page of each PDF. Free-only mode refuses it. Keep "Cloudflare AI (free)" for PDFs that already contain text.
 - Press Read again and the previous result is replaced. Stop keeps the text read so far.
 
@@ -209,16 +218,17 @@ Pull structured fields out of invoices, receipts and other documents, review the
 - Press **Extract**. One row per document appears with a status ("Extracting…", "Done", "Failed"). The summary line counts documents extracted, to check, corrected and failed.
 - Every cell is editable. Entries are understood and tidied as you leave the cell (`1.234,56`, `(12.00)`, dates to `YYYY-MM-DD`, yes/no words, choices). A doubtful value stays as typed and is flagged in the **Check** column, never silently changed.
 - A table field shows a button "N rows" that opens a nested grid you can edit, with **Add row**. **Source** opens the page image the row came from.
-- Failed rows have **Retry**; **Retry failed** retries all of them.
+- Failed rows have **Retry**; **Retry failed** retries all of them, and only them. A Retry after a request that may have been billed asks first.
+- Your corrections count as unsaved work: leaving the page asks until you have downloaded a file.
 
 **Output**
-- The **Download** menu offers **JSON**, **CSV** (documents, one per table field, and one row per line item) and an **Excel workbook**. Only documents that finished are exported, with your corrections.
+- The **Download** menu offers **JSON**, **CSV: documents**, one CSV per table field (for example "CSV: line items"), "CSV: one row per …" (every line item with its document's values) and **Excel workbook**. Only documents that finished are exported, with your corrections.
 - The workbook has a "Documents" sheet and one sheet per table field, keyed by document number. Currency columns are numbers formatted `#,##0.00`, and dates are real dates.
 - There is no Copy or Send to… here. History keeps the extracted JSON as it was when the run ended; later corrections are not in History.
 
 **Limits and tips**
-- The tool asks the model for a strict JSON schema when it supports that, plain JSON mode otherwise, and falls back by itself if no provider can serve the strict request. An answer that cannot be read gets one repair attempt, then the row fails.
-- Press **Extract** again and the whole grid, with your corrections, is replaced without asking. Export first.
+- The tool asks the model for a strict JSON schema when it supports that, plain JSON mode otherwise, and falls back by itself if no provider can serve the strict request. An answer that cannot be read gets one repair attempt, then the row fails; a refusal is not repaired (the row fails with the model's words).
+- Press **Extract** again and the whole grid is replaced. If you have corrections you have not downloaded, "Replace your corrections?" asks first; **Extract again** goes ahead. Each press uses the fields, options and instructions as they were when you pressed it.
 - Removing a file from the list later disables **Source** and Retry for its rows.
 
 ### Table extractor
@@ -237,15 +247,17 @@ Find tables, and optionally charts, in pages and turn them into editable grids y
 - Press **Find tables**. The summary reads "N tables · M rows · X of K pages read". Every table is a card with an editable title, editable headers and cells, a "From a chart" badge where it came from a chart, and a note about where it was found.
 - Per card: **Add row**, add or remove columns and rows, **Copy for a spreadsheet** (tab-separated, paste straight into a spreadsheet), **Merge with next page** (for a table that continues on the next page; a repeated header row is dropped) and **Delete table** (with Undo).
 - The grid is one Tab stop; arrow keys move between cells.
-- A page that could not be read is listed with one **Retry**. A page whose answer hit the length limit is flagged because its last rows may be missing.
+- A page that could not be read is listed with one **Retry** (it reads just those pages, and asks first if a request may have been billed). A page whose answer hit the length limit is flagged because its last rows may be missing.
+- Your edits count as unsaved work: leaving the page asks until you have downloaded a file.
 
 **Output**
-- **Download**: **CSV** (one table), **CSV files (ZIP, one per table)**, **Excel workbook (a sheet per table)** or **Markdown**. Edits are included.
+- **Download**: with one table, **CSV**; with several, **CSV files (ZIP, one per table)** instead. Both cases also offer **Excel workbook (a sheet per table)** and **Markdown**. Edits are included.
 - Numbers that are plain numbers as printed become numeric cells; identifiers such as phone numbers and codes with leading zeros stay text.
 - History keeps the tables as Markdown as they were when the run ended.
 
 **Limits and tips**
-- Pressing **Find tables** again clears all tables and edits without asking.
+- Pressing **Find tables** again replaces all tables. If you have edits you have not downloaded, "Replace your edits?" asks first; **Find tables again** goes ahead.
+- The tool sends only the settings the chosen model supports, and falls back from strict JSON to plain JSON mode when needed. A model that declines a page fails just that page.
 - A page with no tables is not an error; the status says "no tables found".
 
 ### Speech-to-text
@@ -253,7 +265,7 @@ Find tables, and optionally charts, in pages and turn them into editable grids y
 Transcribe recordings and uploads of any length, with timestamps, subtitles and an editor.
 
 **Input**
-- **Record** with your microphone (the browser asks for permission the first time): **Record**, **Pause**/**Resume**, **Stop recording**, with a level meter and, with several microphones, a "Microphone" picker. A recording can last 2 hours. It stays in this tab until you press "Download recording".
+- **Record** with your microphone (the browser asks for permission the first time): **Record**, **Pause**/**Resume**, **Stop recording**, with a level meter and, with several microphones, a "Microphone" picker. A recording can last 2 hours. It stays in this tab until you press "Download recording"; replacing or removing one you have not downloaded asks first.
 - Or drop one audio or video file (MP3, WAV, M4A, OGG, WebM, FLAC, MP4 and others; a video's sound track is used). If you drop several, the first is used.
 - **Vocabulary (optional)**: names and terms to spell right, separated by commas. Only Deepgram and AssemblyAI models take it; for other models the note says it is not sent.
 
@@ -264,16 +276,17 @@ Transcribe recordings and uploads of any length, with timestamps, subtitles and 
 
 **How long recordings work**
 - A short file in a format the API reads goes as it is, in one request. Anything else (long audio, video, other formats) is decoded in the browser to 16 kHz mono and cut at pauses into parts. If the browser cannot decode a file, ffmpeg (about 32 MB, downloaded once) does it.
-- Two parts are transcribed at a time. At each seam, repeated words are removed and times continue without a jump. A part that fails is marked and **never retried automatically**; **Retry** (on the part or on the notice) is a new run for just those parts.
+- Two parts are transcribed at a time. At each seam, repeated words are removed and times continue without a jump. A part that fails is marked and **never retried automatically**; **Retry** (on the part or on the notice) is a new run for just those parts, and it asks first when the failed request may have been billed. The error toast's Retry also sends only the parts without a result.
 - Speaker labels are per request, so a long recording numbers its speakers again in each part. Give the same person the same name in each part.
 
 **Output**
 - Press **Transcribe**. The **editor** has a "Segments" and a "Text" view, a search box, and a **Follow playback** switch. Each segment has a time button that plays from there and a text box you can correct. A **Speakers** group lets you name speakers.
 - **Copy** gives plain text. **Download**: **Text** (.txt), **Subtitles (SRT)** and **Subtitles (WebVTT)** (only when every part has times), **JSON (segments and words)** and **Word document**. **Send to…** sends the text.
+- Your edits and speaker names are unsaved work until you copy, download or send the transcript: leaving the page asks. Press **Transcribe** again and "Replace your work?" asks before it replaces an edited transcript; if the recording then cannot be decoded, the last transcript stays.
 - History keeps the transcript text. Audio, edits and speaker names are memory only.
 
 **Limits and tips**
-- There is no file-size cap in the tool; browser memory is the limit.
+- There is no file-size cap in the tool; browser memory is the limit. A recording whose length the browser cannot read is cut first, so the estimate and the budget check use its real length.
 - AssemblyAI models take at most 110 seconds per request, so parts are shorter for them.
 - Free-only mode blocks this tool (no free transcription model).
 
@@ -291,10 +304,11 @@ Read text aloud in a chosen voice, stitched into one audio file.
 
 **How it works**
 - Press **Read aloud**. The text is cut into pieces of about 60 seconds of speech at paragraph, sentence and clause boundaries, never mid-word if it can be avoided. Three pieces are made at a time, then all pieces are joined into one file with no gaps (this uses ffmpeg, downloaded once, for MP3).
-- If pieces fail or you press Stop, the finished ones are kept and a notice offers **Retry N parts** or **Make the other N**: a new run for just those. Pieces are never retried automatically. Pressing **Read aloud** again with the same text, model, voice and speed continues the same plan; changing any of them starts a new plan and drops un-joined pieces.
+- If pieces fail or you press Stop, the finished ones are kept and a notice offers **Retry N parts** or **Make the other N**: a new run for just those. Pieces are never retried automatically, and a Retry after a piece that may have been billed asks first. If every piece is made but the join failed, **Join again** finishes it without a new request.
+- Pressing **Read aloud** again reuses every piece already made from the same words with the same model, voice and speed, and makes only the rest (if nothing is missing, it just joins them again). If a change would throw away paid pieces that are not joined yet, "Replace the parts already made?" asks first. Changing the audio format never remakes a piece: the join follows the format you choose now.
 
 **Output**
-- Each finished file is a card with a waveform player, **Download** (MP3 and WAV), **Send to…** and **Remove** (which does not ask).
+- Each finished file is a card with a waveform player, **Download** (MP3 and WAV), **Send to…** and **Remove** (which asks first if the file was not downloaded).
 - History keeps the text and settings; audio is memory only.
 
 **Limits and tips**
@@ -319,11 +333,12 @@ Compose songs and instrumentals with Google's Lyria models.
 
 **Output**
 - Press **Compose**. Variations run at the same time as one run with one budget question. Each song is a card with a waveform player, a lyrics panel (the line being sung is highlighted), **Download** (MP3 and WAV), **Send to…** and **Remove**.
-- A failed variation has **Retry** (a run of one). It is not offered when Lyria declined the request, because you would be charged for the same answer.
+- A failed variation has **Retry** (a run of one; it asks first when the request may have been billed). It is not offered when Lyria declined the request, or answered without any audio (that answer was billed), because you would be charged for the same answer. The error toast's Retry sends only the variations without a song.
+- **Remove** on a song you have not downloaded asks first.
 
 **Limits and tips**
-- Lyria always makes its own length; a target only shortens it.
-- An empty form still runs ("Compose a song.") and is billed.
+- Lyria always makes its own length; a target only shortens it (a target longer than the song is said, and the song is kept whole).
+- An empty form is not sent: the tool asks you to describe the music first (a description, a style or lyrics; a reference image alone is enough).
 - Free-only mode blocks this tool.
 
 ### Image generation
@@ -339,14 +354,16 @@ Create images from a prompt, with variations and reference images.
 
 **Output**
 - Press **Generate**. Several images go as one request when the model allows `n`, otherwise as one request each (three at a time) with consecutive seeds.
-- Results gather in a gallery, newest group first. Each card has a zoomable viewer, **Download** (PNG, JPG, WebP), **Send to…**, **Variations** (one new image with a new seed), **Use as reference**, **Edit** (opens Image editor) and **Remove**.
-- A request that returns nothing becomes a failed card with its own **Retry**.
+- Results gather in a gallery, newest group first. Each card has a zoomable viewer, **Download** (PNG, JPG, WebP), **Send to…**, **Variation** (one new image with a new seed), **Use as reference**, **Edit** (opens Image editor) and **Remove** (which asks first if the image was not downloaded).
+- A request that returns nothing becomes a failed card with its own **Retry**; it asks first when the request may have been billed. The error toast's Retry sends only the requests that still have no images.
+- **Stop** keeps the images already made (also from a stream that was cut off).
 - History keeps the prompt and settings (with the seed) so Reopen reproduces a run. Images are never stored.
 
 **Limits and tips**
 - Free-only mode blocks this tool (no free image model).
 - The estimate scales with count, size and references; an unknown or zero catalog price shows as Unknown, never Free.
 - Undownloaded images trigger the leave warning.
+- An SVG result is offered as PNG, and as an SVG with scripts and external links removed.
 
 ### Image editor
 
@@ -364,13 +381,14 @@ Paint a mask to change, remove or extend parts of an image.
 
 **Output**
 - Press **Edit**. Every edit is a new version (Version 1, 2, …); the original is "Original". Click a thumbnail to go back to that version; the next edit starts from the version on screen and nothing is overwritten. **Show before** compares a version with the one it came from.
-- A version's card offers **Download** (PNG, JPG, WebP), **Send to…** and **Remove** (no confirmation).
+- A version's card offers **Download** (PNG, JPG, WebP), **Send to…** and **Remove** (which asks first if the version was not downloaded, and waits while an edit runs).
+- **Stop** keeps the picture the model already made.
 - History keeps the instruction and settings, never the pictures.
 
 **Limits and tips**
 - The API has no mask setting. For Inpaint and Outpaint the tool sends the picture with your area tinted magenta, the plain picture and the mask, with an instruction naming each. The model decides what it changes and may also alter things outside the mask; "Keep outside the mask" repairs that afterwards.
 - A model that takes fewer reference images receives fewer of these; a model that takes none cannot edit.
-- While an edit runs, loading, changing versions and painting wait.
+- From the moment you press **Edit**, loading, changing versions and painting wait.
 - Free-only mode blocks this tool.
 
 ### Isolated image
@@ -389,7 +407,8 @@ Put product photos on a pure white square, checked and ready for a shop.
 - Changing size, margin, threshold, sharpening, format or quality re-makes results locally, with no new request and no cost.
 
 **Run and review**
-- Press **Isolate**. It sends only photos without a result. A failed photo has **Retry** and **Another model…**; a finished one has **Review**, **Edit again** (a new paid request) and **Another model…**. **Retry failed** retries all.
+- Press **Isolate**. It sends only photos without a result. A failed photo has **Retry** and **Another model…**; a finished one has **Review**, **Edit again** (a new paid request) and **Another model…**. **Retry not isolated** retries every photo that has no result. A Retry after a request that may have been billed asks first. **Stop** keeps the answer the model already made.
+- If the model answered but the local steps then failed, the paid answer is kept: **Finish again, no new request** (and **Retry not isolated**) finish it again without a new request.
 - **QA** runs on the exported pixels. A photo **passes** when every border pixel is exactly `#FFFFFF` and the product touches no edge, of the square or of the model's picture. Failures say why: border pixels not white, product touching an edge, product possibly cut off by the model, a background that could not be told from the product, or JPG compression tinting the border (export PNG or use a larger margin). A failed QA never blocks the download; it asks you to look.
 - **Review** shows each photo with a "Before / after" wipe or "Side by side" (to check logos and text the model may have changed), a per-photo **Margin** and **White threshold** that apply instantly, and Previous/Next.
 
@@ -403,7 +422,7 @@ Put product photos on a pure white square, checked and ready for a shop.
 
 ### Video studio
 
-Generate, continue and extend video clips, arrange them on a timeline and join them into one MP4. Video studio needs a cross-origin isolated page; on your first visit it reloads once to get there ([Browser support](#browser-support)).
+Generate, continue and extend video clips, arrange them on a timeline and join them into one MP4. Video studio needs a cross-origin isolated page; on your first visit it reloads once to get there, if you have not started using the page yet ([Browser support](#browser-support)).
 
 **Make: One clip**
 - **Start from**: "Text only" (default), "First frame", "First and last frame", "Reference images", "Continue a clip (from its last frame)" or "Extend a clip (native, supported models)". Only the pickers for the chosen mode are shown.
@@ -415,15 +434,15 @@ Generate, continue and extend video clips, arrange them on a timeline and join t
 - Settings drawer: **Exact size**, **Seed** (0 to 4,294,967,295; empty means a new one each time) and the switch **Notify me when videos are ready** (a browser notification when a clip or sequence finishes while the tab is in the background; the browser asks for permission when you turn it on).
 
 **Generate**
-- Press **Generate**. It sends the request, adds a job and frees the button at once, so you can start more clips or leave the page. A **Jobs** list shows each as Queued, Running, Done or Failed.
-- A job is polled (about every 30 seconds after a quick start) only while a Video studio tab is open. Finished clips are downloaded then and placed on the timeline.
+- Press **Generate**. It sends the request, adds a job and frees the button at once, so you can start more clips or leave the page. A **Jobs** list shows each as Queued, Running, Done, Failed or Canceled (a job you stopped waiting for).
+- A job is polled (about every 30 seconds after a quick start) only while a Video studio tab is open. Finished clips are downloaded then and placed on the timeline. A status check with no answer after 60 seconds is retried; a job that keeps failing to answer, or is still running after 3 hours, is given up and counts as maybe billed.
 - The **x** on a job opens "Stop waiting for this clip?". OpenRouter cannot cancel a video job: it still finishes and may be billed, but this page will not download it.
 
 **Make: Sequence**
 - A list of 1 to 20 **Steps**, each with a prompt and optional images (reference images, or a last frame the step ends on).
 - **How steps connect**: *Chained* (each step continues from the last frame of the one before; steps run one at a time, so the result plays as one shot; **First step continues** can start from a clip you already have) or *Independent* (each step is its own clip, up to three at once).
-- **Style for every step** is appended to each prompt. **Run the list** N times (1 to 10). **Spend cap** stops before a step would pass it. **If a step fails**: "Stop" or "Skip it".
-- The estimate line shows the total ("About $X for N clips"). **Start sequence** asks one budget question for the whole sequence (only when a limit would be broken), then runs. **Pause**, **Stop** and **Resume** work between steps; steps already sent still finish. **Re-run** on a step makes a new take; the old take stays on the timeline but is left out of the join, and the chained clip after it is marked so you can re-run it too.
+- **Style for every step** is appended to each prompt. **Run the list** N times (1 to 10). **Spend cap** stops before a step would pass it (an amount above $0; leave it empty for no cap). **If a step fails**: "Stop" or "Skip it".
+- The estimate line shows the total ("About $X for N clips"). **Start sequence** asks one budget question for the whole sequence (only when a limit would be broken), then runs. **Pause**, **Stop** and **Resume** work between steps; steps already sent still finish ("Paused: steps already sent still finish."), and a Pause, Stop or failed step never cancels a request that is already on its way. The page announces every pause or stop, including the ones the cap, a failed step or a missing key cause, and each blocker. **Re-run** on a step makes a new take; the old take stays on the timeline but is left out of the join, and the chained clip after it is marked so you can re-run it too.
 - When a step cannot go on (a clip it continues from is gone, or its image was lost), the run pauses and offers choices: continue from another clip, send without a first frame, or re-run the previous step.
 - While a sequence runs, step prompts, image roles and style are read-only; the cap and failure rule stay editable.
 
@@ -447,13 +466,13 @@ Generate, continue and extend video clips, arrange them on a timeline and join t
 Ask yes/no, choice and score questions about a situation and get answers with probabilities.
 
 **Input**
-- **Situation**: a free "Text" box, or "Key-value fields" (name and value rows). Switching keeps both. You can drop text, JSON or XML files (up to 1,000,000 bytes) on the page; they are appended to the text.
+- **Situation**: a free "Text" box, or "Key-value fields" (name and value rows). Switching keeps both. You can drop text, JSON or XML files on the page (Markdown, CSV, logs and YAML count as text); files over 1 MB are skipped, and the status line says how many. A drop adds its text to the "Text" box and switches the situation to "Text" (your key-value rows are kept).
 - **Questions**: **Add question**, each with a name, a **Type** and instructions.
   - **Yes/No**: optional criteria for Yes and for No (fill in both or neither).
-  - **Choice**: at least two options, each with a description.
+  - **Choice**: at least two options; each can have a description, which is optional.
   - **Score**: an ordered scale of at least two levels, lowest first (drag to reorder, or use Move up/down). The score is a position on the scale: 1.99 is almost level 2.
   - Every question has a **Threshold** (0 to 100 %, starting at 80) and an **Id** that names it in the request and the answers.
-- Library bar: pick a **Starter template** (Ticket triage, Approve or escalate, Content review) or a **Saved decider**, then **Load**. **Save as…** keeps your questions (and, if you tick it, the situation) under a name; **Rename** and **Delete** manage saved ones. Saved deciders live in this browser.
+- Library bar: pick a **Starter template** (Ticket triage, Approve or escalate, Content review) or a **Saved decider**, then **Load**. **Save as…** keeps your questions (and, if you tick it, the situation) under a name; **Rename** and **Delete** manage saved ones. Saved deciders live in this browser and are shared between tabs. **Load** asks first if it would replace questions you changed and did not save.
 
 **Settings drawer**
 - **Starting threshold** for new questions (80). The model is chosen with the model chip. Jev (`typesafe/jev-1.13`, the default) and Mercury Decide (free) are the models verified to accept these questions; others may refuse them or answer in another shape.
@@ -469,6 +488,7 @@ Ask yes/no, choice and score questions about a situation and get answers with pr
 - The questions are answered independently and probabilities can drift a little between runs.
 - The tool shows "Input: about N of M tokens" and refuses a run that does not fit the model's context.
 - Cost is by input tokens only. It works in free-only mode with Mercury Decide.
+- If the answer arrives but recording the run fails, you are told, and the answer stays on screen (it was paid for); it never becomes a failure with a Retry.
 - Decisions use OpenRouter's alpha endpoint, which may change.
 
 ### Bot-to-bot chat
@@ -490,12 +510,12 @@ Let two models talk to each other while you moderate, inside hard limits.
 
 **Output**
 - A badge shows "Not started", "Running", "Paused" or "Ended · Turn limit / Time limit / Cost cap / Stop phrase / Stopped". **Copy** puts the Markdown transcript on the clipboard, **Export** downloads **Markdown** or **JSON**, and **New conversation** clears it (with Undo).
-- The conversation is saved in this browser as text. History gets one entry per Start, Resume or Step, with the transcript so far.
+- The conversation is saved in this browser as text, and a turn is saved as the bot speaks, so a reload keeps what had been said. History gets one entry per Start, Resume or Step, with the transcript so far.
 
 **Limits and tips**
-- "Ended · Stopped" is not final: Resume continues it. After a turn, limits are checked in this order: time, stop phrase, cost, turns. Before a turn, the cost check assumes the turn uses all of Max tokens, so a paid bot whose estimate alone exceeds the cap cannot start; raise the cap or lower Max tokens.
+- "Ended · Stopped" is not final: Resume continues it. Before a turn, limits are checked in this order: turns, time, cost. The cost check assumes the turn uses all of Max tokens, so a paid bot whose estimate alone exceeds the cap cannot start; raise the cap or lower Max tokens. After a turn: a turn cut by the time limit comes first, then the stop phrase, the cost cap, the turn limit and the time limit.
 - With a paid model and the default cap, Start asks for confirmation in Warn mode (the booking is above $0.10).
-- A reply with no text is a failed turn ("It may have spent its token limit on reasoning"); raise Max tokens per turn or change the model.
+- A reply with no text is a failed turn ("It may have spent its token limit on reasoning"); raise Max tokens per turn or change the model. A bot that declines to answer fails its turn with its own words. A turn that may have been billed warns instead of offering Retry.
 - Only one tab can run a conversation at a time.
 - Free-only mode refuses a bot whose model is not free.
 
@@ -516,7 +536,7 @@ Send one input to two to four models, vote blind, and compare answers, cost and 
 **Run**
 - Press **Compare**. All contenders start together; the budget question is asked once for the whole round ("Model arena round: N models"). A round is all or none: if one contender is refused, none is sent.
 - Each panel shows its status, the streaming answer and metrics: first token, total time, tokens, tokens per second and cost (cost shows "Hidden" while blind).
-- A failed contender has **Retry** for just that one.
+- A failed or stopped contender has **Retry** for just that one. When its request may have been billed, there is no Retry: a note links to OpenRouter activity instead. A model that declines to answer fails its panel with its words.
 
 **Vote and compare**
 - When every answer is in, "Which answer is best?" offers **Model A** to **D**, **Tie** and **All bad**, plus **Reveal without voting**. After voting, names, prices and the "Side by side" table appear, with badges for the fastest and the cheapest.
@@ -538,7 +558,7 @@ The navbar on every page has the **Tools** menu (grouped as Documents, Audio, Im
 Search first: type in the box (press `/` to jump to it) and Enter opens the best match. Below it:
 
 - **Favorites**: tools you starred. Press the star on a tool's card to add or remove it.
-- **Recent runs**: your five latest runs with their cost ("Free" for free models), each opening the run in its tool, and a link to all of History.
+- **Recent runs**: your five latest runs with their cost ("Free" for free models, `≈` for an estimate), each opening the run in its tool, and a link to all of History.
 - **Every tool by category**. A tool card shows a "Free" badge when its main model is currently free.
 
 New visitors see the setup wizard here (connect, pick favorites, try a sample).
@@ -558,8 +578,8 @@ The OpenRouter catalog, about 650 models, with your own numbers next to it.
 Every run of every tool, newest first, grouped by day. Text only: images, audio and video are never stored.
 
 - **Search** prompts, outputs and titles; filter by **Tool**, **Status** (Done, Failed, Stopped, Running), **Model**, **Key**, **From** and **To** dates, and **Starred only**. The list loads a page at a time ("Show more").
-- A row opens a drawer with the prompt, settings, output, usage by model, errors and ids. From there: **Reopen in <tool>** (puts the prompt and settings back in the tool), **Re-run with another model**, **Star**, **Copy output**, **Export JSON** and **Delete** (with Undo). Runs in progress cannot be deleted.
-- The **Export and delete** menu has **Export all as JSON**, **Export filtered as JSON** and **Delete filtered runs…** (you type `delete` to confirm; Undo is offered for a few seconds).
+- A row opens a drawer with the prompt, settings, output, usage by model, errors and ids. From there: **Reopen in <tool>** (puts the prompt and settings back in the tool), **Re-run with another model**, **Star**, **Copy output**, **Export JSON** and **Delete** (with Undo). Runs in progress are never deleted, one by one or in bulk, and a bulk delete says how many it kept.
+- The **Export and delete** menu has **Export all as JSON**, **Export filtered as JSON** and **Delete filtered runs…** (you type `delete` to confirm; starred runs are included; Undo is offered and stays until you dismiss it).
 - History is deleted after the retention period (**Settings → Data**, 90 days by default). Starred runs are kept.
 
 ### Stats
@@ -580,10 +600,10 @@ Eight sections, reachable from the side list or by link (`settings/#budgets`):
 - **Keys**: add, rename, recolor, set default, remove; balance per key; the data-retention preference. See [First steps](#first-steps).
 - **Default models**: the **Free-only mode** switch and one default model per capability (Text, Vision, Image generation, Text-to-speech, Speech-to-text, Video, Music, Decisions) with **Change** and **Reset**. ORtoolbox ships cheap, fast defaults and the best free model where one exists. Choosing the shipped model again means "follow the shipped default". The page also lists which capabilities have no free model, and how many free requests you used today.
 - **Tool bindings**: pin a key or a model to one tool. The tool's own model chip and key chip set the same thing. Bot-to-bot chat and Model arena choose their models inside the tool, so there is nothing to pin.
-- **Budgets**: mode, per-run threshold, monthly limits, with this month's spend. See [First steps](#4-budgets-and-cost-estimates).
+- **Budgets**: mode, per-run threshold, monthly limits, with this month's spend. Each meter counts the month as budget checks do: it includes what runs in progress hold, and a figure with an estimate in it is marked `≈`, as on Stats. See [First steps](#4-budgets-and-cost-estimates).
 - **Appearance**: **Theme** (Light, Dark, System), **Accent color** (picker, eight presets, Reset; text on buttons and links switches between light and dark to stay readable), **Density** (Comfortable or Compact) and **Reduce motion**. Changes apply at once on every open page.
 - **Passphrase lock**: see [First steps](#2-optional-lock-your-keys-with-a-passphrase).
-- **Data**: storage used; **Keep history and recent prompts for** N days (default 90; saved prompts and starred runs are always kept); **Record recent prompts**; a table of recent prompts, saved prompts and runs per tool with a delete button per row; **Delete all prompts and history** (type `delete all`; keys, settings and spending stats stay) and **Reset everything** (type `reset everything`; removes keys, settings, stats and the lock, as if ORtoolbox had never been opened here).
+- **Data**: storage used; **Keep history and recent prompts for** N days (default 90; saved prompts and starred runs are always kept); **Record recent prompts**; a table of recent prompts, saved prompts and runs per tool with a delete button per row (it also removes the work that tool saves between visits, such as Chat conversations); **Delete all prompts and history** (type `delete all`; also removes background jobs and every tool's saved work; keys, settings and spending stats stay) and **Reset everything** (type `reset everything`; removes keys, settings, stats and the lock, as if ORtoolbox had never been opened here, and anything still running stops and is not counted). The deletions keep work still in progress, with its tool's saved work, so it can finish; the message after a deletion says what it kept.
 
 ### Backup and restore
 
@@ -595,13 +615,15 @@ Settings → **Backup and restore** moves ORtoolbox between browsers or keeps a 
 - **Download backup** saves `ortoolbox-YYYY-MM-DD.ortoolbox.json`.
 
 **Restore from a backup**
-- Drop the file. Choose **Merge** (add what is new, update what is newer, keep the rest) or **Replace** (make this browser match the backup; what the backup lacks is deleted within what it contains). If the file has keys, enter its passphrase, or leave it empty to restore everything else.
+- Drop the file. Choose **Merge** (add what is new, update what is newer, keep the rest; a saved prompt or a tool's saved work such as a Chat conversation is replaced only by a newer copy) or **Replace** (make this browser match the backup; what the backup lacks is deleted within what it contains, but work still in progress is kept and said so). If the file has keys, enter its passphrase, or leave it empty to restore everything else.
 - **Preview** lists exactly what would change, with deletions set apart; invalid records are skipped and counted. Nothing is written until you press **Merge into this browser** or **Replace with this backup** (Replace asks again). A wrong passphrase imports nothing.
 - Imported runs that were still running arrive as stopped. Settings pointing at keys this browser does not have are dropped.
 
 ### Privacy
 
-The Privacy page says in plain words what is stored where and what leaves the browser. In short: there is no ORtoolbox server, no analytics and no cookies; a run sends its prompt and files to OpenRouter and the model provider; settings, favorites and keys are in local storage, history and prompts in IndexedDB, and images, audio and video in memory only. See also the [README](../README.md#privacy-and-security).
+The Privacy page says in plain words what is stored where and what leaves the browser. In short: there is no ORtoolbox server, no analytics and no cookies; a run sends its prompt and files to OpenRouter and the model provider; settings, favorites and keys are in local storage, history, prompts and each tool's saved work in IndexedDB, and images, audio and video in memory only. The exception is Chat: the text of text files you attach and the text read from PDFs is saved with the conversation in IndexedDB, and in full backups. The unlocked key is kept in the tab's session storage, which browsers can bring back when they reopen a closed tab or restore your last session, so keep auto-lock on. See also the [README](../README.md#privacy-and-security).
+
+Third-party licenses, including the source of the GPL-licensed ffmpeg.wasm cores, are in `licenses.txt` on the site (`https://ethanpil.github.io/or-toolbox/licenses.txt`) and in [THIRD-PARTY-NOTICES.txt](../THIRD-PARTY-NOTICES.txt) in the repository.
 
 ### Diagnostics
 
@@ -628,10 +650,10 @@ Free models allow 20 requests a minute and a daily quota (50 a day, or 1,000 onc
 OpenRouter rejects requests when the account or the key has no credit left. Settings → Keys shows the balance. Add credit or raise the key's limit on OpenRouter.
 
 **"This may have gone through".**
-A paid request lost its connection after it was sent, or got a server error. The provider may still have done the work and billed it, so ORtoolbox does not offer a plain Retry. Open the **OpenRouter activity** link and look for the request. If it is not there, run it again by hand. Tools that handle this differently (Text-to-speech parts, Speech-to-text parts, Video studio) never retry on their own and give you a Retry for just the missing pieces.
+A paid request lost its connection after it was sent (or nothing arrived for 5 minutes on a stream), or got a server error. The provider may still have done the work and billed it, so ORtoolbox does not offer a plain Retry. Open the **OpenRouter activity** link and look for the request. If it is not there, run it again by hand. Tools that handle this differently (Text-to-speech parts, Speech-to-text parts, Video studio) never retry on their own and give you a Retry for just the missing pieces.
 
 **My images, audio or video are gone after a reload.**
-They are never stored (only text goes to History). Download results before leaving; the leave warning lists what is not downloaded yet.
+They are never stored (only text goes to History). Download results before leaving; the leave warning lists what is not downloaded yet. A reply you were watching in Chat keeps the text that had arrived.
 
 **Video jobs after a reload.**
 See [Video studio](#video-studio). Jobs and the sequence state are saved; clips are downloaded again from OpenRouter while it still has them; uploaded videos and images must be added again.
@@ -642,18 +664,24 @@ Open Models and press **Refresh**. A failed load is remembered for five minutes.
 **"Browser storage is full".**
 Delete history in Settings → Data (per tool or all), or lower the retention days.
 
+**"This browser blocks saving".**
+You are in a private window, or site data is blocked for this site. ORtoolbox works for this visit, but nothing is kept. Allow site data for the site and reload.
+
+**"ORtoolbox was updated".**
+The site changed while a page was open and a part of it is gone. Press **Reload**.
+
 **Ctrl+V or a drop does nothing.**
 Tools take only the file types they support and show a toast with what they skipped. Pasting does not work while a text field also carries text.
 
 **A first visit reloads once.**
-Video studio and Diagnostics reload once on your first visit to become cross-origin isolated. No other page does.
+Video studio and Diagnostics reload once on your first visit to become cross-origin isolated, but only if you have not started using the page yet (a page opened by Send to never reloads). No other page does.
 
 ## Browser support
 
 ORtoolbox targets current versions of Chrome and Edge (Chromium), Firefox and Safari. The automated tests run in Chromium, Firefox and WebKit.
 
 - **Cross-origin isolation.** Multi-threaded ffmpeg (video joining and trimming, audio joins, WAV and MP3 conversion, cutting long recordings) needs the page to be cross-origin isolated. GitHub Pages cannot send the headers, so the site's service worker adds them; the first visit registers it and the next page load is isolated. If your browser blocks service workers (some private windows), ffmpeg falls back to a single thread: slower, same result. Diagnostics shows the state.
-- **Offline.** The service worker also keeps the app shell, so the pages open without a network and History and settings stay readable. Tools need the network to run.
+- **Offline.** The service worker also keeps the app shell, so the pages open without a network and History and settings stay readable. Tools need the network to run. It checks every cached file against a checksum made at build time, so another site on the same host cannot plant code in the cache.
 - **Install.** The site can be installed as an app from your browser's menu.
 - **Microphone.** Recording needs a secure page (https), a browser with MediaRecorder and your permission.
 - **Safari** cannot write WebP from the canvas, so image cards drop that format from their download menu after one failed attempt.
