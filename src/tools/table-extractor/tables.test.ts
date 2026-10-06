@@ -218,9 +218,10 @@ describe('parseTables', () => {
     });
     const made = toTable(
       { title: '', kind: 'table', headers: ['a'], rows: [['1'], ['']], notes: '' },
-      { id: 'x', fileId: 'f', fileName: 'p.png', pageNumber: 1, pageCount: 1, index: 3 },
+      { id: 'x', fileId: 'f', fileName: 'p.png', pageNumber: 1, pageCount: 1 },
     );
-    expect(made.title).toBe('Table 3');
+    // Untitled: named by its place in the list when shown, not by when it was made.
+    expect(made.title).toBe('');
     expect(made.rows).toEqual([['1']]);
   });
 });

@@ -5,15 +5,17 @@
  * an Excel workbook with a sheet per table, Markdown, and TSV for pasting into a spreadsheet. One run per
  * Run press; its output is the tables as Markdown.
  */
-import { InvalidInputError, userMessage } from '../../core/errors';
+import type { ChatResponse } from '../../core/api/types';
+import { InvalidInputError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import type { RunHandle } from '../../core/types';
 import { copyText } from '../../ui/clipboard';
 import { documentInput, type PageRef, textImage } from '../../ui/components/document-input';
 import { emptyState } from '../../ui/components/empty-state';
 import { type ExportFormat, exportMenu } from '../../ui/components/export-menu';
+import { failureLine } from '../../ui/components/failure-line';
 import { focusedKey, focusKey, h, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop } from '../../ui/feedback/errors';
+import { type FailureText, isStop } from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
@@ -21,6 +23,7 @@ import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
 import type { ToolContext, ToolInstance } from '../../ui/tool/index';
 import { retryGate } from '../../ui/tool/retry-gate';
+import { pendingOnly } from '../../ui/tool/runner';
 import {
   csvZip,
   tableCsv,
@@ -34,11 +37,16 @@ import { type TableCard, tableCard } from './grid';
 import {
   canMerge,
   describeTables,
+  estimateTokens,
   type ExtractedTable,
+  fallbackMode,
+  isUnsupportedStrict,
   mergeTables,
+  type OutputMode,
   outputMode,
   pageRequest,
   parseTables,
+  responseRefusal,
   toTable,
 } from './tables';
 import { progressBar } from '../../ui/components/progress-bar';
@@ -48,6 +56,8 @@ interface PageState {
   ref: PageRef;
   status: 'queued' | 'running' | 'done' | 'failed' | 'stopped';
   error: string | null;
+  /** How to show the failure (`failureText`: after an unknown outcome it carries the caution and the link). */
+  failure: FailureText | null;
   found: number;
   /** The answer hit the length limit: its complete rows were kept, later ones may be missing. */
   truncated: boolean;
@@ -67,10 +77,26 @@ export function setup(ctx: ToolContext): ToolInstance {
     concurrency: uid('te-concurrency'),
   };
 
+  /**
+   * What the read that is going on began with, taken once when Find tables was pressed. Nothing read per page may
+   * change what a page costs or says (the image size, the PDF text hint, the charts switch, the instructions), so
+   * the estimate and every request come from this, never from the form.
+   */
+  interface Began {
+    charts: boolean;
+    instructions: string;
+    textHint: boolean;
+    maxSide: number;
+    concurrency: number;
+    /** `getState().settings` of that moment, for History. */
+    settings: Record<string, unknown>;
+  }
+  let active: Began | null = null;
+
   // --- input zone -----------------------------------------------------------------------------------------
   const docs = documentInput({
     accept: ctx.manifest.accepts,
-    maxSide: () => Number(size.value) || 2048,
+    maxSide: () => active?.maxSide ?? (Number(size.value) || 2048),
     onChange: () => void ui.refreshEstimate(),
     label: 'Drop pages with tables',
   });
@@ -215,6 +241,14 @@ export function setup(ctx: ToolContext): ToolInstance {
     compact: true,
     testId: 'te-empty',
   });
+  const none = emptyState({
+    icon: 'table',
+    title: 'No tables found',
+    text: 'The pages were read, but no table or chart was found on them. Try a larger page image in Settings, or say in the extra instructions what to look for.',
+    compact: true,
+    testId: 'te-none',
+  });
+  none.hidden = true;
   const progress = progressBar({ label: 'Pages read', hidden: true, testId: 'te-progress' });
   ui.output.append(
     h(
@@ -225,6 +259,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       failedBox,
       truncatedBox,
       empty,
+      none,
       list,
     ),
   );
@@ -234,9 +269,38 @@ export function setup(ctx: ToolContext): ToolInstance {
     return first ? `${first.replace(/\.[^.]+$/, '')}-tables` : 'tables';
   };
 
+  /** Edits made since the tables were last exported (or last filled by a read). */
+  let unsaved = false;
+  let releaseHold: (() => void) | null = null;
+  /** Edited tables are unsaved work: leaving the page asks first, until they are exported. */
+  const syncHold = (): void => {
+    const dirty = unsaved && tables.length > 0;
+    if (dirty && !releaseHold) releaseHold = ui.holdWork('Edited tables not exported yet');
+    else if (!dirty && releaseHold) {
+      releaseHold();
+      releaseHold = null;
+    }
+  };
+  const edited = (): void => {
+    unsaved = true;
+    syncHold();
+  };
+
+  /** Building a file is what saves the edits: from then on they are exported. */
+  const exporting = (list: ExportFormat[]): ExportFormat[] =>
+    list.map((format) => ({
+      ...format,
+      build: async () => {
+        const blob = await format.build();
+        unsaved = false;
+        syncHold();
+        return blob;
+      },
+    }));
+
   /** The download formats; they read the tables when chosen, so only one table versus several changes them. */
   const formats = (single: boolean): ExportFormat[] => {
-    return [
+    return exporting([
       single
         ? {
             label: 'CSV',
@@ -264,7 +328,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         icon: 'markdown',
         build: () => new Blob([tablesMarkdown(tables)], { type: 'text/markdown' }),
       },
-    ];
+    ]);
   };
 
   const menu = exportMenu({
@@ -287,7 +351,14 @@ export function setup(ctx: ToolContext): ToolInstance {
       pages.length === 0 && tables.length === 0
         ? ''
         : `${describeTables(tables)} · ${done} of ${plural(pages.length, 'page')} read`;
-    empty.hidden = tables.length > 0 || reading;
+    // Pages were read and none held a table: say so, instead of inviting the user to add pages again.
+    const noneFound =
+      !reading &&
+      tables.length === 0 &&
+      pages.some((page) => page.status === 'done') &&
+      pages.every((page) => page.status !== 'done' || page.found === 0);
+    empty.hidden = tables.length > 0 || reading || noneFound;
+    none.hidden = !noneFound;
     progress.element.hidden = !reading;
     progress.update(
       done + failed.length,
@@ -304,12 +375,34 @@ export function setup(ctx: ToolContext): ToolInstance {
             { class: 'alert alert-warning d-flex flex-wrap align-items-center gap-2 mb-0' },
             icon('exclamation-triangle'),
             h(
-              'span',
+              'div',
               { class: 'me-auto' },
-              `${plural(failed.length, 'page')} not read: `,
-              failed
-                .map((page) => `${pageName(page)}${page.error ? ` (${page.error})` : ''}`)
-                .join('; '),
+              `${plural(failed.length, 'page')} not read:`,
+              h(
+                'ul',
+                { class: 'mb-0 ps-3' },
+                failed.map((page) =>
+                  h(
+                    'li',
+                    null,
+                    pageName(page),
+                    page.error
+                      ? [
+                          ': ',
+                          failureLine(
+                            page.failure ?? {
+                              text: page.error,
+                              outcomeUnknown: false,
+                              activityUrl: null,
+                              note: null,
+                            },
+                            { className: 'd-inline', testId: 'te-error' },
+                          ),
+                        ]
+                      : null,
+                  ),
+                ),
+              ),
             ),
             retryButton(failed.map((page) => page.key)),
           ),
@@ -338,6 +431,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       menuShape = shape;
       menu.update({ formats: formats(shape === 'one'), disabled: shape === 'none' });
     }
+    syncHold();
   };
 
   /** The card drawn for each table, reused for as long as the table object stays the same. */
@@ -346,9 +440,11 @@ export function setup(ctx: ToolContext): ToolInstance {
   const cardHandlers = {
     onReplace: (next: ExtractedTable, key?: string) => {
       tables = tables.map((candidate) => (candidate.id === next.id ? next : candidate));
+      unsaved = true;
       renderTables(key);
       renderSummary();
     },
+    onEdit: edited,
     onDelete: (gone: ExtractedTable) => deleteTable(gone),
     onMerge: (first: ExtractedTable) => {
       const at = tables.indexOf(first);
@@ -356,6 +452,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       if (!next) return;
       const merged = mergeTables(first, next);
       tables = [...tables.slice(0, at), merged, ...tables.slice(at + 2)];
+      unsaved = true;
       renderTables(`${merged.id}:title`);
       renderSummary();
       announce(
@@ -412,6 +509,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     const deletedIn = extraction;
     const name = tableTitle(gone, at + 1);
     tables = tables.filter((candidate) => candidate !== gone);
+    unsaved = true;
     renderTables();
     renderSummary();
     const neighbour = tables[Math.min(at, tables.length - 1)];
@@ -446,15 +544,44 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- running --------------------------------------------------------------------------------------------
-  const estimateFor = (count: number, model: string): Promise<number | null> =>
-    count === 0
+  const estimateFor = (
+    refs: readonly PageRef[],
+    model: string,
+    began: Pick<Began, 'textHint' | 'maxSide'>,
+  ): Promise<number | null> =>
+    refs.length === 0
       ? Promise.resolve(null)
       : ctx.models.estimate({
           kind: 'tokens',
           model,
-          promptTokens: count * 2600,
-          completionTokens: count * 2500,
+          ...estimateTokens({
+            pages: refs.length,
+            // Each PDF page whose own text goes along (a page image has none).
+            hintPages: began.textHint ? refs.filter((ref) => ref.kind === 'pdf').length : 0,
+            maxSide: began.maxSide,
+          }),
         });
+
+  /** The form's settings: the state Prompts and History keep (`getState().settings`). */
+  const formSettings = () => ({
+    charts: charts.checked,
+    textHint: textHint.checked,
+    maxSide: Number(size.value),
+    concurrency: Number(concurrency.value),
+  });
+
+  /** The form as it is now, as a snapshot a run can hold on to. */
+  const readForm = (): Began => ({
+    charts: charts.checked,
+    instructions: prompt.value,
+    textHint: textHint.checked,
+    maxSide: Number(size.value),
+    concurrency: Number(concurrency.value) || 3,
+    settings: formSettings(),
+  });
+
+  /** The error each failed page ended with, for its Retry (a request that may have been billed asks first). */
+  const failures = new Map<string, unknown>();
 
   /** A Retry button that follows the runner (see `retryGate`). */
   function retryButton(keys: string[]): HTMLButtonElement {
@@ -475,25 +602,55 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   /** Reads `keys` again (a Retry); the runner's own Retry after a refusal repeats the same pages. */
   function retry(keys: string[]): void {
-    if (keys.length > 0) gate.retry(keys, 'Reading cannot start now.');
+    if (keys.length === 0) return;
+    const errors = keys.flatMap((key) => (failures.has(key) ? [failures.get(key)] : []));
+    void gate.retryFailed(
+      errors.find((error) => isOutcomeUnknown(error)) ?? errors[0],
+      keys,
+      'Reading cannot start now.',
+    );
   }
 
   const CUT_OFF_NOTE =
     'The answer was cut off at the length limit; rows at the end of this page may be missing.';
 
+  /** The structured-output mode of the batch being read; strict mode can drop to JSON mode mid-batch. */
+  interface BatchMode {
+    mode: OutputMode;
+    supported: readonly string[];
+  }
+
   const readPage = async (
     run: RunHandle,
     page: PageState,
-    mode: ReturnType<typeof outputMode>,
+    batch: BatchMode,
+    began: Began,
+    maxCompletionTokens: number | null,
   ): Promise<void> => {
     const input = await docs.loadPage(page.ref);
-    const body = pageRequest(run.model, input, {
-      charts: charts.checked,
-      mode,
-      instructions: prompt.value,
-      textHint: textHint.checked,
-    });
-    const response = await ctx.api.chat(body, { run });
+    const ask = () =>
+      pageRequest(run.model, input, {
+        charts: began.charts,
+        mode: batch.mode,
+        instructions: began.instructions,
+        textHint: began.textHint,
+        supported: batch.supported,
+        maxCompletionTokens,
+      });
+    let body = ask();
+    let response: ChatResponse;
+    try {
+      response = await ctx.api.chat(body, { run });
+    } catch (error) {
+      // No provider serves the strict request: carry on (this page and the rest) in JSON mode.
+      if (body.response_format?.type !== 'json_schema' || !isUnsupportedStrict(error)) throw error;
+      if (batch.mode === 'schema') batch.mode = fallbackMode(batch.supported);
+      body = ask();
+      response = await ctx.api.chat(body, { run });
+    }
+    // A model that declined (or a filter that blocked it) did not read the page.
+    const refusal = responseRefusal(response);
+    if (refusal) throw new InvalidInputError(`The model did not answer: ${refusal}`);
     const choice = response.choices[0];
     const truncated = choice?.finish_reason === 'length';
     // Cut off: keep the tables and rows that were complete, and say so.
@@ -501,14 +658,13 @@ export function setup(ctx: ToolContext): ToolInstance {
     if ('problem' in parsed)
       throw new InvalidInputError(`The model's answer could not be read: ${parsed.problem}`);
     // Replace this page's earlier tables (a retry), keep everything in file and page order.
-    const fresh = parsed.tables.map((raw, index) =>
+    const fresh = parsed.tables.map((raw) =>
       toTable(raw, {
         id: uid('table'),
         fileId: page.ref.fileId,
         fileName: page.ref.fileName,
         pageNumber: page.ref.pageNumber,
         pageCount: page.ref.pageCount,
-        index: tables.length + index + 1,
       }),
     );
     const last = fresh.at(-1);
@@ -526,7 +682,26 @@ export function setup(ctx: ToolContext): ToolInstance {
     ].sort((a, b) => rank(a) - rank(b));
   };
 
+  /** The plan of the Find tables press that is going or was last (null before beginRun accepted a press). */
+  let pressed: string[] | null = null;
+
   const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
+    if (!keys) pressed = null;
+    // Everything the run uses is read here, once.
+    const began = readForm();
+    active = began;
+    try {
+      await perform(signal, keys, began);
+    } finally {
+      active = null;
+    }
+  };
+
+  const perform = async (
+    signal: AbortSignal,
+    keys: string[] | undefined,
+    began: Began,
+  ): Promise<void> => {
     const refs = keys ? [] : docs.selection();
     if (!keys && refs.length === 0) {
       ui.status(docs.files().length ? 'Choose at least one page.' : 'Add an image or a PDF first.');
@@ -536,10 +711,23 @@ export function setup(ctx: ToolContext): ToolInstance {
       ? pages.filter((page) => keys.includes(page.key)).map((page) => page.ref)
       : refs;
     if (planned.length === 0) return;
+    if (!keys) {
+      // A new read replaces the tables: ask before it throws away edits nothing has exported.
+      const replaceIt = await ui.confirmDiscard({
+        what: 'the tables you edited',
+        isDirty: () => unsaved && tables.length > 0,
+        title: 'Replace your edits?',
+        confirmLabel: 'Find tables again',
+      });
+      if (!replaceIt) return;
+    }
 
     const model = ctx.model().model;
     const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
-    const mode = outputMode(info?.supportedParameters ?? []);
+    const supported = info?.supportedParameters ?? [];
+    const maxCompletionTokens = info?.maxCompletionTokens ?? null;
+    const batchMode: BatchMode = { mode: outputMode(supported), supported };
+    const startMode = batchMode.mode;
     // Refused before anything was sent (no key, locked, free-only, budget, Cancel): the tables, their edits and
     // the list of failed pages stay exactly as they were.
     const handle = await ctx.beginRun(
@@ -548,13 +736,18 @@ export function setup(ctx: ToolContext): ToolInstance {
           planned.map((ref) => ref.fileName),
           { retry: keys !== undefined },
         ),
-        ...(keys && model ? { estimateUsd: await estimateFor(planned.length, model) } : {}),
+        // What this press reads, as it was when pressed (a retry books only its own pages).
+        estimateUsd: model ? await estimateFor(planned, model, began) : null,
+        prompt: began.instructions,
+        settings: began.settings,
       },
       signal,
     );
+    if (!keys) pressed = planned.map((ref) => `${ref.fileId}:${ref.pageNumber}`);
 
-    // The run is on: only now replace (or reset) what it reads.
-    extraction += 1;
+    // The run is on: only now replace (or reset) what it reads. Only a read that replaces the tables makes an
+    // earlier Undo stale: a retry fills pages that had no tables.
+    if (!keys) extraction += 1;
     let batch: PageState[];
     if (keys) {
       batch = pages.filter((page) => keys.includes(page.key));
@@ -564,39 +757,54 @@ export function setup(ctx: ToolContext): ToolInstance {
         ref,
         status: 'queued',
         error: null,
+        failure: null,
         found: 0,
         truncated: false,
       }));
       tables = [];
+      failures.clear();
+      unsaved = false;
       batch = pages;
       renderTables();
     }
     for (const page of batch) {
       page.status = 'queued';
       page.error = null;
+      page.failure = null;
       page.truncated = false;
+      failures.delete(page.key);
     }
     reading = true;
     renderSummary();
     try {
       const outcome = await runItems({
         items: batch,
-        concurrency: Number(concurrency.value) || 3,
+        concurrency: began.concurrency,
         signal: handle.signal,
-        work: (page) => readPage(handle, page, mode),
-        onItem: ({ item: page, status, error }) => {
+        work: (page) => readPage(handle, page, batchMode, began, maxCompletionTokens),
+        onItem: ({ item: page, status, error, failure }) => {
           page.status = status;
-          if (status === 'failed') page.error = userMessage(error);
+          if (status === 'failed') {
+            page.error = failure?.text ?? userMessage(error);
+            page.failure = failure ?? null;
+            failures.set(page.key, error);
+          }
           if (status === 'running' || status === 'queued') return;
           renderTables();
           renderSummary();
           const done = pages.filter((item) => item.status === 'done').length;
-          ui.status(`Read ${done} of ${plural(pages.length, 'page')}`);
+          // A counter, not a status per page: a long PDF would flood a screen reader.
+          ui.progress(`Read ${done} of ${plural(pages.length, 'page')}`);
           void handle.checkpoint({ output: () => tablesMarkdown(tables) }).catch(() => undefined);
         },
       });
+      // Strict outputs can be refused mid-batch (no provider serves them): say that the rest came in JSON mode.
       ui.status(
-        `${batchSummary(outcome, 'page')} · ${tables.length ? describeTables(tables) : 'no tables found'}`,
+        `${batchSummary(outcome, 'page')} · ${tables.length ? describeTables(tables) : 'no tables found'}${
+          batchMode.mode === startMode
+            ? ''
+            : ' · Strict answers were not available for this model, so JSON mode was used.'
+        }`,
       );
       if (tables.length === 0) announce('No tables found on these pages.');
       await handle.finish({
@@ -606,7 +814,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           tables: tables.length,
           failed: pages.filter((page) => page.status !== 'done').length,
           cutOff: pages.filter((page) => page.truncated).length,
-          mode,
+          mode: batchMode.mode,
         },
       });
     } catch (error) {
@@ -619,20 +827,23 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner = ui.runner<string[]>({ label: 'Find tables', icon: 'table', run });
+  // A replay after an error covers only the pages without a result, so a fatal error part-way never pays twice;
+  // a press the run refused (nothing began) is replayed as the whole press.
+  const isDone = (key: string): boolean =>
+    pages.some((page) => page.key === key && page.status === 'done');
+  const unfinished = pendingOnly<string>(isDone, () => pressed ?? []);
+  const runner = ui.runner<string[]>({
+    label: 'Find tables',
+    icon: 'table',
+    run,
+    replayArg: (arg) => (arg === undefined && pressed === null ? undefined : unfinished(arg)),
+  });
   // The Retry button follows Run (busy, disabled by this tool or the framework).
   const gate = retryGate(runner);
   renderSummary();
 
-  const settings = () => ({
-    charts: charts.checked,
-    textHint: textHint.checked,
-    maxSide: Number(size.value),
-    concurrency: Number(concurrency.value),
-  });
-
   return {
-    getState: () => ({ prompt: prompt.value, settings: settings() }),
+    getState: () => ({ prompt: prompt.value, settings: formSettings() }),
     applyState({ prompt: text, settings: state }) {
       prompt.value = text;
       if (typeof state['charts'] === 'boolean') charts.checked = state['charts'];
@@ -643,7 +854,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         concurrency.value = String(state['concurrency']);
       void ui.refreshEstimate();
     },
-    estimate: (model) => estimateFor(docs.selection().length, model),
+    estimate: (model) => estimateFor(docs.selection(), model, readForm()),
     onFiles: (files) => void docs.add(files),
     onReceive: (items) => {
       const files = items.flatMap((item) =>

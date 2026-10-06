@@ -33,6 +33,8 @@ export interface TableCardOptions {
   onDelete: (table: ExtractedTable) => void;
   onMerge: (table: ExtractedTable) => void;
   onCopy: (table: ExtractedTable) => void;
+  /** A title, a header or a cell was edited in place (the table is already updated). */
+  onEdit?: () => void;
 }
 
 export interface TableCard {
@@ -133,13 +135,19 @@ export function tableCard(table: ExtractedTable, options: TableCardOptions): Tab
       oninput: () => {
         table.title = title.value;
         relabel();
+        options.onEdit?.();
       },
       onchange: () => {
         table.title = title.value.trim();
         relabel();
+        options.onEdit?.();
       },
     }),
-    (element) => element.setAttribute('aria-label', `Title of table ${position}`),
+    (element) => {
+      element.setAttribute('aria-label', `Title of table ${position}`);
+      // An untitled table is named by its place in the list; the name follows when the list changes.
+      element.placeholder = `Table ${position}`;
+    },
   );
 
   const headerCells = table.headers.map((header, c) => {
@@ -152,11 +160,13 @@ export function tableCard(table: ExtractedTable, options: TableCardOptions): Tab
         'data-testid': 'te-header',
         oninput: () => {
           table.headers[c] = input.value;
+          options.onEdit?.();
         },
         onchange: () => {
           renameHeader(table, c, input.value);
           input.value = table.headers[c] ?? '';
           relabel();
+          options.onEdit?.();
         },
       }),
       (element) => element.setAttribute('aria-label', `Header of column ${c + 1}, ${name()}`),
@@ -195,7 +205,10 @@ export function tableCard(table: ExtractedTable, options: TableCardOptions): Tab
             value: row[c] ?? '',
             'data-focus-key': key(`c:${r}:${c}`),
             'data-testid': 'te-cell',
-            oninput: () => setCell(table, r, c, input.value),
+            oninput: () => {
+              setCell(table, r, c, input.value);
+              options.onEdit?.();
+            },
           }),
           (element) =>
             element.setAttribute(

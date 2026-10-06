@@ -3,7 +3,9 @@
  * makes (cells, rows, columns, headers, merging a table that continues on the next page). Edits that change the
  * shape return a new table; the grid swaps it in.
  */
-import type { ChatRequest } from '../../core/api/types';
+import type { ChatRequest, ChatResponse } from '../../core/api/types';
+import { ApiError } from '../../core/errors';
+import { outputCap } from '../../core/tokens';
 import { isRecord, parseJsonSafe } from '../../core/util';
 
 export interface ExtractedTable {
@@ -42,6 +44,66 @@ export function outputMode(supportedParameters: readonly string[]): OutputMode {
   if (supportedParameters.includes('structured_outputs')) return 'schema';
   if (supportedParameters.includes('response_format')) return 'json';
   return 'prompt';
+}
+
+/**
+ * A strict structured-output request that no provider can serve: OpenRouter answers 404 "No endpoints found that
+ * can handle the requested parameters" (or a 400 naming the response format) when the routing constraint leaves
+ * nothing. The batch then carries on in JSON mode instead of failing every page.
+ */
+export function isUnsupportedStrict(error: unknown): boolean {
+  if (!(error instanceof ApiError) || (error.status !== 400 && error.status !== 404)) return false;
+  return /no endpoints|response_format|json_schema|structured output/i.test(error.message);
+}
+
+/** The mode after strict outputs were refused: JSON mode when the model takes `response_format`, else the prompt. */
+export function fallbackMode(supportedParameters: readonly string[]): OutputMode {
+  return supportedParameters.includes('response_format') ? 'json' : 'prompt';
+}
+
+/**
+ * Why a non-streamed answer holds no usable tables: the model's own refusal (`message.refusal`), or a reply that
+ * ended with `finish_reason` `content_filter` or `error` before any content. Null for a normal answer.
+ */
+export function responseRefusal(response: ChatResponse): string | null {
+  const choice = response.choices[0];
+  const refusal = choice?.message['refusal'];
+  if (typeof refusal === 'string' && refusal.trim()) return refusal.trim();
+  if ((choice?.message.content ?? '').trim()) return null;
+  if (choice?.finish_reason === 'content_filter') {
+    return 'The provider’s content filter blocked this reply.';
+  }
+  if (choice?.finish_reason === 'error') return 'The model stopped with an error before answering.';
+  return null;
+}
+
+/** The longest text layer sent per page, in characters. */
+export const TEXT_HINT_CHARS = 6000;
+/** The answer's cap: a big table is many tokens. */
+export const MAX_ANSWER_TOKENS = 16_000;
+
+/**
+ * Input tokens of one page image whose longest side is `maxSide` px, for an A4-shaped page: its pixels / 750,
+ * deliberately on the high side (most models downscale). The same rule as OCR's `imageTokens`.
+ */
+export function imageTokens(maxSide: number): number {
+  return Math.ceil((maxSide * Math.round(maxSide / Math.SQRT2)) / 750);
+}
+
+/**
+ * Tokens for `pages` page images at `maxSide` px, `hintPages` of them with their PDF text, and a long answer each:
+ * dense tables are most of what a page costs.
+ */
+export function estimateTokens(plan: { pages: number; hintPages: number; maxSide: number }): {
+  promptTokens: number;
+  completionTokens: number;
+} {
+  return {
+    promptTokens:
+      plan.pages * (300 + imageTokens(plan.maxSide)) +
+      plan.hintPages * Math.ceil(TEXT_HINT_CHARS / 4),
+    completionTokens: plan.pages * 2500,
+  };
 }
 
 /** Strict structured-output schema of one page's answer. */
@@ -114,9 +176,22 @@ export function pageRequest(
     imageDataUrl: string;
     text?: string;
   },
-  options: { charts: boolean; mode: OutputMode; instructions: string; textHint: boolean },
+  options: {
+    charts: boolean;
+    mode: OutputMode;
+    instructions: string;
+    textHint: boolean;
+    /**
+     * The model's `supported_parameters`. With strict outputs the request asks OpenRouter to route only to
+     * endpoints that honour every parameter sent, so a parameter the model lacks (say `temperature`) would leave
+     * no endpoint at all: only supported ones are sent. Unknown (omitted): all are sent.
+     */
+    supported?: readonly string[];
+    /** The model's own output cap (`ModelInfo.maxCompletionTokens`): `max_tokens` never exceeds it. */
+    maxCompletionTokens?: number | null;
+  },
 ): ChatRequest {
-  const hint = options.textHint ? (page.text ?? '').trim().slice(0, 6000) : '';
+  const hint = options.textHint ? (page.text ?? '').trim().slice(0, TEXT_HINT_CHARS) : '';
   const body: ChatRequest = {
     model,
     messages: [
@@ -136,9 +211,13 @@ export function pageRequest(
         ],
       },
     ],
-    temperature: 0,
-    max_tokens: 16_000,
   };
+  const supports = (parameter: string): boolean =>
+    !options.supported || options.supported.includes(parameter);
+  if (supports('temperature')) body.temperature = 0;
+  if (supports('max_tokens')) {
+    body.max_tokens = Math.min(MAX_ANSWER_TOKENS, outputCap(options.maxCompletionTokens));
+  }
   if (options.mode === 'schema') {
     body.response_format = {
       type: 'json_schema',
@@ -314,13 +393,14 @@ export function toTable(
     fileName: string;
     pageNumber: number;
     pageCount: number;
-    index: number;
   },
 ): ExtractedTable {
   const { headers, rows } = rectangular(raw.headers, raw.rows);
   return {
     id: source.id,
-    title: raw.title || `Table ${source.index}`,
+    // An untitled table stays untitled: it is shown as "Table N" by its place in the list (`tableTitle`), which
+    // the order the pages answer in must not decide.
+    title: raw.title,
     kind: raw.kind,
     fileId: source.fileId,
     fileName: source.fileName,
