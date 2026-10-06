@@ -681,7 +681,23 @@ export interface BudgetCheck {
   reasons: BudgetReason[];
 }
 
+/** This UTC month's spend as budget checks count it (`BudgetsService.monthSpend`). */
+export interface MonthSpend {
+  /** Finished spend plus what running runs hold. */
+  usd: number;
+  /** The part of `usd` that is an estimate: costs worked out from catalog prices, and what running runs hold. */
+  estimatedUsd: number;
+  /** The part of `usd` that running runs hold (their reservations, or what they spent if more). */
+  heldUsd: number;
+  byKey: Map<string, { usd: number; estimatedUsd: number }>;
+}
+
 export interface BudgetsService {
+  /**
+   * The month's spend exactly as `check` counts it (stats ledger plus running runs' holds), read once for the total
+   * and every key. For meters: they must never show room that `check` would refuse.
+   */
+  monthSpend(): Promise<MonthSpend>;
   /**
    * disabled → ok. warn → confirm when any rule is exceeded. hard → block when a monthly rule is exceeded,
    * confirm when only the per-run threshold is exceeded. Spend comes from local stats (current UTC month).

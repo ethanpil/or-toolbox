@@ -9,7 +9,7 @@
  * blocked.
  */
 
-import type { BudgetCheck, BudgetReason, BudgetsService, CoreServices } from '../types';
+import type { BudgetCheck, BudgetReason, BudgetsService, CoreServices, MonthSpend } from '../types';
 import { getDb } from '../storage/db';
 import { utcMonthRange } from '../stats';
 import { RUN_HOLD_PREFIX, holdOf, parseHold, type RunHold } from '../runs/holds';
@@ -29,11 +29,6 @@ export function formatUsd(value: number): string {
 function exceeds(spent: number, estimate: number | null, limit: number, partly: boolean): boolean {
   if (estimate == null) return spent >= limit;
   return partly ? spent + estimate >= limit : spent + estimate > limit;
-}
-
-interface MonthSpend {
-  total: number;
-  byKey: Map<string, number>;
 }
 
 /**
@@ -68,20 +63,29 @@ async function readHolds(): Promise<RunHold[]> {
 }
 
 export function createBudgetsService(core: CoreServices): BudgetsService {
-  /** Finished spend this month plus running runs' holds, overall and per key. */
+  /** Finished spend this month plus running runs' holds, overall and per key (one read of each). */
   const readSpend = async (): Promise<MonthSpend> => {
     const [rows, holds] = await Promise.all([core.stats.rows(utcMonthRange()), readHolds()]);
-    const spend: MonthSpend = { total: 0, byKey: new Map() };
-    const add = (keyId: string, usd: number): void => {
-      spend.total += usd;
-      spend.byKey.set(keyId, (spend.byKey.get(keyId) ?? 0) + usd);
+    const spend: MonthSpend = { usd: 0, estimatedUsd: 0, heldUsd: 0, byKey: new Map() };
+    const add = (keyId: string, usd: number, estimatedUsd: number): void => {
+      const key = spend.byKey.get(keyId) ?? { usd: 0, estimatedUsd: 0 };
+      key.usd += usd;
+      key.estimatedUsd += estimatedUsd;
+      spend.byKey.set(keyId, key);
+      spend.usd += usd;
+      spend.estimatedUsd += estimatedUsd;
     };
-    for (const row of rows) add(row.keyId, row.costUsd);
-    for (const hold of holds) add(hold.keyId, hold.usd);
+    for (const row of rows) add(row.keyId, row.costUsd, row.estimatedUsd ?? 0);
+    for (const hold of holds) {
+      add(hold.keyId, hold.usd, hold.usd); // a reservation is a guess until the run ends
+      spend.heldUsd += hold.usd;
+    }
     return spend;
   };
 
   return {
+    monthSpend: readSpend,
+
     async check({ keyId, estimateUsd, group = false, unknownParts = 0 }) {
       const budgets = core.settings.get().budgets;
       if (budgets.mode === 'disabled') return { verdict: 'ok', reasons: [] };
@@ -129,8 +133,8 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
         return { verdict: 'confirm', reasons };
       }
 
-      if (monthly != null && exceeds(spend.total, estimate, monthly, partly)) {
-        const spent = spend.total;
+      if (monthly != null && exceeds(spend.usd, estimate, monthly, partly)) {
+        const spent = spend.usd;
         reasons.push({
           kind: 'monthly',
           limitUsd: monthly,
@@ -142,7 +146,7 @@ export function createBudgetsService(core: CoreServices): BudgetsService {
         });
       }
 
-      const spentOnKey = spend.byKey.get(keyId) ?? 0;
+      const spentOnKey = spend.byKey.get(keyId)?.usd ?? 0;
       if (keyLimit != null && exceeds(spentOnKey, estimate, keyLimit, partly)) {
         const name = core.keys.get(keyId)?.name;
         const label = name ? `the key “${name}”` : 'this key';

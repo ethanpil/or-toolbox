@@ -555,7 +555,7 @@ describe('import modes', () => {
         'prompts-changed',
         'history-changed',
         'stats-changed',
-        'jobs-changed',
+        // No 'jobs-changed': populate()'s job is open, so Replace keeps it ("announces the jobs it deleted").
       ]),
     );
   });
@@ -952,5 +952,70 @@ describe('atomic import', () => {
       expected: keysFile([{ id: 'k7', secret: 'later' }]),
     });
     expect(await snapshot()).toEqual(before);
+  });
+});
+
+describe('replace keeps work in progress', () => {
+  /** A running video run with its job and saved state, a finished chat run, a finished job and chat state. */
+  async function seedWork(): Promise<void> {
+    const db = await getDb();
+    await db.put('runs', runRecord('live', { tool: 'video-studio', status: 'running' }));
+    await db.put('runs', runRecord('done', { tool: 'chat' }));
+    await db.put('jobs', jobRecord('open-job', { state: 'running', runId: null }));
+    await db.put(
+      'jobs',
+      jobRecord('delivering', { tool: 'video-studio', state: 'succeeded', runId: 'live' }),
+    );
+    await db.put('jobs', jobRecord('old-job', { tool: 'chat', state: 'failed' }));
+    await db.put('kv', { key: 'tool:video-studio:timeline', value: { v: 1 }, updatedAt: 1 });
+    await db.put('kv', { key: 'tool:chat:thread:a', value: { v: 1 }, updatedAt: 1 });
+  }
+
+  const ids = async (store: 'runs' | 'jobs'): Promise<string[]> =>
+    (await (await getDb()).getAllKeys(store)).sort();
+
+  it('keeps running runs, open jobs, jobs of a running run and their tools’ state', async () => {
+    await seedWork();
+    const blob = backupBlob({
+      runs: [runRecord('theirs')],
+      toolState: [
+        { key: 'tool:video-studio:timeline', value: { v: 'backup' }, updatedAt: 999 },
+        { key: 'tool:ocr:state', value: { v: 'backup' }, updatedAt: 1 },
+      ],
+    });
+    const preview = await core.backup.import(blob, { mode: 'replace' });
+
+    expect(await ids('runs')).toEqual(['live', 'theirs']);
+    expect(await ids('jobs')).toEqual(['delivering', 'open-job']);
+    const db = await getDb();
+    expect((await db.get('kv', 'tool:video-studio:timeline'))?.value).toEqual({ v: 1 });
+    expect(await db.get('kv', 'tool:chat:thread:a')).toBeUndefined();
+    expect((await db.get('kv', 'tool:ocr:state'))?.value).toEqual({ v: 'backup' });
+    expect(preview.changes).toContain('Replace 1 run with 1 from the backup'); // not the running one
+    expect(preview.changes).toContain(
+      'Keep 1 run and 2 jobs in progress, and the saved state of 1 tool',
+    );
+  });
+
+  it('never overwrites a running run with the backup’s copy of the same id', async () => {
+    await seedWork();
+    const blob = backupBlob({ runs: [runRecord('live', { tool: 'video-studio', status: 'ok' })] });
+    await core.backup.import(blob, { mode: 'replace' });
+    expect((await (await getDb()).get('runs', 'live'))?.status).toBe('running');
+  });
+
+  it('says nothing about kept work when there is none', async () => {
+    const preview = await core.backup.import(backupBlob({}), { mode: 'replace' });
+    expect(preview.changes.some((line) => line.startsWith('Keep'))).toBe(false);
+  });
+
+  it('announces the jobs it deleted', async () => {
+    await seedWork();
+    events.length = 0;
+    await core.backup.import(backupBlob({}), { mode: 'replace' });
+    const jobs = events
+      .filter((e) => e.type === 'jobs-changed')
+      .map((e) => (e as { id: string }).id);
+    expect(jobs).toEqual(['old-job']);
   });
 });
