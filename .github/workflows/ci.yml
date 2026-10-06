@@ -43,6 +43,14 @@ jobs:
       # Typecheck + lint + unit tests.
       - run: npm run check
 
+      # A workbook written by our XLSX writer must open in a reader that shares none of its code: the app writes
+      # a sample (src/core/export/xlsx-sample.ts) and openpyxl checks every value, type and format.
+      - name: XLSX opens in openpyxl
+        run: |
+          XLSX_OUT="$RUNNER_TEMP/sample.xlsx" npx vitest run src/core/export/xlsx-sample.test.ts
+          python3 -m pip install --quiet openpyxl
+          python3 scripts/check-xlsx.py "$RUNNER_TEMP/sample.xlsx"
+
       # The build that is tested below is the build that is deployed.
       - run: npm run build
 
