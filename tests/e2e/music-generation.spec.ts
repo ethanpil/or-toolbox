@@ -25,13 +25,50 @@ const CATALOG = (
 ).data.filter((model) => model.id.startsWith('google/lyria-'));
 
 /**
- * The song: an ID3v2.3 tag (Lyria's carry a C2PA manifest; here 32 bytes of padding) and four copies of the
- * 3.24 s speech fixture, about 13 seconds of MP3.
+ * The audio frames of an MP3 file: without its ID3v2 tag, and without its first frame when that is a Xing/Info
+ * header (which states the length of that one file, and which Firefox and WebKit take as the length of the whole
+ * stream when they find it at the start).
+ */
+function mp3Frames(file: Buffer): Buffer {
+  const tag =
+    file.subarray(0, 3).toString('latin1') === 'ID3'
+      ? 10 +
+        (((file[6]! & 0x7f) << 21) |
+          ((file[7]! & 0x7f) << 14) |
+          ((file[8]! & 0x7f) << 7) |
+          (file[9]! & 0x7f))
+      : 0;
+  const header = file.readUInt32BE(tag);
+  const version = (header >>> 19) & 3; // 3: MPEG-1, 2: MPEG-2, 0: MPEG-2.5 (all Layer III here)
+  const kbps = (
+    version === 3
+      ? [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+      : [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+  )[(header >>> 12) & 15]!;
+  const rate = [
+    [11025, 12000, 8000],
+    [0, 0, 0],
+    [22050, 24000, 16000],
+    [44100, 48000, 32000],
+  ][version]![(header >>> 10) & 3]!;
+  const length =
+    Math.floor(((version === 3 ? 144 : 72) * kbps * 1000) / rate) + ((header >>> 9) & 1);
+  const first = file.subarray(tag, tag + length);
+  const isHeader = first.includes('Xing', 0, 'latin1') || first.includes('Info', 0, 'latin1');
+  return file.subarray(isHeader ? tag + length : tag);
+}
+
+/**
+ * The song: an ID3v2.3 tag (Lyria's carry a C2PA manifest; here 32 bytes of padding) and the audio frames of
+ * four copies of the 3.24 s speech fixture, about 13 seconds of MP3, as one file (one encode, no header that
+ * claims a shorter length).
  */
 const SONG = Buffer.concat([
   Buffer.from([0x49, 0x44, 0x33, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20]),
   Buffer.alloc(32),
-  ...Array.from({ length: 4 }, () => readFileSync(join(MEDIA_FIXTURES_DIR, 'speech.mp3'))),
+  ...Array.from({ length: 4 }, () =>
+    mp3Frames(readFileSync(join(MEDIA_FIXTURES_DIR, 'speech.mp3'))),
+  ),
 ]);
 
 const LYRICS = [
