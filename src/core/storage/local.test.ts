@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { StorageFullError, StorageUnavailableError, errorCode } from '../errors';
-import { local, writeJson } from './local';
+import { local, webStorageBlocked, writeJson } from './local';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -28,5 +28,26 @@ describe('writeJson', () => {
       throw new DOMException('full', 'QuotaExceededError');
     });
     expect(() => writeJson(storage, 'k', 1)).toThrow(StorageFullError);
+  });
+});
+
+describe('webStorageBlocked', () => {
+  it('is false while a write works, and leaves nothing behind', () => {
+    expect(webStorageBlocked()).toBe(false);
+    expect(local()!.length).toBe(0);
+  });
+
+  it('is true when the browser refuses the write', () => {
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('denied', 'SecurityError');
+    });
+    expect(webStorageBlocked()).toBe(true);
+  });
+
+  it('is false when the store is only full: that is another message', () => {
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('full', 'QuotaExceededError');
+    });
+    expect(webStorageBlocked()).toBe(false);
   });
 });

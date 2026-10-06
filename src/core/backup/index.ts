@@ -17,6 +17,9 @@
  *   count). Keys are merged only when both sides use the same passphrase lock (or there is no lock and no
  *   key here yet): a merge never removes or swaps a lock.
  * - Import `replace`: the backup's scope is replaced. Keys are replaced only when the backup carries keys.
+ *   Work in progress is kept (`liveWork`, like the deletions in Settings → Data): running runs, open jobs, jobs of a
+ *   running run and the saved state of their tools stay, the backup's copies of them are not written, and the
+ *   preview says what was kept. Stats are replaced (a running run books its spend when it ends).
  * - Runs that were `running` when the backup was made arrive as `aborted`.
  * - Atomic: everything is decoded, validated and planned first (a wrong passphrase imports nothing). Then
  *   keys (through `core.keys.replaceFile`, refused if another tab changed them since the preview) and
@@ -45,8 +48,14 @@ import { getDb, type KvEntry, type StoredStatsRow } from '../storage/db';
 import { deepMerge, jsonCopy } from '../settings/merge';
 import { migrateSettings, normalizeSettings } from '../settings/schema';
 import { statsKey } from '../stats';
-import { TOOL_STATE_PREFIX, announceToolState, prefixRange } from '../tool-state';
+import {
+  TOOL_STATE_PREFIX,
+  announceToolState,
+  parseToolStateKey,
+  prefixRange,
+} from '../tool-state';
 import { isFinalState } from '../jobs';
+import { liveWork, type LiveWork } from '../data';
 import { isFiniteNumber, isPlainObject, isString, parseJsonSafe, stripUnsafeKeys } from '../util';
 import { version as APP_VERSION } from '../../../package.json';
 
@@ -85,6 +94,7 @@ const N = {
   job: ['job', 'jobs'],
   toolState: ['tool state entry', 'tool state entries'],
   stats: ['stats row', 'stats rows'],
+  tool: ['tool', 'tools'],
   keyPin: ['tool key pin', 'tool key pins'],
   keyBudget: ['per-key budget', 'per-key budgets'],
 } satisfies Record<string, Noun>;
@@ -107,6 +117,17 @@ function mergeLines(added: number, updated: number, noun: Noun): string[] {
 
 const skipLine = (count: number, noun: Noun): string[] =>
   count > 0 ? [`Skip ${plural(count, noun)} (invalid records)`] : [];
+
+/** "Keep 1 run and 2 jobs in progress, and the saved state of 1 tool", or null when Replace keeps nothing. */
+function keptLine(kept: LiveWork, stateTools: number): string | null {
+  const work = [
+    kept.runIds.size > 0 ? plural(kept.runIds.size, N.run) : null,
+    kept.jobIds.size > 0 ? plural(kept.jobIds.size, N.job) : null,
+  ].filter((part): part is string => part !== null);
+  if (work.length === 0) return null;
+  const state = stateTools > 0 ? `, and the saved state of ${plural(stateTools, N.tool)}` : '';
+  return `Keep ${work.join(' and ')} in progress${state}`;
+}
 
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
@@ -610,32 +631,47 @@ export function createBackupService(core: CoreServices): BackupService {
       const found = await Promise.all(ids.map((id) => read.objectStore(store).get(id)));
       return new Map(ids.flatMap((id, i) => (found[i] === undefined ? [] : [[id, found[i] as T]])));
     };
-    const [localRuns, localJobs, localTool, localStats, counts] = await Promise.all([
-      lookup<RunRecord>(
-        'runs',
-        file.runs.items.map((r) => r.id),
-      ),
-      lookup<JobRecord>(
-        'jobs',
-        file.jobs.items.map((j) => j.id),
-      ),
-      lookup<KvEntry>(
-        'kv',
-        file.toolState.items.map((e) => e.key),
-      ),
-      lookup<StoredStatsRow>(
-        'stats',
-        file.stats.items.map((s) => s.key),
-      ),
-      Promise.all([
-        read.objectStore('runs').count(),
-        read.objectStore('jobs').count(),
-        read.objectStore('kv').getAllKeys(prefixRange(TOOL_STATE_PREFIX)),
-        read.objectStore('stats').count(),
-      ]),
-    ]);
+    const [localRuns, localJobs, localTool, localStats, counts, running, allJobs] =
+      await Promise.all([
+        lookup<RunRecord>(
+          'runs',
+          file.runs.items.map((r) => r.id),
+        ),
+        lookup<JobRecord>(
+          'jobs',
+          file.jobs.items.map((j) => j.id),
+        ),
+        lookup<KvEntry>(
+          'kv',
+          file.toolState.items.map((e) => e.key),
+        ),
+        lookup<StoredStatsRow>(
+          'stats',
+          file.stats.items.map((s) => s.key),
+        ),
+        Promise.all([
+          read.objectStore('runs').count(),
+          read.objectStore('jobs').count(),
+          read.objectStore('kv').getAllKeys(prefixRange(TOOL_STATE_PREFIX)),
+          read.objectStore('stats').count(),
+        ]),
+        read.objectStore('runs').index('status').getAll('running'),
+        read.objectStore('jobs').getAll(),
+      ]);
     await read.done;
-    const [runCount, jobCount, toolKeys, statsCount] = counts;
+    const [totalRuns, totalJobs, toolKeys, statsCount] = counts;
+    // What Replace must leave alone (decided again inside the write transaction).
+    const kept = replace && all ? liveWork(running, allJobs) : liveWork([], []);
+    const keptState = (key: string): boolean => {
+      const parsed = parseToolStateKey(key);
+      return parsed !== null && kept.tools.has(parsed.tool);
+    };
+    const runCount = totalRuns - kept.runIds.size;
+    const jobCount = totalJobs - kept.jobIds.size;
+    const doomedStateCount = toolKeys.filter((key) => !keptState(key)).length;
+    const keptStateTools = new Set(
+      toolKeys.flatMap((key) => (keptState(key) ? [parseToolStateKey(key)?.tool] : [])),
+    );
 
     const puts = {
       prompts: [] as PromptEntry[],
@@ -653,10 +689,13 @@ export function createBackupService(core: CoreServices): BackupService {
       existing: (item: T) => T | undefined,
       pick: (incoming: T, local: T) => T | null,
       out: T[],
+      /** Replace leaves work in progress alone: the backup's copy of it is not written. */
+      isKept: (item: T) => boolean = () => false,
     ): void => {
       if (replace) {
-        out.push(...checked.items);
-        const line = replaceLine(localCount, checked.items.length, noun);
+        const items = checked.items.filter((item) => !isKept(item));
+        out.push(...items);
+        const line = replaceLine(localCount, items.length, noun);
         if (line) changes.push(line);
       } else {
         let added = 0;
@@ -703,6 +742,7 @@ export function createBackupService(core: CoreServices): BackupService {
             ? incoming
             : null,
         puts.runs,
+        (run) => kept.runIds.has(run.id),
       );
       plan(
         N.recent,
@@ -723,14 +763,16 @@ export function createBackupService(core: CoreServices): BackupService {
             ? incoming
             : null,
         puts.jobs,
+        (job) => kept.jobIds.has(job.id),
       );
       plan(
         N.toolState,
         file.toolState,
-        toolKeys.length,
+        doomedStateCount,
         (e) => localTool.get(e.key),
         newer<KvEntry>((e) => e.updatedAt),
         puts.kv,
+        (entry) => keptState(entry.key),
       );
       plan(
         N.stats,
@@ -745,6 +787,8 @@ export function createBackupService(core: CoreServices): BackupService {
         },
         puts.stats,
       );
+      const keptText = keptLine(kept, keptStateTools.size);
+      if (keptText) changes.push(keptText);
     }
 
     const preview: BackupPreview = {
@@ -763,6 +807,10 @@ export function createBackupService(core: CoreServices): BackupService {
       },
       changes,
     };
+
+    /** What Replace deleted, for the announcements (filled by `writeRecords`). */
+    const deletedJobs: string[] = [];
+    const deletedState: string[] = [];
 
     /** Every IndexedDB change in one transaction: all of it lands, or none. */
     const writeRecords = async (): Promise<void> => {
@@ -790,10 +838,32 @@ export function createBackupService(core: CoreServices): BackupService {
           const kv = tx.objectStore('kv');
           const stats = tx.objectStore('stats');
           if (replace) {
-            op(runs.clear());
-            op(jobs.clear());
+            // Work that began after the preview is kept too: decided here, in the same transaction as the writes.
+            const [nowRunning, nowJobs, stateKeys] = await Promise.all([
+              runs.index('status').getAll('running'),
+              jobs.getAll(),
+              kv.getAllKeys(prefixRange(TOOL_STATE_PREFIX)),
+            ]);
+            const live = liveWork(nowRunning, nowJobs);
+            const stateKept = (key: string): boolean => {
+              const parsed = parseToolStateKey(key);
+              return parsed !== null && live.tools.has(parsed.tool);
+            };
+            for (const id of await runs.getAllKeys()) if (!live.runIds.has(id)) op(runs.delete(id));
+            for (const job of nowJobs) {
+              if (live.jobIds.has(job.id)) continue;
+              op(jobs.delete(job.id));
+              deletedJobs.push(job.id);
+            }
             op(stats.clear());
-            for (const key of toolKeys) op(kv.delete(key));
+            for (const key of stateKeys) {
+              if (stateKept(key)) continue;
+              op(kv.delete(key));
+              deletedState.push(key);
+            }
+            puts.runs = puts.runs.filter((run) => !live.runIds.has(run.id));
+            puts.jobs = puts.jobs.filter((job) => !live.jobIds.has(job.id));
+            puts.kv = puts.kv.filter((entry) => !stateKept(entry.key));
           }
           for (const run of puts.runs) op(runs.put(run));
           for (const job of puts.jobs) op(jobs.put(job));
@@ -854,13 +924,10 @@ export function createBackupService(core: CoreServices): BackupService {
       if (all) {
         if (replace || puts.runs.length > 0) core.bus.emit({ type: 'history-changed' });
         if (replace || puts.stats.length > 0) core.bus.emit({ type: 'stats-changed' });
-        const touched = new Set([
-          ...(replace ? [...localJobs.keys()] : []),
-          ...puts.jobs.map((j) => j.id),
-        ]);
+        const touched = new Set([...deletedJobs, ...puts.jobs.map((j) => j.id)]);
         for (const id of touched) core.bus.emit({ type: 'jobs-changed', id });
         // Open tools read their state again, or an idle tab would later write its old state over the import.
-        announceToolState(core.bus, [...(replace ? toolKeys : []), ...puts.kv.map((e) => e.key)]);
+        announceToolState(core.bus, [...deletedState, ...puts.kv.map((e) => e.key)]);
       }
     };
 

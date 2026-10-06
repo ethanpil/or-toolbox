@@ -270,7 +270,7 @@ export function onboarding(core: CoreServices, options: OnboardingOptions): HTML
       h(
         'p',
         { class: 'text-body-secondary' },
-        'Open a tool with an example already filled in, then press Run.',
+        'Open a tool with an example already filled in. Its main button starts it.',
       ),
       h(
         'div',

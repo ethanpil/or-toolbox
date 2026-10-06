@@ -8,12 +8,14 @@ import {
   RateLimitError,
   RunCancelledError,
   StorageFullError,
+  StorageUnavailableError,
   userMessage,
 } from '../../core/errors';
 import { h } from '../dom';
 import { announce } from './announce';
 import { confirmDialog, promptDialog, typedConfirm } from './dialogs';
-import { BLIND_ACTIVITY_NOTE, failureText, presentError } from './errors';
+import { BLIND_ACTIVITY_NOTE, failureText, needsAction, presentError } from './errors';
+import { noticeIfStorageBlocked } from './storage-notice';
 import { setFieldError } from './field-error';
 import { modalOpen, openModal } from './modal';
 import { toast } from './toast';
@@ -294,6 +296,15 @@ describe('presentError', () => {
     );
   });
 
+  it('says what to do when the browser blocks saving, and stays until closed', async () => {
+    await presentError(new StorageUnavailableError());
+    const shown = $('error-toast')!;
+    expect(shown.textContent).toContain('This browser blocks saving');
+    expect(shown.textContent).toContain('Allow site data for this site and reload the page.');
+    expect(shown.textContent).not.toContain('Retry');
+    expect(needsAction(new StorageUnavailableError())).toBe(true);
+  });
+
   it('shows an error once, however many places report it', async () => {
     const error = new NetworkError();
     await presentError(error);
@@ -490,5 +501,20 @@ describe('failureText', () => {
     failureText(error);
     await presentError(error);
     expect($('error-toast')).not.toBeNull();
+  });
+});
+
+describe('noticeIfStorageBlocked', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('says nothing while the browser saves, and tells once when it does not', () => {
+    noticeIfStorageBlocked(() => false);
+    expect($('storage-notice')).toBeNull();
+
+    noticeIfStorageBlocked(() => true);
+    noticeIfStorageBlocked(() => true);
+    expect(count('storage-notice')).toBe(1);
+    expect($('storage-notice')!.textContent).toContain('This browser blocks saving');
+    expect($('storage-notice')!.textContent).toContain('still works for this visit');
   });
 });

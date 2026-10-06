@@ -71,6 +71,7 @@ All notable changes to this project are documented here. The format follows
 - v1 README and user guide (`docs/user-guide.md`: first steps, every tool, platform pages, troubleshooting), with screenshots in `docs/images/` (e29928a).
 - `ChatStreamResult.refusal` names a model's refusal or a reply cut by the content filter or an error (f566153); `EstimateInput` tokens take `audio: { input, output }` (1f43772); `isoDateTime()` in `format.ts` (eeece28); `StorageUnavailableError` (46725c8); OAuth's `KeyNotSavedError` with `save()` (03f3b6b).
 - Stage 8 framework: `retryGate().retryFailed(error, keys)` (asks before resending a request that may have been billed), `failureLine()`, `ItemOutcome.failure`, `pendingOnly(isDone, allKeys)` for plain-run replays (13f0060); `resultRemoval()`/`confirmUndownloaded()` and `sanitizeSvg()` (fd0aca4); `ui.confirmDiscard()`, `RunnerOptions.stopOnEscape`, Alt+Shift+N to reach a toast's action (b60be68); `ToolTestContext.settle()` (1457b54).
+- `budgets.monthSpend()` (the month as budget checks count it, with running runs' holds and the estimated part), `webStorageBlocked()` and a once-per-page notice when the browser blocks saving (1b5cf0c, 0285ce8).
 
 ### Changed
 
@@ -118,6 +119,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Backup Replace keeps running runs, open jobs, jobs of a running run and those tools' saved state, and says what it kept (1b5cf0c, 0285ce8).
+- Settings → Budgets meters read the month once, include what running runs hold and mark estimates with ≈ like Stats (1b5cf0c, 0285ce8).
+- A stored run or prompt with an impossible time no longer breaks Home, History, Models or the prompts panel; a run of a removed tool no longer breaks History, Home, the palette or a job's notification (0285ce8).
+- `presentError` explains a browser that blocks saving; delete dialogs name what they kept; onboarding no longer says every tool has a "Run" button; Undo texts no longer promise "a few seconds" (0285ce8).
 - Backup merge keeps the newer saved and recent prompts (`usedAt`) and tool state (`updatedAt`) instead of always taking the backup's, merges favorites saved under the old British names, and skips records with times no date can hold (eeece28).
 - An older tab never writes over a keys file of another version or with an unreadable lock, and keeps key entries it cannot parse (83a06e4).
 - "Connect with OpenRouter" keeps a new key it could not save (locked meanwhile, storage full) and offers to save it, instead of losing it (03f3b6b).

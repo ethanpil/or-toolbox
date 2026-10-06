@@ -4,8 +4,8 @@
  * "Reset everything" (keys and settings too), both behind a typed confirmation.
  */
 import { MAX_RETENTION_DAYS } from '../../core/settings/schema';
-import type { CoreServices, ToolId, ToolManifest } from '../../core/types';
-import { tools } from '../../tools/registry';
+import type { CoreServices, DataDeletion, ToolId, ToolManifest } from '../../core/types';
+import { findTool, tools } from '../../tools/registry';
 import { dataTable } from '../../ui/components/data-table';
 import { meter } from '../../ui/components/meter';
 import { switchField } from '../../ui/components/switch-field';
@@ -17,7 +17,7 @@ import { formatInt, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { saveSettings } from '../../ui/settings-actions';
 import { historyUrl, settingsUrl } from '../../ui/shell/links';
-import { parseWhole, storageUsage } from './logic';
+import { deletionKeptNote, parseWhole, storageUsage } from './logic';
 import { card, loadingLine, numberField, rerender, type SectionView } from './ui';
 
 interface Counts {
@@ -26,13 +26,12 @@ interface Counts {
   runs: number;
 }
 
-/** What a deletion says about the runs it kept: they must still book their spend when they end. */
-function keptNote(keptRuns: number): string {
-  if (keptRuns === 0) return '';
-  return keptRuns === 1
-    ? ' 1 run still in progress was kept.'
-    : ` ${formatInt(keptRuns)} runs still in progress were kept.`;
-}
+/** What a deletion says it kept: running work must still book its spend and deliver its result. */
+const kept = ({ keptRuns, keptTools }: DataDeletion): string =>
+  deletionKeptNote(
+    keptRuns,
+    keptTools.map((id) => findTool(id)?.name ?? id),
+  );
 
 export function dataSection(core: CoreServices): SectionView {
   let counts: Map<ToolId, Counts> | null = null;
@@ -132,12 +131,12 @@ export function dataSection(core: CoreServices): SectionView {
         h(
           'p',
           null,
-          `This deletes ${plural(count.recent, 'recent prompt')}, ${plural(count.saved, 'saved prompt')} and ${plural(count.runs, 'run')} of history for ${tool.name}, and the work it keeps between visits, such as conversations.`,
+          `This deletes ${plural(count.recent, 'recent prompt')}, ${plural(count.saved, 'saved prompt')} and ${plural(count.runs, 'run')} of history for ${tool.name}, and the work it saves between visits, such as conversations.`,
         ),
         h(
           'p',
           { class: 'mb-0 text-body-secondary' },
-          'Runs still in progress are kept. Spending stats and the other tools are not affected.',
+          'A run still in progress is kept, with the saved work of its tool, so it can finish. Spending stats and other tools are not affected.',
         ),
       ),
       confirmLabel: 'Delete',
@@ -146,8 +145,8 @@ export function dataSection(core: CoreServices): SectionView {
     });
     if (!confirmed) return;
     try {
-      const { keptRuns } = await core.data.deleteToolData(tool.id);
-      toast({ message: `${tool.name}: data deleted.${keptNote(keptRuns)}`, variant: 'success' });
+      const deletion = await core.data.deleteToolData(tool.id);
+      toast({ message: `${tool.name}: data deleted.${kept(deletion)}`, variant: 'success' });
     } catch (error) {
       await presentError(error);
     }
@@ -261,13 +260,13 @@ export function dataSection(core: CoreServices): SectionView {
         h(
           'p',
           null,
-          'This deletes every recent and saved prompt, all history, the video job list and each tool’s saved state, for every tool.',
+          'This deletes every recent and saved prompt, all history, background jobs such as videos, and the work each tool saves between visits (conversations, for example), for every tool.',
         ),
         h(
           'p',
           null,
           h('strong', null, 'Kept: '),
-          'your keys, your settings and the spending stats your budgets use, and runs still in progress (with their tool’s saved state).',
+          'your keys, your settings, the spending stats your budgets use, and anything still in progress (with the saved work of its tool), so it can finish.',
         ),
       ),
       phrase: 'delete all',
@@ -276,9 +275,9 @@ export function dataSection(core: CoreServices): SectionView {
     });
     if (!confirmed) return;
     try {
-      const { keptRuns } = await core.data.deleteAllPromptsAndHistory();
+      const deletion = await core.data.deleteAllPromptsAndHistory();
       toast({
-        message: `All prompts and history deleted.${keptNote(keptRuns)}`,
+        message: `All prompts and history deleted.${kept(deletion)}`,
         variant: 'success',
       });
     } catch (error) {
@@ -298,7 +297,7 @@ export function dataSection(core: CoreServices): SectionView {
           null,
           'This deletes everything ORtoolbox stores in this browser: ',
           h('strong', null, 'your keys'),
-          ', settings, prompts, history, stats and the passphrase lock. It cannot be undone.',
+          ', settings, prompts, history, stats and the passphrase lock. Anything still in progress stops and is not counted. It cannot be undone.',
         ),
         h(
           'p',
@@ -396,7 +395,7 @@ export function dataSection(core: CoreServices): SectionView {
       { title: 'Delete data', icon: 'exclamation-octagon', testId: 'data-danger' },
       dangerRow(
         'Delete all prompts and history',
-        'Every tool’s prompts, history, jobs and saved state. Your keys, settings and spending stats stay.',
+        'Every tool’s prompts, history, jobs and saved work. Your keys, settings and spending stats stay.',
         h(
           'button',
           {

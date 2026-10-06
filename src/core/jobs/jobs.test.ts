@@ -346,6 +346,23 @@ describe('completion notification', () => {
     );
   });
 
+  it('still notifies a job whose tool this build does not know', async () => {
+    stubNotification('granted');
+    setVisibility('hidden');
+    core.jobs.register('video', scripted([{ state: 'succeeded', result: 'ok' }]));
+    const added = await core.jobs.add({
+      ...input,
+      tool: 'removed-tool' as typeof input.tool,
+      notify: true,
+    });
+    await until(async () => (await job(added.id))?.state === 'succeeded');
+    await settle();
+    expect(NotificationSpy).toHaveBeenCalledExactlyOnceWith(
+      'Job: finished',
+      expect.objectContaining({ body: 'Your result is ready.' }),
+    );
+  });
+
   it('never notifies a job that did not opt in', async () => {
     stubNotification('granted');
     setVisibility('hidden');

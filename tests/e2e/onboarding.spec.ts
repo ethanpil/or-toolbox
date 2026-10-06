@@ -41,6 +41,8 @@ test('paste a key, pick favorites and try a sample', async ({ page, mock }) => {
   await page.getByTestId('onboarding-next').click();
 
   await expect(wizard.getByRole('heading', { level: 3 })).toHaveText('Try a sample');
+  // Each tool's button has its own label (Send, Read, Extract…), so the step does not say "Run".
+  await expect(wizard).not.toContainText('press Run');
   await page.getByTestId('try-chat').click();
   await expect(page).toHaveURL(/\/tools\/chat\/$/);
   // Whatever the tool's sample is, it fills the main prompt field (the `tool-prompt` convention).

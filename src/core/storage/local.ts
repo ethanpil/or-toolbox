@@ -80,6 +80,25 @@ export function writeJson(storage: Storage | undefined, key: string, value: unkn
   }
 }
 
+const PROBE_KEY = 'ortoolbox:probe';
+
+/**
+ * True when the browser refuses to store anything (no `localStorage`, or a write raises a SecurityError): the page
+ * can then tell the user at once, instead of a settings change or a key looking saved and being gone on the next
+ * page. A store that is only full is not blocked (`StorageFullError` says that when a write meets it).
+ */
+export function webStorageBlocked(): boolean {
+  const storage = local();
+  if (!storage) return true;
+  try {
+    storage.setItem(PROBE_KEY, '1');
+    storage.removeItem(PROBE_KEY);
+    return false;
+  } catch (error) {
+    return !isQuotaError(error);
+  }
+}
+
 export function removeItem(storage: Storage | undefined, key: string): void {
   try {
     storage?.removeItem(key);

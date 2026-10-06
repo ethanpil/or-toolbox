@@ -19,6 +19,7 @@ import type { CoreServices } from '../../core/types';
 import type { ToolId } from '../../tools/types';
 import { type Child, h } from '../dom';
 import { installAnnouncer } from '../feedback/announce';
+import { noticeIfStorageBlocked } from '../feedback/storage-notice';
 import { userMessage } from '../../core/errors';
 import { installAppearance } from './appearance';
 import { budgetConfirm } from './budget-confirm';
@@ -117,6 +118,7 @@ export function mountPage(
   installPaletteShortcut(core);
   installLeaveGuard(core);
   installActivityTracker(core);
+  noticeIfStorageBlocked();
   core.runs.setConfirmHandler(budgetConfirm);
 
   const page: PageContext = {

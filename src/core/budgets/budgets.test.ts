@@ -699,3 +699,46 @@ describe('spend reads', () => {
     expect(rows).not.toHaveBeenCalled();
   });
 });
+
+describe('monthSpend (the Settings meters)', () => {
+  it('reads the month once for the total and every key, and counts what running runs hold', async () => {
+    await spend('k1', 0.5);
+    await spend('k2', 0.25);
+    const db = await getDb();
+    const row = (await db.getAll('stats')).find((r) => r.keyId === 'k1');
+    await db.put('stats', { ...row!, estimatedUsd: 0.2 }); // 0.2 of k1's 0.5 is an estimate
+    await core.runs.begin({ tool: 'chat', model: 'm/paid', estimateUsd: 0.3 });
+
+    const rows = vi.spyOn(core.stats, 'rows');
+    const month = await core.budgets.monthSpend();
+    expect(rows).toHaveBeenCalledOnce();
+
+    expect(month.usd).toBeCloseTo(1.05);
+    expect(month.heldUsd).toBeCloseTo(0.3);
+    expect(month.estimatedUsd).toBeCloseTo(0.5); // 0.2 estimated cost + 0.3 reserved for the run going now
+    expect(month.byKey.get('k1')).toEqual({
+      usd: expect.closeTo(0.8) as number,
+      estimatedUsd: expect.closeTo(0.5) as number,
+    });
+    expect(month.byKey.get('k2')).toEqual({ usd: 0.25, estimatedUsd: 0 });
+  });
+
+  it('never shows room that a check would refuse', async () => {
+    setBudgets({ mode: 'hard', monthlyUsd: 1, perRunUsd: 10 });
+    await spend('k1', 0.5);
+    await core.runs.begin({ tool: 'chat', model: 'm/paid', estimateUsd: 0.45 });
+    const { usd } = await core.budgets.monthSpend();
+    expect(usd).toBeCloseTo(0.95); // $0.05 left, as a meter would say
+    expect((await core.budgets.check({ keyId: 'k1', estimateUsd: 0.04 })).verdict).toBe('ok');
+    expect((await core.budgets.check({ keyId: 'k1', estimateUsd: 0.06 })).verdict).toBe('block');
+  });
+
+  it('is zero in an empty month', async () => {
+    expect(await core.budgets.monthSpend()).toEqual({
+      usd: 0,
+      estimatedUsd: 0,
+      heldUsd: 0,
+      byKey: new Map(),
+    });
+  });
+});

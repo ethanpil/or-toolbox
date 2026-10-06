@@ -15,7 +15,7 @@ import { h, replace } from '../dom';
 import { confirmDialog, promptDialog } from '../feedback/dialogs';
 import { presentError } from '../feedback/errors';
 import { toast } from '../feedback/toast';
-import { formatDateTime, formatRelativeTime, plural } from '../format';
+import { formatDateTime, formatRelativeTime, isoDateTime, plural } from '../format';
 import { icon } from '../icon';
 import { uid } from '../id';
 import { settingsUrl } from '../shell/links';
@@ -254,7 +254,7 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
       const count = kind === 'all' ? lists.recent.length + lists.saved.length : lists[kind].length;
       const ok = await confirmDialog({
         title: `Clear ${what}?`,
-        message: `${plural(count, 'prompt')} for ${getTool(tool).name} will be deleted. You can undo this for a few seconds.`,
+        message: `${plural(count, 'prompt')} for ${getTool(tool).name} will be deleted. You can undo this right after.`,
         confirmLabel: 'Clear',
         tone: 'danger',
         testId: 'clear-confirm',
@@ -308,7 +308,7 @@ export function promptsPanel(core: CoreServices, options: PromptsPanelOptions): 
         { class: 'small text-body-secondary mt-1' },
         h(
           'time',
-          { dateTime: new Date(entry.usedAt).toISOString(), title: formatDateTime(entry.usedAt) },
+          { dateTime: isoDateTime(entry.usedAt), title: formatDateTime(entry.usedAt) },
           formatRelativeTime(entry.usedAt),
         ),
         settingsCount > 0 ? ` · ${plural(settingsCount, 'setting')}` : '',

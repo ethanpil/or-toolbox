@@ -30,7 +30,7 @@ import type {
 import { ApiError, InvalidInputError, KeyLockedError, OrError, userMessage } from '../errors';
 import { getDb } from '../storage/db';
 import { HOUR_MS, MAX_TIMEOUT_MS, isFiniteNumber, sleep, webLocks } from '../util';
-import { getTool } from '../../tools/registry';
+import { findTool } from '../../tools/registry';
 
 export const DEFAULT_POLL_MS = 5000;
 export const MAX_POLL_MS = 60_000;
@@ -102,9 +102,12 @@ function showNotification(title: string, body: string, tag: string): void {
   }
 }
 
+/** The tool's name; a job stored by a build that had a tool this one lacks is still announced. */
+const toolName = (tool: string): string => findTool(tool)?.name ?? 'Job';
+
 /** One job's notification: finished, failed (remote) or stopped checking (gave up). */
 function notifyJob(job: JobRecord): void {
-  const name = getTool(job.tool).name;
+  const name = toolName(job.tool);
   const [title, body] =
     job.state === 'succeeded'
       ? [`${name}: finished`, 'Your result is ready.']
@@ -116,7 +119,7 @@ function notifyJob(job: JobRecord): void {
 
 /** A group's one notification, summing up its ended jobs (cancelled ones left out). */
 function notifyGroup(job: JobRecord, group: JobRecord[], groupId: string): void {
-  const name = getTool(job.tool).name;
+  const name = toolName(job.tool);
   const ok = group.filter((j) => j.state === 'succeeded').length;
   const failed = group.filter((j) => j.state === 'failed').length;
   const title =

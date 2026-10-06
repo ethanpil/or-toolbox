@@ -18,6 +18,7 @@ import {
   test,
 } from '../mock/index.ts';
 import { seedApp, TEST_KEY_ID, testKeysFile } from './app.ts';
+import { makeRun, makeStats, seedDb, utcDayAgo } from './seed.ts';
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 
 const PASSPHRASE = 'correct horse battery staple';
@@ -387,6 +388,39 @@ test('budgets: the mode and limits persist, and invalid amounts are refused', as
   await expect(page.getByTestId('budgets-off')).toBeVisible();
 });
 
+test('budgets: spent this month marks estimates with ≈ and counts what a running run holds', async ({
+  page,
+  context,
+}) => {
+  await seedApp(context, {
+    key: true,
+    settings: { budgets: { mode: 'warn', perRunUsd: 10, monthlyUsd: 1, perKeyMonthlyUsd: {} } },
+  });
+  await page.goto('settings/#budgets');
+  await expect(page.getByTestId('budget-month-spend-value')).toHaveText('$0.00');
+
+  // $0.20 of the month's $0.50 is worked out from catalog prices.
+  await seedDb(page, {
+    stats: [makeStats(utcDayAgo(0), { costUsd: 0.5, estimatedUsd: 0.2, keyId: TEST_KEY_ID })],
+  });
+  await expect(page.getByTestId('budget-month-spend-value')).toHaveText('≈ $0.50');
+  await expect(page.getByTestId('budget-monthly-meter-text')).toHaveText(
+    '≈ $0.50 of $1.00 · $0.50 left',
+  );
+
+  // A run in progress holds its reservation, so the meter shows the room a new run would really have.
+  await seedDb(page, {
+    runs: [makeRun('live', 1, { status: 'running', finishedAt: null, reservedUsd: 0.3 })],
+  });
+  await expect(page.getByTestId('budget-month-spend-value')).toHaveText('≈ $0.80');
+  await expect(page.getByTestId('budget-month-spend')).toContainText(
+    '$0.30 held for runs in progress',
+  );
+  await expect(page.getByTestId('budget-monthly-meter-text')).toHaveText(
+    '≈ $0.80 of $1.00 · $0.20 left',
+  );
+});
+
 test('appearance: theme and accent apply live and persist across a reload', async ({
   page,
   context,
@@ -572,7 +606,9 @@ test('data: delete one tool’s rows, then delete all with a typed confirmation'
 
   await page.getByTestId('delete-all').click();
   const dialog = page.getByTestId('delete-all-dialog');
-  await expect(dialog).toContainText('your keys, your settings and the spending stats');
+  await expect(dialog).toContainText(
+    'your keys, your settings, the spending stats your budgets use',
+  );
   await expect(dialog.getByTestId('dialog-confirm')).toBeDisabled();
   await dialog.getByTestId('typed-confirm-input').fill('delete al');
   await expect(dialog.getByTestId('dialog-confirm')).toBeDisabled();
@@ -795,12 +831,16 @@ test.describe('review fixes', () => {
       db.close();
     });
 
+    // A run going now (written after the page's start-up sweep): Replace keeps it.
+    await seedDb(page, { runs: [makeRun('live', 1, { status: 'running', finishedAt: null })] });
+
     await chooseBackup(page, file);
     await page.getByTestId('backup-mode-replace').check();
     await page.getByTestId('backup-preview-button').click();
     const destructive = page.getByTestId('backup-destructive');
     await expect(destructive).toBeVisible();
     await expect(destructive).toContainText('Delete 1 saved prompt');
+    await expect(page.getByTestId('backup-changes')).toContainText('Keep 1 run in progress');
 
     await page.getByTestId('backup-apply').click();
     const dialog = page.getByTestId('replace-confirm-dialog');
@@ -812,6 +852,7 @@ test.describe('review fixes', () => {
     await page.getByTestId('backup-apply').click();
     await page.getByTestId('replace-confirm-dialog').getByTestId('dialog-confirm').click();
     await expect(page.getByTestId('backup-restored')).toBeVisible({ timeout: PBKDF2_WAIT });
+    await expect(page.getByTestId('backup-restored')).toContainText('Kept 1 run in progress.');
   });
 
   test('budgets: per-key labels follow renames', async ({ page, context }) => {

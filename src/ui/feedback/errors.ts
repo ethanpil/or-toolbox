@@ -12,6 +12,7 @@
  * | `rate-limited` | the message (whose limit it was), the limits in general, with Retry |
  * | `network` | the message, with Retry |
  * | `storage-full` | a link to Settings → Data |
+ * | `storage-unavailable` | that the browser blocks saving and what to do (no Retry: nothing helps until the user allows site data) |
  * | anything else | `userMessage(error)`, with Retry when given |
  *
  * Before the codes: a paid request that may have gone through (`isOutcomeUnknown`, set by the API client) never gets
@@ -52,7 +53,8 @@ export function needsAction(error: unknown): boolean {
     code === 'locked' ||
     code === 'free-only' ||
     code === 'budget-blocked' ||
-    code === 'storage-full'
+    code === 'storage-full' ||
+    code === 'storage-unavailable'
   );
 }
 
@@ -253,6 +255,16 @@ export async function presentError(
         title: 'Browser storage is full',
         message: userMessage(error),
         action: { label: 'Free up space', href: settingsUrl('data') },
+        testId: 'error-toast',
+      });
+      return;
+    case 'storage-unavailable':
+      // No Retry (it would fail again), and no auto-hide: the user has to read what to change in the browser.
+      toast({
+        variant: 'danger',
+        title: 'This browser blocks saving',
+        message: userMessage(error),
+        timeoutMs: 0,
         testId: 'error-toast',
       });
       return;
