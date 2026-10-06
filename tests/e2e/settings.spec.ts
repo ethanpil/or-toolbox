@@ -606,7 +606,9 @@ test('data: delete one tool’s rows, then delete all with a typed confirmation'
 
   await page.getByTestId('delete-all').click();
   const dialog = page.getByTestId('delete-all-dialog');
-  await expect(dialog).toContainText('your keys, your settings and the spending stats');
+  await expect(dialog).toContainText(
+    'your keys, your settings, the spending stats your budgets use',
+  );
   await expect(dialog.getByTestId('dialog-confirm')).toBeDisabled();
   await dialog.getByTestId('typed-confirm-input').fill('delete al');
   await expect(dialog.getByTestId('dialog-confirm')).toBeDisabled();

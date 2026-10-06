@@ -392,7 +392,10 @@ test.describe('a browser that blocks saving', () => {
   test('a setting that cannot be saved says why instead of looking saved', async ({ page }) => {
     await page.goto('settings/#appearance');
     await page.getByTestId('storage-notice').locator('.btn-close').click();
-    await page.getByTestId('theme-option-dark').check();
+    await page
+      .getByTestId('settings-section-appearance')
+      .getByText('Dark', { exact: true })
+      .click();
     await expect(page.getByTestId('error-toast')).toContainText('This browser blocks saving');
   });
 });
