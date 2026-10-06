@@ -50,9 +50,10 @@ const ABORTED = new Set(['net::ERR_ABORTED', 'NS_BINDING_ABORTED', 'Load request
  *
  * Always ignored: an abort (`ABORTED`) of an `<audio>`/`<video>` read of a
  * `blob:` URL (the element cancels range reads it no longer needs: after the
- * metadata, on a seek), and of a font (only the browser loads fonts; WebKit
- * cancels the icon font's preload when a page redirects at once, as the OAuth
- * callback does). Aborts the app causes itself are opt-in per test through
+ * metadata, on a seek), and of the site's own files (the app never aborts
+ * them; the browser does when a page leaves at once, as the OAuth callback
+ * does: Firefox drops the logo, WebKit the icon font preload). Aborts the app
+ * causes itself (requests to OpenRouter) are opt-in per test through
  * `allowAborted`.
  *
  * ```ts
@@ -67,7 +68,7 @@ export async function watchForProblems(
 ): Promise<string[]> {
   const problems: string[] = [];
   const expectedAbort = (request: Request): boolean =>
-    request.resourceType() === 'font' ||
+    ['localhost', '127.0.0.1'].includes(new URL(request.url()).hostname) ||
     (request.url().startsWith('blob:')
       ? request.resourceType() === 'media'
       : allowAborted.includes(new URL(request.url()).pathname));
