@@ -31,10 +31,13 @@ const shown = (testId: string) =>
     expect($(testId)?.contains(document.activeElement)).toBe(true);
   });
 
-afterEach(() => {
+afterEach(async () => {
   document.body.replaceChildren();
   document.body.removeAttribute('class');
   document.body.removeAttribute('style');
+  // Bootstrap ends a hide with a fallback timer (`transitionend` after the duration + 5 ms); let it fire while the
+  // page still exists, or the last test's timer lands after jsdom is torn down (seen on CI).
+  await new Promise((resolve) => setTimeout(resolve, 50));
 });
 
 describe('toast', () => {

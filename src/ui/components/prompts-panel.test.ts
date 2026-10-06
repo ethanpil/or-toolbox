@@ -11,8 +11,11 @@ beforeEach(async () => {
   await resetDb();
   localStorage.clear();
 });
-afterEach(() => {
+afterEach(async () => {
   document.body.replaceChildren();
+  // A panel's last refresh (two IndexedDB reads) may still be on its way; let it land while the page exists, or
+  // it draws into a torn-down jsdom after the file's last test (seen on CI).
+  await new Promise((resolve) => setTimeout(resolve, 50));
 });
 
 describe('promptsPanel for a promptless tool', () => {
