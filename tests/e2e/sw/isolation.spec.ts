@@ -10,6 +10,13 @@ import { expect, test } from '../../mock/index.ts';
 import { waitUntilControlled, waitUntilIsolated, watchForProblems } from '../support.ts';
 
 /**
+ * That no reload happens can only be seen over time: nothing announces a reload that did not come. The page decides
+ * at start (the isolation guard runs once, from its first script), so a couple of seconds after the worker controls
+ * it is far longer than a reload would take.
+ */
+const stayedPut = (page: Page, ms = 2000): Promise<void> => page.waitForTimeout(ms);
+
+/**
  * Counts documents requested by the main frame: 1 for the first load, +1 per reload or navigation. Counts
  * navigation requests rather than `framenavigated`, which also fires for same-document history changes (the
  * OAuth callback removes its single-use code from the address bar with `history.replaceState`), and rather
@@ -34,7 +41,7 @@ test('a page that needs threads reloads exactly once on a first visit, then is i
   expect(documents()).toBe(2);
 
   // No reload loop: the page stays put.
-  await page.waitForTimeout(3000);
+  await stayedPut(page, 3000);
   expect(documents()).toBe(2);
   expect(await isolated(page)).toBe(true);
   await expect(page.getByTestId('page-title')).toHaveText('Diagnostics');
@@ -44,7 +51,7 @@ test('other pages never reload; the next page they open is isolated', async ({ p
   const documents = countDocuments(page);
   await page.goto('');
   await waitUntilControlled(page);
-  await page.waitForTimeout(2000);
+  await stayedPut(page);
   expect(documents()).toBe(1);
   expect(await isolated(page)).toBe(false);
 
@@ -58,7 +65,7 @@ test('the OAuth callback never reloads, even on a first visit', async ({ page })
   const callback = 'auth/callback/?code=single-use-code&state=abc';
   await page.goto(callback);
   await waitUntilControlled(page);
-  await page.waitForTimeout(2000);
+  await stayedPut(page);
 
   expect(documents()).toBe(1);
   const navigation = await page.evaluate(
@@ -81,7 +88,7 @@ test('a page the user has started using does not reload for isolation', async ({
   const documents = countDocuments(page);
   await page.goto('diagnostics/');
   await waitUntilControlled(page);
-  await page.waitForTimeout(2000);
+  await stayedPut(page);
 
   expect(documents()).toBe(1);
   expect(await isolated(page)).toBe(false);
@@ -122,7 +129,7 @@ test('a page opened by Send to never reloads: the hand-over cannot be repeated',
   const documents = countDocuments(page);
   await page.goto('tools/video-studio/?receive=hand-over-1');
   await waitUntilControlled(page);
-  await page.waitForTimeout(2000);
+  await stayedPut(page);
 
   expect(documents()).toBe(1);
 });
@@ -135,7 +142,7 @@ test('the isolation reload happens at most once per tab', async ({ page, context
   const documents = countDocuments(page);
   await page.goto('diagnostics/');
   await waitUntilControlled(page);
-  await page.waitForTimeout(2000);
+  await stayedPut(page);
 
   expect(documents()).toBe(1);
   expect(await isolated(page)).toBe(false);
@@ -156,7 +163,7 @@ test('once the worker is in control, every page is isolated from the first byte'
     await page.goto(route);
     expect(await isolated(page), route).toBe(true);
   }
-  await page.waitForTimeout(2000);
+  await stayedPut(page);
 
   expect(documents()).toBe(4);
   expect(problems).toEqual([]);

@@ -266,6 +266,7 @@ test.describe('charts', () => {
     ]);
 
     const first = page.getByTestId('chart-spend-legend-item').first();
+    await expect(page.getByTestId('chart-spend-canvas')).toHaveAttribute('data-rendered', 'true');
     await expect(first).toHaveAttribute('aria-pressed', 'true');
     await first.click();
     await expect(first).toHaveAttribute('aria-pressed', 'false');
@@ -364,7 +365,8 @@ test.describe('charts', () => {
   });
 
   test('follows the theme without a reload', async ({ page }) => {
-    await page.emulateMedia({ colorScheme: 'light' });
+    // Without the bars growing in, a drawn chart is the final picture (nothing to wait for to settle).
+    await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'reduce' });
     await openStats(page);
     await expect(page.getByTestId('chart-spend-canvas')).toHaveAttribute('data-rendered', 'true');
     await expect.poll(() => isDrawn(page, 'chart-spend-canvas')).toBe(true);
@@ -378,18 +380,7 @@ test.describe('charts', () => {
         .first()
         .locator('.or-legend-swatch')
         .evaluate((node) => getComputedStyle(node).backgroundColor);
-    // The bars grow for a moment; wait until the picture stops changing.
-    const settled = async (): Promise<string> => {
-      let previous = await pixels();
-      for (let attempt = 0; attempt < 20; attempt++) {
-        await page.waitForTimeout(250);
-        const next = await pixels();
-        if (next === previous) return next;
-        previous = next;
-      }
-      return previous;
-    };
-    const lightPixels = await settled();
+    const lightPixels = await pixels();
     const lightSwatch = await swatch();
 
     await page.emulateMedia({ colorScheme: 'dark' });
@@ -668,6 +659,8 @@ test.describe('hidden series', () => {
   test('a hidden series is shown again when the legend goes away', async ({ page }) => {
     await openStats(page);
     const canvas = page.getByTestId('chart-spend-canvas');
+    // The legend belongs to a chart that has been drawn: a click before that is lost.
+    await expect(canvas).toHaveAttribute('data-rendered', 'true');
     await expect(canvas).toHaveAttribute('data-hidden', '0');
     await page.getByTestId('chart-spend-legend-item').first().click();
     await expect(canvas).toHaveAttribute('data-hidden', '1');
@@ -695,6 +688,7 @@ test.describe('hidden series', () => {
   }) => {
     await openStats(page);
     const canvas = page.getByTestId('chart-spend-canvas');
+    await expect(canvas).toHaveAttribute('data-rendered', 'true');
     await page.getByTestId('chart-spend-legend-item').filter({ hasText: 'OCR' }).click();
     await expect(canvas).toHaveAttribute('data-hidden', '1');
     // Stacking by model: the ids are different, so the hidden tool is forgotten.
