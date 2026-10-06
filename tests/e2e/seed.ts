@@ -128,11 +128,28 @@ export async function seedDb(
   }));
   await page.evaluate(
     async ({ runs, stats }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open('ortoolbox');
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error ?? new Error('open failed'));
-      });
+      // Never create the database: opening it before the app has (no version) would make an empty one, and the
+      // app's own open would then find no stores. Abort that upgrade and wait for the app to create it.
+      const openExisting = (): Promise<IDBDatabase | null> =>
+        new Promise((resolve, reject) => {
+          const request = indexedDB.open('ortoolbox');
+          let created = false;
+          request.onupgradeneeded = () => {
+            created = true;
+            request.transaction?.abort();
+          };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () =>
+            created ? resolve(null) : reject(request.error ?? new Error('open failed'));
+        });
+      let db: IDBDatabase | null = null;
+      for (let tries = 0; !db; tries++) {
+        db = await openExisting();
+        if (!db) {
+          if (tries > 100) throw new Error('The app never created its database.');
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
       const tx = db.transaction(['runs', 'stats'], 'readwrite');
       for (const run of runs) tx.objectStore('runs').put(run);
       for (const row of stats) tx.objectStore('stats').put(row);
