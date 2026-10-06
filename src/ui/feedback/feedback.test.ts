@@ -296,6 +296,28 @@ describe('presentError', () => {
     );
   });
 
+  it('words the free-only advice for what was refused: a model, a paid add-on, or both', async () => {
+    await presentError(new FreeOnlyError(['openai/gpt-6-luna']));
+    expect($('error-toast')!.textContent).toContain(
+      'Pick a free model, or turn free-only mode off.',
+    );
+    document.body.replaceChildren();
+
+    await presentError(new FreeOnlyError([], ['Mistral OCR (PDF parser)']));
+    const addon = $('error-toast')!.textContent ?? '';
+    expect(addon).toContain('Mistral OCR (PDF parser) is not free');
+    expect(addon).toContain(
+      'Switch Mistral OCR (PDF parser) to a free option in this tool’s settings, or turn free-only mode off.',
+    );
+    expect(addon).not.toContain('Pick a free model');
+    document.body.replaceChildren();
+
+    await presentError(new FreeOnlyError(['openai/gpt-6-luna'], ['Mistral OCR (PDF parser)']));
+    expect($('error-toast')!.textContent).toContain(
+      'Pick a free model and switch Mistral OCR (PDF parser) to a free option in this tool’s settings, or turn free-only mode off.',
+    );
+  });
+
   it('says what to do when the browser blocks saving, and stays until closed', async () => {
     await presentError(new StorageUnavailableError());
     const shown = $('error-toast')!;
