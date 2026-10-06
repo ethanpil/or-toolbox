@@ -1,14 +1,25 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatRequest, ChatResponse, RawModel } from '../../core/api/types';
-import { ApiError, FreeOnlyError, RunCancelledError } from '../../core/errors';
+import { ApiError, FreeOnlyError, KeyLockedError, RunCancelledError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
 import { setup } from './tool';
 
+const imageSizes = vi.hoisted(() => [] as (number | undefined)[]);
 vi.mock('../../core/media/image', () => ({
-  toDataUrl: (blob: File) => Promise.resolve(`data:image/png;base64,${blob.name}`),
+  toDataUrl: (blob: File, options?: { maxDimension?: number }) => {
+    imageSizes.push(options?.maxDimension);
+    return Promise.resolve(`data:image/png;base64,${blob.name}`);
+  },
+}));
+// The unlock dialog: the user enters the passphrase at once, and the tool's Retry follows.
+vi.mock('../../ui/feedback/unlock', () => ({ unlockDialog: () => Promise.resolve(true) }));
+// Saving a file is not what these tests check; building it is.
+vi.mock('../../core/files', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  downloadBlob: vi.fn(),
 }));
 vi.mock('../../core/media/pdf', () => ({
   openPdf: () =>
@@ -49,6 +60,7 @@ const pageOf = (body: ChatRequest): number =>
 
 let t: ToolTestContext | null = null;
 beforeEach(async () => {
+  imageSizes.length = 0;
   isolateChannels();
   await resetDb();
   localStorage.clear();
@@ -382,7 +394,10 @@ describe('Table extractor tool', { timeout: 30_000 }, () => {
 
     $$(t.zones.output, 'te-delete')[2]!.click(); // C
     const undoC = [...document.querySelectorAll<HTMLElement>('[data-testid="toast-undo"]')].at(-1)!;
-    await t.runners[0]!.trigger();
+    // The tables were edited (one deleted): Find tables asks before it replaces them.
+    const again = t.runners[0]!.trigger();
+    await answerDiscard(true);
+    await again;
     expect(titles()).toEqual(['A', 'B', 'C']);
     undoC.click();
     // The new extraction replaced the tables: the old C is not added again.
@@ -552,5 +567,356 @@ describe('Table extractor tool', { timeout: 30_000 }, () => {
     const run = (await t.core.history.query({ tool: 'table-extractor' }))[0]!;
     expect(run.status).toBe('ok');
     expect(run.output).toContain('cut off');
+  });
+});
+
+/** Answers the "Replace your edits?" question that Find tables asks over tables with unexported edits. */
+const answerDiscard = async (accept: boolean): Promise<void> => {
+  const dialog = await vi.waitFor(() => {
+    const element = document.querySelector<HTMLElement>('[data-testid="discard-dialog"]');
+    expect(element).not.toBeNull();
+    return element!;
+  });
+  dialog
+    .querySelector<HTMLElement>(`[data-testid="${accept ? 'dialog-confirm' : 'dialog-cancel'}"]`)!
+    .click();
+  await vi.waitFor(() =>
+    expect(document.querySelector('[data-testid="discard-dialog"]')).toBeNull(),
+  );
+};
+
+const ONE_TABLE = [{ title: 'T', kind: 'table', headers: ['a'], rows: [['1']], notes: '' }];
+
+describe('Table extractor tool: run safety', { timeout: 30_000 }, () => {
+  const unknown = (): ApiError =>
+    Object.assign(new ApiError('Bad gateway', 502), { outcomeUnknown: true });
+
+  const mountWith = async (
+    chat: (body: ChatRequest) => Promise<ChatResponse>,
+    files: string[] = ['a.png', 'b.png', 'c.png'],
+    catalog: RawModel[] = [MODEL],
+  ) => {
+    const fn = vi.fn(chat);
+    t = createToolTestContext(getTool('table-extractor'), {
+      catalog,
+      modelOverride: catalog[0]!.id,
+      api: { chat: fn },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.(files.map((name) => new File(['png'], name, { type: 'image/png' })));
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(files.length));
+    return { tool, chat: fn };
+  };
+
+  const nameOf = (body: ChatRequest): string =>
+    /“(.+?)”/.exec((body.messages[1]?.content as { text?: string }[])[0]?.text ?? '')?.[1] ?? '?';
+
+  it('the Retry after a fatal error part-way (keys locked) reads only the pages without a result', async () => {
+    const seen: string[] = [];
+    let broke = false;
+    const { tool } = await mountWith((body) => {
+      const name = nameOf(body);
+      seen.push(name);
+      if (name === 'b.png' && !broke) {
+        broke = true;
+        return Promise.reject(new KeyLockedError());
+      }
+      return Promise.resolve(answer(ONE_TABLE));
+    });
+    tool.applyState({ prompt: '', settings: { concurrency: 1 } });
+    await t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect(seen).toHaveLength(4));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect(seen).toEqual(['a.png', 'b.png', 'b.png', 'c.png']);
+    expect($$(t!.zones.output, 'te-table')).toHaveLength(3);
+  });
+
+  it('words a page that may have been billed with the caution and the link, and asks before its Retry', async () => {
+    const seen: string[] = [];
+    let failB = true;
+    await mountWith(
+      (body) => {
+        const name = nameOf(body);
+        seen.push(name);
+        return name === 'b.png' && failB
+          ? Promise.reject(unknown())
+          : Promise.resolve(answer(ONE_TABLE));
+      },
+      ['a.png', 'b.png'],
+    );
+    await t!.runners[0]!.trigger();
+    expect($$(t!.zones.output, 'te-failed')[0]?.textContent).toContain(
+      'may still have done the work',
+    );
+    expect($$(t!.zones.output, 'te-error-activity')[0]?.getAttribute('href')).toMatch(
+      /openrouter\.ai\/activity/,
+    );
+
+    $$(t!.zones.output, 'te-retry-failed')[0]!.click();
+    const dialog = await vi.waitFor(() => {
+      const element = document.querySelector<HTMLElement>('[data-testid="retry-unknown-confirm"]');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    dialog.querySelector<HTMLElement>('[data-testid="dialog-cancel"]')!.click();
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="retry-unknown-confirm"]')).toBeNull(),
+    );
+    expect(seen).toHaveLength(2);
+
+    failB = false;
+    $$(t!.zones.output, 'te-retry-failed')[0]!.click();
+    const again = await vi.waitFor(() => {
+      const element = document.querySelector<HTMLElement>('[data-testid="retry-unknown-confirm"]');
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    again.querySelector<HTMLElement>('[data-testid="dialog-confirm"]')!.click();
+    await vi.waitFor(() => expect(seen).toHaveLength(3));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+  });
+
+  it('reads every page with the settings and instructions of the moment Find tables was pressed', async () => {
+    const bodies: ChatRequest[] = [];
+    const release: (() => void)[] = [];
+    const { tool } = await mountWith(
+      (body) =>
+        new Promise<ChatResponse>((resolve) => {
+          bodies.push(body);
+          release.push(() => resolve(answer(ONE_TABLE)));
+        }),
+      ['a.png', 'b.png'],
+    );
+    tool.applyState({
+      prompt: 'First instructions',
+      settings: { concurrency: 1, charts: false, textHint: true, maxSide: 1024 },
+    });
+    const running = t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    tool.applyState({
+      prompt: 'Other instructions',
+      settings: { charts: true, textHint: false, maxSide: 2048 },
+    });
+    release.shift()!();
+    await vi.waitFor(() => expect(bodies).toHaveLength(2));
+    release.shift()!();
+    await running;
+    expect(bodies[1]!.messages[0]).toEqual(bodies[0]!.messages[0]);
+    expect(JSON.stringify(bodies[1]!.messages[0])).toContain('First instructions');
+    expect(JSON.stringify(bodies[1]!.messages[0])).toContain('Ignore charts');
+    expect(imageSizes).toEqual([1024, 1024]);
+    const run = (await t!.core.history.query({ tool: 'table-extractor' }))[0]!;
+    expect(run.prompt).toBe('First instructions');
+    expect(run.settings).toMatchObject({ charts: false, textHint: true, maxSide: 1024 });
+  });
+
+  it('sends only the parameters the model supports, and no more output than it can give', async () => {
+    const bare: RawModel = { ...MODEL, supported_parameters: ['response_format'] };
+    const { chat } = await mountWith(() => Promise.resolve(answer(ONE_TABLE)), ['a.png'], [bare]);
+    await t!.runners[0]!.trigger();
+    const body = chat.mock.calls[0]![0];
+    expect(body).not.toHaveProperty('temperature');
+    expect(body).not.toHaveProperty('max_tokens');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  it('clamps the answer to the model’s own output cap', async () => {
+    const capped: RawModel = {
+      ...MODEL,
+      id: 'test/capped',
+      top_provider: { max_completion_tokens: 2000 },
+      supported_parameters: ['max_tokens', 'temperature'],
+    };
+    const { chat } = await mountWith(() => Promise.resolve(answer(ONE_TABLE)), ['a.png'], [capped]);
+    await t!.runners[0]!.trigger();
+    const body = chat.mock.calls[0]![0];
+    expect(body.max_tokens).toBe(2000);
+    expect(body.temperature).toBe(0);
+    expect(body).not.toHaveProperty('response_format');
+  });
+
+  it('falls back to JSON mode for the batch when no provider serves the strict request', async () => {
+    const { chat, tool } = await mountWith(
+      (body) =>
+        body.response_format?.type === 'json_schema'
+          ? Promise.reject(
+              new ApiError('No endpoints found that can handle the requested parameters.', 404),
+            )
+          : Promise.resolve(answer(ONE_TABLE)),
+      ['a.png', 'b.png'],
+    );
+    tool.applyState({ prompt: '', settings: { concurrency: 1 } });
+    await t!.runners[0]!.trigger();
+    expect(chat.mock.calls.map((call) => call[0].response_format?.type)).toEqual([
+      'json_schema',
+      'json_object',
+      'json_object',
+    ]);
+    expect($$(t!.zones.output, 'te-table')).toHaveLength(2);
+    const run = (await t!.core.history.query({ tool: 'table-extractor' }))[0]!;
+    expect(run.meta).toMatchObject({ mode: 'json' });
+  });
+
+  it('estimates from the image size and the PDF text hint', async () => {
+    const { tool } = await mountWith(() => Promise.resolve(answer(ONE_TABLE)), ['a.png']);
+    tool.applyState({ prompt: '', settings: { maxSide: 1024 } });
+    const small = (await tool.estimate?.('test/vision'))!;
+    tool.applyState({ prompt: '', settings: { maxSide: 2048 } });
+    const large = (await tool.estimate?.('test/vision'))!;
+    // A 1,024 px page is 989 tokens, a 2,048 px page 3,954 (× $1 per million).
+    expect(large - small).toBeCloseTo((3954 - 989) / 1_000_000, 5);
+  });
+
+  it('announces progress as a counter, not as a status per page', async () => {
+    await mountWith(() => Promise.resolve(answer(ONE_TABLE)));
+    const status = vi.spyOn(t!.ctx.ui, 'status');
+    const progress = vi.spyOn(t!.ctx.ui, 'progress');
+    await t!.runners[0]!.trigger();
+    expect(progress.mock.calls.map((call) => call[0])).toContain('Read 3 of 3 pages');
+    expect(
+      status.mock.calls.map((call) => call[0]).filter((text) => /^Read \d/.test(text)),
+    ).toEqual([]);
+  });
+
+  it('a refusal marks the page failed with its words', async () => {
+    await mountWith(
+      (body) =>
+        nameOf(body) === 'b.png'
+          ? Promise.resolve({
+              id: 'g',
+              model: 'm',
+              choices: [
+                {
+                  index: 0,
+                  finish_reason: 'stop',
+                  message: { role: 'assistant', content: null, refusal: 'I cannot read this.' },
+                },
+              ],
+            } as ChatResponse)
+          : Promise.resolve(answer(ONE_TABLE)),
+      ['a.png', 'b.png'],
+    );
+    await t!.runners[0]!.trigger();
+    expect($$(t!.zones.output, 'te-table')).toHaveLength(1);
+    expect($$(t!.zones.output, 'te-failed')[0]?.textContent).toContain('I cannot read this.');
+  });
+
+  it('numbers untitled tables by their place in the document, whatever page finished first', async () => {
+    const release = new Map<number, () => void>();
+    // Two pages of one PDF, the second answering first.
+    t = createToolTestContext(getTool('table-extractor'), {
+      catalog: [MODEL],
+      modelOverride: 'test/vision',
+      api: {
+        chat: (body: ChatRequest) =>
+          new Promise<ChatResponse>((resolve) => {
+            release.set(pageOf(body), () =>
+              resolve(
+                answer([
+                  {
+                    title: '',
+                    kind: 'table',
+                    headers: [`p${pageOf(body)}`],
+                    rows: [['1']],
+                    notes: '',
+                  },
+                ]),
+              ),
+            );
+          }),
+      },
+    });
+    const tool = await t.mount(setup);
+    tool.onFiles?.([new File(['%PDF'], 'report.pdf', { type: 'application/pdf' })]);
+    await vi.waitFor(() => expect($$(t!.zones.input, 'doc-file')).toHaveLength(1));
+    const running = t.runners[0]!.trigger();
+    await vi.waitFor(() => expect(release.size).toBe(2));
+    release.get(2)!();
+    await vi.waitFor(() => expect($$(t!.zones.output, 'te-table')).toHaveLength(1));
+    release.get(1)!();
+    await running;
+    const headers = $$(t.zones.output, 'te-header').map(
+      (input) => (input as HTMLInputElement).value,
+    );
+    expect(headers).toEqual(['p1', 'p2']);
+    // The first table in the list is Table 1, the second Table 2, not the order they arrived in.
+    const placeholders = $$(t.zones.output, 'te-title').map(
+      (input) => (input as HTMLInputElement).placeholder,
+    );
+    expect(placeholders).toEqual(['Table 1', 'Table 2']);
+    const run = (await t.core.history.query({ tool: 'table-extractor' }))[0]!;
+    expect(run.output).toMatch(/## Table 1\n\n\*report\.pdf, page 1\*/);
+    expect(run.output).toMatch(/## Table 2\n\n\*report\.pdf, page 2\*/);
+  });
+
+  it('says so when the pages were read and held no table, instead of the first-run hint', async () => {
+    await mountWith(() => Promise.resolve(answer([])), ['a.png']);
+    expect($$(t!.zones.output, 'te-empty')[0]?.hidden).toBe(false);
+    expect($$(t!.zones.output, 'te-none')[0]?.hidden).toBe(true);
+    await t!.runners[0]!.trigger();
+    expect($$(t!.zones.output, 'te-empty')[0]?.hidden).toBe(true);
+    expect($$(t!.zones.output, 'te-none')[0]?.hidden).toBe(false);
+    expect($$(t!.zones.output, 'te-none')[0]?.textContent).toContain('No tables found');
+  });
+
+  it('does not refuse Undo of a deleted table after a retry of another page', async () => {
+    const failing = new Set(['b.png']);
+    await mountWith(
+      (body) =>
+        failing.has(nameOf(body))
+          ? Promise.reject(new ApiError('Mocked error 400', 400))
+          : Promise.resolve(
+              answer([
+                { title: nameOf(body), kind: 'table', headers: ['x'], rows: [['1']], notes: '' },
+              ]),
+            ),
+      ['a.png', 'b.png'],
+    );
+    await t!.runners[0]!.trigger();
+    $$(t!.zones.output, 'te-delete')[0]!.click();
+    const undo = [...document.querySelectorAll<HTMLElement>('[data-testid="toast-undo"]')].at(-1)!;
+    failing.clear();
+    $$(t!.zones.output, 'te-retry-failed')[0]!.click();
+    await vi.waitFor(() => expect($$(t!.zones.output, 'te-table')).toHaveLength(1));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    undo.click();
+    expect(
+      $$(t!.zones.output, 'te-title').map((input) => (input as HTMLInputElement).value),
+    ).toEqual(['a.png', 'b.png']);
+  });
+
+  it('holds edited tables until they are exported, and asks before Find tables replaces them', async () => {
+    const { chat } = await mountWith(() => Promise.resolve(answer(ONE_TABLE)), ['a.png']);
+    await t!.runners[0]!.trigger();
+    expect(t!.core.results.holds()).toEqual([]);
+    // Without an edit, Find tables runs again at once.
+    await t!.runners[0]!.trigger();
+    expect(chat).toHaveBeenCalledTimes(2);
+
+    const cell = $$(t!.zones.output, 'te-cell')[0] as HTMLInputElement;
+    cell.value = 'edited';
+    cell.dispatchEvent(new Event('input'));
+    expect(t!.core.results.holds()).toEqual(['Edited tables not exported yet']);
+
+    const declined = t!.runners[0]!.trigger();
+    await answerDiscard(false);
+    await declined;
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(($$(t!.zones.output, 'te-cell')[0] as HTMLInputElement).value).toBe('edited');
+
+    // Exporting releases the hold.
+    document.querySelector<HTMLElement>('[data-testid="export-md"]')!.click();
+    await vi.waitFor(() => expect(t!.core.results.holds()).toEqual([]));
+
+    // An edit after the export holds again; accepting the question replaces the tables.
+    const title = $$(t!.zones.output, 'te-title')[0] as HTMLInputElement;
+    title.value = 'Renamed';
+    title.dispatchEvent(new Event('input'));
+    expect(t!.core.results.holds()).toHaveLength(1);
+    const accepted = t!.runners[0]!.trigger();
+    await answerDiscard(true);
+    await accepted;
+    expect(chat).toHaveBeenCalledTimes(3);
+    expect(t!.core.results.holds()).toEqual([]);
   });
 });

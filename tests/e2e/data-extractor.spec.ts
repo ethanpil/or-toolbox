@@ -359,3 +359,71 @@ test('build a schema with the keyboard, save it, and get it back from Prompts', 
   );
   expect(problems).toEqual([]);
 });
+
+test('Extract again asks before it replaces corrected values, and leaving asks until they are exported', async ({
+  page,
+  context,
+  mock,
+}) => {
+  test.slow();
+  await seedApp(context, {
+    key: true,
+    settings: { tools: { 'data-extractor': { model: 'test/vision' } } },
+  });
+  mock.json('GET', '/api/v1/models', { data: [MODEL] });
+  mock.respond('POST', '/api/v1/chat/completions', (call) => {
+    const n = Number(/receipt-(\d+)/.exec(fileOf(call))?.[1]);
+    return {
+      body: {
+        id: `gen-${n}`,
+        model: 'test/vision',
+        choices: [
+          {
+            index: 0,
+            finish_reason: 'stop',
+            message: { role: 'assistant', content: JSON.stringify(receipt(n)) },
+          },
+        ],
+        usage: { prompt_tokens: 2000, completion_tokens: 200, total_tokens: 2200, cost: 0.0024 },
+      },
+    };
+  });
+  const problems = await watchForProblems(page);
+  await page.goto('tools/data-extractor/');
+  await addReceipts(page);
+  await page.getByTestId('run-button').click();
+  await expect(page.getByTestId('de-summary')).toHaveText(
+    '10 of 10 documents extracted · 1 to check',
+  );
+
+  const total = page.getByLabel('Total, document 3', { exact: true });
+  await total.fill('99.95');
+  await total.press('Tab');
+  await expect(page.getByTestId('de-summary')).toContainText('1 corrected');
+
+  // The corrections are unsaved work: the app's leave dialog names them.
+  const guard = page.getByTestId('leave-guard');
+  await page.getByTestId('history-link').click();
+  await expect(guard).toBeVisible();
+  await expect(page.getByTestId('leave-guard-list')).toContainText(
+    'Corrected values not exported yet',
+  );
+  await page.getByTestId('leave-guard-stay').click();
+  await expect(guard).toBeHidden();
+
+  // Extract again asks first; declining sends nothing and keeps the correction.
+  await page.getByTestId('run-button').click();
+  const question = page.getByTestId('discard-dialog');
+  await expect(question).toBeVisible();
+  await question.getByTestId('dialog-cancel').click();
+  await expect(question).toHaveCount(0);
+  expect(mock.calls('/api/v1/chat/completions')).toHaveLength(10);
+  await expect(total).toHaveValue('99.95');
+
+  // Once exported, the corrections are saved: leaving no longer asks.
+  await page.getByTestId('de-export').click();
+  await Promise.all([page.waitForEvent('download'), page.getByTestId('export-json').click()]);
+  await page.getByTestId('history-link').click();
+  await expect(page).toHaveURL(/\/history\//);
+  expect(problems).toEqual([]);
+});

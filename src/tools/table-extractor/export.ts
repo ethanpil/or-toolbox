@@ -23,8 +23,9 @@ function columns(table: ExtractedTable): ExportColumn[] {
 const MAX_SIGNIFICANT_DIGITS = 15;
 
 /**
- * A cell of a numeric column as it goes to the workbook. Plain digits (`42`, `007`, `1.50`, a 20-digit id) stay
- * text: the core writer's canonical check turns into numbers only those that lose nothing. A formatted number
+ * A cell of a numeric column as it goes to the workbook. Plain digits (`42`, `007`, `1.50`, a 20-digit id) go on to
+ * the core writer as written, and its canonical check decides: `42` and `1.50` (as 1.5) become numbers, `007` and
+ * a 20-digit id stay text. A formatted number
  * (`1,200`, `$12`, `(4)`) becomes a number only when nothing written is lost either: no sign but a minus, no
  * leading zero, no trailing zero after the decimal mark, at most 15 significant digits. Phone numbers (`+1555…`)
  * and codes stay as written.

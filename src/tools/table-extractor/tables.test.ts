@@ -218,9 +218,10 @@ describe('parseTables', () => {
     });
     const made = toTable(
       { title: '', kind: 'table', headers: ['a'], rows: [['1'], ['']], notes: '' },
-      { id: 'x', fileId: 'f', fileName: 'p.png', pageNumber: 1, pageCount: 1, index: 3 },
+      { id: 'x', fileId: 'f', fileName: 'p.png', pageNumber: 1, pageCount: 1 },
     );
-    expect(made.title).toBe('Table 3');
+    // Untitled: named by its place in the list when shown, not by when it was made.
+    expect(made.title).toBe('');
     expect(made.rows).toEqual([['1']]);
   });
 });
@@ -244,7 +245,7 @@ describe('grid edits', () => {
   it('keeps the headers the model gave, column by column, through column edits', () => {
     const made = toTable(
       { title: 'T', kind: 'table', headers: ['Region', 'Q1'], rows: [['North', '1']], notes: '' },
-      { id: 'x', fileId: 'f', fileName: 'p.pdf', pageNumber: 1, pageCount: 2, index: 1 },
+      { id: 'x', fileId: 'f', fileName: 'p.pdf', pageNumber: 1, pageCount: 2 },
     );
     expect(made.sourceHeaders).toEqual(['Region', 'Q1']);
     renameHeader(made, 0, 'Area');

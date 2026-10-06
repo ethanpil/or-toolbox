@@ -6,6 +6,7 @@
  */
 import { toCsv, type ExportColumn, type ExportRow } from '../../core/export/table';
 import type { XlsxColumn, XlsxSheet } from '../../core/export/xlsx';
+import type { FailureText } from '../../ui/feedback/errors';
 import { type ColumnType, type FieldDef, type FieldType, fieldLabel, type Value } from './schema';
 
 export type DocStatus = 'queued' | 'running' | 'done' | 'failed' | 'stopped';
@@ -26,6 +27,8 @@ export interface DocResult {
   /** Cells the user corrected, same keys as `issues`. */
   edited: string[];
   error: string | null;
+  /** How to show the failure (`failureText`: after an unknown outcome it carries the caution and the activity link). */
+  failure?: FailureText | null;
 }
 
 /** "1, 3-4" style page list for a cell. */

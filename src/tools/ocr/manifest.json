@@ -1,7 +1,7 @@
 {
   "id": "ocr",
   "name": "OCR",
-  "description": "Turn images and PDFs into text, including handwriting and math.",
+  "description": "Turn images and PDFs into text, including handwriting, math and page layout.",
   "category": "documents",
   "icon": "file-earmark-text",
   "capabilities": ["vision"],

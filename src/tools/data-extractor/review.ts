@@ -6,6 +6,7 @@
  * Rows are redrawn one at a time (a document finishing never disturbs a cell being edited in another row), and
  * text typed but not yet committed survives a redraw of its own row.
  */
+import { failureLine } from '../../ui/components/failure-line';
 import { focusedKey, focusKey, h } from '../../ui/dom';
 import { setFieldError } from '../../ui/feedback/field-error';
 import { plural } from '../../ui/format';
@@ -274,7 +275,17 @@ export function reviewGrid(options: ReviewGridOptions): ReviewGrid {
           ),
           doc.status === 'failed' || doc.status === 'stopped' ? retryButton(doc, label) : null,
         ),
-        doc.error ? h('div', { class: 'small text-danger-emphasis text-wrap' }, doc.error) : null,
+        doc.error
+          ? failureLine(
+              doc.failure ?? {
+                text: doc.error,
+                outcomeUnknown: false,
+                activityUrl: null,
+                note: null,
+              },
+              { className: 'small text-danger-emphasis text-wrap', testId: 'de-error' },
+            )
+          : null,
       ),
       h(
         'td',

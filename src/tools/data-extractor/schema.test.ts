@@ -39,6 +39,21 @@ describe('field names', () => {
     ]);
     expect(problems.map((problem) => problem.index)).toEqual([1, 2, 3, 4]);
     expect(validateSchema(invoice)).toEqual([]);
+    // Names the response parser drops: an answer filed under one would never arrive.
+    const unsafe = validateSchema([
+      { name: 'constructor', type: 'text', description: '', required: false },
+      { name: '__proto__', type: 'text', description: '', required: false },
+      {
+        name: 'rows',
+        type: 'table',
+        description: '',
+        required: false,
+        columns: [{ name: 'prototype', type: 'text', description: '' }],
+      },
+    ]);
+    expect(unsafe.map((problem) => problem.index)).toEqual([0, 1, 2]);
+    expect(unsafe[0]?.message).toMatch(/constructor/);
+    expect(unsafe[2]?.message).toMatch(/prototype/);
     for (const preset of PRESETS) expect(validateSchema(preset.fields), preset.id).toEqual([]);
   });
 
@@ -170,6 +185,23 @@ describe('normalisation', () => {
     'reads %j without doubt',
     (text) => {
       expect(readNumber(text)?.doubtful).toBeUndefined();
+    },
+  );
+
+  it.each([
+    ['CHF 12.50', 12.5],
+    ['12.50 CHF', 12.5],
+    ['USD 1,200', 1200],
+    ['(EUR 5.00)', -5],
+    ['SEK 1 234,50', 1234.5],
+  ])('reads %j with its currency code', (text, value) => {
+    expect(parseNumber(text)).toBe(value);
+  });
+
+  it.each(['5 and 6', '5 the 6', '12 tons', 'no 5', '1 a 2', '5 xyz', 'abc 12', '3 pcs'])(
+    'does not strip words that are not currency codes from %j',
+    (text) => {
+      expect(parseNumber(text)).toBeNull();
     },
   );
 

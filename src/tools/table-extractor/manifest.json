@@ -6,7 +6,13 @@
   "icon": "table",
   "capabilities": ["vision"],
   "accepts": ["image/png", "image/jpeg", "image/webp", "application/pdf"],
-  "produces": ["text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+  "produces": [
+    "text/csv",
+    "text/tab-separated-values",
+    "text/markdown",
+    "application/zip",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  ],
   "usesJobs": false,
   "lazyLibs": ["pdfjs-dist", "fflate"],
   "defaults": {}

@@ -10,11 +10,12 @@ import { ApiError, NetworkError } from '../../core/errors';
 import { getDb } from '../../core/storage/db';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient, CallOptions } from '../../core/types';
+import { atStake } from '../../ui/shell/leave-guard';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import type { ToolInstance } from '../../ui/tool/types';
 import { getTool } from '../registry';
 import { paramsFrom, reasoningChoices, SAMPLE_PROMPT, setup } from './chat';
-import { activePath, appendUser, parseThread, type Thread } from './thread';
+import { activePath, appendUser, deleteBranch, parseThread, type Thread } from './thread';
 
 const model = (id: string, prompt: string, input: string[] = ['text', 'image']): RawModel => ({
   id,
@@ -895,5 +896,178 @@ describe('review fixes', () => {
     await vi.waitFor(() => expect(messages()).toHaveLength(4));
     expect(messages()[2]!.querySelector('img')).not.toBeNull();
     expect($$('attachment-missing')).toHaveLength(0);
+  });
+});
+
+describe('stage 8 fixes', { timeout: 30_000 }, () => {
+  /** A stream that sends `first`, then waits to be stopped. */
+  const hanging = (first: string) =>
+    vi.fn(
+      (_body: ChatRequest, opts: StreamOptions): Promise<ChatStreamResult> =>
+        new Promise((_resolve, reject) => {
+          opts.onEvent({ type: 'text', text: first });
+          opts.run.signal.addEventListener('abort', () =>
+            reject(new DOMException('Stopped by the user.', 'AbortError')),
+          );
+        }),
+    );
+
+  it('keeps the billed partial text of a reply in the thread and in History while it streams', async () => {
+    const chatStream = hanging('The first half');
+    await mount({ chatStream });
+    composer().value = 'Tell me a long story';
+    const done = t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect(chatStream).toHaveBeenCalled());
+
+    // Not at the end of the reply: while it streams, the thread and the run's record hold what has arrived.
+    await eventually(async () => {
+      const [stored] = await storedThreads();
+      // (A thread read back marks a reply left streaming as stopped.)
+      expect(Object.values(stored!.nodes).find((node) => node.role === 'assistant')).toMatchObject({
+        status: 'stopped',
+        content: 'The first half',
+      });
+    });
+    await eventually(async () => {
+      const [run] = await (await getDb()).getAll('runs');
+      expect(run).toMatchObject({ status: 'running', output: 'The first half' });
+    });
+
+    // A reload now (this tab is gone; another opens): the reply is a stopped one with its text.
+    const b = await mountTab({ chatStream: fakeStream().chatStream });
+    await vi.waitFor(() =>
+      expect(contents(b.zones.output)).toEqual(['Tell me a long story', 'The first half']),
+    );
+    expect($$('message-stopped', b.zones.output)).toHaveLength(1);
+
+    // Leaving the page asks first: a reply in progress is a run in progress.
+    expect(atStake(t!.core)).toEqual(['1 run in progress']);
+    t!.runners[0]!.stop();
+    await done;
+  });
+
+  it('shows a refusal as the reply’s failure instead of an empty “Reply complete”', async () => {
+    const refuse = (text: string, refusal: string) =>
+      vi.fn((_body: ChatRequest, opts: StreamOptions): Promise<ChatStreamResult> => {
+        if (text) opts.onEvent({ type: 'text', text });
+        return Promise.resolve({
+          id: 'gen-1',
+          model: 'a/cheap',
+          text,
+          reasoning: '',
+          images: [],
+          audioChunks: [],
+          audioTranscript: '',
+          finishReason: 'stop',
+          usage: null,
+          refusal,
+        });
+      });
+    // A filter blocked it: no text at all.
+    await mount({ chatStream: refuse('', 'The provider’s content filter blocked this reply.') });
+    await send('Something');
+    await vi.waitFor(() => expect($$('message-error')).toHaveLength(1));
+    expect($('message-error').textContent).toContain('content filter blocked');
+    expect(t!.status()).not.toBe('Reply complete.');
+    expect(t!.status()).toContain('content filter blocked');
+    await eventually(async () => {
+      const [run] = await (await getDb()).getAll('runs');
+      expect(run?.output).toContain('content filter blocked');
+    });
+  });
+
+  it('shows the words of a model that declined as the failure, not as a reply to send back later', async () => {
+    const refuse = (text: string, refusal: string) =>
+      vi.fn((_body: ChatRequest, opts: StreamOptions): Promise<ChatStreamResult> => {
+        if (text) opts.onEvent({ type: 'text', text });
+        return Promise.resolve({
+          id: 'gen-1',
+          model: 'a/cheap',
+          text,
+          reasoning: '',
+          images: [],
+          audioChunks: [],
+          audioTranscript: '',
+          finishReason: 'stop',
+          usage: null,
+          refusal,
+        });
+      });
+    await mount({ chatStream: refuse('I cannot help with that.', 'I cannot help with that.') });
+    await send('Something else');
+    await vi.waitFor(() => expect($$('message-error')).toHaveLength(1));
+    expect($('message-error').textContent).toContain('I cannot help with that.');
+    expect(contents().filter((text) => text === 'I cannot help with that.')).toHaveLength(0);
+    await eventually(async () => {
+      const [stored] = await storedThreads();
+      const reply = Object.values(stored!.nodes).find((node) => node.role === 'assistant');
+      expect(reply).toMatchObject({ status: 'error', content: '' });
+    });
+  });
+
+  it('prices a request that carries audio at the audio rates', async () => {
+    const audioModel = model('d/listens', '0.000001', ['text', 'audio']);
+    t = createToolTestContext(getTool('chat'), {
+      catalog: [...CATALOG, audioModel],
+      api: { chatStream: fakeStream().chatStream },
+    });
+    t.core.settings.update((draft) => {
+      draft.tools.chat = { model: 'd/listens' };
+    });
+    const tool = await t.mount(setup);
+    await vi.waitFor(() => expect(composerModel()).toContain('Name of d/listens'));
+    const estimate = vi.spyOn(t.ctx.models, 'estimate');
+    await tool.estimate!('d/listens');
+    expect(estimate.mock.calls.at(-1)![0]).not.toHaveProperty('audio');
+
+    tool.onFiles!([new File([new Uint8Array([1, 2, 3])], 'note.mp3', { type: 'audio/mpeg' })]);
+    await vi.waitFor(() => expect($$('composer-attachment').length).toBeGreaterThan(0));
+    await tool.estimate!('d/listens');
+    expect(estimate.mock.calls.at(-1)![0]).toMatchObject({ audio: { input: true } });
+  });
+
+  it('writes a thread under the store’s lock, and builds the Export menu once', async () => {
+    const { chatStream } = fakeStream();
+    await mount({ chatStream });
+    const update = vi.spyOn(t!.ctx.state, 'update');
+    const set = vi.spyOn(t!.ctx.state, 'set');
+    const exportMenu = $('chat-export');
+    await send('Hello');
+    await t!.settle();
+    expect(update.mock.calls.some((call) => String(call[0]).startsWith('thread:'))).toBe(true);
+    expect(set.mock.calls.some((call) => String(call[0]).startsWith('thread:'))).toBe(false);
+    // The same menu, now enabled: a redraw would close one the user has open.
+    expect($('chat-export')).toBe(exportMenu);
+    expect($<HTMLButtonElement>('chat-export').disabled).toBe(false);
+  });
+
+  it('ends the run when its messages cannot be added, instead of leaving it running', async () => {
+    const { chatStream } = fakeStream();
+    await mount({ chatStream });
+    await send('Question');
+    await t!.settle();
+    const begin = t!.ctx.beginRun.bind(t!.ctx);
+    t!.ctx.beginRun = async (spec, signal) => {
+      const handle = await begin(spec, signal);
+      // While the run is being booked, another tab deletes the question the reply would answer.
+      const [stored] = await storedThreads();
+      deleteBranch(stored!, stored!.roots[0]!);
+      stored!.rev += 1;
+      const value = JSON.parse(JSON.stringify(stored)) as unknown;
+      await (
+        await getDb()
+      ).put('kv', {
+        key: `tool:chat:thread:${stored!.id}`,
+        value,
+        updatedAt: 1,
+      });
+      t!.core.bus.emit({ type: 'tool-state-changed', tool: 'chat', key: `thread:${stored!.id}` });
+      await vi.waitFor(() => expect(messages()).toHaveLength(0));
+      return handle;
+    };
+    $$('message-regenerate')[0]!.click();
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false), { timeout: 5000 });
+    const runs = await (await getDb()).getAll('runs');
+    expect(runs.map((run) => run.status).sort()).toEqual(['error', 'ok']);
   });
 });

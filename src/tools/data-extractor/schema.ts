@@ -3,7 +3,7 @@
  * validation and normalisation of what a model returns (numbers, currency amounts, dates, booleans, choices,
  * lists and tables of line items). Pure: no DOM, no network.
  */
-import { isRecord, parseJsonSafe } from '../../core/util';
+import { isRecord, isUnsafeKey, parseJsonSafe } from '../../core/util';
 
 export const FIELD_TYPES = [
   'text',
@@ -72,6 +72,13 @@ export function fieldLabel(name: string): string {
   return words ? words[0]!.toUpperCase() + words.slice(1) : name;
 }
 
+/**
+ * Why `__proto__`, `constructor` and `prototype` cannot name a field or a column: the parser of the model's answer
+ * (`parseJsonSafe`) drops those keys, so a value filed under one would never arrive.
+ */
+export const unsafeName = (name: string): string =>
+  `“${name}” cannot be a name: answers filed under it are dropped. Use another.`;
+
 /** Problems that make a schema unusable, by field index (`-1` for the schema as a whole). */
 export function validateSchema(fields: readonly FieldDef[]): { index: number; message: string }[] {
   const problems: { index: number; message: string }[] = [];
@@ -79,6 +86,7 @@ export function validateSchema(fields: readonly FieldDef[]): { index: number; me
   const seen = new Set<string>();
   fields.forEach((field, index) => {
     if (!field.name) problems.push({ index, message: 'Give the field a name.' });
+    else if (isUnsafeKey(field.name)) problems.push({ index, message: unsafeName(field.name) });
     else if (seen.has(field.name))
       problems.push({ index, message: `“${field.name}” is used twice.` });
     seen.add(field.name);
@@ -95,7 +103,9 @@ export function validateSchema(fields: readonly FieldDef[]): { index: number; me
       const names = new Set<string>();
       for (const column of columns) {
         if (!column.name) problems.push({ index, message: 'Every column needs a name.' });
-        else if (names.has(column.name))
+        else if (isUnsafeKey(column.name)) {
+          problems.push({ index, message: unsafeName(column.name) });
+        } else if (names.has(column.name))
           problems.push({ index, message: `Column “${column.name}” is used twice.` });
         names.add(column.name);
       }
@@ -241,7 +251,22 @@ export interface Normalized {
   issue?: string;
 }
 
-const CURRENCY_MARKS = /[$€£¥₹₩₽₺₪฿₫₦₴₱]|\b[A-Z]{3}\b|\b(?:USD|EUR|GBP|CHF|JPY|CAD|AUD)\b/gi;
+/**
+ * ISO 4217 codes of the currencies in use. Only these, and only in capitals as documents print them, are stripped
+ * from a number: a pattern for any three letters made "5 and 6" read as 56.
+ */
+const CURRENCY_CODES =
+  'AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD ' +
+  'CAD CDF CHF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD ' +
+  'GNF GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT ' +
+  'LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR ' +
+  'NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SOS SRD SSP ' +
+  'STN SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XOF XPF ' +
+  'YER ZAR ZMW ZWL';
+const CURRENCY_MARKS = new RegExp(
+  `[$€£¥₹₩₽₺₪฿₫₦₴₱]|\\b(?:${CURRENCY_CODES.split(' ').join('|')})\\b`,
+  'g',
+);
 
 /** A number read from text, and why it may be wrong when the text could mean another one. */
 export interface ReadNumber {

@@ -4,6 +4,8 @@
  */
 import type { ChatRequest, ContentPart } from '../../core/api/types';
 import type { PdfEngineId } from '../../core/models/pdf-engines';
+import { outputCap } from '../../core/tokens';
+import type { FailureText } from '../../ui/feedback/errors';
 
 export type OcrMode = 'printed' | 'handwriting' | 'math' | 'layout';
 
@@ -63,7 +65,14 @@ export interface PageRequestInput {
 export function pageRequest(
   model: string,
   page: PageRequestInput,
-  settings: { mode: OcrMode; language: string; instructions: string; textHint: boolean },
+  settings: {
+    mode: OcrMode;
+    language: string;
+    instructions: string;
+    textHint: boolean;
+    /** The model's own output cap (`ModelInfo.maxCompletionTokens`): `max_tokens` never exceeds it. */
+    maxCompletionTokens?: number | null;
+  },
 ): ChatRequest {
   const parts = [`Page ${page.pageNumber} of ${page.pageCount} of “${page.fileName}”.`];
   if (settings.instructions.trim())
@@ -85,7 +94,7 @@ export function pageRequest(
       { role: 'system', content: systemPrompt(settings.mode, settings.language) },
       { role: 'user', content },
     ],
-    max_tokens: MAX_PAGE_TOKENS,
+    max_tokens: Math.min(MAX_PAGE_TOKENS, outputCap(settings.maxCompletionTokens)),
     temperature: 0,
   };
 }
@@ -94,7 +103,14 @@ export function pageRequest(
 export function pdfRequest(
   model: string,
   file: { fileName: string; dataUrl: string },
-  settings: { mode: OcrMode; language: string; instructions: string; engine: PdfEngineId },
+  settings: {
+    mode: OcrMode;
+    language: string;
+    instructions: string;
+    engine: PdfEngineId;
+    /** The model's own output cap (`ModelInfo.maxCompletionTokens`): `max_tokens` never exceeds it. */
+    maxCompletionTokens?: number | null;
+  },
 ): ChatRequest {
   const text = [
     `Transcribe the whole of “${file.fileName}”, page by page. Start every page with a line “Page N” in italics (*Page N*).`,
@@ -121,7 +137,7 @@ export function pdfRequest(
       },
     ],
     plugins: [{ id: 'file-parser', pdf: { engine: settings.engine } }],
-    max_tokens: MAX_DOCUMENT_TOKENS,
+    max_tokens: Math.min(MAX_DOCUMENT_TOKENS, outputCap(settings.maxCompletionTokens)),
     temperature: 0,
   };
 }
@@ -178,6 +194,8 @@ export interface PageResult {
   status: PageStatus;
   text: string;
   error: string | null;
+  /** How to show the failure (`failureText`: after an unknown outcome it carries the caution and the activity link). */
+  failure?: FailureText | null;
   /** The answer stopped at the length limit (`finish_reason: length`): the end of the page may be missing. */
   truncated: boolean;
 }
@@ -267,17 +285,17 @@ export function combineMarkdown(results: readonly PageResult[], separators = tru
 }
 
 /**
- * Plain text: the pages with simple separator lines and the same markers as the Markdown; when pages are
- * missing, a first line lists them.
+ * Plain text: the pages with simple separator lines (unless `separators` is off, like the Markdown) and the same
+ * markers as the Markdown; when pages are missing, a first line lists them.
  */
-export function combinePlainText(results: readonly PageResult[]): string {
+export function combinePlainText(results: readonly PageResult[], separators = true): string {
   const single = results.length <= 1;
   const blocks = results.filter(isShown).map((result) => {
     const note = pageNote(result);
     const body = [unwrapFence(result.text).trim(), note ? `[${note}]` : '']
       .filter(Boolean)
       .join('\n\n');
-    return single ? body : `--- ${pageLabel(result)} ---\n\n${body}`;
+    return single || !separators ? body : `--- ${pageLabel(result)} ---\n\n${body}`;
   });
   const missing = missingPages(results);
   if (missing.length > 0 && !single) {
