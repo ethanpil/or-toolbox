@@ -571,7 +571,9 @@ describe('Data extractor tool: run safety', { timeout: 30_000 }, () => {
 
   it('asks for no more output than the model can give', async () => {
     const small: RawModel = { ...STRUCTURED, top_provider: { max_completion_tokens: 2000 } };
-    const chat = vi.fn(() => Promise.resolve(response(GOOD)));
+    const chat = vi.fn<(body: ChatRequest) => Promise<ChatResponse>>(() =>
+      Promise.resolve(response(GOOD)),
+    );
     t = createToolTestContext(getTool('data-extractor'), {
       catalog: [small],
       modelOverride: 'test/structured',

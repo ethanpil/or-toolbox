@@ -69,7 +69,6 @@ import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { queryWords } from '../../ui/shell/palette-search';
 import { composing } from '../../ui/shell/shortcuts';
-import { stopOnEscape } from '../../ui/tool/stop-on-escape';
 import type { SendItem, ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/types';
 import { toJson, toMarkdown } from './export';
 import { addCodeCopyButtons, codeOf, replies } from './markdown-view';
@@ -105,6 +104,9 @@ import {
   messageView,
   type RunState,
 } from './view';
+
+/** How long a streaming reply may go unsaved in its thread, in milliseconds. */
+const PROGRESS_MS = 1500;
 
 export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 
@@ -260,24 +262,28 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     writes = writes.then(write).catch((error: unknown) => void presentError(error));
   };
 
-  /** Writes a thread, merging first when another tab stored a newer version since this tab's base. */
+  /**
+   * Writes a thread, merging first when another tab stored a newer version since this tab's base. The read, the
+   * merge and the write are one `state.update` under the key's lock, so two tabs never write the same `rev`.
+   */
   async function write(thread: Thread): Promise<void> {
-    const key = `${STATE_THREAD}${thread.id}`;
-    const stored = parseThread(await ctx.state.get(key));
-    const base = bases.get(thread.id);
-    if (stored && base && stored.rev > base.rev) {
-      mergeInto(thread, base, stored);
-      if (thread === current) {
-        renderAll();
-        toast({
-          variant: 'info',
-          message: 'This chat also changed in another tab. Both changes are kept.',
-          testId: 'chat-merged',
-        });
-      } else renderThreads();
-    }
-    thread.rev = Math.max(thread.rev, stored?.rev ?? 0) + 1;
-    await ctx.state.set(key, thread);
+    await ctx.state.update<unknown>(`${STATE_THREAD}${thread.id}`, (raw) => {
+      const stored = parseThread(raw);
+      const base = bases.get(thread.id);
+      if (stored && base && stored.rev > base.rev) {
+        mergeInto(thread, base, stored);
+        if (thread === current) {
+          renderAll();
+          toast({
+            variant: 'info',
+            message: 'This chat also changed in another tab. Both changes are kept.',
+            testId: 'chat-merged',
+          });
+        } else renderThreads();
+      }
+      thread.rev = Math.max(thread.rev, stored?.rev ?? 0) + 1;
+      return thread;
+    });
     bases.set(thread.id, baseOf(thread));
   }
 
@@ -605,7 +611,31 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     icon('clipboard'),
     'Copy',
   );
-  const exportHost = h('span', { class: 'd-inline-block' });
+  /** Built once: a redraw of the header must not close a menu the user has open (`update` changes it in place). */
+  const exportMenuEl = exportMenu({
+    label: 'Export',
+    filename: () => current.title,
+    disabled: true,
+    testId: 'chat-export',
+    formats: [
+      {
+        label: 'Markdown',
+        extension: 'md',
+        icon: 'markdown',
+        build: () => new Blob([toMarkdown(current)], { type: 'text/markdown' }),
+      },
+      {
+        label: 'JSON',
+        extension: 'json',
+        icon: 'filetype-json',
+        build: () =>
+          new Blob([`${JSON.stringify(toJson(current), null, 2)}\n`], {
+            type: 'application/json',
+          }),
+      },
+    ],
+  });
+  const exportHost = h('span', { class: 'd-inline-block' }, exportMenuEl);
   // A labelled region, not a live region: streamed text must not be read out as it arrives.
   const log = h('div', {
     class: 'or-chat-log',
@@ -1112,31 +1142,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     const empty = isEmpty(current);
     renameButton.disabled = empty;
     copyAllButton.disabled = empty;
-    exportHost.replaceChildren(
-      exportMenu({
-        label: 'Export',
-        filename: () => current.title,
-        disabled: empty,
-        testId: 'chat-export',
-        formats: [
-          {
-            label: 'Markdown',
-            extension: 'md',
-            icon: 'markdown',
-            build: () => new Blob([toMarkdown(current)], { type: 'text/markdown' }),
-          },
-          {
-            label: 'JSON',
-            extension: 'json',
-            icon: 'filetype-json',
-            build: () =>
-              new Blob([`${JSON.stringify(toJson(current), null, 2)}\n`], {
-                type: 'application/json',
-              }),
-          },
-        ],
-      }),
-    );
+    exportMenuEl.update({ disabled: empty });
   };
 
   const messageActions: MessageActions = {
@@ -1624,6 +1630,12 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   /** The cost of a request on the dearest of its models (a fallback may answer); null when the first is unknown. */
   async function estimateFor(built: BuiltRequest): Promise<number | null> {
     const models = [built.body.model, ...(built.body.models ?? [])];
+    // Audio is priced at the audio rates (high: the whole prompt), so a request that carries any says so.
+    const hasAudio = built.body.messages.some(
+      (message) =>
+        Array.isArray(message.content) &&
+        message.content.some((part) => part.type === 'input_audio'),
+    );
     const costs = await Promise.all(
       models.map((model) =>
         ctx.models
@@ -1632,6 +1644,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
             model,
             promptTokens: built.promptTokens,
             completionTokens: built.completionTokens,
+            ...(hasAudio ? { audio: { input: true } } : {}),
           })
           .catch(() => null),
       ),
@@ -1745,30 +1758,37 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         signal,
       );
 
-      // The run may go ahead: commit the messages.
+      // The run may go ahead: commit the messages. The thread may have changed while the run was booked (another
+      // tab deleted what this answers): then the run ends here, never left running with nothing sent.
       let userId = answers;
-      if (newUser) {
-        userId = addNode(thread, newUser.parent, {
-          role: 'user',
-          content: newUser.content,
-          ...(newUser.attachments.length > 0 ? { attachments: newUser.attachments } : {}),
-        }).id;
+      let reply: ChatNode;
+      try {
+        if (newUser) {
+          userId = addNode(thread, newUser.parent, {
+            role: 'user',
+            content: newUser.content,
+            ...(newUser.attachments.length > 0 ? { attachments: newUser.attachments } : {}),
+          }).id;
+        }
+        if (action.kind === 'send') {
+          composer.value = '';
+          pending = [];
+          renderComposer();
+          void ui.refreshEstimate();
+        }
+        if (action.kind === 'edit') editing = null;
+        if (replaces) deleteBranch(thread, replaces);
+        reply = addNode(thread, userId, {
+          role: 'assistant',
+          content: '',
+          model,
+          status: 'streaming',
+          ...(built.trimmed > 0 ? { trimmed: built.trimmed } : {}),
+        });
+      } catch (error) {
+        await run.fail(error).catch(() => undefined);
+        throw error;
       }
-      if (action.kind === 'send') {
-        composer.value = '';
-        pending = [];
-        renderComposer();
-        void ui.refreshEstimate();
-      }
-      if (action.kind === 'edit') editing = null;
-      if (replaces) deleteBranch(thread, replaces);
-      const reply = addNode(thread, userId, {
-        role: 'assistant',
-        content: '',
-        model,
-        status: 'streaming',
-        ...(built.trimmed > 0 ? { trimmed: built.trimmed } : {}),
-      });
       persist(thread);
       const mine: LiveReply = { thread, node: reply, stream: null, reasoning: null };
       live = mine;
@@ -1783,6 +1803,16 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           : 'Reply started.',
       );
 
+      // What has arrived is billed: History's record of the run (the core throttles its writes) and the thread
+      // (stored at most every PROGRESS_MS) keep it, so a reload or a crash keeps the partial text.
+      let progressTimer: ReturnType<typeof setTimeout> | null = null;
+      const saveProgress = (): void => {
+        void run.checkpoint({ output: () => reply.content }).catch(() => undefined);
+        progressTimer ??= setTimeout(() => {
+          progressTimer = null;
+          persist(thread);
+        }, PROGRESS_MS);
+      };
       try {
         const answer = await ctx.api.chatStream(built.body, {
           run,
@@ -1791,6 +1821,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
             if (event.type === 'text') {
               reply.content += event.text;
               if (shown) mine.stream?.append(event.text);
+              saveProgress();
             } else if (event.type === 'reasoning') {
               const first = !reply.reasoning;
               reply.reasoning = (reply.reasoning ?? '') + event.text;
@@ -1802,18 +1833,31 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           },
         });
         keepParsed(toParse, answer.annotations);
-        reply.content = answer.text || reply.content;
         if (answer.reasoning) reply.reasoning = answer.reasoning;
         if (answer.model) reply.servedModel = answer.model;
-        reply.status = 'done';
         const usage = usageOf(run.totals);
         if (usage) reply.usage = usage;
-        ui.status(
-          answer.finishReason === 'length'
-            ? 'Reply complete. It hit the token limit: raise Max tokens in Settings for longer replies.'
-            : 'Reply complete.',
-        );
-        await run.finish({ output: reply.content, meta: { threadId: thread.id } });
+        if (answer.refusal) {
+          // The model declined (its words were streamed as text), or a filter blocked the reply: a failed reply,
+          // not an empty "complete" one, and nothing to send back as the model's earlier answer. Billed as usual.
+          reply.content = '';
+          reply.status = 'error';
+          reply.error = answer.refusal;
+          ui.status(`The model did not answer: ${answer.refusal}`);
+          await run.finish({
+            output: answer.refusal,
+            meta: { threadId: thread.id, refusal: true },
+          });
+        } else {
+          reply.content = answer.text || reply.content;
+          reply.status = 'done';
+          ui.status(
+            answer.finishReason === 'length'
+              ? 'Reply complete. It hit the token limit: raise Max tokens in Settings for longer replies.'
+              : 'Reply complete.',
+          );
+          await run.finish({ output: reply.content, meta: { threadId: thread.id } });
+        }
       } catch (error) {
         const usage = usageOf(run.totals);
         if (usage) reply.usage = usage;
@@ -1841,6 +1885,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         await run.fail(error);
         throw error;
       } finally {
+        if (progressTimer) clearTimeout(progressTimer);
         mine.stream?.dispose();
         if (live === mine) live = null;
         persist(thread);
@@ -1866,6 +1911,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     label: 'Send',
     icon: 'send',
     container: runnerHost,
+    // Escape in the message field stops the reply too (the field has no use for the key).
+    stopOnEscape: { allowIn: [composer] },
     run: (signal, action) => perform(action ?? { kind: 'send' }, signal),
   });
   runner.subscribe(({ busy, disabledReason }) => {
@@ -1903,8 +1950,6 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     'input',
     debounce(() => void ui.refreshEstimate(), 300),
   );
-  // Escape stops the reply, from the composer too (it has no use for the key).
-  stopOnEscape(runner, { allowIn: [composer] });
 
   // --- live updates -------------------------------------------------------------------------------------
   ctx.settings.subscribe((next, prev) => {

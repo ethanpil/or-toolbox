@@ -245,7 +245,7 @@ describe('grid edits', () => {
   it('keeps the headers the model gave, column by column, through column edits', () => {
     const made = toTable(
       { title: 'T', kind: 'table', headers: ['Region', 'Q1'], rows: [['North', '1']], notes: '' },
-      { id: 'x', fileId: 'f', fileName: 'p.pdf', pageNumber: 1, pageCount: 2, index: 1 },
+      { id: 'x', fileId: 'f', fileName: 'p.pdf', pageNumber: 1, pageCount: 2 },
     );
     expect(made.sourceHeaders).toEqual(['Region', 'Q1']);
     renameHeader(made, 0, 'Area');
