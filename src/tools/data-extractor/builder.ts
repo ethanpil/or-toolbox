@@ -3,6 +3,7 @@
  * Required box; choices for a Choice field and columns for a table of line items. Fields and columns move
  * with Up/Down buttons (no drag-only interaction), and every control keeps focus across redraws.
  */
+import { isUnsafeKey } from '../../core/util';
 import { focusKey, h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { setFieldError } from '../../ui/feedback/field-error';
@@ -19,6 +20,7 @@ import {
   fieldLabel,
   normalizeFieldName,
   TYPE_LABELS,
+  unsafeName,
   validateSchema,
 } from './schema';
 
@@ -112,6 +114,10 @@ export function schemaBuilder(options: { onChange: () => void }): SchemaBuilder 
         const name = normalizeFieldName(input.value);
         if (!name) {
           setFieldError(input, feedback, 'Give it a name with letters or digits.');
+          return;
+        }
+        if (isUnsafeKey(name)) {
+          setFieldError(input, feedback, unsafeName(name));
           return;
         }
         if (taken().includes(name)) {

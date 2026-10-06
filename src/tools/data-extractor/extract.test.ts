@@ -8,6 +8,7 @@ import {
   outputMode,
   parseAnswer,
   repairRequest,
+  responseRefusal,
   systemPrompt,
 } from './extract';
 import { presetById } from './presets';
@@ -182,6 +183,55 @@ describe('parseAnswer', () => {
       problem: 'That answer was JSON, but not one object.',
     });
     expect(parseAnswer(fields, '{"x":1}').ok).toBe(false);
+  });
+
+  it('estimates what a page costs from the image size and the PDF text hint', () => {
+    const base = estimateDocumentTokens(fields, 2, { maxSide: 1600, hintPages: 0 });
+    const large = estimateDocumentTokens(fields, 2, { maxSide: 2048, hintPages: 0 });
+    const small = estimateDocumentTokens(fields, 2, { maxSide: 1024, hintPages: 0 });
+    expect(large.promptTokens).toBeGreaterThan(base.promptTokens);
+    expect(small.promptTokens).toBeLessThan(base.promptTokens);
+    // 2,413 tokens for a 1,600 px page, as OCR counts it.
+    expect(
+      base.promptTokens - estimateDocumentTokens(fields, 1, { maxSide: 1600 }).promptTokens,
+    ).toBe(2413);
+    // Each PDF page whose text goes along adds up to 4,000 characters (about 1,000 tokens).
+    const hinted = estimateDocumentTokens(fields, 2, { maxSide: 1600, hintPages: 2 });
+    expect(hinted.promptTokens - base.promptTokens).toBe(2000);
+  });
+
+  it('never asks for more output than the model can give', () => {
+    const settings = { instructions: '', mode: 'json' as const, textHint: false };
+    const doc = { fileName: 'a.png', pages: [page] };
+    expect(buildRequest('m', fields, doc, settings).max_tokens).toBe(8192);
+    expect(
+      buildRequest('m', fields, doc, { ...settings, maxCompletionTokens: 2000 }).max_tokens,
+    ).toBe(2000);
+    expect(
+      buildRequest('m', fields, doc, { ...settings, maxCompletionTokens: 64_000 }).max_tokens,
+    ).toBe(8192);
+  });
+
+  it('finds a refusal in a non-streamed answer', () => {
+    const answer = (message: Record<string, unknown>, finish: string | null = 'stop') => ({
+      id: 'g',
+      model: 'm',
+      choices: [
+        {
+          index: 0,
+          finish_reason: finish,
+          message: { role: 'assistant' as const, content: null, ...message },
+        },
+      ],
+    });
+    expect(responseRefusal(answer({ content: '{"a":1}' }))).toBeNull();
+    expect(responseRefusal(answer({ content: null, refusal: 'I cannot help with that.' }))).toBe(
+      'I cannot help with that.',
+    );
+    expect(responseRefusal(answer({ content: '' }, 'content_filter'))).toMatch(/content filter/);
+    expect(responseRefusal(answer({ content: '' }, 'error'))).toMatch(/error before answering/);
+    // Text with a filter finish is an answer, whatever the reason it stopped.
+    expect(responseRefusal(answer({ content: '{"a":1}' }, 'content_filter'))).toBeNull();
   });
 
   it('estimates more for more pages and tables', () => {

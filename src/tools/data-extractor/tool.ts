@@ -6,7 +6,7 @@
  * batch, its output the JSON of the results (checkpointed as documents finish).
  */
 import type { ChatRequest, ChatResponse } from '../../core/api/types';
-import { InvalidInputError, userMessage } from '../../core/errors';
+import { InvalidInputError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import { toJsonBlob } from '../../core/export/table';
 import type { RunHandle } from '../../core/types';
 import { isRecord } from '../../core/util';
@@ -30,6 +30,7 @@ import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
 import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
 import { retryGate } from '../../ui/tool/retry-gate';
+import { pendingOnly } from '../../ui/tool/runner';
 import { schemaBuilder } from './builder';
 import {
   buildRequest,
@@ -41,6 +42,7 @@ import {
   outputMode,
   parseAnswer,
   repairRequest,
+  responseRefusal,
 } from './extract';
 import {
   type DocResult,
@@ -99,8 +101,13 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   const initialPreset =
     presetById(typeof options['preset'] === 'string' ? options['preset'] : '') ??
     presetById(DEFAULT_PRESET)!;
+  /** The saved set used last time (`options.schema`), when it still exists. */
+  const rememberedSet =
+    typeof options['schema'] === 'string' && options['schema'].startsWith('saved:')
+      ? saved.find((schema) => `saved:${schema.id}` === options['schema'])
+      : undefined;
   /** Where the fields came from: `preset:<id>`, `saved:<id>` or `custom`. */
-  let source = `preset:${initialPreset.id}`;
+  let source = rememberedSet ? `saved:${rememberedSet.id}` : `preset:${initialPreset.id}`;
   let dirty = false;
 
   const builder = schemaBuilder({
@@ -110,7 +117,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       void ui.refreshEstimate();
     },
   });
-  builder.setFields(initialPreset.fields);
+  builder.setFields(rememberedSet?.fields ?? initialPreset.fields);
 
   const schemaSelect = h('select', {
     id: ids.schema,
@@ -197,12 +204,47 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     summary.textContent = `${plural(fields.length, 'field')}: ${fields.map((field) => fieldLabel(field.name)).join(', ')}`;
   }
 
-  const persistSaved = async (): Promise<void> => {
+  /**
+   * Takes a stored list in (after a change here or in another tab). The set in use that is gone stays in the form
+   * as Custom fields, so the picker never shows nothing.
+   */
+  const setSaved = (list: SavedSchema[]): void => {
+    saved = list;
+    if (source.startsWith('saved:') && !savedOf(source)) source = 'custom';
+    renderSchemaBar();
+  };
+
+  /**
+   * Changes the stored list as a read-modify-write under the key's lock, so a save in another tab is never
+   * overwritten by the list this tab read earlier. Resolves false (and says why) when it could not be stored.
+   */
+  const changeSaved = async (change: (list: SavedSchema[]) => SavedSchema[]): Promise<boolean> => {
     try {
-      await ctx.state.set(STATE_KEY, saved);
+      const next = await ctx.state.update<unknown>(STATE_KEY, (current) =>
+        change(readSaved(current)),
+      );
+      setSaved(readSaved(next));
+      return true;
     } catch (error) {
       void presentError(error);
+      return false;
     }
+  };
+
+  // Saved sets change here and in other tabs: read them again (our own writes compare equal and stop there).
+  ctx.bus.on('tool-state-changed', (event) => {
+    if (event.tool !== ctx.manifest.id || event.key !== STATE_KEY) return;
+    void ctx.state
+      .get<unknown>(STATE_KEY)
+      .then((value) => setSaved(readSaved(value)))
+      .catch(() => undefined);
+  });
+
+  /** A source the picker can show: a preset or saved set that exists, else Custom. */
+  const knownSource = (value: unknown): string => {
+    if (typeof value !== 'string') return 'custom';
+    if (value.startsWith('preset:')) return presetById(value.slice(7)) ? value : 'custom';
+    return value.startsWith('saved:') && savedOf(value) ? value : 'custom';
   };
 
   async function chooseSchema(value: string): Promise<void> {
@@ -227,7 +269,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     source = value;
     dirty = false;
     builder.setFields(fields);
-    if (value.startsWith('preset:')) ctx.options.set({ preset: value.slice(7) });
+    ctx.options.set(
+      value.startsWith('preset:') ? { preset: value.slice(7), schema: value } : { schema: value },
+    );
     renderSchemaBar();
     void ui.refreshEstimate();
   }
@@ -246,20 +290,22 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       maxLength: 80,
     });
     if (!name?.trim()) return;
-    const existing = saved.find(
-      (schema) => schema.name.toLowerCase() === name.trim().toLowerCase(),
-    );
-    const schema: SavedSchema = {
-      id: existing?.id ?? uid('schema'),
-      name: name.trim(),
-      fields: builder.fields(),
-    };
-    saved = existing
-      ? saved.map((item) => (item === existing ? schema : item))
-      : [...saved, schema];
+    let schema!: SavedSchema;
+    const stored = await changeSaved((list) => {
+      const existing = list.find((item) => item.name.toLowerCase() === name.trim().toLowerCase());
+      schema = {
+        id: existing?.id ?? uid('schema'),
+        name: name.trim(),
+        fields: builder.fields(),
+      };
+      return existing
+        ? list.map((item) => (item.id === existing.id ? schema : item))
+        : [...list, schema];
+    });
+    if (!stored) return;
     source = `saved:${schema.id}`;
     dirty = false;
-    await persistSaved();
+    ctx.options.set({ schema: source });
     renderSchemaBar();
     toast({ message: `Saved “${schema.name}”.`, variant: 'success' });
   }
@@ -275,9 +321,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       maxLength: 80,
     });
     if (!name?.trim()) return;
-    schema.name = name.trim();
-    await persistSaved();
-    renderSchemaBar();
+    await changeSaved((list) =>
+      list.map((item) => (item.id === schema.id ? { ...item, name: name.trim() } : item)),
+    );
   }
 
   async function deleteSchema(): Promise<void> {
@@ -290,17 +336,47 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       tone: 'danger',
     });
     if (!sure) return;
-    saved = saved.filter((item) => item !== schema);
     source = 'custom';
-    await persistSaved();
-    renderSchemaBar();
+    ctx.options.set({ schema: source });
+    if (!(await changeSaved((list) => list.filter((item) => item.id !== schema.id)))) {
+      source = `saved:${schema.id}`;
+      ctx.options.set({ schema: source });
+      renderSchemaBar();
+      return;
+    }
     toast({ message: `Deleted “${schema.name}”.` });
   }
+
+  /**
+   * What the extraction that is going on began with, read once when Extract was pressed. Nothing read per document
+   * may change what a document costs or says (the image size, the PDF text hint, the instructions, the fields), so
+   * the estimate and every request come from this, never from the form.
+   */
+  interface Began {
+    fields: FieldDef[];
+    instructions: string;
+    textHint: boolean;
+    maxSide: number;
+    perPage: boolean;
+    concurrency: number;
+    /** `getState().settings` of that moment, for History. */
+    settings: ToolSnapshot['settings'];
+  }
+  let active: Began | null = null;
+  /** The form's settings: the state Prompts and History keep (`getState().settings`). */
+  const formSettings = (): ToolSnapshot['settings'] => ({
+    schema: source,
+    fields: builder.fields(),
+    perPage: perPage.checked,
+    textHint: textHint.checked,
+    maxSide: Number(size.value),
+    concurrency: Number(concurrency.value),
+  });
 
   // --- input zone -----------------------------------------------------------------------------------------
   const docs = documentInput({
     accept: ctx.manifest.accepts,
-    maxSide: () => Number(size.value) || 1600,
+    maxSide: () => active?.maxSide ?? (Number(size.value) || 1600),
     onChange: () => void ui.refreshEstimate(),
     label: 'Drop invoices, receipts or other documents',
   });
@@ -398,7 +474,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     formSwitch(
       perPage,
       'One extraction per page',
-      `For PDFs where every page is its own document (a scanned stack of receipts). Otherwise a file is one document (up to ${MAX_PAGES_PER_REQUEST} pages per request).`,
+      `For PDFs where every page is its own document (a scanned stack of receipts). Otherwise a PDF is read as one document, ${MAX_PAGES_PER_REQUEST} pages to a request: a longer one becomes one row for every ${MAX_PAGES_PER_REQUEST} pages.`,
     ),
     formSwitch(
       textHint,
@@ -470,9 +546,23 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       : 'extracted-data';
   };
 
+  /** Corrections made since the values were last exported (or the grid was last filled). */
+  let unsaved = false;
+  let releaseHold: (() => void) | null = null;
+  /** Corrected values are unsaved work: leaving the page asks first, until they are exported. */
+  const syncHold = (): void => {
+    const dirty = unsaved && results.some((doc) => doc.edited.length > 0);
+    if (dirty && !releaseHold) releaseHold = ui.holdWork('Corrected values not exported yet');
+    else if (!dirty && releaseHold) {
+      releaseHold();
+      releaseHold = null;
+    }
+  };
+
   const grid = reviewGrid({
     fields: () => gridFields,
     onEdit: () => {
+      unsaved = true;
       renderSummary();
     },
     onRetry: (doc) => retry([doc.key]),
@@ -533,10 +623,22 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
 
   let reading = false;
 
+  /** Building a file is what saves the corrections: from then on they are exported. */
+  const exporting = (list: ExportFormat[]): ExportFormat[] =>
+    list.map((format) => ({
+      ...format,
+      build: async () => {
+        const blob = await format.build();
+        unsaved = false;
+        syncHold();
+        return blob;
+      },
+    }));
+
   const formats = (): ExportFormat[] => {
     const fields = gridFields;
     const tables = tableFields(fields);
-    return [
+    return exporting([
       {
         label: 'JSON',
         extension: 'json',
@@ -574,7 +676,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         icon: 'file-earmark-excel',
         build: () => workbook(fields, results),
       },
-    ];
+    ]);
   };
 
   const menu = exportMenu({
@@ -619,6 +721,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       menuDisabled = done.length === 0;
       menu.update({ formats: formats(), disabled: menuDisabled });
     }
+    syncHold();
   }
 
   async function showSource(doc: DocResult): Promise<void> {
@@ -696,9 +799,9 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
   }
 
   // --- running --------------------------------------------------------------------------------------------
-  const planUnits = (): Unit[] => {
+  const planUnits = (onePerPage: boolean): Unit[] => {
     const refs = docs.selection();
-    if (perPage.checked)
+    if (onePerPage)
       return refs.map((ref) => ({ key: `${ref.fileId}:${ref.pageNumber}`, refs: [ref] }));
     const byFile = new Map<string, PageRef[]>();
     for (const ref of refs) byFile.set(ref.fileId, [...(byFile.get(ref.fileId) ?? []), ref]);
@@ -712,13 +815,20 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     return planned;
   };
 
-  const estimateFor = (plan: readonly Unit[], model: string): Promise<number | null> => {
+  const estimateFor = (
+    plan: readonly Unit[],
+    model: string,
+    began: Pick<Began, 'fields' | 'textHint' | 'maxSide'>,
+  ): Promise<number | null> => {
     if (plan.length === 0) return Promise.resolve(null);
-    const fields = builder.fields();
     let promptTokens = 0;
     let completionTokens = 0;
     for (const unit of plan) {
-      const tokens = estimateDocumentTokens(fields, unit.refs.length);
+      const tokens = estimateDocumentTokens(began.fields, unit.refs.length, {
+        maxSide: began.maxSide,
+        // Each PDF page whose own text goes along (a page image has none).
+        hintPages: began.textHint ? unit.refs.filter((ref) => ref.kind === 'pdf').length : 0,
+      });
       promptTokens += tokens.promptTokens;
       completionTokens += tokens.completionTokens;
     }
@@ -738,28 +848,39 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     doc: DocResult,
     pages: readonly PageInput[],
     batch: BatchMode,
+    began: Began,
+    maxCompletionTokens: number | null,
   ): ChatRequest =>
     buildRequest(
       run.model,
-      gridFields,
+      began.fields,
       { fileName: doc.fileName, pages },
       {
-        instructions: prompt.value,
+        instructions: began.instructions,
         mode: batch.mode,
-        textHint: textHint.checked,
+        textHint: began.textHint,
         supported: batch.supported,
+        maxCompletionTokens,
       },
     );
+
+  /** A model that declined (or a filter that blocked it) did not read the document: no parsing, no repair. */
+  const refuse = (answer: ChatResponse): void => {
+    const refusal = responseRefusal(answer);
+    if (refusal) throw new InvalidInputError(`The model did not answer: ${refusal}`);
+  };
 
   const extractOne = async (
     run: RunHandle,
     unit: Unit,
     doc: DocResult,
     batch: BatchMode,
+    began: Began,
+    maxCompletionTokens: number | null,
   ): Promise<void> => {
     const pages: PageInput[] = [];
     for (const ref of unit.refs) pages.push(await docs.loadPage(ref));
-    let body = requestFor(run, doc, pages, batch);
+    let body = requestFor(run, doc, pages, batch, began, maxCompletionTokens);
     let first: ChatResponse;
     try {
       first = await ctx.api.chat(body, { run });
@@ -767,14 +888,16 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       // No provider serves the strict request: carry on (this document and the rest) in JSON mode.
       if (body.response_format?.type !== 'json_schema' || !isUnsupportedStrict(error)) throw error;
       if (batch.mode === 'schema') batch.mode = fallbackMode(batch.supported);
-      body = requestFor(run, doc, pages, batch);
+      body = requestFor(run, doc, pages, batch, began, maxCompletionTokens);
       first = await ctx.api.chat(body, { run });
     }
+    refuse(first);
     const answer = first.choices[0]?.message.content ?? '';
-    let parsed = parseAnswer(gridFields, answer);
+    let parsed = parseAnswer(began.fields, answer);
     if (!parsed.ok) {
       const second = await ctx.api.chat(repairRequest(body, answer, parsed.problem), { run });
-      parsed = parseAnswer(gridFields, second.choices[0]?.message.content ?? '');
+      refuse(second);
+      parsed = parseAnswer(began.fields, second.choices[0]?.message.content ?? '');
       if (!parsed.ok)
         throw new InvalidInputError(`The model's answer could not be read: ${parsed.problem}`);
     }
@@ -783,12 +906,54 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     doc.edited = [];
   };
 
+  /** The error each failed document ended with, for its Retry (a request that may have been billed asks first). */
+  const failures = new Map<string, unknown>();
+
   /** Extracts `keys` again (a Retry); the runner's own Retry after a refusal repeats the same documents. */
   function retry(keys: string[]): void {
-    if (keys.length > 0) gate.retry(keys, 'Extracting cannot start now.');
+    if (keys.length === 0) return;
+    const errors = keys.flatMap((key) => (failures.has(key) ? [failures.get(key)] : []));
+    void gate.retryFailed(
+      errors.find((error) => isOutcomeUnknown(error)) ?? errors[0],
+      keys,
+      'Extracting cannot start now.',
+    );
   }
 
+  /** The form as it is now, as a snapshot a run can hold on to (a retry keeps the fields the grid has). */
+  const readForm = (keys: boolean): Began => {
+    const fields = keys ? gridFields : builder.fields();
+    return {
+      fields,
+      instructions: prompt.value,
+      textHint: textHint.checked,
+      maxSide: Number(size.value),
+      perPage: perPage.checked,
+      concurrency: Number(concurrency.value) || 3,
+      settings: { ...formSettings(), fields },
+    };
+  };
+
+  /** The plan of the Extract press that is going or was last (null before beginRun accepted a press). */
+  let pressed: string[] | null = null;
+
   const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
+    if (!keys) pressed = null;
+    // Everything the run uses is read here, once.
+    const began = readForm(keys !== undefined);
+    active = began;
+    try {
+      await perform(signal, keys, began);
+    } finally {
+      active = null;
+    }
+  };
+
+  const perform = async (
+    signal: AbortSignal,
+    keys: string[] | undefined,
+    began: Began,
+  ): Promise<void> => {
     let plan: Unit[];
     if (keys) {
       plan = keys.flatMap((key) => units.get(key) ?? []);
@@ -799,17 +964,27 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         ui.status('Fix the fields first.');
         return;
       }
-      plan = planUnits();
+      plan = planUnits(began.perPage);
       if (plan.length === 0) {
         ui.status(docs.files().length ? 'Choose at least one page.' : 'Add a document first.');
         return;
       }
+      // A new extraction replaces the grid: ask before it throws away corrections nothing has saved.
+      const replaceIt = await ui.confirmDiscard({
+        what: 'the corrections you made in the grid',
+        isDirty: () => unsaved && results.some((doc) => doc.edited.length > 0),
+        title: 'Replace your corrections?',
+        confirmLabel: 'Extract again',
+      });
+      if (!replaceIt) return;
     }
 
     const model = ctx.model().model;
     const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
     const supported = info?.supportedParameters ?? [];
+    const maxCompletionTokens = info?.maxCompletionTokens ?? null;
     const batchMode: BatchMode = { mode: outputMode(supported), supported };
+    const startMode = batchMode.mode;
     // Refused before anything was sent (no key, locked, free-only, budget, Cancel): the grid, its corrections and
     // the statuses stay exactly as they were.
     const runHandle = await ctx.beginRun(
@@ -818,14 +993,20 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           plan.map((unit) => unit.refs[0]!.fileName),
           { retry: keys !== undefined },
         ),
-        ...(keys && model ? { estimateUsd: await estimateFor(plan, model) } : {}),
+        // What this press extracts, as it was when pressed (a retry books only its own documents).
+        estimateUsd: model ? await estimateFor(plan, model, began) : null,
+        prompt: began.instructions,
+        settings: began.settings,
       },
       signal,
     );
+    if (!keys) pressed = plan.map((unit) => unit.key);
 
     // The run is on: only now replace (or reset) what it extracts.
     if (!keys) {
-      gridFields = builder.fields();
+      gridFields = began.fields;
+      failures.clear();
+      unsaved = false;
       units = new Map(plan.map((unit) => [unit.key, unit]));
       results = plan.map((unit, index) => ({
         key: unit.key,
@@ -839,6 +1020,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
         issues: {},
         edited: [],
         error: null,
+        failure: null,
       }));
       grid.render(results);
     }
@@ -849,6 +1031,8 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     for (const doc of batch) {
       doc.status = 'queued';
       doc.error = null;
+      doc.failure = null;
+      failures.delete(doc.key);
       grid.update(doc);
     }
     reading = true;
@@ -859,27 +1043,37 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     try {
       const outcome = await runItems({
         items: plan,
-        concurrency: Number(concurrency.value) || 3,
+        concurrency: began.concurrency,
         signal: runHandle.signal,
         work: async (unit) => {
           const doc = docOf(unit);
-          if (doc) await extractOne(runHandle, unit, doc, batchMode);
+          if (doc) await extractOne(runHandle, unit, doc, batchMode, began, maxCompletionTokens);
         },
-        onItem: ({ item, status, error }) => {
+        onItem: ({ item, status, error, failure }) => {
           const doc = docOf(item);
           if (!doc) return;
           doc.status = status;
-          if (status === 'failed') doc.error = userMessage(error);
+          if (status === 'failed') {
+            doc.error = failure?.text ?? userMessage(error);
+            doc.failure = failure ?? null;
+            failures.set(doc.key, error);
+          }
           grid.update(doc);
           renderSummary();
           if (status === 'running' || status === 'queued') return;
-          ui.status(
+          // A counter, not a status per document: hundreds of them would flood a screen reader.
+          ui.progress(
             `Extracted ${results.filter((entry) => entry.status === 'done').length} of ${plural(results.length, 'document')}`,
           );
           void runHandle.checkpoint({ output: json }).catch(() => undefined);
         },
       });
-      ui.status(batchSummary(outcome, 'document'));
+      // Strict outputs can be refused mid-batch (no provider serves them): say that the rest came in JSON mode.
+      ui.status(
+        batchMode.mode === startMode
+          ? batchSummary(outcome, 'document')
+          : `${batchSummary(outcome, 'document')} · Strict answers were not available for this model, so JSON mode was used.`,
+      );
       await runHandle.finish({
         output: json(),
         meta: {
@@ -898,24 +1092,24 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
     }
   };
 
-  const runner = ui.runner<string[]>({ label: 'Extract', icon: 'braces', run });
+  // A replay after an error covers only the documents without a result, so a fatal error part-way never pays
+  // twice; a press the run refused (nothing began) is replayed as the whole press.
+  const isDone = (key: string): boolean =>
+    results.some((doc) => doc.key === key && doc.status === 'done');
+  const unfinished = pendingOnly<string>(isDone, () => pressed ?? []);
+  const runner = ui.runner<string[]>({
+    label: 'Extract',
+    icon: 'braces',
+    run,
+    replayArg: (arg) => (arg === undefined && pressed === null ? undefined : unfinished(arg)),
+  });
   // Retry buttons follow Run (busy, disabled by this tool or the framework).
   const gate = retryGate(runner);
   gate.bind(retryFailed);
   renderSchemaBar();
   renderSummary();
 
-  const getState = (): ToolSnapshot => ({
-    prompt: prompt.value,
-    settings: {
-      schema: source,
-      fields: builder.fields(),
-      perPage: perPage.checked,
-      textHint: textHint.checked,
-      maxSide: Number(size.value),
-      concurrency: Number(concurrency.value),
-    },
-  });
+  const getState = (): ToolSnapshot => ({ prompt: prompt.value, settings: formSettings() });
 
   return {
     getState,
@@ -924,7 +1118,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       const fields = readFields(settings['fields']);
       if (fields) {
         builder.setFields(fields);
-        source = typeof settings['schema'] === 'string' ? settings['schema'] : 'custom';
+        source = knownSource(settings['schema']);
         dirty = false;
       }
       if (typeof settings['perPage'] === 'boolean') perPage.checked = settings['perPage'];
@@ -937,7 +1131,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
       renderSchemaBar();
       void ui.refreshEstimate();
     },
-    estimate: (model) => estimateFor(planUnits(), model),
+    estimate: (model) => estimateFor(planUnits(perPage.checked), model, readForm(false)),
     onFiles: (files) => void docs.add(files),
     onReceive: (items) => {
       const files = items.flatMap((item) =>

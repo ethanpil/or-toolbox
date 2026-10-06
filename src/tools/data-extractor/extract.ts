@@ -2,8 +2,9 @@
  * One extraction request: the prompt, the page images, the structured-output mode the model supports, parsing
  * the answer and the one repair request when it was not usable JSON.
  */
-import type { ChatRequest, ContentPart } from '../../core/api/types';
+import type { ChatRequest, ChatResponse, ContentPart } from '../../core/api/types';
 import { ApiError } from '../../core/errors';
+import { outputCap } from '../../core/tokens';
 import { isRecord } from '../../core/util';
 import {
   extractJson,
@@ -91,6 +92,8 @@ export function buildRequest(
      * no endpoint at all: only supported ones are sent. Unknown (omitted): all are sent.
      */
     supported?: readonly string[];
+    /** The model's own output cap (`ModelInfo.maxCompletionTokens`): `max_tokens` never exceeds it. */
+    maxCompletionTokens?: number | null;
   },
 ): ChatRequest {
   const content: ContentPart[] = [
@@ -121,7 +124,9 @@ export function buildRequest(
   const supports = (parameter: string): boolean =>
     !settings.supported || settings.supported.includes(parameter);
   if (supports('temperature')) body.temperature = 0;
-  if (supports('max_tokens')) body.max_tokens = MAX_ANSWER_TOKENS;
+  if (supports('max_tokens')) {
+    body.max_tokens = Math.min(MAX_ANSWER_TOKENS, outputCap(settings.maxCompletionTokens));
+  }
   if (settings.mode === 'schema') {
     body.response_format = {
       type: 'json_schema',
@@ -151,6 +156,23 @@ export function isUnsupportedStrict(error: unknown): boolean {
 /** The mode after strict outputs were refused: JSON mode when the model takes `response_format`, else the prompt. */
 export function fallbackMode(supportedParameters: readonly string[]): OutputMode {
   return supportedParameters.includes('response_format') ? 'json' : 'prompt';
+}
+
+/**
+ * Why a non-streamed answer holds no usable data: the model's own refusal (`message.refusal`), or a reply that ended
+ * with `finish_reason` `content_filter` or `error` before any content. Null for a normal answer. A refusal is not
+ * parsed and never repaired (another request would only pay for the same refusal).
+ */
+export function responseRefusal(response: ChatResponse): string | null {
+  const choice = response.choices[0];
+  const refusal = choice?.message['refusal'];
+  if (typeof refusal === 'string' && refusal.trim()) return refusal.trim();
+  if ((choice?.message.content ?? '').trim()) return null;
+  if (choice?.finish_reason === 'content_filter') {
+    return 'The provider’s content filter blocked this reply.';
+  }
+  if (choice?.finish_reason === 'error') return 'The model stopped with an error before answering.';
+  return null;
 }
 
 /** The follow-up request after an answer that was not usable JSON: same conversation, plus what went wrong. */
@@ -190,14 +212,33 @@ export function parseAnswer(fields: readonly FieldDef[], text: string): Parsed {
   return { ok: true, result: normalizeRecord(fields, data) };
 }
 
-/** Rough tokens for one document: images, the schema prompt, and an answer that grows with tables. */
+/**
+ * Input tokens of one page image whose longest side is `maxSide` px, for an A4-shaped page: its pixels / 750,
+ * deliberately on the high side (most models downscale). The same rule as OCR's `imageTokens`.
+ */
+export function imageTokens(maxSide: number): number {
+  return Math.ceil((maxSide * Math.round(maxSide / Math.SQRT2)) / 750);
+}
+
+/** A PDF text layer sent as a hint, at most `TEXT_HINT_CHARS` (about four characters per token). */
+const TEXT_HINT_TOKENS = Math.ceil(TEXT_HINT_CHARS / 4);
+
+/**
+ * Rough tokens for one document: its page images at `maxSide`, the text of the `hintPages` PDF pages sent along, the
+ * schema prompt, and an answer that grows with tables.
+ */
 export function estimateDocumentTokens(
   fields: readonly FieldDef[],
   pages: number,
+  options: { maxSide?: number; hintPages?: number } = {},
 ): { promptTokens: number; completionTokens: number } {
   const tables = fields.filter((field) => field.type === 'table').length;
   return {
-    promptTokens: pages * 1600 + 600 + fields.length * 40,
+    promptTokens:
+      pages * imageTokens(options.maxSide ?? 1600) +
+      (options.hintPages ?? 0) * TEXT_HINT_TOKENS +
+      600 +
+      fields.length * 40,
     completionTokens: 300 + fields.length * 30 + tables * 600 * pages,
   };
 }

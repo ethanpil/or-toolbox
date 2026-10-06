@@ -31,6 +31,21 @@ const button = (label: string): HTMLButtonElement =>
   document.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`)!;
 
 describe('schema builder', () => {
+  it('refuses a name the response parser would drop, and keeps the old one', () => {
+    const builder = mount();
+    const input = document.querySelector<HTMLInputElement>('[aria-label="Name of field 1"]')!;
+    input.value = 'Constructor';
+    input.dispatchEvent(new Event('change'));
+    expect(builder.fields()[0]?.name).toBe('first');
+    expect(input.classList.contains('is-invalid')).toBe(true);
+    expect(input.parentElement?.querySelector('.invalid-feedback')?.textContent).toMatch(
+      /cannot be a name/,
+    );
+    input.value = 'Constructor name';
+    input.dispatchEvent(new Event('change'));
+    expect(builder.fields()[0]?.name).toBe('constructor_name');
+  });
+
   it('keeps focus on the moved field when its move button becomes disabled', () => {
     const builder = mount();
     button('Move field second up').focus();
