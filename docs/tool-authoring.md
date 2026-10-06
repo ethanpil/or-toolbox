@@ -100,7 +100,7 @@ try {
 
 - **Stop** (an `AbortError`, or Cancel in the budget confirmation, `RunCancelledError`) is not an error: nothing is shown but a neutral "Stopped" status; partial output stays.
 - An error the output panel already showed inline (`output.fail(error)` marks it) is not shown again.
-- Errors that need an action (no key → Connect / paste a key, locked → unlock, free-only, budget blocked, storage full) always go to `presentError`, which opens the right dialog and retries.
+- Errors that need an action (no key → Connect / paste a key, locked → unlock, free-only, budget blocked, storage full, storage blocked by the browser) always go to `presentError`, which opens the right dialog and retries.
 - Anything else is shown once: inline by the output panel, or by `presentError` (a toast with Retry) when there is no panel.
 - **Unknown outcome:** a paid request that may have gone through (`isOutcomeUnknown(error)`: connection lost after sending, 408, or a 5xx other than 503) never gets a plain Retry. Give the runner a `safeAction` (e.g. `{ label: 'Check status', onClick }`); without one the toast links to OpenRouter's activity page. Set `retryUnknownOutcome` only when sending again cannot pay twice.
 
