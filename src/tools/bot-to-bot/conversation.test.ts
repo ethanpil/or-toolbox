@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
+  closeRun,
   type Conversation,
   CONVERSATION_VERSION,
+  countSpend,
   createConversation,
   dropFailedEmpty,
   editEntry,
   endedBy,
   type Entry,
   nextSpeaker,
+  openRun,
   parseConversation,
+  settleOpenRun,
   turnCount,
   undoEdit,
 } from './conversation';
@@ -198,5 +202,54 @@ describe('stored markers', () => {
     const parsed = parseConversation(JSON.parse(JSON.stringify(conversation)));
     expect(parsed).toEqual(conversation);
     expect(parsed?.entries[1]?.outcomeUnknown).toBe(true);
+  });
+});
+
+describe('runs a reload cut off', () => {
+  const fresh = (): Conversation => createConversation({ opener: 'Hi', first: 'a', bots: BOTS });
+
+  it('counts a turn on its run, and a run that ended in the page leaves nothing to settle', () => {
+    const conversation = fresh();
+    openRun(conversation, 'r1');
+    countSpend(conversation, 'r1', 0.01);
+    expect(conversation.spentUsd).toBe(0.01);
+    expect(conversation.openRuns).toEqual([{ id: 'r1', countedUsd: 0.01 }]);
+    closeRun(conversation, 'r1');
+    expect(conversation.openRuns).toBeUndefined();
+  });
+
+  it('settles against the ledger: adds only what was not counted, never lowers the total', () => {
+    const conversation = fresh();
+    openRun(conversation, 'r1');
+    countSpend(conversation, 'r1', 0.01);
+    expect(settleOpenRun(conversation, 'r1', { usd: 0.05, approx: true })).toBe(true);
+    expect(conversation.spentUsd).toBeCloseTo(0.05, 10);
+    expect(conversation.spentApprox).toBe(true);
+    expect(conversation.openRuns).toBeUndefined();
+    // Already settled: a second call changes nothing.
+    expect(settleOpenRun(conversation, 'r1', { usd: 0.05, approx: true })).toBe(false);
+
+    const lower = fresh();
+    openRun(lower, 'r2');
+    countSpend(lower, 'r2', 0.04);
+    settleOpenRun(lower, 'r2', { usd: 0.01, approx: false });
+    expect(lower.spentUsd).toBe(0.04);
+    expect(lower.spentApprox).toBe(false);
+  });
+
+  it('marks the total approximate when the run record is gone', () => {
+    const conversation = fresh();
+    openRun(conversation, 'r1');
+    settleOpenRun(conversation, 'r1', null);
+    expect(conversation.spentApprox).toBe(true);
+  });
+
+  it('survives storage and drops what is malformed', () => {
+    const conversation = fresh();
+    openRun(conversation, 'r1');
+    const raw = JSON.parse(JSON.stringify(conversation)) as Record<string, unknown>;
+    expect(parseConversation(raw)?.openRuns).toEqual([{ id: 'r1', countedUsd: 0 }]);
+    raw['openRuns'] = [{ id: 'r1' }, { id: 'r1' }, { id: 5 }, 'x', { countedUsd: 1 }];
+    expect(parseConversation(raw)?.openRuns).toEqual([{ id: 'r1', countedUsd: 0 }]);
   });
 });

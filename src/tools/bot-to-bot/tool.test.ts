@@ -586,6 +586,111 @@ describe('persistence', () => {
     await done;
   });
 
+  describe('a turn cut off by a reload', () => {
+    /** What a reload leaves: the stored conversation (one turn counted, one cut off) and the run's record. */
+    async function leftByReload(status: RunRecord['status']): Promise<void> {
+      const conversation = createConversation({
+        opener: 'Hi',
+        first: 'a',
+        bots: {
+          a: { name: 'Bot A', model: 'a/cheap', persona: '' },
+          b: { name: 'Bot B', model: 'a/cheap', persona: '' },
+        },
+      });
+      const turn = (id: string, speaker: 'a' | 'b', content: string, status: string) => ({
+        id,
+        kind: 'bot' as const,
+        speaker,
+        name: speaker === 'a' ? 'Bot A' : 'Bot B',
+        model: 'a/cheap',
+        content,
+        status: status as 'done',
+        createdAt: 1,
+      });
+      conversation.entries.push(
+        {
+          ...turn('t1', 'a', 'Hello', 'done'),
+          usage: {
+            promptTokens: 1,
+            completionTokens: 1,
+            costUsd: 0.0004,
+            costEstimated: false,
+            costUnknown: false,
+            latencyMs: 1,
+          },
+        },
+        turn('t2', 'b', 'Half a th', 'streaming'),
+      );
+      conversation.spentUsd = 0.0004;
+      conversation.openRuns = [{ id: 'r1', countedUsd: 0.0004 }];
+      const db = await getDb();
+      await db.put('kv', {
+        key: 'tool:bot-to-bot:conversation',
+        value: JSON.parse(JSON.stringify(conversation)) as unknown,
+        updatedAt: 1,
+      });
+      await db.put('runs', {
+        id: 'r1',
+        tool: 'bot-to-bot',
+        status,
+        model: 'a/cheap',
+        models: ['a/cheap'],
+        keyId: 'k1',
+        keyName: 'Work',
+        startedAt: 1,
+        finishedAt: status === 'running' ? null : 2,
+        latencyMs: null,
+        title: 'Hi',
+        prompt: 'Hi',
+        settings: null,
+        output: null,
+        error: null,
+        // Two requests went out; the second never reported (the page was gone): its cost is unknown, so the
+        // ledger books the reservation.
+        usage: {
+          requests: 2,
+          promptTokens: 1,
+          completionTokens: 1,
+          costUsd: 0.0004,
+          latencyMsTotal: 1,
+          costEstimated: false,
+          costUnknown: status !== 'running',
+          byModel: {},
+        },
+        reservedUsd: 0.003,
+        jobId: null,
+        inFlight: 1,
+        meta: {},
+        starred: false,
+        groupId: conversation.id,
+      });
+    }
+
+    it('adds the run’s booked cost to the conversation when the run is already final', async () => {
+      await leftByReload('aborted');
+      await mount();
+      await vi.waitFor(() => expect($('bots-cost').textContent).toBe('≈ $0.003 / $0.25'));
+      await t!.settle();
+      expect((await stored())?.spentUsd).toBeCloseTo(0.003, 10);
+      expect((await stored())?.spentApprox).toBe(true);
+    });
+
+    it('waits for the page-start sweep to finalize the run, then adds it once', async () => {
+      await leftByReload('running');
+      await mount();
+      expect($('bots-cost').textContent).toBe('$0.0004 / $0.25');
+      await t!.core.runs.sweep();
+      await vi.waitFor(() => expect($('bots-cost').textContent).toBe('≈ $0.003 / $0.25'));
+      await t!.settle();
+      // Settled for good: another load adds nothing.
+      await t!.cleanup();
+      document.body.replaceChildren();
+      await mount();
+      await t!.settle();
+      expect($('bots-cost').textContent).toBe('≈ $0.003 / $0.25');
+    });
+  });
+
   it('follows a conversation another tab stored', async () => {
     await mount();
     const conversation = createConversation({
