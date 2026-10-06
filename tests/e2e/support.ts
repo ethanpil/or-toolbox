@@ -34,21 +34,26 @@ export interface WatchOptions {
   /**
    * URL paths (exact, e.g. `'/api/v1/chat/completions'`) of requests the app aborts on purpose: Stop cancels the
    * requests in flight, and the API client cancels a stream once it has read `data: [DONE]`, which Chromium can
-   * report before it has seen the end of the body. Their `net::ERR_ABORTED` is not a problem; any other failure
-   * of them still is.
+   * report before it has seen the end of the body. Their abort is not a problem; any other failure of them still
+   * is.
    */
   allowAborted?: readonly string[];
 }
+
+/** How each engine reports a request the page aborted: Chromium, Firefox, WebKit. */
+const ABORTED = new Set(['net::ERR_ABORTED', 'NS_BINDING_ABORTED', 'Load request cancelled']);
 
 /**
  * Collects everything that should never happen on a healthy page: console
  * errors, uncaught exceptions, failed responses and CSP violations. Call
  * before the first `page.goto()`, then assert the returned list is empty.
  *
- * Always ignored: `net::ERR_ABORTED` on an `<audio>`/`<video>` read of a
+ * Always ignored: an abort (`ABORTED`) of an `<audio>`/`<video>` read of a
  * `blob:` URL (the element cancels range reads it no longer needs: after the
- * metadata, on a seek). Aborts the app causes itself are opt-in per test
- * through `allowAborted`.
+ * metadata, on a seek), and of a font (only the browser loads fonts; WebKit
+ * cancels the icon font's preload when a page redirects at once, as the OAuth
+ * callback does). Aborts the app causes itself are opt-in per test through
+ * `allowAborted`.
  *
  * ```ts
  * const problems = await watchForProblems(page, { allowAborted: ['/api/v1/chat/completions'] });
@@ -62,9 +67,10 @@ export async function watchForProblems(
 ): Promise<string[]> {
   const problems: string[] = [];
   const expectedAbort = (request: Request): boolean =>
-    request.url().startsWith('blob:')
+    request.resourceType() === 'font' ||
+    (request.url().startsWith('blob:')
       ? request.resourceType() === 'media'
-      : allowAborted.includes(new URL(request.url()).pathname);
+      : allowAborted.includes(new URL(request.url()).pathname));
 
   page.on('console', (message) => {
     if (message.type() === 'error') problems.push(`console.error: ${message.text()}`);
@@ -77,7 +83,7 @@ export async function watchForProblems(
   });
   page.on('requestfailed', (request) => {
     const errorText = request.failure()?.errorText ?? 'unknown';
-    if (errorText === 'net::ERR_ABORTED' && expectedAbort(request)) return;
+    if (ABORTED.has(errorText) && expectedAbort(request)) return;
     problems.push(`request failed: ${request.url()} (${errorText})`);
   });
 
@@ -152,9 +158,14 @@ export async function runFfmpegSmokeTest(
 
 /** Runs axe (WCAG 2.2 A/AA) and fails on serious or critical violations. */
 export async function expectNoSeriousA11yViolations(page: Page): Promise<void> {
-  // A toast fading in is half transparent, and axe would measure its text at that contrast.
+  // A toast fading in is half transparent, and axe would measure its text at that contrast. Bootstrap drops
+  // `showing` when the fade starts, not when it ends, so wait for every toast on screen to be fully opaque.
   await page.waitForFunction(
-    () => document.querySelector('.toast.showing, .toast.hiding') === null,
+    () =>
+      document.querySelector('.toast.showing, .toast.hiding') === null &&
+      [...document.querySelectorAll('.toast.show')].every(
+        (toast) => getComputedStyle(toast).opacity === '1',
+      ),
   );
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
