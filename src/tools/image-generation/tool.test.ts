@@ -5,11 +5,13 @@ import { ApiError, KeyLockedError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient } from '../../core/types';
 import type * as Media from '../../core/media/image';
+import type * as Dialogs from '../../ui/feedback/dialogs';
 import type * as Errors from '../../ui/feedback/errors';
+import type * as Client from '../../core/api/client';
 import { presentError, wasPresented } from '../../ui/feedback/errors';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
-import { stemFrom, setup } from './tool';
+import { setup } from './tool';
 
 // jsdom cannot decode: sizes come from a stand-in header read, references from a stand-in encoder.
 vi.mock('../../core/media/image', async (importOriginal) => ({
@@ -23,6 +25,21 @@ vi.mock('../../core/media/image', async (importOriginal) => ({
 vi.mock('../../ui/feedback/errors', async (importOriginal) => ({
   ...(await importOriginal<typeof Errors>()),
   presentError: vi.fn(() => Promise.resolve()),
+}));
+
+// A Stop attaches the completed images to the abort; the real attachment is private to the client.
+const partials = vi.hoisted(() => new WeakMap<object, unknown>());
+vi.mock('../../core/api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof Client>()),
+  partialImageResult: (error: unknown) =>
+    typeof error === 'object' && error !== null ? (partials.get(error) ?? null) : null,
+}));
+const dialogs = vi.hoisted(() => ({
+  confirm: vi.fn<(options: unknown) => Promise<boolean>>(() => Promise.resolve(true)),
+}));
+vi.mock('../../ui/feedback/dialogs', async (importOriginal) => ({
+  ...(await importOriginal<typeof Dialogs>()),
+  confirmDialog: dialogs.confirm,
 }));
 
 const KLEIN = 'black-forest-labs/flux.2-klein-4b';
@@ -118,6 +135,8 @@ beforeEach(async () => {
   isolateChannels();
   await resetDb();
   localStorage.clear();
+  dialogs.confirm.mockReset();
+  dialogs.confirm.mockImplementation(() => Promise.resolve(true));
 });
 afterEach(async () => {
   await t.cleanup();
@@ -454,8 +473,73 @@ describe('Image generation', () => {
     expect(t.zones.output.querySelectorAll('[data-testid="imagegen-result"]')).toHaveLength(2);
   });
 
-  it('names files after the prompt', () => {
-    expect(stemFrom('A lighthouse, on a ROCKY coast at dusk!')).toBe('a-lighthouse-on-a-rocky');
-    expect(stemFrom('   ')).toBe('image');
+  it('M1: a request that may have been billed says so and asks before it is sent again', async () => {
+    let fail = true;
+    const images: ApiClient['images'] = (body) => {
+      calls.push(body);
+      if (fail) {
+        fail = false;
+        return Promise.reject(
+          Object.assign(new ApiError('Provider returned an error', 502), { outcomeUnknown: true }),
+        );
+      }
+      return Promise.resolve({
+        created: 0,
+        images: [{ blob: png(), mediaType: 'image/png' }],
+        usage: { cost: 0.014 },
+        generationId: null,
+      });
+    };
+    await mount({ images });
+    $<HTMLTextAreaElement>('tool-prompt').value = 'A fox';
+    $<HTMLTextAreaElement>('tool-prompt').dispatchEvent(new Event('input'));
+    await t.runners[0]!.trigger();
+    expect($('imagegen-error').textContent).toContain('check your OpenRouter activity');
+    expect($('imagegen-error-activity')).not.toBeNull();
+
+    dialogs.confirm.mockImplementation(() => Promise.resolve(false));
+    $<HTMLButtonElement>('imagegen-retry').click();
+    await vi.waitFor(() => expect(dialogs.confirm).toHaveBeenCalledTimes(1));
+    expect(dialogs.confirm.mock.calls[0]![0]).toMatchObject({ title: 'Retry anyway?' });
+    expect(calls).toHaveLength(1);
+
+    dialogs.confirm.mockImplementation(() => Promise.resolve(true));
+    $<HTMLButtonElement>('imagegen-retry').click();
+    await vi.waitFor(() =>
+      expect(t.zones.output.querySelector('[data-testid="imagegen-result"]')).not.toBeNull(),
+    );
+    expect(calls).toHaveLength(2);
+  });
+
+  it('A10: Stop keeps the images that were already made, and a stopped card holds the rest', async () => {
+    const images: ApiClient['images'] = (body, options) => {
+      calls.push(body);
+      return new Promise((_, reject) => {
+        options.signal!.addEventListener('abort', () => {
+          const stopped = new DOMException('Stopped by the user.', 'AbortError');
+          partials.set(stopped, {
+            created: 0,
+            images: [png(), png()].map((blob) => ({ blob, mediaType: 'image/png' })),
+            usage: { cost: 0.02 },
+            generationId: null,
+          });
+          reject(stopped);
+        });
+      });
+    };
+    const tool = await mount({ images }, MULTI);
+    tool.applyState({ prompt: 'A fox', settings: { count: 3 } });
+    const running = t.runners[0]!.trigger();
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    t.runners[0]!.stop();
+    await running;
+    expect(calls[0]?.n).toBe(3);
+    // Paid for: both are in the gallery, as results that hold the page until downloaded.
+    expect(t.zones.output.querySelectorAll('[data-testid="imagegen-result"]')).toHaveLength(2);
+    expect(t.core.results.pending()).toHaveLength(2);
+    const stopped = t.zones.output.querySelector('[data-testid="imagegen-failed"]')!;
+    expect(stopped.querySelector('h4')?.textContent).toBe('Image 3');
+    expect(stopped.textContent).toContain('Stopped before it was ready.');
+    expect(t.status()).toBe('Stopped');
   });
 });

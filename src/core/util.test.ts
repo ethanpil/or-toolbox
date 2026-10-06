@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeLockManager } from './testing/state-fakes';
-import { debounce, holdLock, lockRunner } from './util';
+import { createTicker, debounce, holdLock, lockRunner } from './util';
 
 const setLocks = (value: FakeLockManager | undefined): void => {
   Object.defineProperty(navigator, 'locks', { value, configurable: true });
@@ -106,5 +106,27 @@ describe('debounce', () => {
     debounced();
     vi.advanceTimersByTime(10);
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('createTicker', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('ticks with the whole seconds since the start, and a new start replaces the old', () => {
+    const ticker = createTicker();
+    const first = vi.fn();
+    const second = vi.fn();
+    ticker.start(first);
+    vi.advanceTimersByTime(2000);
+    expect(first.mock.calls).toEqual([[1], [2]]);
+    ticker.start(second, Date.now() - 10_000);
+    vi.advanceTimersByTime(1000);
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledWith(11);
+    ticker.stop();
+    ticker.stop();
+    vi.advanceTimersByTime(5000);
+    expect(second).toHaveBeenCalledTimes(1);
   });
 });

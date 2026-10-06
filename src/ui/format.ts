@@ -298,3 +298,27 @@ export function formatShortcut(key: string): string {
 export function plural(count: number, one: string, many = `${one}s`): string {
   return `${count} ${count === 1 ? one : many}`;
 }
+
+/** `text` cut to at most `max` characters, ending in an ellipsis when it was cut. */
+export function shorten(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** A short file stem from some text (a prompt): its first five words, `lighthouse-on-a-rocky-coast`. */
+export function stemFrom(text: string, fallback: string): string {
+  const words = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 5);
+  return words.join('-').slice(0, 48) || fallback;
+}
+
+/** A time for a file name, in the reader's own time zone like every date on screen: `2026-10-03-153045`. */
+export function fileStamp(time: number): string {
+  const date = new Date(time);
+  const two = (n: number): string => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())}-${two(date.getHours())}${two(date.getMinutes())}${two(date.getSeconds())}`;
+}

@@ -8,7 +8,9 @@
  * Send to…, Remove) and download one by one or as a ZIP. The tool is promptless: the instruction is fixed, and
  * Prompts saves settings presets.
  */
-import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
+import { partialImageResult } from '../../core/api/client';
+import type { GeneratedImage } from '../../core/api/types';
+import { InvalidInputError, isAbortError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import { zipFiles } from '../../core/export/zip';
 import { downloadBlob } from '../../core/files';
 import { type Box, fitWithin, readImageSize } from '../../core/media/image';
@@ -18,6 +20,7 @@ import { abortError, debounce, utcDay } from '../../core/util';
 import { compareSlider, type CompareSlider } from '../../ui/components/compare-slider';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
+import { failureLine } from '../../ui/components/failure-line';
 import { type ImageResultCard, imageResultCard } from '../../ui/components/image-result-card';
 import { modelPicker } from '../../ui/components/model-picker';
 import { progressBar } from '../../ui/components/progress-bar';
@@ -26,7 +29,7 @@ import { switchField } from '../../ui/components/switch-field';
 import { focusedKey, focusKey, h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
 import { confirmDialog } from '../../ui/feedback/dialogs';
-import { isStop, presentError } from '../../ui/feedback/errors';
+import { type FailureText, isStop, presentError } from '../../ui/feedback/errors';
 import { formatBytes, formatEstimate, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
@@ -99,7 +102,14 @@ interface Photo {
   /** Pixel size from the file's header (no decoding), once read: the estimate's answer size. */
   dims: { width: number; height: number } | null;
   phase: Phase;
+  /** What went wrong, as one line (also what History and the status line say). */
   error: string | null;
+  /** The request's failure, worded for the card (a request that may have been billed says so). */
+  failure: FailureText | null;
+  /** The error behind `failure`: Retry asks first when the request may have been billed. */
+  cause: unknown;
+  /** The post-processing failed after the model's answer (kept, paid for): it can be redone without a request. */
+  processFailed: boolean;
   /** The model's answer (paid for), kept so the post-processing can run again without a request. */
   edited: Blob | null;
   model: string | null;
@@ -184,6 +194,11 @@ export function setup(ctx: ToolContext): ToolInstance {
   const inRun = (photo: Photo): boolean =>
     photo.phase === 'queued' || photo.phase === 'editing' || photo.phase === 'processing';
   const pending = (): Photo[] => photos.filter((photo) => !photo.result && !inRun(photo));
+  /** A paid answer is kept but its post-processing failed: only a free redo is left to do. */
+  const keptAnswer = (photo: Photo): boolean =>
+    photo.edited !== null && photo.processFailed && !photo.result && !inRun(photo);
+  /** The photos a plain Isolate sends: without a result and without a paid answer already in hand. */
+  const toSend = (): Photo[] => pending().filter((photo) => !keptAnswer(photo));
   const withResults = (): Photo[] => photos.filter((photo) => photo.result);
 
   // --- settings drawer ------------------------------------------------------------------------------------
@@ -448,7 +463,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   let estimateVersion = 0;
   const renderCount = (): void => {
     const total = photos.length;
-    const todo = pending().length;
+    const todo = toSend().length;
     const parts = [total === 0 ? 'No photos yet' : plural(total, 'photo')];
     if (total > 0 && todo !== total) parts.push(`${todo} to isolate`);
     if (todo > 0 && lastEstimate !== undefined) parts.push(formatEstimate(lastEstimate));
@@ -544,6 +559,9 @@ export function setup(ctx: ToolContext): ToolInstance {
       dims: null,
       phase: 'idle',
       error: null,
+      failure: null,
+      cause: null,
+      processFailed: false,
       edited: null,
       model: null,
       editRun: null,
@@ -642,11 +660,11 @@ export function setup(ctx: ToolContext): ToolInstance {
       hidden: true,
       'data-focus-key': 'retry-failed',
       'data-testid': 'iso-retry-failed',
-      onclick: () =>
-        retry(photos.filter((photo) => !photo.result && !inRun(photo) && photo.phase !== 'idle')),
+      onclick: () => retryRest(),
     },
     icon('arrow-clockwise'),
-    'Retry failed',
+    // Failed and stopped photos alike: the summary counts them together as "not isolated".
+    'Retry not isolated',
   );
   const zipButton = h(
     'button',
@@ -712,7 +730,8 @@ export function setup(ctx: ToolContext): ToolInstance {
         {
           type: 'button',
           class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
-          'aria-label': `Retry ${photo.name}`,
+          // The accessible name starts with the visible text.
+          'aria-label': `${photo.result ? 'Edit again' : 'Retry'}: ${photo.name}`,
           'data-focus-key': `retry:${photo.key}`,
           'data-testid': 'iso-retry',
           onclick: () => retry([photo]),
@@ -779,14 +798,39 @@ export function setup(ctx: ToolContext): ToolInstance {
         )
       : null;
 
-  const errorNote = (photo: Photo): HTMLElement | null =>
-    photo.error
-      ? h(
-          'div',
-          { class: 'small text-danger-emphasis', role: 'note', 'data-testid': 'iso-error' },
-          photo.error,
-        )
-      : null;
+  /** The photo's problem: the request's failure (with the activity link when it may have been billed), or text. */
+  const errorNote = (photo: Photo): HTMLElement | null => {
+    if (!photo.error) return null;
+    const line = photo.failure
+      ? failureLine(photo.failure, { testId: 'iso-error' })
+      : h('div', { class: 'small text-danger-emphasis', 'data-testid': 'iso-error' }, photo.error);
+    return h(
+      'div',
+      { class: 'vstack gap-1', role: 'note' },
+      line,
+      // The model's answer was paid for and is kept: finishing it again costs no request.
+      photo.processFailed && photo.edited
+        ? h(
+            'div',
+            null,
+            h(
+              'button',
+              {
+                type: 'button',
+                class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
+                'aria-label': `Finish again without a new request: ${photo.name}`,
+                'data-focus-key': `reprocess:${photo.key}`,
+                'data-testid': 'iso-reprocess',
+                disabled: inRun(photo),
+                onclick: () => reprocess(photo),
+              },
+              icon('arrow-repeat'),
+              'Finish again, no new request',
+            ),
+          )
+        : null,
+    );
+  };
 
   /** A result card's own part (thumbnail, badges, QA reasons), redrawn in place so focus stays put. */
   const paintExtra = (photo: Photo, result: Processed): void => {
@@ -848,7 +892,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     if (notDownloaded([photo]).length === 0) return true;
     const ok = await confirmDialog({
       title: 'Remove this photo?',
-      message: `The result for ${photo.name} has not been downloaded.`,
+      message: `The result for ${photo.name} has not been downloaded. Removing it removes the photo too.`,
       confirmLabel: 'Remove',
       tone: 'danger',
       testId: 'iso-remove-dialog',
@@ -888,7 +932,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         {
           label: 'Edit again',
           icon: 'arrow-clockwise',
-          ariaLabel: `Edit ${photo.name} again`,
+          ariaLabel: `Edit again: ${photo.name}`,
           onClick: () => retry([photo]),
           testId: 'iso-retry',
         },
@@ -1374,9 +1418,7 @@ export function setup(ctx: ToolContext): ToolInstance {
               qa.reasons.map((reason) => h('li', null, reason)),
             ),
         qa.note ? h('div', { class: 'small mt-1 text-body-secondary' }, qa.note) : null,
-        photo.error
-          ? h('div', { class: 'small mt-1 text-danger-emphasis', role: 'note' }, photo.error)
-          : null,
+        errorNote(photo),
       ),
     );
     paintControls(photo);
@@ -1448,9 +1490,11 @@ export function setup(ctx: ToolContext): ToolInstance {
       ...output,
     };
     photo.failedKey = null;
+    photo.processFailed = false;
     if (!inRun(photo)) {
       photo.phase = 'done';
       photo.error = null;
+      photo.failure = null;
       // A result made again (review or settings) whose verdict turned is said out loud.
       if (previous && previous.qa.pass !== qa.pass) {
         announce(
@@ -1520,6 +1564,8 @@ export function setup(ctx: ToolContext): ToolInstance {
           photo.job = null;
           if (!isAbortError(error)) {
             photo.failedKey = key;
+            photo.processFailed = true;
+            photo.failure = null;
             photo.error = `Could not finish the result: ${userMessage(error)}`;
           }
           refresh();
@@ -1599,6 +1645,17 @@ export function setup(ctx: ToolContext): ToolInstance {
     });
   };
 
+  /** The model's answer for a photo, kept (it is paid for) so its post-processing can run again for free. */
+  const keepAnswer = (run: RunHandle, photo: Photo, image: GeneratedImage): void => {
+    photo.edited = image.blob;
+    photo.model = run.model;
+    photo.editRun = run.id;
+    photo.margin = null;
+    photo.threshold = null;
+    photo.failedKey = null;
+    photo.processFailed = false;
+  };
+
   /** One photo: the edit request, then its post-processing. */
   const isolate = async (
     run: RunHandle,
@@ -1608,21 +1665,38 @@ export function setup(ctx: ToolContext): ToolInstance {
   ): Promise<void> => {
     const dataUrl = await referenceDataUrl(photo.file, request.sendSize);
     signal.throwIfAborted();
-    const answer = await ctx.api.images(
-      buildRequest(run.model, request.instruction, dataUrl, request.params),
-      { run, signal },
-    );
-    const image = answer.images[0];
+    let image: GeneratedImage | undefined;
+    try {
+      image = (
+        await ctx.api.images(
+          buildRequest(run.model, request.instruction, dataUrl, request.params),
+          {
+            run,
+            signal,
+          },
+        )
+      ).images[0];
+    } catch (error) {
+      // A Stop keeps an answer that was already made (paid for): the run's end finishes it, with no request.
+      const kept = partialImageResult(error)?.images[0];
+      if (kept) keepAnswer(run, photo, kept);
+      throw error;
+    }
     if (!image) throw new InvalidInputError('The model returned no image.');
-    photo.edited = image.blob;
-    photo.model = run.model;
-    photo.editRun = run.id;
-    photo.margin = null;
-    photo.threshold = null;
-    photo.failedKey = null;
+    keepAnswer(run, photo, image);
     photo.phase = 'processing';
     updateCard(photo);
-    await process(photo, signal);
+    try {
+      await process(photo, signal);
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      // The answer is paid for and kept: only the redo, which needs no request, is offered first.
+      photo.processFailed = true;
+      photo.failedKey = processingKey(settings, photo);
+      throw new InvalidInputError(`Could not finish the result: ${userMessage(error)}`, {
+        cause: error,
+      });
+    }
   };
 
   const historyText = (): string =>
@@ -1651,9 +1725,15 @@ export function setup(ctx: ToolContext): ToolInstance {
   const run = async (signal: AbortSignal, arg?: RunArg): Promise<void> => {
     let targets = arg
       ? photos.filter((photo) => arg.keys.includes(photo.key) && !inRun(photo))
-      : pending();
+      : toSend();
     if (targets.length === 0) {
       if (!arg) {
+        const kept = pending().filter(keptAnswer);
+        if (kept.length > 0) {
+          // Only paid answers are left: finishing them needs no request.
+          reprocess(...kept);
+          return;
+        }
         ui.status(
           photos.length === 0
             ? 'Add product photos first.'
@@ -1692,6 +1772,9 @@ export function setup(ctx: ToolContext): ToolInstance {
       photo.job = null;
       photo.phase = 'queued';
       photo.error = null;
+      photo.failure = null;
+      photo.cause = null;
+      photo.processFailed = false;
     }
     running = true;
     let finished = 0;
@@ -1712,12 +1795,14 @@ export function setup(ctx: ToolContext): ToolInstance {
         concurrency: settings.concurrency,
         signal: handle.signal,
         work: (photo, itemSignal) => isolate(handle, photo, request, itemSignal),
-        onItem: ({ item: photo, status, error }) => {
+        onItem: ({ item: photo, status, error, failure }) => {
           if (status === 'running') photo.phase = 'editing';
           else if (status === 'done') photo.phase = 'done';
           else if (status === 'failed') {
             photo.phase = 'failed';
-            photo.error = userMessage(error);
+            photo.error = failure?.text ?? userMessage(error);
+            photo.failure = failure ?? null;
+            photo.cause = error;
           } else photo.phase = status;
           if (status !== 'running' && status !== 'queued') finished += 1;
           updateCard(photo);
@@ -1755,7 +1840,7 @@ export function setup(ctx: ToolContext): ToolInstance {
    */
   const madeByLastRun = (key: string): boolean => {
     const photo = photoOf(key);
-    return !photo || (photo.result !== null && photo.editRun === lastRun);
+    return !photo || (photo.edited !== null && photo.editRun === lastRun);
   };
   const remaining = pendingOnly(madeByLastRun);
 
@@ -1775,7 +1860,44 @@ export function setup(ctx: ToolContext): ToolInstance {
   const retry = (list: readonly Photo[], model?: string): void => {
     if (list.length === 0) return;
     const keys = list.map((photo) => photo.key);
-    gate.retry(model ? { keys, model } : { keys }, 'Isolating cannot start now.');
+    // A photo whose request may have been billed asks before it is sent again (with another model: the user
+    // chose a new request knowing that).
+    const cause = model
+      ? undefined
+      : list.map((photo) => photo.cause).find((error) => isOutcomeUnknown(error));
+    void gate.retryFailed(cause, model ? { keys, model } : { keys }, 'Isolating cannot start now.');
+  };
+
+  /**
+   * Redoes the post-processing of photos whose paid answer is kept (their result failed): the answer is
+   * decoded again in the worker, with no request. A photo that failed the same way before is tried again.
+   */
+  const reprocess = (...list: Photo[]): void => {
+    const todo = list.filter((photo) => photo.edited !== null && !inRun(photo));
+    if (todo.length === 0) return;
+    for (const photo of todo) {
+      photo.failedKey = null;
+      photo.processFailed = false;
+      photo.error = null;
+      photo.failure = null;
+      updateCard(photo);
+      updatePhotoRow(photo);
+      if (detail?.key === photo.key) updateDetail();
+    }
+    ui.status(
+      `Finishing ${plural(todo.length, 'photo')} from the answers already paid for: no new request.`,
+    );
+    reconcile();
+  };
+
+  /** "Retry not isolated": photos with a paid answer kept are finished for free, the others are sent again. */
+  const retryRest = (): void => {
+    const rest = photos.filter((photo) => !photo.result && !inRun(photo) && photo.phase !== 'idle');
+    // Sorted before the redo clears the marks that tell them apart.
+    const kept = rest.filter(keptAnswer);
+    const unsent = rest.filter((photo) => !kept.includes(photo));
+    reprocess(...kept);
+    retry(unsent);
   };
 
   const retryWithModel = async (photo: Photo): Promise<void> => {
@@ -1834,7 +1956,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     },
     estimate: async (model) => {
       const version = ++estimateVersion;
-      const usd = await estimateFor(model, pending());
+      const usd = await estimateFor(model, toSend());
       if (version === estimateVersion) {
         lastEstimate = usd;
         renderCount();

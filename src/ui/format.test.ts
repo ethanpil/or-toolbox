@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { KeyStatus } from '../core/types';
 import {
   describeRunCost,
+  fileStamp,
   formatContext,
   formatCount,
   formatDate,
@@ -16,6 +17,8 @@ import {
   isoDateTime,
   keyBalance,
   plural,
+  shorten,
+  stemFrom,
   usageLine,
 } from './format';
 
@@ -322,5 +325,25 @@ describe('keyBalance', () => {
     expect(
       keyBalance(status({ limitUsd: 10, limitRemainingUsd: null, usageUsd: 4 })),
     ).toMatchObject({ remaining: '$6.00 left', remainingPercent: 60 });
+  });
+});
+
+describe('shorten, stemFrom, fileStamp', () => {
+  it('shorten cuts to the limit with an ellipsis, and leaves short text alone', () => {
+    expect(shorten('abcdef', 6)).toBe('abcdef');
+    expect(shorten('abcdefg', 6)).toBe('abcde…');
+  });
+
+  it('stemFrom takes the first five words, lowercased, with a fallback', () => {
+    expect(stemFrom('A lighthouse, on a ROCKY coast at dusk!', 'image')).toBe(
+      'a-lighthouse-on-a-rocky',
+    );
+    expect(stemFrom('   ', 'clip')).toBe('clip');
+    expect(stemFrom('x'.repeat(80), 'image')).toHaveLength(48);
+  });
+
+  it('fileStamp is local time, not UTC', () => {
+    const local = new Date(2026, 9, 3, 7, 5, 9).getTime();
+    expect(fileStamp(local)).toBe('2026-10-03-070509');
   });
 });

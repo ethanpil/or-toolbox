@@ -11,6 +11,7 @@ import type {
 import { withPartialResult } from '../../core/api/chat-stream';
 import { ApiError, NetworkError } from '../../core/errors';
 import type * as AudioModule from '../../core/media/audio';
+import type * as Dialogs from '../../ui/feedback/dialogs';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { CallOptions } from '../../core/types';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
@@ -45,6 +46,13 @@ vi.mock('../../core/media/audio', async (original) => {
       blob.size < 64 ? Promise.reject(new Error('unreadable')) : real.getAudioDuration(blob),
   };
 });
+const dialogs = vi.hoisted(() => ({
+  confirm: vi.fn<(options: unknown) => Promise<boolean>>(() => Promise.resolve(true)),
+}));
+vi.mock('../../ui/feedback/dialogs', async (importOriginal) => ({
+  ...(await importOriginal<typeof Dialogs>()),
+  confirmDialog: dialogs.confirm,
+}));
 const announced = vi.hoisted(() => [] as string[]);
 vi.mock('../../ui/feedback/announce', () => ({
   announce: (text: string) => announced.push(text),
@@ -123,6 +131,8 @@ beforeEach(async () => {
   localStorage.clear();
   trims.calls.length = 0;
   announced.length = 0;
+  dialogs.confirm.mockReset();
+  dialogs.confirm.mockImplementation(() => Promise.resolve(true));
   URL.createObjectURL = vi.fn(() => 'blob:x');
   URL.revokeObjectURL = vi.fn();
   // jsdom implements neither media playback nor canvas drawing (the waveform).
@@ -133,7 +143,13 @@ beforeEach(async () => {
 afterEach(async () => {
   await t?.cleanup();
   t = null;
+  vi.useRealTimers();
+  document.querySelectorAll('[data-testid="toasts"] > *').forEach((node) => node.remove());
 });
+
+/** What the API client throws for a paid request that may have gone through. */
+const unknownOutcome = (): ApiError =>
+  Object.assign(new ApiError('Provider returned error', 502), { outcomeUnknown: true });
 
 describe('Music generation tool', { timeout: 30_000 }, () => {
   it('round-trips the song form', async () => {
@@ -540,5 +556,113 @@ describe('Music generation tool', { timeout: 30_000 }, () => {
     audios[0]!.dispatchEvent(new Event('play'));
     expect(pause.mock.contexts).toEqual(expect.arrayContaining([audios[1], audios[2]]));
     expect(pause.mock.contexts).not.toContain(audios[0]);
+  });
+
+  it('M1: a song that may have been billed says so and asks before it is composed again', async () => {
+    let calls = 0;
+    const ok = answer();
+    const chatStream = vi.fn((body: ChatRequest, opts: StreamOptions) => {
+      calls += 1;
+      return calls === 2 ? Promise.reject(unknownOutcome()) : ok(body, opts);
+    });
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Two please', settings: { variations: 2 } });
+    await t.runners[0]!.trigger();
+    const failed = $$(t.zones.output, 'music-variation').find(
+      (card) => card.dataset['status'] === 'failed',
+    )!;
+    expect($(failed, 'music-failed')?.textContent).toContain('check your OpenRouter activity');
+    expect($(failed, 'music-failed-activity')).not.toBeNull();
+
+    dialogs.confirm.mockImplementation(() => Promise.resolve(false));
+    $(failed, 'music-retry')!.click();
+    await vi.waitFor(() => expect(dialogs.confirm).toHaveBeenCalledTimes(1));
+    expect(dialogs.confirm.mock.calls[0]![0]).toMatchObject({ title: 'Retry anyway?' });
+    expect(chatStream).toHaveBeenCalledTimes(2);
+
+    dialogs.confirm.mockImplementation(() => Promise.resolve(true));
+    $(failed, 'music-retry')!.click();
+    await vi.waitFor(() => expect(failed.dataset['status']).toBe('done'));
+    expect(chatStream).toHaveBeenCalledTimes(3);
+  });
+
+  it('M1: an answer without any audio was billed: it says so and offers no Retry', async () => {
+    const chatStream = vi.fn(() => Promise.resolve(lyriaResult({ audio: null, lyrics: '' })));
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Something odd', settings: {} });
+    await t.runners[0]!.trigger();
+    expect($(t.zones.output, 'music-failed')?.textContent).toContain('That answer was billed');
+    expect($(t.zones.output, 'music-retry')).toBeNull();
+    expect(chatStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('M2: the error toast’s Retry composes only the variations without an answer', async () => {
+    let calls = 0;
+    const ok = answer();
+    const chatStream = vi.fn((body: ChatRequest, opts: StreamOptions) => {
+      calls += 1;
+      // The second request hits a fatal error while the first and third go through.
+      return calls === 2
+        ? Promise.reject(new ApiError('Not enough credits', 402, {}))
+        : ok(body, opts);
+    });
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'Three please', settings: { variations: 3 } });
+    await t.runners[0]!.trigger();
+    expect(chatStream).toHaveBeenCalledTimes(3);
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-testid="toast-retry"]')).not.toBeNull(),
+    );
+    document.querySelector<HTMLButtonElement>('[data-testid="toast-retry"]')!.click();
+    await vi.waitFor(() => expect(chatStream).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    const statuses = $$(t.zones.output, 'music-variation').map((card) => card.dataset['status']);
+    expect(statuses).toEqual(['done', 'done', 'done']);
+    const [record] = await t.core.history.query({ tool: 'music-generation' });
+    expect(record).toMatchObject({ title: 'Retry: variation 2', prompt: '', status: 'ok' });
+  });
+
+  it('an empty form is not sent: Lyria would make something up and bill it', async () => {
+    const chatStream = vi.fn(answer());
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: {} });
+    await t.runners[0]!.trigger();
+    expect(chatStream).not.toHaveBeenCalled();
+    expect(t.status()).toBe('Describe the music first: add a description, a style or lyrics.');
+    expect(await t.core.history.query({ tool: 'music-generation' })).toHaveLength(0);
+    // Any one field is enough.
+    tool.applyState({ prompt: '', settings: { genre: 'Folk pop' } });
+    await t.runners[0]!.trigger();
+    expect(chatStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('warns where the length is chosen when the target is longer than the song Lyria makes', async () => {
+    t = musicContext();
+    const tool = await t.mount(setup);
+    const warning = () => $(t!.zones.input, 'music-length-warning')!;
+    tool.applyState({ prompt: 'x', settings: { targetSeconds: 20 } });
+    expect(warning().hidden).toBe(true);
+    // The default model is Clip: about 30 seconds.
+    tool.applyState({ prompt: 'x', settings: { targetSeconds: 120 } });
+    expect(warning().hidden).toBe(false);
+    expect(warning().textContent).toBe(
+      'A Clip makes about 30 seconds, so a target of 120 seconds probably cuts nothing.',
+    );
+    tool.applyState({ prompt: 'x', settings: { targetSeconds: null } });
+    expect(warning().hidden).toBe(true);
+  });
+
+  it('names the files by local time, the same clock as the heading above the cards', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date(2026, 9, 3, 23, 30, 5) });
+    const chatStream = vi.fn(answer());
+    t = musicContext(chatStream);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: 'A jingle', settings: {} });
+    await t.runners[0]!.trigger();
+    expect($(t.zones.output, 'music-result')?.textContent).toContain('music-2026-10-03-233005.mp3');
   });
 });

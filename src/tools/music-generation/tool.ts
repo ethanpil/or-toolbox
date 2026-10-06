@@ -13,18 +13,27 @@
 import { partialStreamResult } from '../../core/api/chat-stream';
 import { base64ToBlob } from '../../core/api/encoding';
 import type { ChatStreamResult } from '../../core/api/types';
-import { ApiError, InvalidInputError, isAbortError, userMessage } from '../../core/errors';
+import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
 import { getAudioDuration } from '../../core/media/audio';
 import type { RunHandle } from '../../core/types';
+import { createTicker } from '../../core/util';
 import type { AudioPlayer } from '../../ui/components/audio-player';
 import { type AudioResultCard, audioResultCard } from '../../ui/components/audio-result-card';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
+import { failureLine } from '../../ui/components/failure-line';
 import { h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, markPresented } from '../../ui/feedback/errors';
+import { type FailureText, failureText, isStop } from '../../ui/feedback/errors';
 import { setFieldError } from '../../ui/feedback/field-error';
-import { formatBytes, formatDateTime, formatDuration, formatUsd, plural } from '../../ui/format';
+import {
+  fileStamp,
+  formatBytes,
+  formatDateTime,
+  formatDuration,
+  formatUsd,
+  plural,
+} from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { setToolBinding } from '../../ui/settings-actions';
@@ -51,6 +60,7 @@ const LENGTHS = [
     name: 'Clip',
     model: 'Lyria 3 Clip',
     wait: 'about 10 seconds',
+    seconds: 30,
     detail: 'about 30 seconds: a jingle, a loop or a preview',
   },
   {
@@ -58,6 +68,7 @@ const LENGTHS = [
     name: 'Song',
     model: 'Lyria 3 Pro',
     wait: 'about a minute',
+    seconds: 180,
     detail: 'about 3 minutes, with verses, choruses and a bridge',
   },
 ] as const;
@@ -75,7 +86,10 @@ const IMAGE_MAX_SIDE = 1024;
 /** How much of a text-only answer (a refusal) is shown. */
 const REFUSAL_CHARS = 300;
 
-/** Lyria answered with words and no music (a refusal): asking again the same way gets the same answer. */
+/**
+ * Lyria answered, and the answer holds no music (words only, or nothing): the request was answered and billed, so
+ * asking again the same way would only be charged for the same answer. No Retry is offered.
+ */
 class NoMusicError extends InvalidInputError {}
 
 interface Song {
@@ -109,8 +123,11 @@ interface Variation {
   status: ItemStatus;
   phase: string;
   song: Song | null;
-  error: string | null;
-  /** The failure was Lyria declining: a retry would only be charged for the same answer. */
+  /** Why it failed, worded for its card (a request that may have been billed says so). */
+  failure: FailureText | null;
+  /** The error behind `failure`: its Retry asks first when the request may have been billed. */
+  cause: unknown;
+  /** The failure was Lyria answering without music: a retry would only be charged for the same answer. */
   refused: boolean;
   card: HTMLElement;
   /** The song as a result card (player, downloads, Send to…, Remove), once it is made. */
@@ -119,9 +136,9 @@ interface Variation {
   removeButton: HTMLButtonElement | null;
 }
 
-/** The runner's argument: retry one variation. */
+/** The runner's argument: retry these variations (all of one Compose press). */
 interface RetryArg {
-  retry: Variation;
+  retry: Variation[];
 }
 
 const isVariationCount = (value: unknown): value is (typeof VARIATIONS)[number] =>
@@ -409,12 +426,19 @@ export function setup(ctx: ToolContext): ToolInstance {
     );
     return { length, input, price, element };
   });
+  // A target longer than the song Lyria makes cuts nothing: said where the length is chosen.
+  const lengthWarning = h('div', {
+    class: 'form-text text-warning-emphasis',
+    hidden: true,
+    'data-testid': 'music-length-warning',
+  });
   const lengthFieldset = h(
     'fieldset',
     null,
     h('legend', { class: 'form-label fw-semibold fs-6 mb-1' }, 'Length'),
     lengthInputs.map((entry) => entry.element),
     lengthNote,
+    lengthWarning,
   );
 
   const syncLength = (): void => {
@@ -592,6 +616,13 @@ export function setup(ctx: ToolContext): ToolInstance {
         : null;
     showError(target, targetFeedback, targetError);
     voiceField.hidden = vocals() === 'instrumental';
+    const length = LENGTHS.find((entry) => entry.id === ctx.model().model);
+    const cutAt = targetSeconds();
+    const pointless = length && cutAt !== null && cutAt > length.seconds * 1.25;
+    lengthWarning.hidden = !pointless;
+    lengthWarning.textContent = pointless
+      ? `A ${length.name} makes about ${plural(length.seconds, 'second')}, so a target of ${plural(cutAt, 'second')} probably cuts nothing.`
+      : '';
     promptPreview.value = buildPrompt(form(), image !== null);
     return lyricsError !== null ? lyrics : targetError !== null ? target : null;
   };
@@ -843,13 +874,13 @@ export function setup(ctx: ToolContext): ToolInstance {
         'Remove',
       );
       body = [
-        h(
-          'div',
-          { class: 'small text-danger-emphasis', role: 'note', 'data-testid': 'music-failed' },
-          variation.status === 'stopped'
-            ? 'Stopped before it was ready.'
-            : (variation.error ?? 'It failed.'),
-        ),
+        variation.status === 'stopped' || !variation.failure
+          ? h(
+              'div',
+              { class: 'small text-danger-emphasis', role: 'note', 'data-testid': 'music-failed' },
+              variation.status === 'stopped' ? 'Stopped before it was ready.' : 'It failed.',
+            )
+          : h('div', { role: 'note' }, failureLine(variation.failure, { testId: 'music-failed' })),
         h(
           'div',
           { class: 'd-flex flex-wrap gap-2 mt-auto' },
@@ -864,7 +895,13 @@ export function setup(ctx: ToolContext): ToolInstance {
                     class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
                     'aria-label': `Retry ${title.toLowerCase()}`,
                     'data-testid': 'music-retry',
-                    onclick: () => gate.retry({ retry: variation }, 'Compose cannot start now.'),
+                    // After a request that may have been billed, Retry asks first.
+                    onclick: () =>
+                      void gate.retryFailed(
+                        variation.cause,
+                        { retry: [variation] },
+                        'Compose cannot start now.',
+                      ),
                   },
                   icon('arrow-clockwise'),
                   'Retry',
@@ -885,11 +922,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   // --- running --------------------------------------------------------------------------------------------
-  let elapsedTimer: ReturnType<typeof setInterval> | null = null;
-  const stopTicker = (): void => {
-    if (elapsedTimer) clearInterval(elapsedTimer);
-    elapsedTimer = null;
-  };
+  const ticker = createTicker();
 
   /** The song from a finished (or broken-off) stream: its audio, lyrics and length, cut to the target. */
   const songFrom = async (
@@ -985,7 +1018,9 @@ export function setup(ctx: ToolContext): ToolInstance {
         const shown = said.length > REFUSAL_CHARS ? `${said.slice(0, REFUSAL_CHARS)}…` : said;
         throw new NoMusicError(`Lyria answered without music: “${shown}”`);
       }
-      throw new ApiError('Lyria answered without any audio. Try again.', 502, {});
+      throw new NoMusicError(
+        'Lyria answered without any audio. That answer was billed, so Retry is not offered: press Compose to ask again.',
+      );
     }
     return songFrom(result, notes, group.targetLength, phase, signal);
   };
@@ -997,12 +1032,14 @@ export function setup(ctx: ToolContext): ToolInstance {
   ): void => {
     variation.status = outcome.status;
     if (outcome.status === 'failed') {
-      variation.error = userMessage(outcome.error);
+      variation.failure = failureText(outcome.error);
+      variation.cause = outcome.error;
       variation.refused = outcome.error instanceof NoMusicError;
     }
     if (outcome.status === 'done' && outcome.value) {
       variation.song = outcome.value;
-      variation.error = null;
+      variation.failure = null;
+      variation.cause = null;
       variation.result = songCard(variation, outcome.value);
     }
     drawVariation(variation);
@@ -1020,81 +1057,128 @@ export function setup(ctx: ToolContext): ToolInstance {
       }),
     ].join('\n');
 
-  const startTicker = (started: number): void => {
-    stopTicker();
-    const tick = (): void => {
-      const seconds = Math.round((Date.now() - started) / 1000);
-      ui.progress(`Composing… ${seconds} s`);
-    };
+  /**
+   * Makes `items` (all of one Compose press) inside `handle`'s run and ends the run: each song as it arrives,
+   * a failed one on its own card, a Stop leaves what is made.
+   */
+  const composeItems = async (
+    handle: RunHandle,
+    group: Group,
+    items: Variation[],
+    retried: boolean,
+  ): Promise<void> => {
+    ticker.start((seconds) => ui.progress(`Composing… ${seconds} s`));
     ui.status('Composing…');
-    elapsedTimer = setInterval(tick, 1000);
+    try {
+      const outcome = await runItems({
+        items,
+        concurrency: items.length,
+        signal: handle.signal,
+        work: (variation, itemSignal) => compose(handle, variation, itemSignal),
+        onItem: (item) => settle(item.item, item),
+      });
+      const made = items.filter((variation) => variation.song);
+      const only = retried && items.length === 1 ? items[0] : undefined;
+      const summary =
+        outcome.failed > 0
+          ? `${made.length} of ${plural(items.length, 'variation')} ready; ${outcome.failed} failed`
+          : only
+            ? `Variation ${only.index + 1} ready`
+            : `${plural(made.length, 'variation')} ready`;
+      // The ticker stops first, or a tick during the History write would overwrite the summary.
+      ticker.stop();
+      ui.status(summary);
+      await handle.finish({
+        output: historyOutput(summary, made, retried || group.count > 1),
+        meta: {
+          variations: items.length,
+          failed: outcome.failed,
+          seconds: made.map((variation) => roundSeconds(variation.song!.seconds)),
+          ...(retried ? { retried: true } : {}),
+          ...(group.targetLength ? { targetSeconds: group.targetLength } : {}),
+        },
+      });
+    } catch (error) {
+      ticker.stop();
+      // Nothing is left spinning: cards still waiting say they were stopped (and offer Retry and Remove).
+      for (const variation of items) {
+        if (variation.status === 'queued' || variation.status === 'running') {
+          settle(variation, { status: 'stopped' });
+        }
+      }
+      ui.status(isStop(error) ? 'Stopped' : 'Failed');
+      await handle.fail(error);
+      throw error;
+    } finally {
+      ticker.stop();
+    }
   };
 
-  /** A failed variation again, as a run of one with the same prompt, image and target. */
-  const retryVariation = async (signal: AbortSignal, variation: Variation): Promise<void> => {
-    const group = variation.group;
-    if (!group.variations.includes(variation) || variation.song) return;
+  /** Failed variations again, as one run with the same prompt, image and target. */
+  const retryVariations = async (signal: AbortSignal, list: Variation[]): Promise<void> => {
+    const todo = list.filter(
+      (variation) => variation.group.variations.includes(variation) && !variation.song,
+    );
+    const group = todo[0]?.group;
+    if (!group) return;
     const each = await ctx.models.estimate({ kind: 'music', model: group.model }).catch(() => null);
+    const numbers = todo.map((variation) => variation.index + 1);
     const handle = await ctx.beginRun(
       {
         model: group.model,
-        title: `Retry: variation ${variation.index + 1}`,
+        title: `Retry: ${
+          numbers.length === 1
+            ? `variation ${numbers[0]}`
+            : `variations ${numbers.slice(0, -1).join(', ')} and ${numbers.at(-1)}`
+        }`,
         prompt: '',
         settings: group.settings,
-        estimateUsd: each,
+        estimateUsd: each === null ? null : each * todo.length,
       },
       signal,
     );
     const length = LENGTHS.find((entry) => entry.id === group.model);
-    Object.assign(variation, {
-      status: 'running',
-      error: null,
-      refused: false,
-      phase: `Composing: Lyria takes ${length?.wait ?? 'a while'}…`,
-    });
-    drawVariation(variation);
-    startTicker(Date.now());
-    try {
-      let song: Song;
-      try {
-        song = await compose(handle, variation, handle.signal);
-      } catch (error) {
-        stopTicker();
-        settle(variation, { status: isStop(error) ? 'stopped' : 'failed', error });
-        ui.status(isStop(error) ? 'Stopped' : `Failed: ${userMessage(error)}`);
-        await handle.fail(error);
-        // The card shows the error (with Retry when it is worth it); no second message for it.
-        markPresented(error);
-        throw error;
-      }
-      stopTicker();
-      settle(variation, { status: 'done', value: song });
-      const summary = `Variation ${variation.index + 1} ready`;
-      ui.status(summary);
-      await handle.finish({
-        output: historyOutput(summary, [variation], true),
-        meta: {
-          variations: 1,
-          failed: 0,
-          seconds: [roundSeconds(variation.song!.seconds)],
-          retried: true,
-          ...(group.targetLength ? { targetSeconds: group.targetLength } : {}),
-        },
+    for (const variation of todo) {
+      Object.assign(variation, {
+        status: 'running',
+        failure: null,
+        cause: null,
+        refused: false,
+        phase: `Composing: Lyria takes ${length?.wait ?? 'a while'}…`,
       });
-    } finally {
-      stopTicker();
+      drawVariation(variation);
     }
+    await composeItems(handle, group, todo, true);
   };
 
   const run = async (signal: AbortSignal, arg?: RetryArg): Promise<void> => {
     if (arg) {
-      await retryVariation(signal, arg.retry);
+      await retryVariations(signal, arg.retry);
       return;
     }
     const invalid = check();
     if (invalid) {
       ui.status('Fix the highlighted fields first.');
       focusField(invalid);
+      return;
+    }
+    // An empty form would be billed for whatever Lyria makes up: ask for something first.
+    const filled = form();
+    if (
+      ![
+        filled.description,
+        filled.genre,
+        filled.mood,
+        filled.tempo,
+        filled.instruments,
+        filled.lyrics,
+      ].some((value) => value.trim()) &&
+      image === null
+    ) {
+      const message = 'Describe the music first: add a description, a style or lyrics.';
+      ui.status(message);
+      announce(message);
+      description.focus();
       return;
     }
     const model = ctx.model().model;
@@ -1130,7 +1214,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       prompt,
       imageUrl,
       targetLength,
-      stem: `music-${new Date(started).toISOString().slice(0, 19).replace(/[T:]/g, '-')}`,
+      stem: `music-${fileStamp(started)}`,
       settings: formSettings,
       section: h('section', { class: 'vstack gap-2', 'data-testid': 'music-group' }),
       variations: [],
@@ -1141,7 +1225,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       status: 'queued',
       phase: `Composing: Lyria takes ${length?.wait ?? 'a while'}…`,
       song: null,
-      error: null,
+      failure: null,
+      cause: null,
       refused: false,
       card: h('div', { class: 'col', 'data-testid': 'music-variation' }),
       result: null,
@@ -1162,53 +1247,36 @@ export function setup(ctx: ToolContext): ToolInstance {
       ),
     );
     groups.unshift(group);
+    plainGroup = group;
     groupsList.prepend(group.section);
     showEmpty();
     for (const variation of group.variations) drawVariation(variation);
 
-    startTicker(started);
-    try {
-      const outcome = await runItems({
-        items: group.variations,
-        concurrency: count,
-        signal: handle.signal,
-        work: (variation, itemSignal) => compose(handle, variation, itemSignal),
-        onItem: (item) => settle(item.item, item),
-      });
-      const made = group.variations.filter((variation) => variation.song);
-      const summary =
-        outcome.failed > 0
-          ? `${made.length} of ${plural(count, 'variation')} ready; ${outcome.failed} failed`
-          : `${plural(made.length, 'variation')} ready`;
-      // The ticker stops first, or a tick during the History write would overwrite the summary.
-      stopTicker();
-      ui.status(summary);
-      await handle.finish({
-        output: historyOutput(summary, made, count > 1),
-        meta: {
-          variations: count,
-          failed: outcome.failed,
-          seconds: made.map((variation) => roundSeconds(variation.song!.seconds)),
-          ...(targetLength ? { targetSeconds: targetLength } : {}),
-        },
-      });
-    } catch (error) {
-      stopTicker();
-      // Nothing is left spinning: cards still waiting say they were stopped (and offer Retry and Remove).
-      for (const variation of group.variations) {
-        if (variation.status === 'queued' || variation.status === 'running') {
-          settle(variation, { status: 'stopped' });
-        }
-      }
-      ui.status(isStop(error) ? 'Stopped' : 'Failed');
-      await handle.fail(error);
-      throw error;
-    } finally {
-      stopTicker();
-    }
+    await composeItems(handle, group, group.variations, false);
   };
 
-  const runner = ui.runner<RetryArg>({ label: 'Compose', icon: 'music-note-beamed', run });
+  /** The Compose press whose cards a replayed run (the error toast's Retry) belongs to. */
+  let plainGroup: Group | null = null;
+
+  // A replayed run sends only the variations without an answer: a finished song, or Lyria's answer without
+  // music (billed), is never paid for again. With nothing made yet it is the plain Compose it was.
+  const answered = (variation: Variation): boolean => variation.song !== null || variation.refused;
+  const runner = ui.runner<RetryArg>({
+    label: 'Compose',
+    icon: 'music-note-beamed',
+    run,
+    replayArg: (arg) => {
+      const among = arg
+        ? arg.retry.filter((variation) => variation.group.variations.includes(variation))
+        : plainGroup && groups.includes(plainGroup)
+          ? plainGroup.variations
+          : null;
+      if (among === null) return arg;
+      const left = among.filter((variation) => !answered(variation));
+      if (left.length === 0) return null;
+      return !arg && left.length === among.length ? undefined : { retry: left };
+    },
+  });
   // A Retry button disappears when its card starts again: focus goes to Stop (or back to Compose).
   const gate = retryGate(runner, {
     fallback: () => (runner.busy ? runner.stopButton : runner.button),

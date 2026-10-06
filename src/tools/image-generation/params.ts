@@ -99,18 +99,38 @@ export interface Effective {
   notes: string[];
 }
 
+/** Two sizes written as `WIDTHxHEIGHT` (spaces or × allowed) are the same pixels. */
+const sameSize = (a: string, b: string): boolean => {
+  const first = parseSize(a);
+  const second = parseSize(b);
+  return (
+    first !== null &&
+    second !== null &&
+    first.width === second.width &&
+    first.height === second.height
+  );
+};
+
 const pick = (wanted: string, values: string[] | null): string | null =>
   wanted && values?.includes(wanted) ? wanted : null;
 
 export function effective(form: GenerationForm, controls: ModelControls): Effective {
   const notes: string[] = [];
   const explicit = parseSize(form.size);
-  const size =
-    explicit && controls.sizes !== null
-      ? controls.sizes === true || controls.sizes.includes(form.size.trim())
-        ? `${explicit.width}x${explicit.height}`
-        : null
-      : null;
+  const wanted = explicit ? `${explicit.width}x${explicit.height}` : null;
+  let size: string | null = null;
+  if (wanted) {
+    // Listed sizes are compared as numbers: "1024 x 1024" is the listed 1024x1024.
+    const sizes = controls.sizes;
+    if (sizes === true || sizes?.some((entry) => sameSize(entry, wanted))) size = wanted;
+    else if (sizes === null) {
+      notes.push('This model takes no exact size, so the aspect ratio and resolution are used.');
+    } else {
+      notes.push(
+        `${wanted} is not one of this model’s sizes (${sizes?.join(', ')}), so the aspect ratio and resolution are used.`,
+      );
+    }
+  }
   let outputFormat = pick(form.outputFormat, controls.outputFormats);
   let background: string | null = null;
   if (form.transparent) {

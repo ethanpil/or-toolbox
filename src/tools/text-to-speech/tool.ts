@@ -14,7 +14,7 @@
  */
 import { defaultSpeechFormat } from '../../core/api/client';
 import type { SpeechResult } from '../../core/api/types';
-import { InvalidInputError, isAbortError, userMessage } from '../../core/errors';
+import { InvalidInputError, isAbortError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import { readAsText, sanitizeFilename, sniffMime } from '../../core/files';
 import { decodeAudio, getAudioDuration } from '../../core/media/audio';
 import { pcmToWav } from '../../core/media/wav';
@@ -23,10 +23,11 @@ import { debounce } from '../../core/util';
 import { audioResultCard } from '../../ui/components/audio-result-card';
 import { dropZone } from '../../ui/components/drop-zone';
 import { emptyState } from '../../ui/components/empty-state';
+import { failureLine } from '../../ui/components/failure-line';
 import { progressBar } from '../../ui/components/progress-bar';
 import { h, replaceWith } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, presentError } from '../../ui/feedback/errors';
+import { type FailureText, isStop, presentError } from '../../ui/feedback/errors';
 import { formatBytes, formatDuration, formatInt, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
@@ -59,7 +60,10 @@ interface Chunk {
   text: string;
   status: ItemStatus;
   blob: Blob | null;
-  error: string | null;
+  /** Why it failed, worded for its line (a request that may have been billed says so). */
+  failure: FailureText | null;
+  /** The error behind `failure`: the Retry asks first when the request may have been billed. */
+  cause: unknown;
 }
 
 /**
@@ -596,7 +600,12 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   /** A notice button that follows Run (unavailable while it is busy or disabled, but focusable). */
-  const actionButton = (label: string, testId: string, arg: () => RunArg): HTMLElement =>
+  const actionButton = (
+    label: string,
+    testId: string,
+    arg: () => RunArg,
+    cause: () => unknown = () => null,
+  ): HTMLElement =>
     gate.bind(
       h(
         'button',
@@ -604,7 +613,8 @@ export function setup(ctx: ToolContext): ToolInstance {
           type: 'button',
           class: 'btn btn-sm btn-warning',
           'data-testid': testId,
-          onclick: () => gate.retry(arg(), 'Reading aloud cannot start now.'),
+          // A part whose request may have been billed asks before it is sent again.
+          onclick: () => void gate.retryFailed(cause(), arg(), 'Reading aloud cannot start now.'),
         },
         label,
       ),
@@ -659,17 +669,26 @@ export function setup(ctx: ToolContext): ToolInstance {
               : `Make the other ${left.length}`,
             'tts-retry',
             () => ({ parts: missing(current).map((chunk) => chunk.key) }),
+            () => failed.map((chunk) => chunk.cause).find(isOutcomeUnknown),
           ),
         ),
         failed.length > 0
           ? h(
               'ul',
               { class: 'small mb-0', 'data-testid': 'tts-failed' },
-              failed
-                .slice(0, 5)
-                .map((chunk) =>
-                  h('li', null, `Part ${chunk.index + 1}: ${chunk.error ?? 'failed'}`),
+              failed.slice(0, 5).map((chunk) =>
+                h(
+                  'li',
+                  null,
+                  `Part ${chunk.index + 1}: `,
+                  chunk.failure
+                    ? failureLine(chunk.failure, {
+                        className: 'd-inline',
+                        testId: 'tts-failed-item',
+                      })
+                    : 'failed',
                 ),
+              ),
             )
           : null,
       ),
@@ -713,7 +732,13 @@ export function setup(ctx: ToolContext): ToolInstance {
         Object.assign(chunk, {
           status: 'failed',
           blob: null,
-          error: 'its audio could not be decoded',
+          failure: {
+            text: 'its audio could not be decoded',
+            outcomeUnknown: false,
+            activityUrl: null,
+            note: null,
+          },
+          cause: null,
         });
       }
     }
@@ -801,24 +826,51 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const newPlan = (value: string, model: string, info: ModelInfo | undefined): Plan => {
+  /**
+   * The plan for `value`. A part of `previous` made with the same model, voice and speed from exactly the same
+   * words is taken over as made (paid for once): editing one paragraph remakes that part only.
+   */
+  const newPlan = (
+    value: string,
+    model: string,
+    info: ModelInfo | undefined,
+    previous: Plan | null,
+  ): Plan => {
     const chosenSpeed = speedFor(info);
+    const chosenVoice = voiceFor(info);
+    const made = new Map<string, Blob[]>();
+    if (
+      previous &&
+      previous.model === model &&
+      previous.voice === chosenVoice &&
+      previous.speed === chosenSpeed
+    ) {
+      for (const chunk of previous.chunks) {
+        if (chunk.status === 'done' && chunk.blob) {
+          made.set(chunk.text, [...(made.get(chunk.text) ?? []), chunk.blob]);
+        }
+      }
+    }
     return {
       model,
-      voice: voiceFor(info),
+      voice: chosenVoice,
       speed: chosenSpeed,
       format: currentFormat(),
       stem: sanitizeFilename(fileStem(value), 'speech'),
       source: value,
       joinNote: null,
-      chunks: splitText(value, limitFor(value, info, chosenSpeed)).map((chunkText, index) => ({
-        key: String(index),
-        index,
-        text: chunkText,
-        status: 'queued',
-        blob: null,
-        error: null,
-      })),
+      chunks: splitText(value, limitFor(value, info, chosenSpeed)).map((chunkText, index) => {
+        const blob = made.get(chunkText)?.shift() ?? null;
+        return {
+          key: String(index),
+          index,
+          text: chunkText,
+          status: blob ? 'done' : 'queued',
+          blob,
+          failure: null,
+          cause: null,
+        };
+      }),
     };
   };
 
@@ -840,16 +892,22 @@ export function setup(ctx: ToolContext): ToolInstance {
 
   const run = async (signal: AbortSignal, arg?: RunArg): Promise<void> => {
     if (arg && 'join' in arg) {
-      if (plan && missing(plan).length === 0) await joinOnly(plan, signal);
+      if (plan && missing(plan).length === 0) {
+        plan.format = currentFormat();
+        await joinOnly(plan, signal);
+      }
       return;
     }
 
     let target: Plan;
     let todo: Chunk[];
     let continued = false;
+    let previous: Plan | null = null;
     if (arg) {
       if (!plan) return;
       target = plan;
+      // The format is the one setting that may change without remaking a part: the join follows the form.
+      target.format = currentFormat();
       todo = plan.chunks.filter(
         (chunk) => arg.parts.includes(chunk.key) && chunk.status !== 'done',
       );
@@ -868,27 +926,29 @@ export function setup(ctx: ToolContext): ToolInstance {
       if (!model) return;
       // Wait for the catalog: a model that lists voices must be sent one.
       const info = await infoFor(model);
-      const previous = plan;
+      previous = plan;
+      // Parts made earlier from the same words, model, voice and speed are kept: only the rest is made.
+      target = newPlan(value, model, info, previous);
+      const kept = target.chunks.length - missing(target).length;
+      continued = kept > 0;
+      // Paid parts that are not joined yet and cannot be kept would be thrown away: ask first.
+      const lost = previous ? madeCount(previous) - kept : 0;
       if (
-        previous &&
-        madeCount(previous) > 0 &&
-        previous.source === value &&
-        previous.model === model &&
-        previous.voice === voiceFor(info) &&
-        previous.speed === speedFor(info)
+        lost > 0 &&
+        !(await ui.confirmDiscard({
+          what: `${plural(lost, 'paid speech part')} not joined yet`,
+          title: 'Replace the parts already made?',
+          testId: 'tts-discard-dialog',
+        }))
       ) {
-        // The same text and voice as the parts already made: finish those instead of paying for them again.
-        target = previous;
-        target.format = currentFormat();
-        continued = true;
-        todo = missing(target);
-        if (todo.length === 0) {
-          await joinOnly(target, signal);
-          return;
-        }
-      } else {
-        target = newPlan(value, model, info);
-        todo = target.chunks;
+        return;
+      }
+      todo = missing(target);
+      if (continued && todo.length === 0) {
+        releasePlan(plan);
+        plan = target;
+        await joinOnly(target, signal);
+        return;
       }
     }
 
@@ -901,8 +961,13 @@ export function setup(ctx: ToolContext): ToolInstance {
         settings: planSettings(target),
         ...(extra
           ? {
-              title: `${arg ? 'Retry' : 'Continue'}: ${plural(todo.length, 'part')} of ${target.stem}`,
-              prompt: '',
+              // The same words again (or a retry) is no new Recent prompt; edited words are.
+              ...(arg || previous?.source === target.source
+                ? {
+                    title: `${arg ? 'Retry' : 'Continue'}: ${plural(todo.length, 'part')} of ${target.stem}`,
+                    prompt: '',
+                  }
+                : {}),
               estimateUsd: await estimateText(
                 todo.map((chunk) => chunk.text).join(' '),
                 target.model,
@@ -919,7 +984,9 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
     running = true;
     target.joinNote = null;
-    for (const chunk of todo) Object.assign(chunk, { status: 'queued', blob: null, error: null });
+    for (const chunk of todo) {
+      Object.assign(chunk, { status: 'queued', blob: null, failure: null, cause: null });
+    }
     const showMade = (first = false): void => {
       const made = madeCount(target);
       bar.update(made, total, `${made} of ${plural(total, 'part')} made`);
@@ -946,7 +1013,10 @@ export function setup(ctx: ToolContext): ToolInstance {
             const chunk = outcome.item;
             chunk.status = outcome.status;
             if (outcome.status === 'done') chunk.blob = outcome.value ?? null;
-            if (outcome.status === 'failed') chunk.error = userMessage(outcome.error);
+            if (outcome.status === 'failed') {
+              chunk.failure = outcome.failure ?? null;
+              chunk.cause = outcome.error;
+            }
             if (outcome.status === 'done' || outcome.status === 'failed') {
               showMade();
               void handle

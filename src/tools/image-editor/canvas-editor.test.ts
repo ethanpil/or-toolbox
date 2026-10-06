@@ -91,4 +91,21 @@ describe('canvasEditor', () => {
     expect(parseInt(zoom.textContent ?? '0', 10)).toBeGreaterThan(afterPixels * 5);
     expect(onMaskChange).toHaveBeenCalledTimes(1); // only the picture load
   });
+
+  it('names the shortcut of the platform on Undo and Redo', () => {
+    const platform = vi.spyOn(navigator, 'platform', 'get');
+    platform.mockReturnValue('Win32');
+    let { editor } = mounted();
+    expect($(editor.element, 'editor-undo').getAttribute('aria-label')).toBe('Undo (Ctrl+Z)');
+    expect($(editor.element, 'editor-redo').getAttribute('aria-label')).toBe('Redo (Ctrl+Shift+Z)');
+    expect($(editor.element, 'editor-undo').getAttribute('aria-keyshortcuts')).toBe('Control+Z');
+    document.body.replaceChildren();
+
+    platform.mockReturnValue('MacIntel');
+    ({ editor } = mounted());
+    expect($(editor.element, 'editor-undo').getAttribute('aria-label')).toBe('Undo (⌘Z)');
+    expect($(editor.element, 'editor-redo').getAttribute('aria-label')).toBe('Redo (⌘⇧Z)');
+    expect($(editor.element, 'editor-undo').getAttribute('aria-keyshortcuts')).toBe('Meta+Z');
+    platform.mockRestore();
+  });
 });

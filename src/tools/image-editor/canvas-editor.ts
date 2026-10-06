@@ -16,6 +16,7 @@ import type { Box, Mask } from '../../core/media/image';
 import { debounce } from '../../core/util';
 import { h } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
+import { isApplePlatform } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import {
@@ -231,18 +232,24 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
       },
       icon(glyph),
     );
+  // The shortcuts are the platform's own: ⌘ on Apple devices, Ctrl elsewhere (the key handler takes both).
+  const apple = isApplePlatform();
+  const modifier = apple ? '⌘' : 'Ctrl+';
+  const modifierKey = apple ? 'Meta' : 'Control';
   const undoButton = button(
-    'Undo (Ctrl+Z)',
+    `Undo (${modifier}Z)`,
     'arrow-counterclockwise',
     'editor-undo',
     () => undo(),
-    {
-      'aria-keyshortcuts': 'Control+Z',
-    },
+    { 'aria-keyshortcuts': `${modifierKey}+Z` },
   );
-  const redoButton = button('Redo (Ctrl+Shift+Z)', 'arrow-clockwise', 'editor-redo', () => redo(), {
-    'aria-keyshortcuts': 'Control+Shift+Z',
-  });
+  const redoButton = button(
+    `Redo (${modifier}${apple ? '⇧' : 'Shift+'}Z)`,
+    'arrow-clockwise',
+    'editor-redo',
+    () => redo(),
+    { 'aria-keyshortcuts': `${modifierKey}+Shift+Z` },
+  );
   const clearButton = button('Clear the mask', 'x-square', 'editor-clear', () => clearMask());
   const invertButton = button('Invert the mask', 'symmetry-vertical', 'editor-invert', () =>
     commit({ type: 'invert' }),
@@ -312,8 +319,8 @@ export function canvasEditor(options: CanvasEditorOptions = {}): CanvasEditor {
       'p',
       { id: ids.help, class: 'form-text mb-0' },
       'Paint over what should change. Keys: B brush, E eraser, H hand, [ and ] size, M show the mask, 0 fit, ' +
-        'Ctrl+Z undo. On the canvas, arrows move the brush, Shift+arrows paint, Enter paints a dot; ' +
-        'Ctrl+wheel or a pinch zooms.',
+        `${modifier}Z undo. On the canvas, arrows move the brush, Shift+arrows paint, Enter paints a dot; ` +
+        `${modifier}wheel or a pinch zooms.`,
     ),
   );
 
