@@ -213,15 +213,17 @@ test.describe('Music generation', () => {
     const full = await decodedSeconds(page);
     expect(full).toBeGreaterThan(12);
     expect(full).toBeLessThan(14);
-    const duration = await player.locator('audio').evaluate(
-      (audio: HTMLAudioElement) =>
-        new Promise<number>((resolve) => {
-          if (audio.readyState >= 1) resolve(audio.duration);
-          else
-            audio.addEventListener('loadedmetadata', () => resolve(audio.duration), { once: true });
-        }),
-    );
-    expect(duration).toBeGreaterThan(12);
+    // The player knows its length. Polled: without a length header WebKit can report 0 at first and settle on
+    // the length a moment later (durationchange).
+    await expect
+      .poll(() =>
+        player
+          .locator('audio')
+          .evaluate((audio: HTMLAudioElement) =>
+            Number.isFinite(audio.duration) ? audio.duration : 0,
+          ),
+      )
+      .toBeGreaterThan(12);
     await expect(page.getByTestId('music-result-meta')).toHaveText(/^0:1[23] · /);
 
     // The line being sung is highlighted as the song plays.
