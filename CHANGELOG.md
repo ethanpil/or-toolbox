@@ -69,6 +69,7 @@ All notable changes to this project are documented here. The format follows
 - Shared `approxTokens()` in `src/core/tokens.ts` (0575155).
 - Stage 7 review, shared UI: `runner.setLabel()`, `runner.addAction()` and `RunnerOptions.hideWhileBusy` for multi-action run bars, `stopOnEscape()` and `composing()` (4a7cacb); `createMarkdownCache()`, `attachmentIntake()` and the `.or-icon-action` button class (cdb6f5f); `describeRunCost()`, `formatRunCost()` and `usageLine()` (6c3967a); `failureText()` with a blind mode for the arena whose failures all read alike (276d460, 2fe9023); manifest field `ownModels` (7200c1b).
 - v1 README and user guide (`docs/user-guide.md`: first steps, every tool, platform pages, troubleshooting), with screenshots in `docs/images/` (e29928a).
+- `ChatStreamResult.refusal` names a model's refusal or a reply cut by the content filter or an error (f566153); `EstimateInput` tokens take `audio: { input, output }` (1f43772); `isoDateTime()` in `format.ts` (eeece28); `StorageUnavailableError` (46725c8); OAuth's `KeyNotSavedError` with `save()` (03f3b6b).
 
 ### Changed
 
@@ -109,6 +110,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Backup merge keeps the newer saved and recent prompts (`usedAt`) and tool state (`updatedAt`) instead of always taking the backup's, merges favorites saved under the old British names, and skips records with times no date can hold (eeece28).
+- An older tab never writes over a keys file of another version or with an unreadable lock, and keeps key entries it cannot parse (83a06e4).
+- "Connect with OpenRouter" keeps a new key it could not save (locked meanwhile, storage full) and offers to save it, instead of losing it (03f3b6b).
+- Passphrases are NFC-normalized; the strength hint asks for 16+ characters or four words (6fba1c1).
+- Privacy page and lock settings no longer claim closing the tab locks the keys, and say that Chat keeps attached text and PDF text (c365873).
+- Two tabs no longer refetch the model catalog from each other when IndexedDB writes fail (dadff39).
+- Chat replies that are refusals or were filtered are no longer silently empty (f566153).
+- Estimates: zero prices on non-`:free` models are unknown, not free; reference images and audio are priced high (1f43772).
+- Blocked localStorage is reported instead of faking a save; IndexedDB quota errors show the storage-full help (46725c8).
 - The sticky Run bar no longer covers a control focused by Tab when the page scrolls smoothly to it: the framework checks again once the scroll ends (d8e6d0c).
 - The first-visit isolation reload no longer happens once the user has started using the page, keeps the parameters the tool already consumed, and never happens on a Send to page (942ff57).
 - After a deploy, a page whose lazy chunk is gone offers a reload; pages served from the cache find their lazy chunks precached (942ff57, a2622e3).

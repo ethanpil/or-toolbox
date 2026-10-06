@@ -49,9 +49,30 @@ const MIGRATIONS: Record<number, (settings: Raw) => Raw> = {
   0: (settings) => settings,
 };
 
-/** Runs every migration from the stored version up to SETTINGS_VERSION. Unsafe keys are dropped first. */
+/**
+ * Settings written before the US spelling used `favouriteTools` and `models.favourites` (still version 1).
+ * Renamed here, before anything merges them, so a merge over current settings sees one name.
+ */
+function renameBritishFields(settings: Raw): Raw {
+  const out = { ...settings };
+  if ('favouriteTools' in out) {
+    out['favoriteTools'] ??= out['favouriteTools'];
+    delete out['favouriteTools'];
+  }
+  const models = out['models'];
+  if (isPlainObject(models) && 'favourites' in models) {
+    const { favourites, ...rest } = models;
+    out['models'] = { ...rest, favorites: rest['favorites'] ?? favourites };
+  }
+  return out;
+}
+
+/**
+ * Runs every migration from the stored version up to SETTINGS_VERSION. Unsafe keys are dropped first and
+ * the old British field names are renamed.
+ */
 export function migrateSettings(raw: unknown): Raw {
-  let settings: Raw = isPlainObject(raw) ? stripUnsafeKeys(raw) : {};
+  let settings: Raw = renameBritishFields(isPlainObject(raw) ? stripUnsafeKeys(raw) : {});
   const stored = settings['version'];
   let version = typeof stored === 'number' && Number.isInteger(stored) && stored >= 0 ? stored : 0;
   while (version < SETTINGS_VERSION) {
@@ -155,8 +176,7 @@ export function normalizeSettings(input: unknown): Settings {
   }
 
   const accent = appearance['accent'];
-  // Settings written before the US spelling used `favouriteTools` and `models.favourites`.
-  const favoriteTools = raw['favoriteTools'] ?? raw['favouriteTools'];
+  const favoriteTools = raw['favoriteTools'];
 
   return {
     version: SETTINGS_VERSION,
@@ -189,12 +209,12 @@ export function normalizeSettings(input: unknown): Settings {
     },
     security: {
       autoLockMinutes: Math.round(
-        // 0 = never auto-lock (the unlocked key still ends with the tab session).
+        // 0 = never auto-lock (a tab the browser reopens or restores then comes back unlocked).
         clamped(security['autoLockMinutes'], 0, MAX_AUTO_LOCK_MINUTES, d.security.autoLockMinutes),
       ),
     },
     models: {
-      favorites: uniqueStrings(models['favorites'] ?? models['favourites']),
+      favorites: uniqueStrings(models['favorites']),
       recent: uniqueStrings(models['recent'], RECENT_MODELS_CAP),
     },
     ui: jsonObject(raw['ui']),

@@ -23,6 +23,7 @@ export type ErrorCode =
   | 'oauth'
   | 'backup'
   | 'storage-full'
+  | 'storage-unavailable'
   | 'not-json-safe'
   | 'state-reset'
   | 'invalid-input';
@@ -198,6 +199,19 @@ export class StorageFullError extends OrError {
   override readonly name = 'StorageFullError';
   constructor(message = 'Browser storage is full. Delete some history in Settings → Data.') {
     super('storage-full', message);
+  }
+}
+
+/**
+ * The browser does not let the site store anything (some privacy modes, blocked site data): the change was not
+ * saved. Never a silent no-op, which would look saved and be gone on the next page.
+ */
+export class StorageUnavailableError extends OrError {
+  override readonly name = 'StorageUnavailableError';
+  constructor(
+    message = 'This browser does not let ORtoolbox save data (a private window, or site data blocked for this site), so this was not saved. Allow site data for this site and reload the page.',
+  ) {
+    super('storage-unavailable', message);
   }
 }
 

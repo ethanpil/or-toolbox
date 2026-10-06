@@ -319,7 +319,14 @@ export interface ModelsService {
 }
 
 export type EstimateInput =
-  | { kind: 'tokens'; model: string; promptTokens: number; completionTokens: number }
+  | {
+      kind: 'tokens';
+      model: string;
+      promptTokens: number;
+      completionTokens: number;
+      /** Which side carries audio, priced at the audio rates (high: all of that side); text when absent. */
+      audio?: { input?: boolean; output?: boolean };
+    }
   | {
       kind: 'speech';
       model: string;

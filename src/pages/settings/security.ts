@@ -91,7 +91,7 @@ export function securitySection(core: CoreServices): SectionView {
       h(
         'p',
         null,
-        'Encrypt your keys with a passphrase. ORtoolbox turns it into an AES-GCM key with PBKDF2 (600,000 rounds of SHA-256) and stores only the encrypted keys. You unlock once per tab; closing the tab, auto-lock or Lock now locks them again.',
+        'Encrypt your keys with a passphrase. ORtoolbox turns it into an AES-GCM key with PBKDF2 (600,000 rounds of SHA-256) and stores only the encrypted keys. You unlock once per tab; auto-lock or Lock now locks them again. Closing the tab may not: browsers bring a tab’s unlocked key back when they reopen a closed tab or restore your last session, so keep auto-lock on.',
       ),
       h(
         'div',
@@ -282,7 +282,7 @@ export function securitySection(core: CoreServices): SectionView {
 
   const autoLock = numberField<number>({
     label: 'Auto-lock after',
-    help: 'Minutes without activity before the keys lock again in a tab; 0 means never (closing the tab still locks them). At most 1,440 (a day).',
+    help: 'Minutes without activity before the keys lock again in a tab; 0 means never, and then a tab the browser reopens or restores comes back unlocked. At most 1,440 (a day).',
     suffix: 'minutes',
     inputMode: 'numeric',
     testId: 'auto-lock-minutes',

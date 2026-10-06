@@ -6,6 +6,7 @@ import { createBus } from '../bus';
 import type { CoreServices, Settings, ToolManifest } from '../types';
 import { LS_KEYS } from '../storage/local';
 import { StorageFullError } from '../storage/local';
+import { StorageUnavailableError } from '../errors';
 import { FakeBroadcastChannel } from '../testing/state-fakes';
 
 /** A "tab": its own bus and settings service, sharing localStorage with other tabs. */
@@ -254,6 +255,32 @@ describe('update, reset, subscribe', () => {
       }),
     ).toThrow(StorageFullError);
     expect(core.settings.get().freeOnly).toBe(false);
+  });
+
+  it('refuses to save when the browser blocks storage, and never reverts what is shown', () => {
+    const settings = tab().settings;
+    const blocked = vi.spyOn(globalThis, 'localStorage', 'get').mockImplementation(() => {
+      throw new DOMException('denied', 'SecurityError');
+    });
+    expect(() =>
+      settings.update((d) => {
+        d.budgets.monthlyUsd = 5;
+      }),
+    ).toThrow(StorageUnavailableError);
+    expect(settings.get().budgets.monthlyUsd).toBeNull();
+    blocked.mockRestore();
+  });
+
+  it('keeps what it shows when storage stops answering reads', () => {
+    const settings = tab().settings;
+    settings.update((d) => {
+      d.budgets.monthlyUsd = 5;
+    });
+    vi.spyOn(globalThis, 'localStorage', 'get').mockImplementation(() => {
+      throw new DOMException('denied', 'SecurityError');
+    });
+    document.dispatchEvent(new Event('visibilitychange')); // a re-sync
+    expect(settings.get().budgets.monthlyUsd).toBe(5);
   });
 
   it('resets to defaults but keeps the default key', () => {

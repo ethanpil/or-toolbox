@@ -63,9 +63,39 @@ describe('tokens and decisions', () => {
     };
     expect(estimateTokens(windowed, 1000, 0)).toBeCloseTo(1000 * 0.000003, 10);
   });
+
+  it('treats zero prices as unknown, not free, for models that are not :free', () => {
+    // Image models list token prices of "0"; so does a paid decisions model.
+    expect(estimateTokens(model('black-forest-labs/flux.2-pro'), 1000, 500)).toBeNull();
+    expect(estimateDecision(model('respan/span-01-lite'), 476)).toBeNull();
+    // A model that bills only one side keeps its price.
+    expect(estimateDecision(model('respan/span-01'), 1000)).toBeCloseTo(0.00002, 10);
+  });
+
+  it('prices audio at the audio rates when the request carries or asks for audio', () => {
+    const gptAudio = model('openai/gpt-audio');
+    expect(estimateTokens(gptAudio, 1000, 500)).toBeCloseTo(1000 * 0.0000025 + 500 * 0.00001, 10);
+    expect(estimateTokens(gptAudio, 1000, 500, { input: true })).toBeCloseTo(
+      1000 * 0.000032 + 500 * 0.00001,
+      10,
+    );
+    expect(estimateTokens(gptAudio, 1000, 500, { input: true, output: true })).toBeCloseTo(
+      1000 * 0.000032 + 500 * 0.000064,
+      10,
+    );
+    // Never below the text price (gpt-audio-mini lists the same).
+    const mini = model('openai/gpt-audio-mini');
+    expect(estimateTokens(mini, 1000, 0, { input: true })).toBeCloseTo(1000 * 0.0000006, 12);
+  });
 });
 
 describe('speech', () => {
+  it('treats all-zero endpoint prices as unknown, not free', () => {
+    expect(
+      estimateSpeech({ model: 'x/tts', characters: 10 }, [endpoint('0'), endpoint('0')]),
+    ).toBeNull();
+  });
+
   it('uses the most expensive endpoint (matches the billed Kokoro request)', () => {
     const endpoints = [endpoint('0.00000062'), endpoint('0.000004')];
     expect(estimateSpeech({ model: 'hexgrad/kokoro-82m', characters: 44 }, endpoints)).toBeCloseTo(
@@ -110,6 +140,10 @@ describe('speech', () => {
 });
 
 describe('transcription', () => {
+  it('treats zero prices as unknown, not free', () => {
+    expect(estimateTranscription(10, { prompt: '0', completion: '0' })).toBeNull();
+  });
+
   it('bills per second, rounding up', () => {
     const whisper = model('openai/whisper-1').pricing.raw;
     expect(estimateTranscription(3.17, whisper)).toBeCloseTo(0.0004, 10);
@@ -157,6 +191,15 @@ describe('image', () => {
     expect(estimateImage(gpt, { images: 4, references: 0, requests: 4 })).toBe(
       estimateImage(gpt, { images: 4 }),
     );
+  });
+
+  it('counts references on megapixel models without an input price, high (FLUX.2 Pro)', () => {
+    const flux = model('black-forest-labs/flux.2-pro'); // $0.03 per MP out, no input price listed
+    const base = estimateImage(flux, { images: 1, width: 1024, height: 1024 }) ?? 0;
+    const withRef =
+      estimateImage(flux, { images: 1, width: 1024, height: 1024, references: 2 }) ?? 0;
+    // Each reference at the output rate for the output size: far above the recorded $0.001 for klein.
+    expect(withRef - base).toBeCloseTo(2 * base, 8);
   });
 
   it('returns null for models without an image price', () => {

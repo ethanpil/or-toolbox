@@ -193,6 +193,77 @@ describe('keys', () => {
     expect(keys.list().map((k) => k.id)).toEqual([a.id]);
   });
 
+  it('keeps entries it cannot read on every write instead of dropping them', async () => {
+    const { keys } = harness();
+    const a = await keys.add({ name: 'A', secret: KEY_A });
+    const future = { id: 'f1', name: 'Future', source: 'device-code', secret: 'x' };
+    const file = storedFile() as unknown as { keys: unknown[] };
+    file.keys.push(future);
+    localStorage.setItem(LS_KEYS.keys, JSON.stringify(file));
+
+    const b = await keys.add({ name: 'B', secret: KEY_B });
+    keys.update(a.id, { name: 'A2' });
+    keys.remove(b.id);
+    expect((storedFile() as unknown as { keys: unknown[] }).keys).toContainEqual(future);
+    expect(keys.list().map((k) => k.name)).toEqual(['A2']);
+
+    // A lock change cannot re-encrypt what it cannot read: refused, nothing written.
+    const before = localStorage.getItem(LS_KEYS.keys);
+    await expect(keys.lock.enable('pass phrase')).rejects.toBeInstanceOf(KeysChangedError);
+    expect(localStorage.getItem(LS_KEYS.keys)).toBe(before);
+    // A replacement under the same lock keeps them too (backup merge, Undo of a removal).
+    keys.replaceFile({ ...keys.exportFile(), keys: [] }, { expected: keys.exportFile() });
+    expect((storedFile() as unknown as { keys: unknown[] }).keys).toEqual([future]);
+  });
+
+  it.each([
+    ['a newer version', (file: Record<string, unknown>) => ({ ...file, version: 2 })],
+    ['a lock it cannot read', (file: Record<string, unknown>) => ({ ...file, lock: { v: 2 } })],
+    ['no key list', (file: Record<string, unknown>) => ({ ...file, keys: 'later' })],
+  ])('never writes over a stored file of %s', async (_label, change) => {
+    const { keys } = harness();
+    await keys.add({ name: 'A', secret: KEY_A });
+    const raw = JSON.stringify(change(storedFile() as unknown as Record<string, unknown>));
+    localStorage.setItem(LS_KEYS.keys, raw);
+
+    expect(keys.list()).toEqual([]);
+    const refused = [
+      keys.add({ name: 'B', secret: KEY_B }),
+      keys.lock.enable('pass phrase'),
+      Promise.resolve().then(() =>
+        keys.replaceFile({ version: 1, keys: [], lock: null }, { expected: keys.exportFile() }),
+      ),
+    ];
+    for (const attempt of refused) {
+      const error: unknown = await attempt.catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(KeysChangedError);
+      expect((error as Error).message).toMatch(/newer version/);
+    }
+    expect(localStorage.getItem(LS_KEYS.keys)).toBe(raw);
+    // Reset everything still clears it.
+    keys.clear();
+    expect(localStorage.getItem(LS_KEYS.keys)).toBeNull();
+  });
+
+  it('never writes over a stored file that is not JSON', async () => {
+    const { keys } = harness();
+    localStorage.setItem(LS_KEYS.keys, '{"version":1,"keys":[');
+    const error: unknown = await keys.add({ name: 'A', secret: KEY_A }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(KeysChangedError);
+    expect(localStorage.getItem(LS_KEYS.keys)).toBe('{"version":1,"keys":[');
+  });
+
+  it('never reports a key as added when the browser blocks storage', async () => {
+    const { keys } = harness();
+    vi.spyOn(globalThis, 'localStorage', 'get').mockImplementation(() => {
+      throw new DOMException('denied', 'SecurityError');
+    });
+    const error: unknown = await keys.add({ name: 'A', secret: KEY_A }).catch((e: unknown) => e);
+    expect(errorCode(error)).toBe('storage-unavailable');
+    vi.restoreAllMocks();
+    expect(keys.list()).toEqual([]);
+  });
+
   it('maps GET /key to KeyStatus and caches it for 60 s', async () => {
     vi.useFakeTimers();
     try {

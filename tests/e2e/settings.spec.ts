@@ -435,7 +435,7 @@ test('passphrase lock: enable, lock now, unlock', async ({ page, context }) => {
   await page.getByTestId('lock-enable').click();
   await expect(page.getByTestId('lock-new')).toHaveClass(/is-invalid/);
   await page.getByTestId('lock-new').fill(PASSPHRASE);
-  await expect(page.getByTestId('lock-new-strength')).toHaveText('Good');
+  await expect(page.getByTestId('lock-new-strength')).toHaveText('Strong');
   await page.getByTestId('lock-confirm').fill('something else');
   await page.getByTestId('lock-enable').click();
   await expect(page.getByTestId('lock-confirm')).toHaveClass(/is-invalid/);

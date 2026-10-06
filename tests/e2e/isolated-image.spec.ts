@@ -16,7 +16,7 @@ import { INTERIOR_WHITE, type TestPhoto, testPhotos } from './isolated-image-pho
 import { expectNoSeriousA11yViolations, watchForProblems } from './support.ts';
 
 const KLEIN = 'black-forest-labs/flux.2-klein-4b';
-/** $0.014 per megapixel, per image token: a 1024 px photo is estimated at 4175 tokens, about $0.0143. */
+/** $0.014 per megapixel, per image token: a 1024 px photo is estimated at 4175 tokens, about $0.0143, and the photo sent as a reference counts as much again (klein lists no input price). */
 const KLEIN_IMAGE_TOKEN = '0.000003418';
 
 interface ImageBody {
@@ -248,12 +248,12 @@ test('gate: 20 product photos come back on pure white, pass the QA and export as
   const problems = await watchForProblems(page);
   await page.goto('tools/isolated-image/');
   await addPhotos(page, photos);
-  await expect(page.getByTestId('iso-count')).toHaveText('20 photos · ≈ $0.29');
+  await expect(page.getByTestId('iso-count')).toHaveText('20 photos · ≈ $0.57');
 
   await page.getByTestId('run-button').click();
-  // About $0.29 is above the default $0.10 per-run threshold: the run asks first.
+  // About $0.57 is above the default $0.10 per-run threshold: the run asks first.
   const dialog = page.getByTestId('budget-dialog');
-  await expect(dialog.getByTestId('budget-estimate')).toContainText('$0.29');
+  await expect(dialog.getByTestId('budget-estimate')).toContainText('$0.57');
   await dialog.getByTestId('budget-confirm').click();
   await expect(page.getByTestId('iso-summary')).toHaveText('20 of 20 results passed QA', {
     timeout: 540_000,
@@ -345,7 +345,7 @@ test('a failed photo is retried on its own; the review compares, and a margin ch
   const problems = await watchForProblems(page);
   await page.goto('tools/isolated-image/');
   await addPhotos(page, photos);
-  await expect(page.getByTestId('iso-count')).toHaveText('3 photos · ≈ $0.043');
+  await expect(page.getByTestId('iso-count')).toHaveText('3 photos · ≈ $0.086');
   await page.getByTestId('run-button').click();
   // The run's last status says what went wrong, and where.
   await expect(page.getByTestId('tool-status')).toHaveText(

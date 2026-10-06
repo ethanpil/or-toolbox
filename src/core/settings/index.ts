@@ -54,8 +54,12 @@ export function createSettingsService(core: CoreServices): SettingsService {
     }
   };
 
-  /** Another tab (or a backup import / reset) changed storage: adopt it if it differs. */
+  /**
+   * Another tab (or a backup import / reset) changed storage: adopt it if it differs. Storage that stopped
+   * answering is not a change: what this page shows stays.
+   */
   const reload = (): void => {
+    if (!local()) return;
     const nextRaw = readRaw();
     if (nextRaw === raw) return;
     raw = nextRaw;

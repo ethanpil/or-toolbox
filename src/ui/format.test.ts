@@ -13,6 +13,7 @@ import {
   formatRunCost,
   formatTokens,
   formatUsd,
+  isoDateTime,
   keyBalance,
   plural,
   usageLine,
@@ -230,6 +231,16 @@ describe('formatRelativeTime', () => {
   it('shows a date after a week, with the year only for another year', () => {
     expect(formatRelativeTime(new Date(2026, 2, 4, 12).getTime(), now)).toBe('Mar 4');
     expect(formatRelativeTime(new Date(2025, 2, 4, 12).getTime(), now)).toBe('Mar 4, 2025');
+  });
+});
+
+describe('isoDateTime', () => {
+  it('gives a <time> value, or none for a time no date can hold', () => {
+    expect(isoDateTime(0)).toBe('1970-01-01T00:00:00.000Z');
+    expect(isoDateTime(1e20)).toBeUndefined();
+    expect(isoDateTime(Number.NaN)).toBeUndefined();
+    // The visible text of such a record must not throw either.
+    expect(() => formatRelativeTime(1e20)).not.toThrow();
   });
 });
 

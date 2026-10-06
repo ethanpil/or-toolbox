@@ -152,4 +152,45 @@ describe('ChatStreamAssembler', () => {
     assembler.push({ choices: [{ delta: { annotations: [cite] } }] });
     expect(assembler.result().annotations).toEqual([file, cite]);
   });
+
+  it('shows a streamed refusal as the reply text and names it', () => {
+    const events: ChatStreamEvent[] = [];
+    const assembler = new ChatStreamAssembler((e) => events.push(e));
+    assembler.push({
+      id: 'g',
+      model: 'm',
+      choices: [{ delta: { content: '', refusal: 'I can' } }],
+    });
+    assembler.push({
+      choices: [{ delta: { refusal: '’t help with that.' }, finish_reason: 'stop' }],
+    });
+    const result = assembler.result();
+    expect(result.text).toBe('I can’t help with that.');
+    expect(result.refusal).toBe('I can’t help with that.');
+    expect(events.filter((e) => e.type === 'text').map((e) => e.text)).toEqual([
+      'I can',
+      '’t help with that.',
+    ]);
+  });
+
+  it.each([
+    ['content_filter', /content filter/],
+    ['error', /stopped with an error/],
+  ])('explains a reply that ended with %s and no content', (reason, message) => {
+    const assembler = new ChatStreamAssembler(() => undefined);
+    assembler.push({ id: 'g', model: 'm', choices: [{ delta: { content: '' } }] });
+    assembler.push({ choices: [{ delta: {}, finish_reason: reason }] });
+    const result = assembler.result();
+    expect(result.text).toBe('');
+    expect(result.refusal).toMatch(message);
+  });
+
+  it('names no refusal for a normal reply, or a filtered one that still has content', () => {
+    const assembler = new ChatStreamAssembler(() => undefined);
+    assembler.push({ id: 'g', model: 'm', choices: [{ delta: { content: 'Hi' } }] });
+    expect(assembler.result().refusal).toBeUndefined();
+    assembler.push({ choices: [{ delta: {}, finish_reason: 'content_filter' }] });
+    expect(assembler.result().refusal).toBeUndefined();
+    expect(assembler.result().finishReason).toBe('content_filter');
+  });
 });

@@ -2,6 +2,10 @@
  * Pre-run cost estimates in USD. Pure functions over catalog data; null when the price cannot be derived.
  * Units differ per model family and are not machine-readable (docs/openrouter-api.md §4.3, §5.4, §7.5), so the
  * heuristics below err on the high side. The real cost always arrives later as `usage.cost`.
+ *
+ * Free models are `:free` ids, answered before any of these run (`ModelsService.estimate`). Here a price of zero
+ * is unknown, not free: image, decisions and media models list "0" for prices they bill another way, so an
+ * estimate whose every price is zero is null.
  */
 
 import type { RawModelEndpoint, RawVideoModel } from '../api/types';
@@ -68,19 +72,40 @@ function tokenPrices(
   return { prompt, completion };
 }
 
+/** Which side of a token request carries audio (`EstimateInput` tokens `audio`). */
+export interface AudioSides {
+  /** The prompt includes audio: every prompt token is priced at the audio input rate when that is higher. */
+  input?: boolean;
+  /** The reply is audio: every completion token is priced at the audio output rate when that is higher. */
+  output?: boolean;
+}
+
+/**
+ * Token requests. Audio is priced per side, high: the prompt token count does not say how much of it is audio,
+ * so with `audio.input` all of it is (`pricing.audio`), and with `audio.output` all of the completion
+ * (`pricing.audio_output`).
+ */
 export function estimateTokens(
   model: ModelInfo,
   promptTokens: number,
   completionTokens: number,
+  audio: AudioSides = {},
 ): number | null {
   const prices = tokenPrices(model, promptTokens);
-  return prices ? promptTokens * prices.prompt + completionTokens * prices.completion : null;
+  if (!prices) return null;
+  const raw = model.pricing.raw;
+  const prompt = audio.input ? Math.max(prices.prompt, price(raw, 'audio')) : prices.prompt;
+  const completion = audio.output
+    ? Math.max(prices.completion, price(raw, 'audio_output'))
+    : prices.completion;
+  if (prompt === 0 && completion === 0) return null;
+  return promptTokens * prompt + completionTokens * completion;
 }
 
 export function estimateDecision(model: ModelInfo, inputTokens: number): number | null {
   // Billing is input tokens only (§8.2).
   const prices = tokenPrices(model, inputTokens);
-  return prices ? inputTokens * prices.prompt : null;
+  return prices && prices.prompt > 0 ? inputTokens * prices.prompt : null;
 }
 
 /**
@@ -97,6 +122,7 @@ export function estimateSpeech(
   if (!sources.some((p) => priceNumber(p['prompt']) !== null)) return null;
   const prompt = Math.max(...sources.map((p) => price(p, 'prompt')));
   const completion = Math.max(...sources.map((p) => price(p, 'completion')));
+  if (prompt === 0 && completion === 0) return null;
   const { characters } = input;
   const units = BYTE_PRICED_TTS.test(input.model)
     ? (input.bytes ?? characters * MAX_UTF8_BYTES_PER_CHARACTER)
@@ -115,6 +141,7 @@ export function estimateTranscription(
   const prompt = priceNumber(pricing['prompt']);
   if (prompt === null) return null;
   const completion = price(pricing, 'completion');
+  if (prompt === 0 && completion === 0) return null;
   if (completion > 0) {
     return (
       seconds * STT_AUDIO_TOKENS_PER_SECOND * prompt +
@@ -127,8 +154,9 @@ export function estimateTranscription(
 
 /**
  * Images: `image_output` is USD per output image token. Per-megapixel models bill width x height / 256 tokens,
- * per-image models a flat 4175 (so 1 MP is the floor). References add the input-image price. A zero price is
- * unknown, not free (free models are `:free` ids, answered before this; some paid models list "0").
+ * per-image models a flat 4175 (so 1 MP is the floor). References add the input-image price; a model that lists
+ * none (per-megapixel FLUX) is charged for each reference as for one more output image, which is high (klein
+ * billed $0.001 for a 1024x1024 reference against $0.014 for the output). A zero price is unknown, not free.
  */
 export function estimateImage(
   model: ModelInfo,
@@ -149,9 +177,10 @@ export function estimateImage(
   const references = input.references ?? 0;
   if (references > 0) {
     const imagePrice = price(raw, 'image');
-    const perReference =
+    const listed =
       (imagePrice >= PER_IMAGE_THRESHOLD ? imagePrice : imagePrice * REFERENCE_IMAGE_TOKENS) +
       (model.pricing.prompt ?? 0) * REFERENCE_IMAGE_TOKENS;
+    const perReference = listed > 0 ? listed : tokens * perToken;
     // Every request uploads its references again: one request with `n`, or one per image.
     total += references * Math.max(1, input.requests ?? 1) * perReference;
   }

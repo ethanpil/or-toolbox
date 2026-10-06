@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import authKeys from '../../../tests/fixtures/openrouter/auth-keys-response.documented.json';
 import { isolateChannels, testCore } from '../api/test-fakes';
-import { ApiError, KeyLockedError, errorCode, userMessage } from '../errors';
+import { ApiError, KeyLockedError, StorageFullError, errorCode, userMessage } from '../errors';
 import { createKeysService } from '../keys/keys';
 import { SS_KEYS } from '../storage/local';
 import type { ApiClient, KeyInfo, KeysService } from '../types';
 import {
+  KeyNotSavedError,
   OAuthError,
   OPENROUTER_AUTH_URL,
   callbackUrl,
@@ -31,16 +32,21 @@ const keyInfo: KeyInfo = {
 function setup(now = () => 1_000_000) {
   const navigate = vi.fn<(href: string) => void>();
   const exchangeAuthCode = vi.fn(() => Promise.resolve({ key: OAUTH_KEY }));
+  const listed: KeyInfo[] = [];
   const add = vi.fn(() => Promise.resolve(keyInfo));
   const lock = { locked: false };
   const oauth = createOAuthService(
     testCore({
       api: { account: { exchangeAuthCode } } as unknown as ApiClient,
-      keys: { add, lock: { unlocked: () => !lock.locked } } as unknown as KeysService,
+      keys: {
+        add,
+        list: () => listed,
+        lock: { unlocked: () => !lock.locked },
+      } as unknown as KeysService,
     }),
     { navigate, now },
   );
-  return { oauth, navigate, exchangeAuthCode, add, lock };
+  return { oauth, navigate, exchangeAuthCode, add, lock, listed };
 }
 
 async function started(
@@ -202,6 +208,36 @@ describe('complete', () => {
     s.lock.locked = false;
     await expect(s.oauth.complete(params)).resolves.toMatchObject({ key: keyInfo });
     expect(s.exchangeAuthCode).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a key it could not save in memory and saves it on request, without a second exchange', async () => {
+    const s = setup();
+    const params = await callbackParams(s, { returnTo: '/or-toolbox/tools/ocr/' });
+    s.add.mockRejectedValueOnce(new KeyLockedError()); // locked during the exchange
+    const error: unknown = await s.oauth.complete(params).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(KeyNotSavedError);
+    const notSaved = error as KeyNotSavedError;
+    expect(errorCode(notSaved.reason)).toBe('locked');
+    expect(userMessage(notSaved)).toMatch(/created on OpenRouter but could not be saved/);
+
+    await expect(notSaved.save()).resolves.toEqual({
+      key: keyInfo,
+      returnTo: '/or-toolbox/tools/ocr/',
+    });
+    expect(s.exchangeAuthCode).toHaveBeenCalledTimes(1);
+    expect(s.add).toHaveBeenCalledTimes(2);
+  });
+
+  it('never saves a key twice when it landed before the failure', async () => {
+    const s = setup();
+    const params = await callbackParams(s);
+    // Stored, then the default-key settings write ran out of space.
+    s.add.mockImplementationOnce(() => {
+      s.listed.push({ ...keyInfo, id: 'landed' });
+      return Promise.reject(new StorageFullError());
+    });
+    await expect(s.oauth.complete(params)).resolves.toMatchObject({ key: { id: 'landed' } });
+    expect(s.add).toHaveBeenCalledTimes(1);
   });
 
   it('refuses to start while locked', async () => {

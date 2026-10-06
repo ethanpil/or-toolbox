@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DB_NAME, getDb } from './db';
+import { StorageFullError } from '../errors';
 import { resetDb } from '../testing/state-fakes';
 
 /** Runs one raw IndexedDB request to completion. */
@@ -14,6 +15,23 @@ function request(make: () => IDBRequest): Promise<unknown> {
 
 beforeEach(resetDb);
 afterEach(() => vi.restoreAllMocks());
+
+describe('quota errors', () => {
+  it('turn into StorageFullError for every store, so the user gets the storage-full help', async () => {
+    const db = await getDb();
+    for (const store of ['kv', 'runs', 'prompts', 'jobs', 'stats'] as const) {
+      const open = vi.spyOn(IDBDatabase.prototype, 'transaction');
+      const tx = db.transaction(store, 'readwrite');
+      const raw = open.mock.results[0]?.value as { _abort(name: string): void };
+      open.mockRestore();
+      // fake-indexeddb's own abort path, as a browser aborts a transaction over its quota.
+      raw._abort('QuotaExceededError');
+      await expect(tx.done).rejects.toBeInstanceOf(StorageFullError);
+      // The same promise every time, so observing one copy is enough.
+      expect(tx.done).toBe(tx.done);
+    }
+  });
+});
 
 describe('getDb', () => {
   it('does not cache a failed open', async () => {

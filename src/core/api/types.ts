@@ -149,6 +149,13 @@ export interface ChatStreamResult {
    * reuse it to skip parsing again [§2.5]) or web citations. Absent when there were none.
    */
   annotations?: Array<Record<string, unknown>>;
+  /**
+   * Why the reply holds no usable answer; absent for a normal reply. The model's own refusal (`delta.refusal`,
+   * which is also streamed as `text`), or a sentence for a reply that ended with `finish_reason` `content_filter`
+   * or `error` before any content (not in `text`). Tools show it instead of an empty "complete" reply and never
+   * parse it as an answer; the request was billed as usual (`usage`).
+   */
+  refusal?: string;
 }
 
 // --- images [§3] -----------------------------------------------------------------------------------

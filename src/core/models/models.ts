@@ -134,11 +134,17 @@ class ListCache<T> {
       });
   }
 
-  /** Keeps a fresh list; the IndexedDB write is not awaited, and other tabs are told once it is stored. */
+  /**
+   * Keeps a fresh list; the IndexedDB write is not awaited, and tabs are told only once it is stored. After a
+   * failed write nothing is announced: another tab would drop its copy, read the old one, refetch and announce
+   * again, and two tabs would refetch the ~1 MB catalog from each other forever.
+   */
   private store(items: T[]): T[] {
     this.memory = { fetchedAt: this.options.now(), items };
     this.failure = null;
-    void this.write(this.memory).then(() => this.options.onRefreshed?.());
+    void this.write(this.memory).then((stored) => {
+      if (stored) this.options.onRefreshed?.();
+    });
     return items;
   }
 
@@ -157,7 +163,8 @@ class ListCache<T> {
     return null;
   }
 
-  private async write(entry: { fetchedAt: number; items: T[] }): Promise<void> {
+  /** True once stored. */
+  private async write(entry: { fetchedAt: number; items: T[] }): Promise<boolean> {
     try {
       await (
         await getDb()
@@ -166,8 +173,10 @@ class ListCache<T> {
         value: { fetchedAt: entry.fetchedAt, [this.options.field]: entry.items },
         updatedAt: entry.fetchedAt,
       });
+      return true;
     } catch {
       // Not cached; the next page load fetches again.
+      return false;
     }
   }
 }
@@ -287,7 +296,9 @@ export function createModelsService(
     switch (input.kind) {
       case 'tokens': {
         const model = await get(input.model);
-        return model ? estimateTokens(model, input.promptTokens, input.completionTokens) : null;
+        return model
+          ? estimateTokens(model, input.promptTokens, input.completionTokens, input.audio)
+          : null;
       }
       case 'decision': {
         const model = await get(input.model);

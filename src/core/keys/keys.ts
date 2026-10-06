@@ -9,10 +9,16 @@
  * `exportFile`/`replaceFile`/`clear`, never through localStorage directly.
  *
  * Unlocking is per tab: sessionStorage `ortoolbox:unlocked` holds `{key, at}`, the raw AES key (base64) and the
- * time of the last `touch()`. It survives navigation between the site's pages in that tab and dies with the
- * tab. A session key that no longer opens the file (passphrase changed elsewhere) is dropped at page start and
- * before it encrypts anything. After `settings.security.autoLockMinutes` (capped at 24 h; 0 disables it)
- * without `touch()` the entry is deleted.
+ * time of the last `touch()`. It survives navigation between the site's pages in that tab (a memory-only key
+ * would ask for the passphrase on every page of this multi-page app). It does NOT reliably die with the tab:
+ * browsers restore sessionStorage when they reopen a closed tab or restore a session (and may keep it on disk
+ * for that), so auto-lock is what bounds it. A session key that no longer opens the file (passphrase changed
+ * elsewhere) is dropped at page start and before it encrypts anything. After
+ * `settings.security.autoLockMinutes` (capped at 24 h; 0 disables it) without `touch()` the entry is deleted;
+ * the check reads `at`, so a tab restored after that delay comes back locked.
+ *
+ * A stored file this build cannot read (another version, damaged JSON, an unreadable lock) is never written
+ * over; entries of a readable file that this build cannot parse are written back unchanged.
  *
  * The default key is `settings.defaultKeyId`, set when the first key is added; when it is null or stale (e.g.
  * after a settings reset) the first key acts as default, so a user with keys is never told to add one.
@@ -126,25 +132,33 @@ function parseLock(value: unknown): StoredKeysFile['lock'] | undefined {
   return { salt, iterations, verifier: parsedVerifier };
 }
 
+export interface ParsedKeysFile {
+  file: StoredKeysFile;
+  /** Stored entries this build cannot read (another version's, or damaged): written back unchanged. */
+  unreadable: unknown[];
+}
+
 /**
- * Validates a keys file. `strict` (replaceFile) rejects anything off: a malformed or duplicate key, a malformed
- * lock, or a key whose secret does not match the lock state. Lenient (reading storage) drops malformed and
- * duplicate keys and a malformed lock, keeping what can still be used.
+ * Validates a keys file. Anything that is not a version-1 file with a key list and a readable lock (or none) is
+ * null. `strict` (replaceFile) also rejects a malformed or duplicate key, or a key whose secret does not match
+ * the lock state. Lenient (reading storage) sets malformed and duplicate keys aside as `unreadable`.
  */
-export function parseKeysFile(value: unknown, strict: boolean): StoredKeysFile | null {
+export function parseKeysFile(value: unknown, strict: boolean): ParsedKeysFile | null {
   if (!isRecord(value) || value['version'] !== 1 || !Array.isArray(value['keys'])) return null;
   let lock: StoredKeysFile['lock'] = null;
   if (value['lock'] != null) {
     const parsed = parseLock(value['lock']);
-    if (parsed === undefined && strict) return null;
-    lock = parsed ?? null;
+    if (parsed === undefined) return null;
+    lock = parsed;
   }
   const keys: StoredKey[] = [];
+  const unreadable: unknown[] = [];
   const ids = new Set<string>();
   for (const item of value['keys'] as unknown[]) {
     const key = parseKey(item);
     if (!key || ids.has(key.id)) {
       if (strict) return null;
+      unreadable.push(item);
       continue;
     }
     const consistent = lock ? key.enc !== null && key.secret === null : key.secret !== null;
@@ -152,25 +166,47 @@ export function parseKeysFile(value: unknown, strict: boolean): StoredKeysFile |
     keys.push(key);
     ids.add(key.id);
   }
-  return { version: 1, keys, lock };
+  return { file: { version: 1, keys, lock }, unreadable };
 }
 
-function readFile(): StoredKeysFile {
-  return (
-    parseKeysFile(readJson<unknown>(local(), LS_KEYS.keys), false) ?? {
-      version: 1,
-      keys: [],
-      lock: null,
-    }
-  );
+/** What storage holds, as this build reads it. */
+interface Stored extends ParsedKeysFile {
+  /** A stored file this build cannot read at all (another version, or damaged): it reads as no keys. */
+  foreign: boolean;
 }
+
+const FOREIGN_FILE =
+  'Your keys were saved by a newer version of ORtoolbox, or are damaged, so this page does not change them. Reload the page. If that does not help, Reset everything in Settings → Data removes them.';
+const UNREADABLE_KEYS =
+  'Some of your keys were saved by a newer version of ORtoolbox, so this page cannot change the lock. Reload the page and try again.';
 
 function rawFile(): string | null {
   return readRaw(local(), LS_KEYS.keys);
 }
 
-function writeFile(file: StoredKeysFile): void {
-  writeJson(local(), LS_KEYS.keys, file);
+function load(): Stored {
+  const raw = rawFile();
+  const parsed =
+    raw === null ? null : parseKeysFile(readJson<unknown>(local(), LS_KEYS.keys), false);
+  return parsed
+    ? { ...parsed, foreign: false }
+    : { file: { version: 1, keys: [], lock: null }, unreadable: [], foreign: raw !== null };
+}
+
+function readFile(): StoredKeysFile {
+  return load().file;
+}
+
+/** Refuses to write over a file this build cannot read; for a lock change, also over unreadable entries. */
+function assertWritable(stored: Stored, lockChange = false): void {
+  if (stored.foreign) throw new KeysChangedError(FOREIGN_FILE);
+  if (lockChange && stored.unreadable.length > 0) throw new KeysChangedError(UNREADABLE_KEYS);
+}
+
+/** Writes `file` over `stored`, keeping the entries this build could not read. */
+function writeFile(stored: Stored, file: StoredKeysFile): void {
+  assertWritable(stored);
+  writeJson(local(), LS_KEYS.keys, { ...file, keys: [...file.keys, ...stored.unreadable] });
 }
 
 function readSession(): UnlockedSession | null {
@@ -408,10 +444,20 @@ export function createKeysService(
     );
   }
 
-  /** Writes `next` only if the stored file is still `before` (no await between the check and the write). */
+  /** The stored file before a lock change; refused when the change could lose something. */
+  function lockChangeSource(): StoredKeysFile {
+    const stored = load();
+    assertWritable(stored, true);
+    return stored.file;
+  }
+
+  /**
+   * Writes a lock change only if the stored file is still `before` (no await between the check and the write),
+   * which `lockChangeSource()` found writable with nothing unreadable in it.
+   */
   function commit(before: string | null, next: StoredKeysFile): void {
     if (rawFile() !== before) throw new KeysChangedError();
-    writeFile(next);
+    writeJson(local(), LS_KEYS.keys, next);
   }
 
   const lock: KeyLock = {
@@ -428,7 +474,7 @@ export function createKeysService(
       wire();
       assertPassphrase(passphrase);
       const before = rawFile();
-      const file = readFile();
+      const file = lockChangeSource();
       if (file.lock) throw new InvalidInputError('The passphrase lock is already on.');
       const salt = randomBytes(16);
       const iterations = options.pbkdf2Iterations ?? PBKDF2_ITERATIONS;
@@ -448,7 +494,7 @@ export function createKeysService(
     async disable(passphrase) {
       wire();
       const before = rawFile();
-      const file = readFile();
+      const file = lockChangeSource();
       if (!file.lock) return;
       const key = await verifiedKey(passphrase, file.lock);
       const keys = await Promise.all(
@@ -487,7 +533,7 @@ export function createKeysService(
       wire();
       assertPassphrase(newPassphrase);
       const before = rawFile();
-      const file = readFile();
+      const file = lockChangeSource();
       if (!file.lock) throw new InvalidInputError('The passphrase lock is off.');
       const oldKey = await verifiedKey(oldPassphrase, file.lock);
       const secrets = await Promise.all(
@@ -544,7 +590,9 @@ export function createKeysService(
       const secret = normalizeKeyInput(input.secret);
       const problem = keyFormatProblem(secret);
       if (problem) throw new InvalidKeyError(problem);
-      const before = readFile();
+      const loaded = load();
+      assertWritable(loaded);
+      const before = loaded.file;
       const stored: StoredKey = {
         id: crypto.randomUUID(),
         name: input.name.trim() || 'OpenRouter key',
@@ -562,10 +610,11 @@ export function createKeysService(
         stored.secret = secret;
       }
       // Re-read after the await so a key added meanwhile in another tab is kept.
-      const file = readFile();
+      const latest = load();
+      const file = latest.file;
       if (JSON.stringify(file.lock) !== JSON.stringify(before.lock)) throw new KeysChangedError();
       file.keys.push(stored);
-      writeFile(file);
+      writeFile(latest, file);
       // Only the first key becomes default; a stale default id is covered by the first-key fallback.
       if (file.keys.length === 1) {
         core.settings.update((draft) => {
@@ -578,23 +627,24 @@ export function createKeysService(
 
     update(id, patch) {
       wire();
-      const file = readFile();
-      const key = file.keys.find((k) => k.id === id);
+      const stored = load();
+      const key = stored.file.keys.find((k) => k.id === id);
       if (!key) return;
       if (patch.name !== undefined) key.name = patch.name.trim() || key.name;
       if (patch.colour !== undefined) key.colour = patch.colour;
       if (patch.noRetention !== undefined) key.noRetention = patch.noRetention;
-      writeFile(file);
+      writeFile(stored, stored.file);
       changed();
     },
 
     remove(id) {
       wire();
-      const file = readFile();
+      const stored = load();
+      const file = stored.file;
       const keys = file.keys.filter((k) => k.id !== id);
       if (keys.length === file.keys.length) return;
       forgetKeys(new Set([id]), keys);
-      writeFile({ ...file, keys });
+      writeFile(stored, { ...file, keys });
       statusCache.delete(id);
       changed();
     },
@@ -682,20 +732,24 @@ export function createKeysService(
 
     replaceFile(next, opts) {
       wire();
-      const valid = parseKeysFile(next, true);
+      const valid = parseKeysFile(next, true)?.file;
       if (!valid)
         throw new InvalidInputError('The keys in this file are invalid; nothing was changed.');
-      const current = readFile();
+      const stored = load();
+      const current = stored.file;
+      const lockChanged = JSON.stringify(current.lock) !== JSON.stringify(valid.lock);
+      // Entries this build cannot read are kept, which works only under the lock they were written with.
+      assertWritable(stored, lockChanged);
       if (opts?.expected !== undefined) {
-        const expected = parseKeysFile(opts.expected, false);
+        const expected = parseKeysFile(opts.expected, false)?.file;
         if (JSON.stringify(expected) !== JSON.stringify(current)) throw new KeysChangedError();
       }
       const kept = new Set(valid.keys.map((k) => k.id));
       forgetKeys(new Set(current.keys.map((k) => k.id).filter((id) => !kept.has(id))), valid.keys);
-      writeFile(valid);
+      writeFile(stored, valid);
       statusCache.clear();
       // A session key from another lock cannot open the new file.
-      if (JSON.stringify(current.lock) !== JSON.stringify(valid.lock)) lockLocal();
+      if (lockChanged) lockLocal();
       changed();
     },
 

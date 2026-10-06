@@ -223,6 +223,15 @@ export function formatDate(when: number | string, options: DateOptions = {}): st
   });
 }
 
+/**
+ * The `dateTime` of a `<time>`: an ISO string, or undefined (no attribute) for a time no `Date` can hold, on
+ * which `toISOString()` throws. Use it for stored times, so one bad record cannot break a whole list.
+ */
+export function isoDateTime(time: number): string | undefined {
+  const date = new Date(time);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
 /** Full date and time for tooltips and `<time>` titles. */
 export function formatDateTime(time: number): string {
   return new Date(time).toLocaleString('en-US', {

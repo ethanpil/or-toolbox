@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { mountAuthCallback, type AuthCallbackEnv } from '../../pages/auth-callback';
 import { KeyLockedError } from '../errors';
 import type { KeyInfo } from '../types';
-import { OAuthError } from './oauth';
+import { StorageFullError } from '../errors';
+import { KeyNotSavedError, OAuthError } from './oauth';
 
 const key: KeyInfo = {
   id: 'k1',
@@ -118,19 +119,50 @@ describe('mountAuthCallback', () => {
     ]);
   });
 
-  it('offers unlock again when the tab locked itself during the exchange', async () => {
+  it('saves the new key after unlocking when the tab locked itself during the exchange', async () => {
     const status = document.createElement('div');
-    let attempts = 0;
-    const e = env(() => {
-      attempts++;
-      return attempts === 1
-        ? Promise.reject(new KeyLockedError())
-        : Promise.resolve({ key, returnTo: null });
-    });
+    const e = env(() =>
+      Promise.reject(
+        new KeyNotSavedError(new KeyLockedError(), () => {
+          e.calls.push('save');
+          return Promise.resolve({ key, returnTo: null });
+        }),
+      ),
+    );
     await mountAuthCallback(status, e);
-    expect(status.querySelector('[data-testid="auth-unlock-form"]')).not.toBeNull();
+    expect(status.querySelector('[data-testid="auth-unlock-form"]')?.textContent).toMatch(
+      /created on OpenRouter/,
+    );
     submitPassphrase(status, 'right');
     await vi.waitFor(() => expect(e.calls.at(-1)).toBe('redirect:/or-toolbox/settings/'));
-    expect(e.calls.filter((c) => c === 'complete:abc')).toHaveLength(2);
+    // The code is spent: the key is saved from memory, never exchanged again.
+    expect(e.calls.filter((c) => c === 'complete:abc')).toHaveLength(1);
+    expect(e.calls).toContain('save');
+  });
+
+  it('offers to save again a key it could not store, and says what leaving means', async () => {
+    const status = document.createElement('div');
+    let saves = 0;
+    const e = env(() =>
+      Promise.reject(
+        new KeyNotSavedError(new StorageFullError(), () => {
+          saves++;
+          return saves === 1
+            ? Promise.reject(new StorageFullError())
+            : Promise.resolve({ key, returnTo: null });
+        }),
+      ),
+    );
+    await mountAuthCallback(status, e);
+    const error = status.querySelector('[data-testid="auth-error"]');
+    expect(error?.textContent).toMatch(/Browser storage is full/);
+    expect(error?.textContent).toMatch(/Keep this page open/);
+    const save = () => status.querySelector<HTMLButtonElement>('[data-testid="auth-save-again"]');
+    save()?.click();
+    await vi.waitFor(() => expect(saves).toBe(1));
+    await vi.waitFor(() => expect(save()?.disabled).toBe(false));
+    save()?.click();
+    await vi.waitFor(() => expect(e.calls.at(-1)).toBe('redirect:/or-toolbox/settings/'));
+    expect(e.start).not.toHaveBeenCalled();
   });
 });

@@ -305,6 +305,8 @@ await ctx.api.chatStream(body, { run, onSend: () => (sentAt = performance.now())
 
 `chatStream` resolves with the assembled `ChatStreamResult`. Its `annotations` (present only when some came) are the streamed `delta.annotations`: for a PDF sent through the `file-parser` plugin, `{ type: 'file', file: { name, content } }` with the parser's text. Keep that text and send it on later turns instead of the PDF (no upload, no parsing, no parser charge), as Chat does.
 
+`refusal` (present only when it applies) says why the reply holds no usable answer: the model's own refusal (`delta.refusal`, which also streamed as `text`), or a sentence for a reply that ended with `finish_reason` `content_filter` or `error` before any content (not in `text`). Show it instead of an empty "complete" reply, never parse it as an answer (no JSON repair request), and remember the request was billed as usual.
+
 ## Cost estimates
 
 Give the instance an `estimate(model)` hook and call `ctx.ui.refreshEstimate()` whenever the input changes:
@@ -313,6 +315,8 @@ Give the instance an `estimate(model)` hook and call `ctx.ui.refreshEstimate()` 
 estimate: (model) =>
   ctx.models.estimate({ kind: 'tokens', model, promptTokens: approxTokens(text.value), completionTokens: maxTokens }),
 ```
+
+A request that sends audio, or asks for audio back, passes `audio: { input: true }` and/or `audio: { output: true }`, so that side is priced at the model's audio rate (all of it: deliberately high). A model whose every price is zero estimates `null` (unknown), never `0`, unless its id is `:free`.
 
 Count tokens with `src/core/tokens.ts`, the one approximation every tool uses (never a copy): `approxTokens(text)` (deliberately high and structure-aware: digits and punctuation weigh more than letters, so JSON and code are not under-counted), `MESSAGE_OVERHEAD` per message, `DEFAULT_OUTPUT_TOKENS`, and the context fit for chat-style requests:
 

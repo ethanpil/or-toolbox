@@ -228,17 +228,22 @@ describe('passphraseStrength', () => {
     expect(passphraseStrength('abc1234')).toMatchObject({ score: 0 });
   });
 
-  it('rewards length and variety', () => {
+  it('rewards length above all: variety does not make a short passphrase strong', () => {
     expect(passphraseStrength('abcdefgh').score).toBe(1);
+    expect(passphraseStrength('Ab1!efgh').score).toBe(1);
     expect(passphraseStrength('abcdefghijkl').score).toBe(2);
+    expect(passphraseStrength('Abcdefghijk1!').score).toBe(2);
+    expect(passphraseStrength('abcdefghijklmnop')).toMatchObject({ score: 3, label: 'Good' });
     expect(passphraseStrength('correct horse battery staple')).toMatchObject({
-      score: 3,
-      label: 'Good',
-    });
-    expect(passphraseStrength('Correct horse battery 9!')).toMatchObject({
       score: 4,
       label: 'Strong',
     });
+    expect(passphraseStrength('Correct horse battery 9!')).toMatchObject({ score: 4 });
+  });
+
+  it('pushes weak and fair passphrases toward 16 characters or four words', () => {
+    expect(passphraseStrength('abcdefghijkl').hint).toMatch(/16 or more characters/);
+    expect(passphraseStrength('abc').hint).toMatch(/16 or more/);
   });
 
   it('marks common and repeated passphrases weak', () => {
