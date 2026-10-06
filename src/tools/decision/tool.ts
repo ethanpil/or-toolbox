@@ -22,7 +22,7 @@ import { uid } from '../../ui/id';
 import type { ToolContext, ToolInstance, ToolSnapshot } from '../../ui/tool/index';
 import { questionBuilder } from './builder';
 import { libraryBar } from './library';
-import { exportDocument, parseDecision, resultVerdict } from './results';
+import { exportDocument, parseDecision, resultVerdict, reviewCount } from './results';
 import { resultsView } from './results-view';
 import {
   blankQuestion,
@@ -45,7 +45,7 @@ import {
 } from './tokens';
 
 /** A dropped text file longer than this is not read: the model's context could not hold it anyway. */
-const MAX_TEXT_BYTES = 1_000_000;
+const MAX_TEXT_BYTES = 1024 * 1024;
 
 export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
@@ -113,6 +113,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     store: ctx.state,
     bus: ctx.bus,
     tool: ctx.manifest.id,
+    defaultThreshold,
     questions: () => builder.questions(),
     state: () => panel.state(),
     hasState: () => hasSituation(panel.state()),
@@ -242,10 +243,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     const handle = await ctx.beginRun({ title: runTitle(questions) }, signal);
     results.busy(true);
     ui.status('Deciding…');
+    let decision: ReturnType<typeof parseDecision>;
+    let response: DecisionResponse;
     try {
       const request = buildRequest(handle.model, state, questions);
-      const response = await ctx.api.decide(request, { run: handle });
-      const decision = parseDecision(response, questions);
+      response = await ctx.api.decide(request, { run: handle });
+      decision = parseDecision(response, questions);
       last = { request, response };
       results.show(decision, questions, keys);
       // A threshold edited while the request was out applies to the cards drawn now.
@@ -260,23 +263,25 @@ export function setup(ctx: ToolContext): ToolInstance {
             current.get(keys[index] ?? '') ?? questions[index]?.threshold ?? 0,
           ) === 'review',
       ).length;
-      ui.status(
-        `Done · ${plural(questions.length, 'question')}, ${review === 0 ? 'all clear' : `${review} to review`}`,
-      );
-      await handle.finish({
-        output: JSON.stringify(response.answers),
-        meta: {
-          questions: questions.length,
-          answeredBy: decision.model,
-          costUsd: decision.costUsd,
-        },
-      });
+      ui.status(`Done · ${plural(questions.length, 'question')}, ${reviewCount(review)}`);
     } catch (error) {
       results.busy(false);
       ui.status(isStop(error) ? 'Stopped' : 'Failed');
       await handle.fail(error);
       throw error;
     }
+    // The answer is in and paid for: a failure to record it is shown, but never turns it into a failed run with a
+    // Retry (which would pay again).
+    await handle
+      .finish({
+        output: JSON.stringify(response.answers),
+        meta: {
+          questions: questions.length,
+          answeredBy: decision.model,
+          costUsd: decision.costUsd,
+        },
+      })
+      .catch((error: unknown) => void presentError(error));
   };
 
   ui.runner({ label: 'Decide', icon: 'signpost-split', run });
@@ -359,7 +364,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     },
     sample() {
       const template = TEMPLATES[0]!;
-      builder.setQuestions(templateQuestions(template.id) ?? []);
+      builder.setQuestions(templateQuestions(template.id, defaultThreshold()) ?? []);
       markBaseline();
       panel.setState({ ...panel.state(), mode: 'text', text: template.sample });
       results.relabel(builder.thresholds());

@@ -95,7 +95,7 @@ export function statePanel(options: { onChange: () => void }): StatePanel {
     h(
       'div',
       { class: 'form-text', id: ids.hint },
-      'You can also drop a .txt file anywhere on the page.',
+      'You can also drop text, JSON or XML files anywhere on the page.',
     ),
   );
 

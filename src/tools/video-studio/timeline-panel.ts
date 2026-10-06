@@ -410,6 +410,7 @@ export function timelinePanel(host: TimelinePanelHost): TimelinePanel {
             'video-clip-extend',
             `Extend ${title}`,
             () => host.extend(clip.id),
+            { disabled: !ready },
           ),
           action(
             clip,

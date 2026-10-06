@@ -62,6 +62,7 @@ import {
   buildVideoRequest,
   CONTINUE_PROMPT,
   controlsFor,
+  type ClipMode,
   type ControlsResult,
   DEFAULT_SETTINGS,
   effectiveFormat,
@@ -132,6 +133,22 @@ export function stemFrom(prompt: string): string {
 const shorten = (text: string, max: number): string =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
+/**
+ * A one-clip job's name in the Jobs list: "Continue clip 2: the camera rises", or "Extend the linked video" when
+ * native extend has no clip of the timeline (the public link is the source).
+ */
+export function clipLabel(
+  mode: ClipMode,
+  sourceIndex: number,
+  typed: string,
+  sent: string,
+): string {
+  if (mode !== 'continue' && mode !== 'extend') return shorten(sent, 70);
+  const verb = mode === 'continue' ? 'Continue' : 'Extend';
+  const what = sourceIndex >= 0 ? `${verb} clip ${sourceIndex + 1}` : `${verb} the linked video`;
+  return `${what}${typed.trim() ? `: ${shorten(typed.trim(), 50)}` : ''}`;
+}
+
 /** Usage for a request that reached OpenRouter without a known cost: the run books its reservation. */
 const unknownUsage = (model: string): Usage => ({
   model,
@@ -183,6 +200,30 @@ export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
   const tool = ctx.manifest.id;
   const store = createStore(ctx.state);
+  /** Why a store write failed, for a message (a failure that is not one of ours is the browser's storage). */
+  const storageReason = (cause: unknown): string =>
+    cause instanceof OrError
+      ? userMessage(cause).replace(/\.$/, '')
+      : 'the browser could not save it';
+  /**
+   * Runs work nobody awaits (a button, a timer, a bus event): a failure is shown, never left as an unhandled
+   * rejection with a page that went stale. `reload` reads the stored timeline again when the page had already
+   * drawn the change.
+   */
+  const background = (work: Promise<unknown>, options: { reload?: 'timeline' } = {}): void => {
+    work.catch((error: unknown) => {
+      void presentError(
+        error instanceof OrError
+          ? error
+          : new OrError(
+              'storage-unavailable',
+              `Could not save your change (${storageReason(error)}).`,
+              { cause: error },
+            ),
+      );
+      if (options.reload === 'timeline') void reloadTimeline().catch(() => undefined);
+    });
+  };
   /** This page, for sequence claims; its life lock tells other tabs it is open. */
   const tabId = uid('video-tab');
   const locks = webLocks();
@@ -270,7 +311,8 @@ export function setup(ctx: ToolContext): ToolInstance {
       scheduleRender();
     },
     // Expired on OpenRouter: recorded, so no tab offers it, joins it or downloads it again.
-    onExpired: (clip) => void saveTimeline((list) => updateClip(list, clip.id, { expired: true })),
+    onExpired: (clip) =>
+      background(saveTimeline((list) => updateClip(list, clip.id, { expired: true }))),
   });
   /** Reads a clip's length once its video is here, and stores it. */
   const measuring = new Set<string>();
@@ -340,14 +382,13 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
   ctx.bus.on('tool-state-changed', (event) => {
     if (event.tool !== tool) return;
-    if (event.key === TIMELINE_KEY) void reloadTimeline();
-    if (event.key === SEQUENCE_KEY) {
-      void reloadSequence().then(() => recoverStarts());
-    }
+    if (event.key === TIMELINE_KEY) background(reloadTimeline());
+    if (event.key === SEQUENCE_KEY) background(reloadSequence().then(() => recoverStarts()));
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible')
-      void recoverStarts().then(() => sequenceRunner.advance());
+    if (document.visibilityState === 'visible') {
+      background(recoverStarts().then(() => sequenceRunner.advance()));
+    }
   });
 
   // --- form edits reach the stored run, field by field --------------------------------------------------------
@@ -397,10 +438,10 @@ export function setup(ctx: ToolContext): ToolInstance {
     pending = mergeEdit(pending, edit);
     if (pendingTimer) clearTimeout(pendingTimer);
     if (now) {
-      void flushEdits().then(() => sequenceRunner.advance());
+      background(flushEdits().then(() => sequenceRunner.advance()));
       return;
     }
-    pendingTimer = setTimeout(() => void flushEdits(), EDIT_DELAY_MS);
+    pendingTimer = setTimeout(() => background(flushEdits()), EDIT_DELAY_MS);
   };
   /**
    * The stored run into the form: the run's values, with this tab's edits not written yet on top. An active run
@@ -436,9 +477,23 @@ export function setup(ctx: ToolContext): ToolInstance {
    * a chained sequence has no open job between steps, so the core's per-group notification would fire after step 1.
    */
   const noteFinish = (before: SequenceRun | null, after: SequenceRun): void => {
+    if (before?.id !== after.id) return;
+    // Every change the user did not just make in front of the page is said: a pause or stop by the cap, the
+    // failure rule, a missing key or a blocker, as well as the end.
+    const newBlocker =
+      after.blocker !== null &&
+      (before.blocker?.slotKey !== after.blocker.slotKey ||
+        before.blocker.kind !== after.blocker.kind);
+    const changed =
+      before.status !== after.status &&
+      (after.status === 'paused' || after.status === 'stopped' || after.status === 'done');
+    if (!changed && !newBlocker) return;
+    announce(
+      after.message ??
+        (after.status === 'done' ? 'The sequence ended.' : `The sequence is ${after.status}.`),
+    );
     const ended = after.status === 'done' || after.status === 'stopped';
-    if (!ended || before?.id !== after.id || before.status === after.status) return;
-    announce(after.message ?? 'The sequence ended.');
+    if (!ended || before.status === after.status) return;
     if (!notifyAllowed() || document.visibilityState !== 'hidden') return;
     try {
       new Notification(
@@ -526,7 +581,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       settings.extendUrl = text;
       formChanged();
     },
-    onUploads: (files) => void addUploads(files),
+    onUploads: (files) => background(addUploads(files)),
     onImages: () => formChanged(),
   });
 
@@ -577,23 +632,27 @@ export function setup(ctx: ToolContext): ToolInstance {
       return id;
     },
     start: () => void startSequencePressed(),
-    pause: () => void saveSequence((current) => (current ? pause(current, Date.now()) : current)),
-    resume: () => void resumeSequence(),
-    stop: () => void saveSequence((current) => (current ? stop(current, Date.now()) : current)),
-    clear: () => void clearSequence(),
-    rerun: (key) => void rerunSlot(key),
+    pause: () =>
+      background(saveSequence((current) => (current ? pause(current, Date.now()) : current))),
+    resume: () => background(resumeSequence()),
+    stop: () =>
+      background(saveSequence((current) => (current ? stop(current, Date.now()) : current))),
+    clear: () => background(clearSequence()),
+    rerun: (key) => background(rerunSlot(key)),
     chooseSource: (key, clipId) =>
-      void answerBlocker((current) => chooseSource(current, key, clipId, Date.now())),
+      background(answerBlocker((current) => chooseSource(current, key, clipId, Date.now()))),
     dropImages: (stepId) =>
-      void answerBlocker((current) => dropStepImages(current, stepId, Date.now())),
+      background(answerBlocker((current) => dropStepImages(current, stepId, Date.now()))),
     rerunPrevious: (key) => {
       const index = run?.slots.findIndex((slot) => slot.key === key) ?? -1;
       const previous = index > 0 ? run?.slots[index - 1] : undefined;
       if (!previous) return;
-      void answerBlocker((current) => {
-        const again = rerun(current, previous.key, Date.now());
-        return again ? { ...again, blocker: null, status: 'running', message: null } : current;
-      });
+      background(
+        answerBlocker((current) => {
+          const again = rerun(current, previous.key, Date.now());
+          return again ? { ...again, blocker: null, status: 'running', message: null } : current;
+        }),
+      );
     },
   });
 
@@ -643,7 +702,8 @@ export function setup(ctx: ToolContext): ToolInstance {
   const jobs = jobList({
     label: (job) => parsePayload(job.payload)?.label ?? 'Video clip',
     onCancel: (job) => void stopWaiting(job),
-    emptyText: 'Clips being generated appear here; they keep going if you leave the page.',
+    emptyText:
+      'Clips being made appear here. If you leave, OpenRouter keeps going and the clip joins the timeline when you open Video studio again.',
     testId: 'video-jobs',
   });
   bindJobList(ctx.jobs, jobs, { tool });
@@ -653,7 +713,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       type: 'button',
       class: 'btn btn-sm btn-outline-secondary',
       'data-testid': 'video-jobs-clear',
-      onclick: () => void clearFinishedJobs(),
+      onclick: () => background(clearFinishedJobs()),
     },
     'Clear finished',
   );
@@ -674,25 +734,40 @@ export function setup(ctx: ToolContext): ToolInstance {
     state: (clip) => media.state(clip),
     downloadButton: (clip) => media.result(clip.id)?.button() ?? null,
     describe: (clip) => describeClip(clip),
-    move: (clipId, delta) => void moveTimelineClip(clipId, delta),
+    move: (clipId, delta) => background(moveTimelineClip(clipId, delta), { reload: 'timeline' }),
     trim: (clipId, trimStart, trimEnd) => {
       const clip = clipById(clipId);
       const value = clampTrim(clip?.duration ?? null, trimStart, trimEnd);
       if (!clip) return value;
       clips = updateClip(clips, clipId, value);
       scheduleRender();
-      void saveTimeline((list) => updateClip(list, clipId, value));
+      background(
+        saveTimeline((list) => updateClip(list, clipId, value)),
+        {
+          reload: 'timeline',
+        },
+      );
       return value;
     },
     setIncluded: (clipId, included) => {
       clips = updateClip(clips, clipId, { included });
       scheduleRender();
-      void saveTimeline((list) => updateClip(list, clipId, { included }));
+      background(
+        saveTimeline((list) => updateClip(list, clipId, { included })),
+        {
+          reload: 'timeline',
+        },
+      );
     },
     setDropFirstFrame: (clipId, dropFirstFrame) => {
       clips = updateClip(clips, clipId, { dropFirstFrame });
       scheduleRender();
-      void saveTimeline((list) => updateClip(list, clipId, { dropFirstFrame }));
+      background(
+        saveTimeline((list) => updateClip(list, clipId, { dropFirstFrame })),
+        {
+          reload: 'timeline',
+        },
+      );
     },
     continueFrom: (clipId) => useSource(clipId, 'continue'),
     extend: (clipId) => useSource(clipId, 'extend'),
@@ -703,7 +778,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         void grabber.open(clip, blob, () => void timeline.focusClip(clipId, 'video-clip-frames'));
       }
     },
-    remove: (clipId) => void removeTimelineClip(clipId),
+    remove: (clipId) => background(removeTimelineClip(clipId), { reload: 'timeline' }),
     retry: (clipId) => {
       const clip = clipById(clipId);
       if (!clip) return;
@@ -996,9 +1071,21 @@ export function setup(ctx: ToolContext): ToolInstance {
       };
       media.put(clip, blob);
       await saveTimeline((list) => insertClip(list, clip, 'end'));
-      clipSourceId = clip.id;
-      if (settings.mode !== 'continue' && settings.mode !== 'extend') settings.mode = 'continue';
-      ui.status(`Added ${name} to the timeline: it is the clip to continue.`);
+      if (settings.tab === 'sequence') {
+        // On the Sequence tab the One clip form is out of sight: leave its mode alone. The video is the clip a new
+        // chained sequence continues, unless one is under way or the steps are independent.
+        const takes = settings.sequence.mode === 'chained' && !isActive(run);
+        if (takes) sequenceSourceId = clip.id;
+        ui.status(
+          takes
+            ? `Added ${name} to the timeline: the sequence starts from it.`
+            : `Added ${name} to the timeline.`,
+        );
+      } else {
+        clipSourceId = clip.id;
+        if (settings.mode !== 'continue' && settings.mode !== 'extend') settings.mode = 'continue';
+        ui.status(`Added ${name} to the timeline: it is the clip to continue.`);
+      }
     }
     formChanged();
   };
@@ -1069,9 +1156,9 @@ export function setup(ctx: ToolContext): ToolInstance {
           if (clipForm.first.references().length === 0) clipForm.first.add([image]);
           else clipForm.last.add([image]);
         }
-      } else {
-        settings.mode = 'first';
-        clipForm.first.add(named.slice(0, 1));
+      } else if (named[0]) {
+        // The form changes to "First frame" for it, and says so.
+        useImage('first', named[0].blob, named[0].name);
       }
       formChanged();
     });
@@ -1145,8 +1232,17 @@ export function setup(ctx: ToolContext): ToolInstance {
    */
   const settleRun = async (job: JobRecord, payload: VideoJobPayload): Promise<void> => {
     if (!job.runId) return;
-    const handle = await ctx.runs.reattach(job.runId).catch(() => null);
-    if (!handle) return; // already final (another tab, or the page-start sweep)
+    const handle = await ctx.runs.reattach(job.runId);
+    if (!handle) {
+      // Already final (another tab, or the page-start sweep) is normal. A run record that is gone is not: the
+      // clip's cost is booked on the job, but nothing in History shows the clip.
+      const record = await ctx.history.get(job.runId).catch(() => undefined);
+      if (!record) {
+        console.warn(`Video studio: the run ${job.runId} of job ${job.id} has no History entry.`);
+        announce('A video finished, but its History entry is gone, so it is not listed there.');
+      }
+      return;
+    }
     if (job.state === 'succeeded') {
       await handle.finish({
         output: `Video clip ready: ${payload.label}.`,
@@ -1196,6 +1292,18 @@ export function setup(ctx: ToolContext): ToolInstance {
           remoteStatus: job.state === 'succeeded' ? 'On the timeline' : null,
         })
         .catch(() => undefined);
+    } catch (error) {
+      // Not marked delivered, so opening this page again places it; Retry does it now.
+      void presentError(
+        new OrError(
+          'storage-unavailable',
+          job.state === 'succeeded'
+            ? `A video was made and paid for, but this page could not put it on the timeline (${storageReason(error)}). Try again; it is also added when you reopen this page.`
+            : `This page could not record that a video job did not finish (${storageReason(error)}).`,
+          { cause: error },
+        ),
+        { retry: () => void deliver(job) },
+      );
     } finally {
       delivering.delete(job.id);
       void sequenceRunner.advance();
@@ -1418,11 +1526,12 @@ export function setup(ctx: ToolContext): ToolInstance {
       signal,
     );
     ui.status('Sending the request…');
-    const sourceIndex = source ? clips.findIndex((clip) => clip.id === source.id) : -1;
-    const label =
-      mode === 'continue' || mode === 'extend'
-        ? `${mode === 'continue' ? 'Continue' : 'Extend'} clip ${sourceIndex + 1}${text0.trim() ? `: ${shorten(text0.trim(), 50)}` : ''}`
-        : shorten(text, 70);
+    const label = clipLabel(
+      mode,
+      source ? clips.findIndex((clip) => clip.id === source.id) : -1,
+      text0,
+      text,
+    );
     try {
       await submitJob(handle, built.body, {
         v: 1,

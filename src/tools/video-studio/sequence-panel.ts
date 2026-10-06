@@ -15,6 +15,7 @@
  */
 import { referencePicker, type ReferencePicker } from '../../ui/components/reference-picker';
 import { h, replace } from '../../ui/dom';
+import { setFieldError } from '../../ui/feedback/field-error';
 import { formatEstimate, formatUsd, plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
@@ -359,17 +360,29 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
     id: ids.cap,
     type: 'number',
     class: 'form-control',
-    min: '0',
+    min: '0.01',
     step: '0.01',
     inputMode: 'decimal',
     placeholder: 'No cap',
     'aria-describedby': ids.capHelp,
     'data-testid': 'seq-cap',
     onchange: () => {
-      const value = Number(cap.value);
-      host.onSpec({ capUsd: cap.value.trim() !== '' && value > 0 ? value : null });
+      // Empty is "no cap"; anything else must be an amount above zero. 0 or less is refused (it must never lift a
+      // cap that is in force), and the stored cap stays as it was.
+      const text = cap.value.trim();
+      const value = Number(text);
+      if (cap.validity.badInput || (text !== '' && !(Number.isFinite(value) && value > 0))) {
+        capInvalid = true;
+        setFieldError(cap, capFeedback, 'Enter an amount above $0, or leave it empty for no cap.');
+        return;
+      }
+      capInvalid = false;
+      setFieldError(cap, capFeedback, null);
+      host.onSpec({ capUsd: text === '' ? null : value });
     },
   });
+  const capFeedback = h('div', { class: 'invalid-feedback d-block' });
+  let capInvalid = false;
   const failure = h(
     'select',
     {
@@ -493,6 +506,7 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
         h('label', { class: 'form-label', htmlFor: ids.cap }, 'Spend cap'),
         h('div', { class: 'input-group' }, h('span', { class: 'input-group-text' }, '$'), cap),
         h('div', { id: ids.capHelp, class: 'form-text' }, 'Stops before a step would pass it.'),
+        capFeedback,
       ),
       h(
         'div',
@@ -749,7 +763,9 @@ export function sequencePanel(host: SequencePanelHost): SequencePanel {
     style.readOnly = locked;
     if (document.activeElement !== repeat) repeat.value = String(spec.repeat);
     repeat.disabled = active;
-    if (document.activeElement !== cap) cap.value = spec.capUsd === null ? '' : String(spec.capUsd);
+    if (document.activeElement !== cap && !capInvalid) {
+      cap.value = spec.capUsd === null ? '' : String(spec.capUsd);
+    }
     failure.value = spec.onFailure;
 
     const clips = spec.steps.length * spec.repeat;

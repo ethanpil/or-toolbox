@@ -7,13 +7,14 @@ import type * as Media from '../../core/media/image';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient } from '../../core/types';
 import { ApiError, NetworkError } from '../../core/errors';
+import { announce } from '../../ui/feedback/announce';
 import type * as Errors from '../../ui/feedback/errors';
 import { presentError } from '../../ui/feedback/errors';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
 import { DEFAULT_SETTINGS, settingsJson } from './params';
 import { SEQUENCE_KEY, TIMELINE_KEY } from './store';
-import { setup, stemFrom } from './tool';
+import { clipLabel, setup, stemFrom } from './tool';
 
 // jsdom cannot decode images or video: stand-ins for the header reads, encoders and frame grabs.
 vi.mock('../../core/media/image', async (importOriginal) => ({
@@ -26,6 +27,7 @@ vi.mock('../../core/media/video', () => ({
   captureFrame: () => Promise.resolve(new Blob(['png'], { type: 'image/png' })),
   clampSeekTime: (time: number) => time,
 }));
+vi.mock('../../ui/feedback/announce', () => ({ announce: vi.fn() }));
 vi.mock('../../ui/feedback/errors', async (importOriginal) => ({
   ...(await importOriginal<typeof Errors>()),
   presentError: vi.fn(() => Promise.resolve()),
@@ -121,6 +123,17 @@ describe('file names', () => {
   it('come from the prompt', () => {
     expect(stemFrom('A fishing boat leaves a quiet harbour!')).toBe('a-fishing-boat-leaves-a');
     expect(stemFrom('???')).toBe('clip');
+  });
+});
+
+describe('job labels', () => {
+  it('name the clip being continued or extended, and never clip 0 for a linked video', () => {
+    expect(clipLabel('continue', 1, ' the camera rises ', 'the camera rises')).toBe(
+      'Continue clip 2: the camera rises',
+    );
+    expect(clipLabel('extend', 0, '', 'x')).toBe('Extend clip 1');
+    expect(clipLabel('extend', -1, '', 'x')).toBe('Extend the linked video');
+    expect(clipLabel('text', -1, '', 'A boat at dawn')).toBe('A boat at dawn');
   });
 });
 
@@ -533,5 +546,144 @@ describe('Video studio', () => {
     expect(confirm).toHaveBeenCalledOnce(); // the Start question; no step asked
     const runs = await t.core.history.query({ tool: 'video-studio' });
     expect(runs.map((run) => run.reservedUsd)).toEqual([0.05, 0.05, 0.05]);
+  });
+  describe('dropped files', () => {
+    it('a video on the Sequence tab joins the timeline and leaves the hidden One clip mode alone', async () => {
+      const tool = await mount();
+      tool.applyState({
+        prompt: '',
+        settings: settingsJson({ ...DEFAULT_SETTINGS, tab: 'sequence', mode: 'text' }),
+      });
+      tool.onFiles?.([new File(['v'], 'up.mp4', { type: 'video/mp4' })]);
+      await vi.waitFor(async () =>
+        expect((await t.ctx.state.get<{ clips: unknown[] }>(TIMELINE_KEY))?.clips).toHaveLength(1),
+      );
+      expect(tool.getState().settings['mode']).toBe('text');
+      expect(tool.getState().settings['tab']).toBe('sequence');
+    });
+
+    it('an image on the One clip tab says it became the first frame', async () => {
+      const tool = await mount();
+      tool.applyState({ prompt: 'A boat', settings: settingsJson(DEFAULT_SETTINGS) });
+      tool.onFiles?.([new File(['i'], 'dawn.png', { type: 'image/png' })]);
+      await vi.waitFor(() => expect(t.status()).toBe('dawn.png is now the first frame.'));
+      expect(tool.getState().settings['mode']).toBe('first');
+    });
+  });
+
+  describe('failures and announcements', () => {
+    /** A stored one-step sequence whose only step is generating (nothing for the runner to start). */
+    async function generating(status: 'running' | 'paused' = 'running') {
+      const { claim, createRun, markRunning } = await import('./sequence');
+      const created = createRun({
+        id: 'seq',
+        spec: {
+          ...DEFAULT_SETTINGS.sequence,
+          steps: [{ id: 'a', prompt: 'One', imageRole: 'references' as const }],
+        },
+        model: GROK,
+        format: DEFAULT_SETTINGS.format,
+        sourceClipId: null,
+        now: 1,
+      });
+      const slot = created.slots[0]!;
+      const run = markRunning(
+        claim(created, slot.key, 0.05, 2, 'other-tab')!,
+        slot.key,
+        { jobId: 'j', runId: 'r', attempt: 1 },
+        3,
+      );
+      return { ...run, status };
+    }
+
+    it('says out loud when the sequence pauses or stops by itself, and when a blocker appears', async () => {
+      await mount();
+      const running = await generating('running');
+      await t.ctx.state.set(SEQUENCE_KEY, running);
+      await vi.waitFor(() => expect($('seq-pause').hidden).toBe(false));
+      vi.mocked(announce).mockClear();
+      // The cap, a missing key or a failed step pauses or stops it.
+      await t.ctx.state.set(SEQUENCE_KEY, {
+        ...running,
+        status: 'paused',
+        message: 'Paused before step 2: Add an OpenRouter key.',
+      });
+      await vi.waitFor(() =>
+        expect(announce).toHaveBeenCalledWith('Paused before step 2: Add an OpenRouter key.'),
+      );
+      // A blocker on an already paused sequence.
+      vi.mocked(announce).mockClear();
+      const message = 'Paused before step 2: there is no clip for it to continue.';
+      await t.ctx.state.set(SEQUENCE_KEY, {
+        ...running,
+        status: 'paused',
+        message,
+        blocker: { slotKey: running.slots[0]!.key, kind: 'source-missing', message },
+      });
+      await vi.waitFor(() => expect(announce).toHaveBeenCalledWith(message));
+      vi.mocked(announce).mockClear();
+      await t.ctx.state.set(SEQUENCE_KEY, {
+        ...running,
+        status: 'stopped',
+        message: 'Stopped: step 1 failed (boom).',
+      });
+      await vi.waitFor(() =>
+        expect(announce).toHaveBeenCalledWith('Stopped: step 1 failed (boom).'),
+      );
+    });
+
+    it('shows a failed Pause write instead of losing it', async () => {
+      await mount();
+      await t.ctx.state.set(SEQUENCE_KEY, await generating('running'));
+      await vi.waitFor(() => expect($('seq-pause').hidden).toBe(false));
+      vi.mocked(presentError).mockClear();
+      const set = vi.spyOn(t.ctx.state, 'set').mockRejectedValue(new Error('disk full'));
+      $('seq-pause').click();
+      await vi.waitFor(() => expect(presentError).toHaveBeenCalled());
+      set.mockRestore();
+    });
+
+    it('announces a paid clip that cannot be put on the timeline, and puts it there on Retry', async () => {
+      const tool = await mount();
+      tool.applyState({ prompt: 'A boat at dawn', settings: oneSecond() });
+      const original = t.ctx.state.set.bind(t.ctx.state);
+      let broken = true;
+      const set = vi
+        .spyOn(t.ctx.state, 'set')
+        .mockImplementation((key, value) =>
+          broken && key === TIMELINE_KEY
+            ? Promise.reject(new Error('disk full'))
+            : original(key, value),
+        );
+      vi.mocked(presentError).mockClear();
+      await t.runners[0]!.trigger();
+      await vi.waitFor(() => expect(presentError).toHaveBeenCalled());
+      const [error, options] = vi.mocked(presentError).mock.calls[0]!;
+      expect((error as Error).message).toMatch(/paid for|was made/i);
+      broken = false;
+      options?.retry?.();
+      await vi.waitFor(async () => {
+        const stored = (await t.ctx.state.get<{ clips: unknown[] }>(TIMELINE_KEY))?.clips;
+        expect(stored).toHaveLength(1);
+      });
+      set.mockRestore();
+    });
+
+    it('says so when a finished clip has no run record to settle (and stays quiet when another tab did)', async () => {
+      const tool = await mount();
+      tool.applyState({ prompt: 'A boat at dawn', settings: oneSecond() });
+      const reattach = vi.spyOn(t.ctx.runs, 'reattach').mockResolvedValue(null);
+      const get = vi.spyOn(t.core.history, 'get').mockResolvedValue(undefined);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      vi.mocked(announce).mockClear();
+      await t.runners[0]!.trigger();
+      await vi.waitFor(() =>
+        expect(announce).toHaveBeenCalledWith(expect.stringMatching(/History entry is gone/)),
+      );
+      expect(warn).toHaveBeenCalled();
+      reattach.mockRestore();
+      get.mockRestore();
+      warn.mockRestore();
+    });
   });
 });

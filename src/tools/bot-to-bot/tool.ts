@@ -30,7 +30,13 @@
  * Entries are redrawn only when their signature changes (view.ts); the run's state never rebuilds them.
  */
 import { toJsonBlob } from '../../core/export/table';
-import { errorCode, InvalidInputError, isAbortError, userMessage } from '../../core/errors';
+import {
+  errorCode,
+  InvalidInputError,
+  isAbortError,
+  OrError,
+  userMessage,
+} from '../../core/errors';
 import { excerpt } from '../../core/runs/index';
 import type { ModelInfo, RunHandle, Usage } from '../../core/types';
 import {
@@ -106,6 +112,8 @@ import {
 } from './view';
 
 const STATE_KEY = 'conversation';
+/** A streaming turn's words so far are stored at most this often (a reload keeps what was said). */
+const PARTIAL_WRITE_MS = 1500;
 
 export const DEFAULT_NAMES: Readonly<Record<Speaker, string>> = { a: 'Bot A', b: 'Bot B' };
 
@@ -1782,6 +1790,20 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
 
       const usages: Usage[] = [];
       let result: TurnResult;
+      /**
+       * The words so far are stored while the turn streams (at most every `PARTIAL_WRITE_MS`), so a reload or a
+       * crash keeps them as a stopped turn, and History's run shows them. The end of the turn writes the rest.
+       */
+      let partialTimer: ReturnType<typeof setTimeout> | null = null;
+      const storePartial = (): void => {
+        if (partialTimer) return;
+        partialTimer = setTimeout(() => {
+          partialTimer = null;
+          if (live?.entry !== entry) return;
+          persist();
+          void run.checkpoint({ output }).catch(() => undefined);
+        }, PARTIAL_WRITE_MS);
+      };
       try {
         const answer = await ctx.api.chatStream(built.body, {
           run: tapUsage(run, (usage) => usages.push(usage)),
@@ -1790,12 +1812,25 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
             if (event.type !== 'text' || !event.text) return;
             const first = !entry.content;
             entry.content += event.text;
+            storePartial();
             if (live?.entry !== entry) return;
             if (first) renderLog();
             else live.stream?.append(event.text);
           },
         });
         entry.content = answer.text || entry.content;
+        // The model declined (or the provider's filter blocked the reply): that is this turn's outcome, shown on
+        // it. The declined words are the reason, not something the bot said. It was billed like any reply, so it
+        // is never asked again by itself (Resume is the user's).
+        if (answer.refusal) {
+          entry.content = '';
+          throw new OrError(
+            'api',
+            answer.text.trim()
+              ? `${bot.name} declined to answer: ${excerpt(answer.refusal, 300)}`
+              : `${bot.name} got no answer: ${answer.refusal}`,
+          );
+        }
         // A reply without text is a failure, not a turn: asking again would send the same request (and pay).
         if (!entry.content.trim()) {
           throw new InvalidInputError(
@@ -1821,6 +1856,7 @@ export async function setup(ctx: ToolContext): Promise<ToolInstance> {
           throw error;
         }
       } finally {
+        if (partialTimer) clearTimeout(partialTimer);
         const usage = turnUsage(usages, estimate);
         if (usage) {
           entry.usage = usage;

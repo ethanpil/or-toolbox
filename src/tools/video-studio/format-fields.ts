@@ -5,6 +5,7 @@
  */
 import { h, replace } from '../../ui/dom';
 import { setFieldError } from '../../ui/feedback/field-error';
+import { formatInt } from '../../ui/format';
 import { uid } from '../../ui/id';
 import { type ClipFormat, MAX_SEED } from './format';
 import { effectiveFormat, resolutionRank, type VideoControls } from './params';
@@ -75,7 +76,7 @@ export function formatFields(options: {
       seedError,
       valid
         ? null
-        : `Enter a whole number from 0 to ${MAX_SEED.toLocaleString('en-US')}, or leave it empty. Until then a new seed is used each time.`,
+        : `Enter a whole number from 0 to ${formatInt(MAX_SEED)}, or leave it empty. Until then a new seed is used each time.`,
     );
     options.onChange({ seed: valid && text !== '' ? value : null });
   });

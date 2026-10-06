@@ -1,10 +1,11 @@
 /**
  * A round as Markdown or JSON: the prompt and settings, each panel's model, answer and metrics, and the vote.
  * Offered only once the names are shown and every answer is in (`exportReady`). Attachments are listed by name;
- * their bytes are never exported. An answer stopped or cut off inside a code fence gets the fence closed, or it
- * would swallow the rest of the Markdown.
+ * their bytes are never exported. Text a model or the user wrote (answers, the prompt, the system prompt) goes
+ * through `safeBlock`: a code fence left open is closed and nothing in it can pass for a section of the export.
  */
 import { formatInt, formatMs, formatRunCost } from '../../ui/format';
+import { safeBlock } from '../../ui/markdown-safe';
 import {
   cutOff,
   entryAt,
@@ -14,29 +15,6 @@ import {
   panelLetter,
   type Round,
 } from './round';
-
-/**
- * `markdown` with a code fence it leaves open closed at the end (CommonMark: a fence closes with the same
- * character, at least as many of it, and nothing else on the line).
- */
-export function closeFences(markdown: string): string {
-  let open: { char: string; length: number } | null = null;
-  for (const line of markdown.split('\n')) {
-    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (!fence) continue;
-    const marker = fence[1]!;
-    const rest = fence[2]!;
-    if (!open) {
-      // A backtick fence's info string may not contain a backtick (that is inline code, not a fence).
-      if (marker[0] === '`' && rest.includes('`')) continue;
-      open = { char: marker[0]!, length: marker.length };
-    } else if (marker[0] === open.char && marker.length >= open.length && rest.trim() === '') {
-      open = null;
-    }
-  }
-  if (!open) return markdown;
-  return `${markdown}${markdown.endsWith('\n') ? '' : '\n'}${open.char.repeat(open.length)}`;
-}
 
 /** `12.3 tok/s` style rate: one decimal below 100. */
 export const formatRate = (perSecond: number): string =>
@@ -61,12 +39,16 @@ export function roundMarkdown(
   name: (id: string) => string,
   isFree: (id: string) => boolean = () => false,
 ): string {
-  const parts: string[] = ['# Model arena round', '## Prompt', round.prompt || '_(no text)_'];
+  const parts: string[] = [
+    '# Model arena round',
+    '## Prompt',
+    round.prompt ? safeBlock(round.prompt) : '_(no text)_',
+  ];
   if (round.attachments.length > 0) {
     parts.push(`_Attachments: ${round.attachments.map((file) => file.name).join(', ')}_`);
   }
   if (round.settings.system.trim()) {
-    parts.push(`**System prompt:**\n\n${round.settings.system.trim()}`);
+    parts.push(`**System prompt:**\n\n${safeBlock(round.settings.system.trim())}`);
   }
   if (round.settings.temperature !== null) {
     parts.push(`**Temperature:** ${round.settings.temperature}`);
@@ -78,7 +60,7 @@ export function roundMarkdown(
     const entry = entryAt(round, panel);
     const metrics = metricsOf(entry);
     parts.push(`## ${panelLabel(panel)}: ${name(entry.model)} (\`${entry.model}\`)`);
-    if (entry.text) parts.push(closeFences(entry.text));
+    if (entry.text) parts.push(safeBlock(entry.text));
     if (cutOff(entry)) parts.push('_(cut off at the length limit)_');
     if (entry.status === 'stopped') parts.push('_(stopped)_');
     if (entry.status === 'error') {

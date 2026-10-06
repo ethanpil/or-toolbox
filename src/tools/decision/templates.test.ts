@@ -38,6 +38,13 @@ describe('starter templates', () => {
     }).toThrow(TypeError);
   });
 
+  it('takes the starting threshold for its questions when one is given', () => {
+    expect(templateQuestions('ticket-triage', 65)!.map((q) => q.threshold)).toEqual([65, 65, 65]);
+    expect(templateQuestions('ticket-triage')!.map((q) => q.threshold)).toEqual([80, 80, 80]);
+    // The template itself is untouched.
+    expect(templateById('ticket-triage')!.questions.map((q) => q.threshold)).toEqual([80, 80, 80]);
+  });
+
   it('does not know a template it was not given', () => {
     expect(templateQuestions('nope')).toBeNull();
     expect(templateById('nope')).toBeUndefined();

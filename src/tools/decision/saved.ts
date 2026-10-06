@@ -56,6 +56,26 @@ export function saveDecider(store: ToolStateStore, decider: SavedDecider): Promi
   return store.set(storeKey(decider.id), decider);
 }
 
+/**
+ * Gives a decider another name, changing only the name of what is stored now (`update` holds the key's lock across
+ * tabs), so a save from another tab since this one read it is kept. Null when the decider is gone (deleted
+ * elsewhere): it is not brought back.
+ */
+export async function renameDecider(
+  store: ToolStateStore,
+  id: string,
+  name: string,
+): Promise<SavedDecider | null> {
+  let renamed: SavedDecider | null = null;
+  await store.update<unknown>(storeKey(id), (current) => {
+    const stored = readDecider(current);
+    if (!stored) return current;
+    renamed = { ...stored, name };
+    return renamed;
+  });
+  return renamed;
+}
+
 export function removeDecider(store: ToolStateStore, id: string): Promise<void> {
   return store.delete(storeKey(id));
 }

@@ -21,6 +21,7 @@ import {
   type OptionBar,
   type QuestionResult,
   resultVerdict,
+  reviewCount,
   type Verdict,
 } from './results';
 import { type QuestionDef, TYPE_LABELS } from './schema';
@@ -264,9 +265,7 @@ export function resultsView(): ResultsView {
     const review = cards.filter(
       (card) => resultVerdict(card.result, card.shown) === 'review',
     ).length;
-    summary.textContent = `${plural(cards.length, 'question')} answered · ${
-      review === 0 ? 'all clear' : `${review} ${review === 1 ? 'needs' : 'need'} review`
-    }`;
+    summary.textContent = `${plural(cards.length, 'question')} answered · ${reviewCount(review)}`;
   };
 
   const confidenceLine = (result: QuestionResult): HTMLElement | null => {

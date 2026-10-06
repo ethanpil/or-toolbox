@@ -232,6 +232,63 @@ describe('sequence runner', () => {
     expect(stored.slots[0]).toMatchObject({ status: 'pending', claimedBy: null });
   });
 
+  it('Pause or Stop while a request is in flight does not abort it: the job is tracked', async () => {
+    let release!: () => void;
+    let signal: AbortSignal | undefined;
+    const t = await harness(newRun(), {
+      beginRun: (input, runSignal) => {
+        signal = runSignal;
+        return Promise.resolve({
+          id: 'r',
+          keyId: 'k',
+          model: input.run.model,
+          fail: () => Promise.resolve({}),
+        } as unknown as RunHandle);
+      },
+      submit: (_handle, body, payload) =>
+        new Promise((resolve) => {
+          release = () => resolve({ id: 'job-1', payload } as unknown as JobRecord);
+        }),
+    });
+    void t.runner.advance();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    // The user presses Pause: the sequence is paused and this page's starts are told to stop.
+    await t.deps.store.updateSequence((run) =>
+      run ? { ...run, status: 'paused', message: 'Paused.' } : run,
+    );
+    t.runner.abortStarts();
+    expect(signal?.aborted).toBe(false);
+    release();
+    await settle();
+    expect((await t.stored()).slots[0]).toMatchObject({ status: 'running', jobId: 'job-1' });
+  });
+
+  it('a Pause before the last check still aborts the start', async () => {
+    let signal: AbortSignal | undefined;
+    let release!: () => void;
+    const t = await harness(newRun(), {
+      beginRun: (input, runSignal) => {
+        signal = runSignal;
+        return new Promise((resolve) => {
+          release = () =>
+            resolve({
+              id: 'r',
+              keyId: 'k',
+              model: input.run.model,
+              fail: () => Promise.resolve({}),
+            } as unknown as RunHandle);
+        });
+      },
+    });
+    void t.runner.advance();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    t.runner.abortStarts();
+    expect(signal?.aborted).toBe(true);
+    release();
+    await settle();
+    expect(t.sent).toEqual([]);
+  });
+
   it('a Stop that lands after the run began aborts the run unsent; stopped stays stopped', async () => {
     const t = await harness(newRun(), {
       beginRun: async (input) => {

@@ -6,8 +6,11 @@ import mercuryResponse from '../../../tests/fixtures/openrouter/decisions-respon
 import modelsFixture from '../../../tests/fixtures/openrouter/models.json';
 import type { DecisionRequest, DecisionResponse, RawModel } from '../../core/api/types';
 import { RateLimitError } from '../../core/errors';
+import { getDb } from '../../core/storage/db';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import { acceptsFile, mimeMatches } from '../../ui/components/file-types';
+import type * as Dialogs from '../../ui/feedback/dialogs';
+import { promptDialog } from '../../ui/feedback/dialogs';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import type { ToolInstance } from '../../ui/tool/types';
 import { getTool } from '../registry';
@@ -15,6 +18,11 @@ import { newDeciderId, type SavedDecider } from './saved';
 import { blankQuestion, type QuestionDef } from './schema';
 import { templateQuestions } from './templates';
 import { setup } from './tool';
+
+vi.mock('../../ui/feedback/dialogs', async (importOriginal) => ({
+  ...(await importOriginal<typeof Dialogs>()),
+  promptDialog: vi.fn(),
+}));
 
 const catalog = (modelsFixture.data as unknown as RawModel[]).filter(
   (model) => model.id === 'typesafe/jev-1.13' || model.id === 'inception/mercury-decide:free',
@@ -243,7 +251,7 @@ describe('the form', () => {
     const huge = new File(['x'], 'huge.txt', { type: 'text/plain' });
     Object.defineProperty(huge, 'size', { value: 5_000_000 });
     tool.onFiles?.([huge]);
-    expect(t.status()).toContain('1 file skipped');
+    expect(t.status()).toBe('1 file skipped: over 1 MB.');
     expect(prompt.value).toBe('First\n\nSecond note');
   });
 
@@ -316,7 +324,7 @@ describe('running', () => {
     expect(textOf(t.zones.output, 'dec-summary')).toBe('3 questions answered · 1 needs review');
     expect(textOf(t.zones.output, 'dec-meta')).toContain('typesafe/jev-1.13-20260917');
     expect(textOf(t.zones.output, 'dec-cost')).toBe('Cost <$0.0001');
-    expect(t.status()).toBe('Done · 3 questions, 1 to review');
+    expect(t.status()).toBe('Done · 3 questions, 1 needs review');
   });
 
   it('records one run whose output is the JSON answers and whose settings restore the form', async () => {
@@ -547,6 +555,34 @@ describe('when the request fails', () => {
   });
 });
 
+describe('when recording a paid answer fails', () => {
+  it('keeps the answer as done: no Failed, no Retry (a retry would pay twice), the write failure is shown', async () => {
+    const decide = decideWith(documentedResponse);
+    const { t, tool } = await mount(decide);
+    loadTriage(tool);
+    const begin = t.core.runs.begin.bind(t.core.runs);
+    const fail = vi.fn();
+    vi.spyOn(t.core.runs, 'begin').mockImplementation(async (spec) => {
+      const handle = await begin(spec);
+      return {
+        ...handle,
+        finish: () => Promise.reject(new Error('the disk is full')),
+        fail: (error: unknown) => {
+          fail(error);
+          return handle.fail(error);
+        },
+      };
+    });
+    await t.runners[0]!.trigger();
+    expect(decide).toHaveBeenCalledTimes(1);
+    expect($$(t.zones.output, 'dec-result')).toHaveLength(3);
+    expect(t.status()).toBe('Done · 3 questions, 1 needs review');
+    expect(fail).not.toHaveBeenCalled();
+    const toast = $(document.body, 'error-toast');
+    expect($$(toast, 'toast-retry')).toHaveLength(0);
+  });
+});
+
 describe('answers belong to the question rows, not to what their ids happen to be', () => {
   const bugAnswer = (noul: number) => ({ model: 'm', answers: { bug: { type: 'noul', noul } } });
 
@@ -716,6 +752,25 @@ describe('the library', () => {
     expect(templateQuestions('content-review')![0]!.name).toBe('Breaks the rules?');
   });
 
+  it('loads a template at the starting threshold from the drawer, and the sample too', async () => {
+    const { t, tool } = await mount(decideWith(documentedResponse));
+    t.ctx.options.set({ threshold: 65 });
+    const select = $(t.zones.input, 'dec-library') as HTMLSelectElement;
+    select.value = 'template:ticket-triage';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    $(t.zones.input, 'dec-load').click();
+    await vi.waitFor(() => expect($$(t.zones.input, 'dec-question')).toHaveLength(3));
+    expect(
+      $$(t.zones.input, 'dec-threshold').map((input) => (input as HTMLInputElement).value),
+    ).toEqual(['65', '65', '65']);
+    await tool.sample?.();
+    await vi.waitFor(() =>
+      expect(
+        $$(t.zones.input, 'dec-threshold').map((input) => (input as HTMLInputElement).value),
+      ).toEqual(['65', '65', '65']),
+    );
+  });
+
   it('lists saved deciders from storage, loads one with its situation, and undoes a delete', async () => {
     const { t, tool } = await mount(decideWith(documentedResponse));
     const saved: SavedDecider = {
@@ -759,5 +814,34 @@ describe('the library', () => {
       expect([...select.options].map((option) => option.textContent)).toContain('Support tickets'),
     );
     expect(select.value).toBe(`saved:${saved.id}`);
+  });
+  it('renames what is stored, keeping a save another tab made since the list was read', async () => {
+    const { t } = await mount(decideWith(documentedResponse));
+    const saved: SavedDecider = {
+      id: newDeciderId(),
+      name: 'Support tickets',
+      questions: triage(),
+      state: null,
+      savedAt: 1_750_000_000_000,
+    };
+    await t.ctx.state.set(`decider:${saved.id}`, saved);
+    const select = $(t.zones.input, 'dec-library') as HTMLSelectElement;
+    await vi.waitFor(() =>
+      expect([...select.options].map((option) => option.textContent)).toContain('Support tickets'),
+    );
+    select.value = `saved:${saved.id}`;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    // Another tab saved other questions under the same id, and this one was not told.
+    const fresh = { ...saved, questions: triage().slice(0, 1) };
+    await (
+      await getDb()
+    ).put('kv', { key: `tool:decision:decider:${saved.id}`, value: fresh, updatedAt: Date.now() });
+    vi.mocked(promptDialog).mockResolvedValue('Renamed');
+    $(t.zones.input, 'dec-rename').click();
+    await vi.waitFor(async () => {
+      const stored = await t.ctx.state.get<SavedDecider>(`decider:${saved.id}`);
+      expect(stored?.name).toBe('Renamed');
+      expect(stored?.questions).toHaveLength(1);
+    });
   });
 });

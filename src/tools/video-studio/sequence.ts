@@ -520,7 +520,8 @@ export function stop(run: SequenceRun, now: number): SequenceRun {
   return {
     ...run,
     status: 'stopped',
-    message: 'Stopped: steps already sent still finish.',
+    message:
+      'Stopped: steps already sent still finish. Resume sends the rest, or start a new sequence.',
     slots: run.slots.map((slot) => ({ ...slot, forced: false })),
     updatedAt: now,
   };
@@ -702,7 +703,8 @@ export function parseSequenceSpec(raw: unknown): SequenceSpec {
         ? repeat
         : 1,
     style: isString(raw['style']) ? raw['style'] : '',
-    capUsd: isFiniteNumber(cap) && cap > 0 ? cap : null,
+    // A stored 0 or less is a cap that stops every further step, never "no cap" (the form refuses to write one).
+    capUsd: isFiniteNumber(cap) ? Math.max(0, cap) : null,
     onFailure: oneOf(raw['onFailure'], ['stop', 'skip'] as const, 'stop'),
     steps: steps.length > 0 ? steps : structuredClone(DEFAULT_SEQUENCE.steps),
   };

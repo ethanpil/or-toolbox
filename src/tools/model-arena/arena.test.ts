@@ -7,6 +7,7 @@ import type {
   RawModel,
 } from '../../core/api/types';
 import { ApiError } from '../../core/errors';
+import { getDb } from '../../core/storage/db';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { ApiClient, CallOptions } from '../../core/types';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
@@ -404,6 +405,33 @@ describe('model arena', () => {
     expect(new Set(after.map((run) => run.groupId)).size).toBe(1);
   });
 
+  it('shows a refusal as the outcome of that panel, billed once, with a Retry, and keeps the others', async () => {
+    const fake = fakeStream();
+    const chatStream = vi.fn(async (body: ChatRequest, opts: StreamOptions) => {
+      if (body.model !== 'beta/two:free') return fake.chatStream(body, opts);
+      opts.onSend?.(1);
+      opts.onEvent({ type: 'text', text: 'I cannot help with that.' });
+      return { ...result(body, 'I cannot help with that.'), refusal: 'I cannot help with that.' };
+    });
+    const { tool } = await mount({ chatStream });
+    form(tool, ['alpha/one:free', 'beta/two:free', 'gamma/three:free']);
+    await t!.runners[0]!.trigger();
+    const errors = $$('panel-error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.textContent).toContain('declined to answer');
+    expect(errors[0]!.textContent).toContain('I cannot help with that.');
+    // The refusal is not an answer: two answers, one failed panel, and the status says so.
+    expect(Object.values(answers()).filter((text) => text?.startsWith('Answer from'))).toHaveLength(
+      2,
+    );
+    expect(t!.status()).toBe(
+      'Round complete: 2 of 3 answered, 1 failed. Vote for the best answer to see the names.',
+    );
+    expect($$('panel-retry')).toHaveLength(1);
+    const runs = await t!.core.history.query({ tool: 'model-arena' });
+    expect(runs.map((run) => run.status).sort()).toEqual(['error', 'ok', 'ok']);
+  });
+
   it('Stop stops every contender and keeps what arrived', async () => {
     const chatStream = heldStream();
     const { tool } = await mount({ chatStream });
@@ -424,6 +452,32 @@ describe('model arena', () => {
     expect(t!.status()).toBe('Stopped. Partial answers are kept.');
     const runs = await t!.core.history.query({ tool: 'model-arena' });
     expect(runs.map((run) => run.status)).toEqual(['aborted', 'aborted']);
+  });
+
+  it('offers Retry on a stopped contender, which runs it alone', async () => {
+    const held = heldStream();
+    const fake = fakeStream();
+    let calls = 0;
+    const chatStream = vi.fn((body: ChatRequest, opts: StreamOptions) =>
+      ++calls <= 2 ? held(body, opts) : fake.chatStream(body, opts),
+    );
+    const { tool } = await mount({ chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free']);
+    const running = t!.runners[0]!.trigger();
+    await vi.waitFor(() => expect(held).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(Object.values(answers()).every((text) => text?.startsWith('Partial'))).toBe(true),
+    );
+    t!.runners[0]!.stop();
+    await running;
+    expect($$('panel-status').map((badge) => badge.textContent)).toEqual(['Stopped', 'Stopped']);
+    const retries = $$('panel-retry');
+    expect(retries).toHaveLength(2);
+    retries[0]!.click();
+    await vi.waitFor(() => expect(fake.bodies).toHaveLength(1));
+    await vi.waitFor(() => expect(t!.runners[0]!.busy).toBe(false));
+    expect($$('panel-status').map((badge) => badge.textContent)).toContain('Done');
+    expect($$('panel-status').filter((badge) => badge.textContent === 'Stopped')).toHaveLength(1);
   });
 
   it('refuses a round before anything starts: free-only, unreadable files, nothing to ask', async () => {
@@ -491,6 +545,49 @@ describe('model arena', () => {
       const stored = parseTally(await t!.ctx.state.get('tally'));
       expect(stored.models['alpha/one:free']).toEqual({ rounds: 2, wins: 1, ties: 1, bad: 0 });
       expect(stored.models['gamma/three:free']).toEqual({ rounds: 2, wins: 0, ties: 1, bad: 0 });
+    });
+  });
+
+  it('shows All bad votes in the tally, beside wins and ties', async () => {
+    const fake = fakeStream();
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free'], { blind: false });
+    await t!.runners[0]!.trigger();
+    $('vote-bad').click();
+    await vi.waitFor(() => expect($$('tally-row')).toHaveLength(2));
+    const head = [...document.querySelectorAll('[data-testid="tally-table"] thead th')].map(
+      (cell) => cell.textContent,
+    );
+    expect(head).toEqual(['Model', 'Wins', 'Ties', 'All bad', 'Rounds']);
+    const cells = [...$('tally-row').querySelectorAll('td')].map((cell) => cell.textContent);
+    expect(cells).toEqual(['0', '0', '1', '1']);
+  });
+
+  it('Reset and its Undo use the tally as stored, not this page’s copy of it', async () => {
+    const fake = fakeStream();
+    const { tool } = await mount({ chatStream: fake.chatStream });
+    form(tool, ['alpha/one:free', 'gamma/three:free'], { blind: false });
+    await t!.runners[0]!.trigger();
+    $('vote-tie').click();
+    await vi.waitFor(() => expect($$('tally-row')).toHaveLength(2));
+    // Another tab voted meanwhile, and this page was not told (no announcement reached it).
+    const other = {
+      v: 1,
+      models: {
+        'alpha/one:free': { rounds: 3, wins: 2, ties: 1, bad: 0 },
+        'gamma/three:free': { rounds: 3, wins: 0, ties: 1, bad: 2 },
+      },
+    };
+    await (
+      await getDb()
+    ).put('kv', { key: 'tool:model-arena:tally', value: other, updatedAt: Date.now() });
+    $('tally-reset').click();
+    await vi.waitFor(async () => {
+      expect(parseTally(await t!.ctx.state.get('tally')).models).toEqual({});
+    });
+    $('toast-undo').click();
+    await vi.waitFor(async () => {
+      expect(parseTally(await t!.ctx.state.get('tally')).models).toEqual(other.models);
     });
   });
 

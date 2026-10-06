@@ -199,10 +199,13 @@ export function panelView(options: PanelOptions): PanelView {
           ? entry.failure.shown
           : entry.failure.blind
         : null;
-    const shown = failure ? JSON.stringify(failure) : '';
+    const stopped = entry.status === 'stopped';
+    const shown = failure ? JSON.stringify(failure) : stopped ? 'stopped' : '';
     if (shown !== problemShown) {
       problemShown = shown;
-      problem.replaceChildren(failure ? errorBlock(failure, index) : '');
+      problem.replaceChildren(
+        failure ? errorBlock(failure, index) : stopped ? stoppedBlock(index) : '',
+      );
     }
 
     const values = metricsOf(entry);
@@ -241,6 +244,18 @@ export function panelView(options: PanelOptions): PanelView {
           failure.outcomeUnknown ? null : options.retryButton(index),
         ),
       ),
+    );
+
+  /** A stopped contender can be run again on its own (its partial answer stays until it is). */
+  const stoppedBlock = (index: number): HTMLElement =>
+    h(
+      'div',
+      {
+        class: 'd-flex flex-wrap align-items-center gap-2 small text-body-secondary',
+        'data-testid': 'panel-stopped',
+      },
+      h('span', null, 'Stopped before it finished.'),
+      options.retryButton(index),
     );
 
   return {
@@ -466,8 +481,8 @@ export function tallyView(naming: Naming): TableView<Tally> {
   const body = h('tbody');
   const table = dataTable({
     scrollerLabel: 'Your votes per model',
-    caption: 'Wins, ties and rounds per model from your votes',
-    head: ['Model', 'Wins', 'Ties', 'Rounds'],
+    caption: 'Wins, ties, all-bad verdicts and rounds per model from your votes',
+    head: ['Model', 'Wins', 'Ties', 'All bad', 'Rounds'],
     numericFrom: 1,
     body,
     class: 'table table-sm align-middle mb-0',
@@ -496,7 +511,7 @@ export function tallyView(naming: Naming): TableView<Tally> {
               { scope: 'row', class: 'fw-normal' },
               h('span', { title: row.model }, naming.name(row.model)),
             ),
-            [row.wins, row.ties, row.rounds].map((value) =>
+            [row.wins, row.ties, row.bad, row.rounds].map((value) =>
               h('td', { class: 'text-end' }, String(value)),
             ),
           ),
