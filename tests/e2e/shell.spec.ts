@@ -235,6 +235,8 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
   await page.setViewportSize({ width: 1000, height: 420 }); // the input zone is longer than the window
   await page.goto('tools/data-extractor/');
   await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
+  // The zones are hidden until the tool has set itself up; Tab would pass them by.
+  await expect(page.getByTestId('tool-prompt')).toBeVisible();
   const runner = page.getByTestId('runner');
 
   /**
@@ -364,6 +366,8 @@ test('on a phone, toasts float above the Run bar instead of covering Run and Sto
   await page.setViewportSize({ width: 375, height: 700 });
   await page.goto('tools/data-extractor/');
   await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
+  // Once the tool has set itself up (before that, nothing takes files).
+  await expect(page.getByTestId('tool-prompt')).toBeVisible();
   // A dropped file the tool does not take: the page says so in a toast.
   await page.evaluate(() => {
     const data = new DataTransfer();

@@ -159,14 +159,22 @@ export async function runFfmpegSmokeTest(
 
 /** Runs axe (WCAG 2.2 A/AA) and fails on serious or critical violations. */
 export async function expectNoSeriousA11yViolations(page: Page): Promise<void> {
-  // A toast fading in is half transparent, and axe would measure its text at that contrast. Bootstrap drops
-  // `showing` when the fade starts, not when it ends, so wait for every toast on screen to be fully opaque.
+  // Something fading in is half transparent, and axe would measure its text at that contrast. Bootstrap drops a
+  // toast's `showing` when its fade starts, not when it ends, so wait for every toast on screen to be fully
+  // opaque and for every finite animation or transition (a dialog and its backdrop fading in) to have ended.
   await page.waitForFunction(
     () =>
       document.querySelector('.toast.showing, .toast.hiding') === null &&
       [...document.querySelectorAll('.toast.show')].every(
         (toast) => getComputedStyle(toast).opacity === '1',
-      ),
+      ) &&
+      document
+        .getAnimations()
+        .every(
+          (animation) =>
+            animation.playState !== 'running' ||
+            animation.effect?.getComputedTiming().iterations === Infinity,
+        ),
   );
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
