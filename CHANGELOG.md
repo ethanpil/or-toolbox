@@ -10,6 +10,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- CI opens a workbook written by the XLSX writer with openpyxl (b0552f1).
+- E2E for the "Connect with OpenRouter" round trip (c730d2b), Image generation Stop keeping the finished image (d154d9e) and a Data extractor failed-document Retry (2215a72); steadier Run bar, Stats and Speech-to-text specs (af39779).
 - Vite multi-page build of 22 pages under `/or-toolbox/`, with strict TypeScript, ESLint, Prettier, Vitest and Playwright (a76487c).
 - Shared page head with CSP meta tag, pre-paint theme script, PWA manifest and generated icons (a76487c).
 - Manifests, registry and placeholder pages for all 14 tools (a76487c).
@@ -78,6 +80,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- OCR, Data extractor and Table extractor share their structured-output helpers and page-image token estimate from core (0c384f5).
+- Color, border, shadow and width transitions removed: motion is transform and opacity only, apart from Bootstrap's stock collapse and progress transitions (812854d).
 - Streams fail after 5 minutes without a byte; a video status read times out after 60 s and is retried (04e84a9).
 - Budget checks and the orphan sweep read small per-run holds instead of running records; History search and its model filter no longer rescan or copy whole outputs (84ca07d, 4e53b56).
 - Faster first paint: icon font and stylesheet cut to the icons used (134 to 16 KB), Bootstrap without unused components, tool styles loaded per tool page, icon font preloaded; shell CSS 53 to 36 KB gzipped. `npm run icon-subset` regenerates the icons (7352f30).
@@ -125,6 +129,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Dragging a Decision score level, or pressing blank space on a tool page, no longer scrolls the page: the Run bar's focus check acts on keyboard focus only (ea94a82).
+- Bot-to-bot: a turn cut off by a reload is added to the conversation's cost total from its run's booked cost, so the cost cap no longer undercounts (8e60451).
+- The free-only toast names a refused paid add-on and says how to switch it off (c0872b1).
+- A failed engine or PDF-reader download says what to do instead of a technical message (812854d).
+- Video studio's job button reads "Stop waiting", matching its dialog (48864cf).
 - Backup Replace keeps running runs, open jobs, jobs of a running run and those tools' saved state, and says what it kept (1b5cf0c, 0285ce8).
 - Settings → Budgets meters read the month once, include what running runs hold and mark estimates with ≈ like Stats (1b5cf0c, 0285ce8).
 - A stored run or prompt with an impossible time no longer breaks Home, History, Models or the prompts panel; a run of a removed tool no longer breaks History, Home, the palette or a job's notification (0285ce8).
