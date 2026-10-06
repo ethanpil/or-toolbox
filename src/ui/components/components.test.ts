@@ -397,6 +397,17 @@ describe('jobList', () => {
     expect(list.element.querySelector('.progress-bar-animated')).not.toBeNull();
   });
 
+  it('names the button after what it does when the tool says so', () => {
+    const list = jobList({
+      label: () => 'Clip 1',
+      onCancel: () => undefined,
+      cancelLabel: 'Stop waiting',
+    });
+    list.update([job({ progress: 0.1 })]);
+    expect(list.element.querySelector('[aria-label="Stop waiting for Clip 1"]')).not.toBeNull();
+    expect(list.element.querySelector('[aria-label="Cancel Clip 1"]')).toBeNull();
+  });
+
   it('shows final states without progress, and an empty state', () => {
     const list = jobList();
     list.update([job({ state: 'failed', error: 'Provider error' })]);

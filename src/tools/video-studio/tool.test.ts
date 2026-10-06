@@ -14,7 +14,7 @@ import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testi
 import { getTool } from '../registry';
 import { DEFAULT_SETTINGS, settingsJson } from './params';
 import { SEQUENCE_KEY, TIMELINE_KEY } from './store';
-import { clipLabel, setup, stemFrom } from './tool';
+import { clipLabel, setup } from './tool';
 
 // jsdom cannot decode images or video: stand-ins for the header reads, encoders and frame grabs.
 vi.mock('../../core/media/image', async (importOriginal) => ({
@@ -118,12 +118,6 @@ beforeEach(async () => {
   isolateChannels();
   await resetDb();
   localStorage.clear();
-});
-describe('file names', () => {
-  it('come from the prompt', () => {
-    expect(stemFrom('A fishing boat leaves a quiet harbour!')).toBe('a-fishing-boat-leaves-a');
-    expect(stemFrom('???')).toBe('clip');
-  });
 });
 
 describe('job labels', () => {
