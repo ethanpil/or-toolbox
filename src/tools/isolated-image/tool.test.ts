@@ -4,7 +4,9 @@ import type { ImageRequest, ImageResult, RawImageModel, RawModel } from '../../c
 import { ApiError } from '../../core/errors';
 import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
 import type { CallOptions } from '../../core/types';
+import type * as Client from '../../core/api/client';
 import type * as ReferencePicker from '../../ui/components/reference-picker';
+import type * as Dialogs from '../../ui/feedback/dialogs';
 import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 import { getTool } from '../registry';
 import { buildInstruction } from './request';
@@ -20,7 +22,25 @@ import { setup } from './tool';
  * Test controls for the replaced raster I/O: `flaws` is what decoding an exported JPG's border finds, `hold`
  * keeps decoding waiting until it resolves, `decoded` counts decodes.
  */
-const io = vi.hoisted(() => ({ flaws: 0, hold: null as Promise<void> | null, decoded: 0 }));
+const io = vi.hoisted(() => ({
+  flaws: 0,
+  hold: null as Promise<void> | null,
+  decoded: 0,
+  /** Decoding the model's answer throws (the post-processing fails after a paid answer). */
+  failDecode: false,
+  /** What a Stop attaches to the abort (the real attachment is private to the client). */
+  partials: new WeakMap<object, unknown>(),
+  confirm: vi.fn<(options: unknown) => Promise<boolean>>(() => Promise.resolve(true)),
+}));
+vi.mock('../../core/api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof Client>()),
+  partialImageResult: (error: unknown) =>
+    typeof error === 'object' && error !== null ? (io.partials.get(error) ?? null) : null,
+}));
+vi.mock('../../ui/feedback/dialogs', async (importOriginal) => ({
+  ...(await importOriginal<typeof Dialogs>()),
+  confirmDialog: io.confirm,
+}));
 const announced = vi.hoisted(() => [] as string[]);
 vi.mock('../../ui/feedback/announce', () => ({
   announce: (text: string) => {
@@ -34,6 +54,7 @@ vi.mock('../../ui/components/reference-picker', async (original) => ({
 }));
 vi.mock('./raster-io', async () => {
   const { createRaster } = await import('../../core/media/image');
+  const { InvalidInputError } = await import('../../core/errors');
   const picture = (cut: boolean) => {
     const img = createRaster(160, 120, '#ffffff');
     for (let y = 0; y < 120; y++) {
@@ -57,6 +78,7 @@ vi.mock('./raster-io', async () => {
     decodeRaster: async (blob: Blob) => {
       io.decoded += 1;
       if (io.hold) await io.hold;
+      if (io.failDecode) throw new InvalidInputError('The picture cannot be decoded.');
       return picture((await blob.text()).startsWith('cut'));
     },
     encodeRaster: (raster: { width: number; height: number }, format: string) =>
@@ -162,6 +184,9 @@ beforeEach(async () => {
   io.flaws = 0;
   io.hold = null;
   io.decoded = 0;
+  io.failDecode = false;
+  io.confirm.mockReset();
+  io.confirm.mockImplementation(() => Promise.resolve(true));
   announced.length = 0;
   urls = 0;
   URL.createObjectURL = vi.fn(() => `blob:test-${++urls}`);
@@ -170,7 +195,12 @@ beforeEach(async () => {
 afterEach(async () => {
   await t?.cleanup();
   t = null;
+  document.querySelectorAll('[data-testid="toasts"] > *').forEach((node) => node.remove());
 });
+
+/** What the API client throws for a paid request that may have gone through. */
+const unknownOutcome = (): ApiError =>
+  Object.assign(new ApiError('Mocked error 502', 502), { outcomeUnknown: true });
 
 describe('Isolated image tool', { timeout: 30_000 }, () => {
   it('is promptless, and round-trips its settings, ignoring what it does not know', async () => {
@@ -618,5 +648,180 @@ describe('Isolated image tool', { timeout: 30_000 }, () => {
     await vi.waitFor(() => expect($$(t!.zones.input, 'iso-photo')).toHaveLength(0));
     expect(removeAll.hidden).toBe(true);
     expect(document.activeElement).toBe($(t.zones.input, 'drop-zone-button'));
+  });
+
+  it('M1: a photo whose request may have been billed says so and asks before it is sent again', async () => {
+    let failB = true;
+    const images = vi.fn<Images>((body) => {
+      if (photoOf(body) === 'b.png' && failB) {
+        failB = false;
+        return Promise.reject(unknownOutcome());
+      }
+      return Promise.resolve(answer(`edited:${photoOf(body)}`));
+    });
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png'), photo('b.png')]);
+    await t.runners[0]!.trigger();
+    const failed = cardFor(t, 'b.png')!;
+    expect($(failed, 'iso-error')?.textContent).toContain('check your OpenRouter activity');
+    expect($(failed, 'iso-error-activity')).not.toBeNull();
+
+    io.confirm.mockImplementation(() => Promise.resolve(false));
+    $<HTMLButtonElement>(failed, 'iso-retry')!.click();
+    await vi.waitFor(() => expect(io.confirm).toHaveBeenCalledTimes(1));
+    expect(io.confirm.mock.calls[0]![0]).toMatchObject({ title: 'Retry anyway?' });
+    expect(images).toHaveBeenCalledTimes(2);
+
+    // The bulk button asks too.
+    $<HTMLButtonElement>(t.zones.output, 'iso-retry-failed')!.click();
+    await vi.waitFor(() => expect(io.confirm).toHaveBeenCalledTimes(2));
+    expect(images).toHaveBeenCalledTimes(2);
+
+    io.confirm.mockImplementation(() => Promise.resolve(true));
+    $<HTMLButtonElement>(failed, 'iso-retry')!.click();
+    await vi.waitFor(() => expect(cardFor(t!, 'b.png')?.dataset['qa']).toBe('pass'));
+    expect(images).toHaveBeenCalledTimes(3);
+  });
+
+  it('names the bulk button for what it retries, and the buttons by their visible text', async () => {
+    let failB = true;
+    const images = vi.fn<Images>((body) => {
+      if (photoOf(body) === 'b.png' && failB) {
+        failB = false;
+        return Promise.reject(new ApiError('Mocked error 400', 400));
+      }
+      return Promise.resolve(answer(`edited:${photoOf(body)}`));
+    });
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png'), photo('b.png')]);
+    await t.runners[0]!.trigger();
+    // Failed and stopped photos are both "not isolated" in the summary: the button says the same.
+    expect($(t.zones.output, 'iso-retry-failed')?.textContent).toBe('Retry not isolated');
+    expect($(cardFor(t, 'b.png')!, 'iso-retry')?.getAttribute('aria-label')).toBe('Retry: b.png');
+    const done = cardFor(t, 'a.png')!;
+    const again = $(done, 'iso-retry')!;
+    expect(again.textContent).toBe('Edit again');
+    expect(again.getAttribute('aria-label')).toBe('Edit again: a.png');
+  });
+
+  it('M7: a result that fails after the paid answer is finished again without a new request', async () => {
+    const images = vi.fn<Images>((body) => Promise.resolve(answer(`edited:${photoOf(body)}`)));
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png')]);
+    io.failDecode = true;
+    await t.runners[0]!.trigger();
+    const failed = cardFor(t, 'a.png')!;
+    expect(failed.dataset['phase']).toBe('failed');
+    expect($(failed, 'iso-error')?.textContent).toBe(
+      'Could not finish the result: The picture cannot be decoded.',
+    );
+    expect(images).toHaveBeenCalledTimes(1);
+    // The answer is paid for: the free redo is offered next to the paid Retry.
+    const free = $<HTMLButtonElement>(failed, 'iso-reprocess')!;
+    expect(free.textContent).toBe('Finish again, no new request');
+    expect($(failed, 'iso-retry')).not.toBeNull();
+
+    io.failDecode = false;
+    free.click();
+    await vi.waitFor(() => expect(cardFor(t!, 'a.png')?.dataset['qa']).toBe('pass'));
+    expect(images).toHaveBeenCalledTimes(1);
+    expect($(cardFor(t, 'a.png')!, 'iso-reprocess')).toBeNull();
+  });
+
+  it('M7: Isolate and Retry not isolated finish a kept answer for free instead of paying again', async () => {
+    const images = vi.fn<Images>((body) => Promise.resolve(answer(`edited:${photoOf(body)}`)));
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png'), photo('b.png')]);
+    io.failDecode = true;
+    await t.runners[0]!.trigger();
+    expect(images).toHaveBeenCalledTimes(2);
+    expect(cards(t).map((card) => card.dataset['phase'])).toEqual(['failed', 'failed']);
+
+    io.failDecode = false;
+    $<HTMLButtonElement>(t.zones.output, 'iso-retry-failed')!.click();
+    await vi.waitFor(() =>
+      expect(cards(t!).map((card) => card.dataset['qa'])).toEqual(['pass', 'pass']),
+    );
+    expect(images).toHaveBeenCalledTimes(2);
+
+    // Plain Isolate with a kept answer and no result: also free.
+    io.failDecode = true;
+    tool.onFiles?.([photo('c.png')]);
+    await t.runners[0]!.trigger();
+    expect(images).toHaveBeenCalledTimes(3);
+    io.failDecode = false;
+    await t.runners[0]!.trigger();
+    await vi.waitFor(() =>
+      expect(cards(t!).map((card) => card.dataset['qa'])).toEqual(['pass', 'pass', 'pass']),
+    );
+    expect(images).toHaveBeenCalledTimes(3);
+  });
+
+  it('M7: the error toast’s Retry does not send a photo again whose answer is kept', async () => {
+    let refuse = true;
+    const images = vi.fn<Images>((body) =>
+      photoOf(body) === 'b.png' && refuse
+        ? Promise.reject(new ApiError('Payment required', 402))
+        : Promise.resolve(answer(`edited:${photoOf(body)}`)),
+    );
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500, concurrency: 1 } });
+    tool.onFiles?.([photo('a.png'), photo('b.png'), photo('c.png')]);
+    const toasts = (): HTMLButtonElement[] => [
+      ...document.querySelectorAll<HTMLButtonElement>('[data-testid="toast-retry"]'),
+    ];
+    // a.png's answer is paid for but cannot be finished; then b.png's 402 stops the batch.
+    io.failDecode = true;
+    await t.runners[0]!.trigger();
+    io.failDecode = false;
+    expect($(cardFor(t, 'a.png')!, 'iso-reprocess')).not.toBeNull();
+    expect(images.mock.calls.map(([body]) => photoOf(body))).toEqual(['a.png', 'b.png']);
+    refuse = false;
+    const retry = await vi.waitFor(() => {
+      expect(toasts()).toHaveLength(1);
+      return toasts()[0]!;
+    });
+    retry.click();
+    await vi.waitFor(() =>
+      expect(images.mock.calls.map(([body]) => photoOf(body))).toEqual([
+        'a.png',
+        'b.png',
+        'b.png',
+        'c.png',
+      ]),
+    );
+  });
+
+  it('A10: Stop keeps the answer that was already made, and the run’s end finishes it for free', async () => {
+    const images = vi.fn<Images>(
+      (_body, options) =>
+        new Promise((_, reject) => {
+          options.run.signal.addEventListener('abort', () => {
+            const stopped = new DOMException('Stopped by the user.', 'AbortError');
+            io.partials.set(stopped, answer('edited:a.png'));
+            reject(stopped);
+          });
+        }),
+    );
+    t = context(images);
+    const tool = await t.mount(setup);
+    tool.applyState({ prompt: '', settings: { size: 500 } });
+    tool.onFiles?.([photo('a.png')]);
+    const running = t.runners[0]!.trigger();
+    await vi.waitFor(() => expect(images).toHaveBeenCalledTimes(1));
+    t.runners[0]!.stop();
+    await running;
+    await vi.waitFor(() => expect(cardFor(t!, 'a.png')?.dataset['qa']).toBe('pass'));
+    expect(images).toHaveBeenCalledTimes(1);
+    expect(t.status()).toBe('Stopped');
   });
 });
