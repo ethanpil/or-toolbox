@@ -73,6 +73,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Streams fail after 5 minutes without a byte; a video status read times out after 60 s and is retried (04e84a9).
+- Budget checks and the orphan sweep read small per-run holds instead of running records; History search and its model filter no longer rescan or copy whole outputs (84ca07d, 4e53b56).
 - `npm run budgets` checks the built JS budgets (shell at most 150 KB gzipped, each tool at most 80 KB more); CI runs it after the build.
 - US spelling "Favorites" everywhere (text, test ids, code and the settings fields `favoriteTools` and `models.favorites`); settings saved under the old field names are still read.
 - `trimOldest()` in `src/core/tokens.ts` replaces Chat's `trimToBudget` and Bot-to-bot's `trimCount` (94c14cf).
@@ -119,6 +121,14 @@ All notable changes to this project are documented here. The format follows
 - Chat replies that are refusals or were filtered are no longer silently empty (f566153).
 - Estimates: zero prices on non-`:free` models are unknown, not free; reference images and audio are priced high (1f43772).
 - Blocked localStorage is reported instead of faking a save; IndexedDB quota errors show the storage-full help (46725c8).
+- A run orphaned with a request in flight books its reservation; one with nothing in flight books exactly its stored cost; a handed-off one books what its job stored (84ca07d).
+- A paid request answered 408 or 5xx (not 503), or with an error in a 200 body, books an unknown cost and is never re-sent; failed `/images` generations stay unbilled, as documented (04e84a9).
+- Error codes such as `failed_to_generate` no longer read as rate limits and retry (04e84a9).
+- A job taken over by another tab never books its cost twice; a job still running after 3 hours is given up with its reservation booked (84ca07d).
+- A Stop that arrives while a model arena round is starting is no longer lost (84ca07d).
+- A Stop during an image stream keeps the completed, billed images (`partialImageResult`) (04e84a9).
+- Deleting history or tool data keeps runs and jobs in progress, so their spend is still booked; a per-tool delete also removes the tool's saved state (4e53b56).
+- `beginRun({ model })` books that model's estimate, so the per-run limit applies (c382456).
 - The sticky Run bar no longer covers a control focused by Tab when the page scrolls smoothly to it: the framework checks again once the scroll ends (d8e6d0c).
 - The first-visit isolation reload no longer happens once the user has started using the page, keeps the parameters the tool already consumed, and never happens on a Send to page (942ff57).
 - After a deploy, a page whose lazy chunk is gone offers a reload; pages served from the cache find their lazy chunks precached (942ff57, a2622e3).

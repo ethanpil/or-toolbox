@@ -27,6 +27,10 @@ export function testCore(parts: Partial<CoreServices> = {}): CoreServices {
 export interface FakeRun extends RunHandle {
   usages: Usage[];
   controller: AbortController;
+  /** Requests marked in flight (`sending`) and not yet ended. */
+  readonly inFlight: number;
+  /** How many times `sending` was called. */
+  readonly sent: number;
 }
 
 export function fakeRun(
@@ -46,7 +50,24 @@ export function fakeRun(
     costUnknown: false,
     byModel: {},
   };
+  let inFlight = 0;
+  let sent = 0;
   return {
+    get inFlight() {
+      return inFlight;
+    },
+    get sent() {
+      return sent;
+    },
+    sending: () => {
+      inFlight++;
+      sent++;
+      let ended = false;
+      return Promise.resolve(() => {
+        if (!ended) inFlight--;
+        ended = true;
+      });
+    },
     id: 'run-1',
     tool,
     model,

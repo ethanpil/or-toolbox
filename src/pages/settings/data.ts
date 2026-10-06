@@ -26,6 +26,14 @@ interface Counts {
   runs: number;
 }
 
+/** What a deletion says about the runs it kept: they must still book their spend when they end. */
+function keptNote(keptRuns: number): string {
+  if (keptRuns === 0) return '';
+  return keptRuns === 1
+    ? ' 1 run still in progress was kept.'
+    : ` ${formatInt(keptRuns)} runs still in progress were kept.`;
+}
+
 export function dataSection(core: CoreServices): SectionView {
   let counts: Map<ToolId, Counts> | null = null;
   let countsError = false;
@@ -124,12 +132,12 @@ export function dataSection(core: CoreServices): SectionView {
         h(
           'p',
           null,
-          `This deletes ${plural(count.recent, 'recent prompt')}, ${plural(count.saved, 'saved prompt')} and ${plural(count.runs, 'run')} of history for ${tool.name}.`,
+          `This deletes ${plural(count.recent, 'recent prompt')}, ${plural(count.saved, 'saved prompt')} and ${plural(count.runs, 'run')} of history for ${tool.name}, and the work it keeps between visits, such as conversations.`,
         ),
         h(
           'p',
           { class: 'mb-0 text-body-secondary' },
-          'Spending stats and the other tools are not affected.',
+          'Runs still in progress are kept. Spending stats and the other tools are not affected.',
         ),
       ),
       confirmLabel: 'Delete',
@@ -138,8 +146,8 @@ export function dataSection(core: CoreServices): SectionView {
     });
     if (!confirmed) return;
     try {
-      await core.data.deleteToolData(tool.id);
-      toast({ message: `${tool.name}: prompts and history deleted.`, variant: 'success' });
+      const { keptRuns } = await core.data.deleteToolData(tool.id);
+      toast({ message: `${tool.name}: data deleted.${keptNote(keptRuns)}`, variant: 'success' });
     } catch (error) {
       await presentError(error);
     }
@@ -259,7 +267,7 @@ export function dataSection(core: CoreServices): SectionView {
           'p',
           null,
           h('strong', null, 'Kept: '),
-          'your keys, your settings and the spending stats your budgets use.',
+          'your keys, your settings and the spending stats your budgets use, and runs still in progress (with their tool’s saved state).',
         ),
       ),
       phrase: 'delete all',
@@ -268,8 +276,11 @@ export function dataSection(core: CoreServices): SectionView {
     });
     if (!confirmed) return;
     try {
-      await core.data.deleteAllPromptsAndHistory();
-      toast({ message: 'All prompts and history deleted.', variant: 'success' });
+      const { keptRuns } = await core.data.deleteAllPromptsAndHistory();
+      toast({
+        message: `All prompts and history deleted.${keptNote(keptRuns)}`,
+        variant: 'success',
+      });
     } catch (error) {
       await presentError(error);
     }

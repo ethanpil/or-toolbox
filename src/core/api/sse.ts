@@ -125,14 +125,22 @@ export class SseParser {
 }
 
 /**
+ * A stream that sends no bytes at all for this long is given up as a dropped connection. OpenRouter sends
+ * `: OPENROUTER PROCESSING` comments while a model works (Lyria Pro: 76 in 43 s; image streams send bare `: `
+ * lines), and reasoning streams send their reasoning, so 5 minutes of silence is far beyond a slow model.
+ */
+export const STREAM_IDLE_MS = 5 * 60_000;
+
+/**
  * Reads an SSE body to the end (or until the handler returns `'stop'`). Rejects with an AbortError when `signal`
- * aborts, with NetworkError when the connection drops, and with whatever the handler throws (the stream is then
- * cancelled).
+ * aborts, with NetworkError when the connection drops or no bytes arrive for `idleMs` (default `STREAM_IDLE_MS`),
+ * and with whatever the handler throws (the stream is then cancelled).
  */
 export async function readSse(
   body: ReadableStream<Uint8Array>,
   handler: SseHandler,
   signal?: AbortSignal,
+  idleMs = STREAM_IDLE_MS,
 ): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder('utf-8');
@@ -145,18 +153,34 @@ export async function readSse(
     throw abortError();
   }
   signal?.addEventListener('abort', onAbort, { once: true });
+  let idle = false;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const watchIdle = (): void => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idle = true;
+      reader.cancel().catch(() => undefined);
+    }, idleMs);
+  };
+  const idleError = (): NetworkError =>
+    new NetworkError(
+      `Nothing arrived for ${Math.round(idleMs / 60_000)} minutes, so the connection was closed.`,
+    );
   try {
     for (;;) {
       let chunk: ReadableStreamReadResult<Uint8Array>;
+      watchIdle();
       try {
         chunk = await reader.read();
       } catch (error) {
         if (signal?.aborted) throw abortError();
+        if (idle) throw idleError();
         throw new NetworkError('The connection dropped while the response was streaming.', {
           cause: error,
         });
       }
       if (signal?.aborted) throw abortError();
+      if (idle) throw idleError();
       if (chunk.done) break;
       parser.push(decoder.decode(chunk.value, { stream: true }));
       if (parser.done) {
@@ -170,6 +194,7 @@ export async function readSse(
     await reader.cancel().catch(() => undefined);
     throw error;
   } finally {
+    if (idleTimer) clearTimeout(idleTimer);
     signal?.removeEventListener('abort', onAbort);
     try {
       reader.releaseLock();

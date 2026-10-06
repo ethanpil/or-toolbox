@@ -54,7 +54,7 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `ui` | The zones and helpers below. |
 | `model(cap?)` | `ResolvedModel` for a capability (default: the primary one, `capabilities[0]`), with free-only applied. `model === null` means nothing may run; for the primary capability the framework already shows the notice and disables Run. See Models per capability. |
 | `modelOverride` | `?model=` or null. |
-| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (default `ctx.model().model`), `prompt` and `settings` (from your `getState()`), `estimateUsd` (default: the header's current estimate, recomputed first if the input changed since), `addons` (default: your `addons()`), and aborts the run when `signal` aborts. Call it **before** changing any tool state (see Refused runs change nothing). |
+| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (default `ctx.model().model`), `prompt` and `settings` (from your `getState()`), `estimateUsd` (default: the header's current estimate, recomputed first if the input changed since; for a `model` other than the header's, your `estimate(model)` hook for that model, so the per-run limit still applies), `addons` (default: your `addons()`), and aborts the run when `signal` aborts. Call it **before** changing any tool state (see Refused runs change nothing). |
 
 ### Models per capability
 
@@ -303,6 +303,18 @@ let sentAt = 0;
 await ctx.api.chatStream(body, { run, onSend: () => (sentAt = performance.now()), onEvent });
 ```
 
+**A Stop keeps what was paid for.** Both streaming calls reject with the abort, and attach what had arrived: `partialStreamResult(error)` (`src/core/api/chat-stream.ts`) for `chatStream`, `partialImageResult(error)` (`src/core/api/client.ts`) for an `images` stream, which holds the images that completed (and were billed) before the Stop. Show and keep those (as session results) before you end the run as stopped; their cost is already on the run, and the rest of the request is booked as unknown (a provider may finish images after the disconnect).
+
+```ts
+} catch (error) {
+  const done = partialImageResult(error)?.images ?? [];
+  for (const image of done) addResultCard(image); // paid: never drop them
+  throw error;                                    // still a Stop
+}
+```
+
+A stream that sends nothing for 5 minutes fails as a dropped connection (`STREAM_IDLE_MS`; OpenRouter sends keep-alive comments while a model works).
+
 `chatStream` resolves with the assembled `ChatStreamResult`. Its `annotations` (present only when some came) are the streamed `delta.annotations`: for a PDF sent through the `file-parser` plugin, `{ type: 'file', file: { name, content } }` with the parser's text. Keep that text and send it on later turns instead of the PDF (no upload, no parsing, no parser charge), as Chat does.
 
 `refusal` (present only when it applies) says why the reply holds no usable answer: the model's own refusal (`delta.refusal`, which also streamed as `text`), or a sentence for a reply that ended with `finish_reason` `content_filter` or `error` before any content (not in `text`). Show it instead of an empty "complete" reply, never parse it as an answer (no JSON repair request), and remember the request was billed as usual.
@@ -333,7 +345,7 @@ body.max_tokens = fit.maxTokens ?? undefined;                    // null: Max to
 
 `trimOldest(tokens, budget, startsAt?)` drops the oldest first and always keeps the last message (the one being answered); with `startsAt(index)`, once something went it drops on until the kept part starts where you allow (Chat passes `(i) => turns[i].role === 'user'`, so no reply is left without its question).
 
-The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it), and `ctx.beginRun` without `estimateUsd` always computes it afresh for the input as it is at that moment (so a paste followed by Ctrl+Enter, before your debounced `refreshEstimate`, books the right amount); only a value set with `ui.setEstimate` is booked as is. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
+The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it), and `ctx.beginRun` without `estimateUsd` always computes it afresh for the input as it is at that moment (so a paste followed by Ctrl+Enter, before your debounced `refreshEstimate`, books the right amount); only a value set with `ui.setEstimate` is booked as is. A run on another model than the header's (`beginRun({ model })`: "Another model…", an arena contender) books your hook's answer for that model; without a hook it is unknown. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
 
 ## Results, downloads and the leave guard
 
@@ -409,7 +421,7 @@ ctx.jobs.subscribe((record) => {
 });
 ```
 
-**Completion is not download.** Return `usage: { costUsd }` with `succeeded` (metadata and cost only): the core books it on the run before the job turns final, so a download that fails later still counts. Download the content separately, with its own retries; when it cannot happen any more (retention), mark the result expired: the cost is already booked. Read `failureKind` on a failed job: `'remote'` (the provider failed, usually free) or `'gave-up'` (the core stopped asking: poll failures, a 404 after retention, a missing key; it may still be billed, and the reservation is booked). Notifications are opt-in: `jobs.add({ …, notify: true })`, or `'group'` for one per group. A deliberate "Stop waiting" ends the run with `run.cancel(reason)` (aborted, not an error).
+**Completion is not download.** Return `usage: { costUsd }` with `succeeded` (metadata and cost only): the core books it on the run before the job turns final, so a download that fails later still counts. Download the content separately, with its own retries; when it cannot happen any more (retention), mark the result expired: the cost is already booked. Read `failureKind` on a failed job: `'remote'` (the provider failed, usually free) or `'gave-up'` (the core stopped asking: poll failures, a 404 after retention, a missing key, or the job was still running 3 hours after it was added, `maxAgeMs` on the handler to change that; it may still be billed, and the reservation is booked). The core records on the run that it booked the job's cost, so a tab that takes the polling over never books it twice. Settings → Data never deletes a running run, an open job, a finished job whose run is still running, or the saved state of a tool that has one: a delivery may still need them. Notifications are opt-in: `jobs.add({ …, notify: true })`, or `'group'` for one per group. A deliberate "Stop waiting" ends the run with `run.cancel(reason)` (aborted, not an error).
 
 Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`. Work that only lives in this page until a later step (a sequence being assembled, parts not yet joined) is protected with `ui.holdWork(description)`. Handed-off runs do not count for the leave guard: the job carries on without the page.
 

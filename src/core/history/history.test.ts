@@ -109,6 +109,15 @@ describe('query', () => {
     expect(ids(await core.history.query({ text: 'nothing like this' }))).toEqual([]);
   });
 
+  it('searches without lowercasing copies of the outputs, and takes the text literally', async () => {
+    await put(run(9, { output: `${'x'.repeat(200_000)} Total (net) +5.00 at the END` }));
+    const lower = vi.spyOn(String.prototype, 'toLowerCase');
+    expect(ids(await core.history.query({ text: 'the end' }))).toEqual(['r9']);
+    expect(ids(await core.history.query({ text: '(NET) +5.00' }))).toEqual(['r9']);
+    expect(ids(await core.history.query({ text: '.*' }))).toEqual([]);
+    expect(lower).not.toHaveBeenCalled();
+  });
+
   it('limits by from and to (inclusive)', async () => {
     const r2 = (await core.history.get('r2'))!.startedAt;
     const r4 = (await core.history.get('r4'))!.startedAt;
@@ -174,20 +183,28 @@ describe('changes', () => {
   it('clears one tool or everything and reports how many', async () => {
     expect(await core.history.count()).toBe(3);
     expect(await core.history.count({ tool: 'chat' })).toBe(2);
-    expect(await core.history.clear({ tool: 'chat' })).toBe(2);
+    expect(await core.history.clear({ tool: 'chat' })).toEqual({ removed: 2, kept: 0 });
     expect(ids(await core.history.query())).toEqual(['r2']);
-    expect(await core.history.clear()).toBe(1);
+    expect(await core.history.clear()).toEqual({ removed: 1, kept: 0 });
     expect(await core.history.count()).toBe(0);
-    expect(await core.history.clear()).toBe(0);
+    expect(await core.history.clear()).toEqual({ removed: 0, kept: 0 });
   });
 
-  it('notifies subscribers on data reset, and stops after unsubscribe', () => {
+  it('never clears a running run (its spend is not booked yet), and says how many it kept', async () => {
+    await put(run(4, { status: 'running' }), run(5, { status: 'running', tool: 'ocr' }));
+    expect(await core.history.clear({ tool: 'chat' })).toEqual({ removed: 2, kept: 1 });
+    expect(await core.history.clear()).toEqual({ removed: 1, kept: 2 });
+    expect(ids(await core.history.query()).sort()).toEqual(['r4', 'r5']);
+  });
+
+  it('tells subscribers which runs changed, and notifies them on data reset until unsubscribed', () => {
     const fn = vi.fn();
     const off = core.history.subscribe(fn);
+    core.bus.emit({ type: 'history-changed', ids: ['r1'] });
     core.bus.emit({ type: 'data-reset' });
     off();
     core.bus.emit({ type: 'history-changed' });
-    expect(fn).toHaveBeenCalledOnce();
+    expect(fn.mock.calls).toEqual([[['r1']], []]);
   });
 });
 
@@ -247,6 +264,12 @@ describe('prune', () => {
       { type: 'history-changed', ids: undefined },
       { type: 'prompts-changed', tool: 'all' },
     ]);
+  });
+
+  it('keeps a running run past retention: its spend is not booked yet', async () => {
+    await put(run(4, { startedAt: NOW - 95 * DAY, status: 'running' }));
+    expect(await core.history.prune()).toBe(1);
+    expect(ids(await core.history.query()).sort()).toEqual(['r2', 'r3', 'r4']);
   });
 
   it('follows the retention setting', async () => {

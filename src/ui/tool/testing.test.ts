@@ -114,6 +114,33 @@ describe('createToolTestContext', () => {
     await run.finish();
   });
 
+  it('books the estimate of the model a run chooses, not of the header model', async () => {
+    t = createToolTestContext(getTool('chat'));
+    const asked: string[] = [];
+    const tool = await t.mount((ctx) => ({
+      ...(tinyTool(ctx) as ToolInstance),
+      estimate: (model) => {
+        asked.push(model);
+        return Promise.resolve(model === 'x/dear' ? 2 : 0.01);
+      },
+    }));
+    tool.applyState({ prompt: 'hello', settings: {} });
+    t.core.settings.update((draft) => {
+      draft.budgets.perRunUsd = 1;
+    });
+    // Over the per-run limit: with an unknown (null) estimate the check would be skipped.
+    const checks: number[] = [];
+    t.core.runs.setConfirmHandler((check) => {
+      checks.push(check.reasons.length);
+      return Promise.resolve(true);
+    });
+    const run = await t.ctx.beginRun({ model: 'x/dear' });
+    expect(asked).toContain('x/dear');
+    expect((await (await getDb()).get('runs', run.id))?.reservedUsd).toBe(2);
+    expect(checks).toEqual([1]);
+    await run.finish();
+  });
+
   it('applies the header model only to the primary capability', () => {
     t = createToolTestContext(getTool('chat'), { modelOverride: 'x/override' });
     t.core.settings.update((draft) => {

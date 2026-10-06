@@ -509,7 +509,6 @@ export interface RunHandle {
   /** The job this run was handed off to (`handOff`), or null. A handed-off run is no longer the page's to lose. */
   readonly jobId: string | null;
   onUsage(fn: (totals: UsageTotals) => void): () => void;
-  /** Persist partial text output during long runs (bot transcripts, batches). */
   /**
    * Persists partial output (throttled: at most one write per interval, the latest wins). Pass `output` as a
    * function to build long text only when a write actually happens; it is also read once more by `finish()`
@@ -533,6 +532,14 @@ export interface RunHandle {
    * job's completion handler calls `runs.reattach(id)` and finishes it. Call right after the job is queued.
    */
   handOff(jobId: string): void;
+  /**
+   * The API client calls this right before each request leaves, and waits: it stores that a request is in flight
+   * (`RunRecord.inFlight`), so a run whose page dies before the answer is booked as an unknown cost (its
+   * reservation), never as "sent nothing". The returned function ends the mark; the client calls it once the
+   * request's usage is reported, or once it was answered without a cost. A run ended with a request still in flight
+   * books an unknown cost. Tools never call it.
+   */
+  sending(): Promise<() => void>;
 }
 
 /** What a budget confirmation asks about: one run (`runs.begin`), or a group at once (`runs.approveGroup`). */
@@ -721,6 +728,11 @@ export interface RunRecord {
   reservedUsd: number;
   /** Job id after `handOff()`; such runs are finalized by the job, never by unload or the sweep. */
   jobId: string | null;
+  /**
+   * Requests sent and not yet answered (`RunHandle.sending`), as last stored. An orphan with one in flight books an
+   * unknown cost. Only on running records (a final record drops it), and absent on ones stored before it existed.
+   */
+  inFlight?: number;
   meta: Record<string, unknown>;
   starred: boolean;
   groupId: string | null;
@@ -753,13 +765,17 @@ export interface HistoryService {
    * comes back `aborted` (with `finishedAt`), never running. Stats are never touched.
    */
   restore(runs: RunRecord[]): Promise<void>;
-  /** Removes all runs, or all runs of one tool; returns how many were removed. */
-  clear(scope?: { tool?: ToolId }): Promise<number>;
+  /**
+   * Removes all runs, or all runs of one tool, except runs still `running` (a live or handed-off run must still book
+   * its spend); returns how many were removed and how many running ones were kept.
+   */
+  clear(scope?: { tool?: ToolId }): Promise<{ removed: number; kept: number }>;
   count(scope?: { tool?: ToolId }): Promise<number>;
   exportJson(ids?: string[]): Promise<Blob>;
-  /** Applies the retention setting (starred runs are kept). Called at page start, at most daily. */
+  /** Applies the retention setting (starred and running runs are kept). Called at page start, at most daily. */
   prune(): Promise<number>;
-  subscribe(fn: () => void): () => void;
+  /** `ids`: the runs that changed, when known (a run begun or finished); undefined for bulk changes and resets. */
+  subscribe(fn: (ids?: readonly string[]) => void): () => void;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -879,6 +895,11 @@ export interface JobHandler<P = unknown, R = unknown> {
   poll(job: JobRecord<P, R>, signal: AbortSignal): Promise<JobPollResult<R>>;
   /** Poll interval; default 5000 ms with gentle backoff on errors. */
   intervalMs?: number | ((job: JobRecord<P, R>) => number);
+  /**
+   * A job still running this long after it was added is given up (`gave-up`, its run books its reservation), so a
+   * remote status that never ends cannot keep it polling forever. Default `MAX_JOB_AGE_MS` (3 hours).
+   */
+  maxAgeMs?: number;
 }
 
 export interface JobsService {
@@ -1065,12 +1086,26 @@ export interface BackupService {
   ): Promise<BackupPreview>;
 }
 
+/**
+ * What a deletion kept: work in progress is never deleted (a running run, an open job, or a finished job whose run
+ * is still running must still book its spend), and a tool with such work keeps its saved state.
+ */
+export interface DataDeletion {
+  /** Runs still `running` that were kept. */
+  keptRuns: number;
+  /** Tools whose saved state was kept because they have work in progress. */
+  keptTools: ToolId[];
+}
+
 export interface DataService {
   storage(): Promise<{ usedBytes: number | null; quotaBytes: number | null }>;
-  /** History + prompts for one tool. */
-  deleteToolData(tool: ToolId): Promise<void>;
-  /** All prompts, history, jobs and tool state; keys, settings and stats (the budget ledger) untouched. */
-  deleteAllPromptsAndHistory(): Promise<void>;
+  /** History, prompts, finished jobs and saved state (`tool:<id>:*`) of one tool, except work in progress. */
+  deleteToolData(tool: ToolId): Promise<DataDeletion>;
+  /**
+   * All prompts, history, jobs and tool state, except work in progress; keys, settings and stats (the budget
+   * ledger) untouched.
+   */
+  deleteAllPromptsAndHistory(): Promise<DataDeletion>;
   /** Everything, including keys and settings. */
   resetEverything(): Promise<void>;
 }

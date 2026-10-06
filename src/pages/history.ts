@@ -100,6 +100,12 @@ class HistoryPage {
   /** The last day section drawn: "Show more" appends its rows here instead of redrawing everything. */
   private lastDay: { key: string; list: HTMLElement } | null = null;
   private modelScan = 0;
+  /** The models of the history, from the last full scan plus the runs added since; null before the first scan. */
+  private knownModels: Set<string> | null = null;
+  /** Models added while a full scan runs (it may have read past them), merged into its result. */
+  private modelsDuringScan = new Set<string>();
+  /** Runs changed since the model filter was last updated; null when the change named none (rescan). */
+  private changedRuns: Set<string> | null = new Set();
 
   private currentRun: RunRecord | null = null;
   private detailGeneration = 0;
@@ -188,8 +194,8 @@ class HistoryPage {
   private readonly readSoon = debounce(() => this.readControls(), SEARCH_DEBOUNCE_MS);
   /** A change in the history (also from another tab) redraws the list once the changes stop. */
   private readonly reloadSoon = debounce(() => void this.reload({ keep: true }), 120);
-  /** The model filter is rebuilt a moment after the history changed. */
-  private readonly scanSoon = debounce(() => void this.scanModels(), 1500);
+  /** The model filter is updated a moment after the history changed. */
+  private readonly scanSoon = debounce(() => void this.updateModels(), 1500);
 
   // The detail drawer.
   private readonly drawerTitleId = uid('run-title');
@@ -255,8 +261,10 @@ class HistoryPage {
       if (params.run) void this.openDeepLink(params.run);
     });
 
-    this.core.history.subscribe(() => {
+    this.core.history.subscribe((ids) => {
       this.reloadSoon();
+      if (!ids || this.changedRuns === null) this.changedRuns = null;
+      else for (const id of ids) this.changedRuns.add(id);
       this.scanSoon();
     });
     this.core.keys.subscribe(() => this.fillKeys());
@@ -447,6 +455,7 @@ class HistoryPage {
   private async scanModels(): Promise<void> {
     const mine = ++this.modelScan;
     const found = new Set<string>();
+    this.modelsDuringScan = new Set();
     let before: number | undefined;
     try {
       for (let pages = 0; pages < MODEL_SCAN_MAX_PAGES; pages++) {
@@ -466,7 +475,36 @@ class HistoryPage {
     } catch {
       return; // The filter keeps what it had.
     }
+    for (const model of this.modelsDuringScan) found.add(model);
+    this.knownModels = found;
     this.paintModels([...found].sort());
+  }
+
+  /**
+   * After a change: the changed runs' models are added to the filter (only those runs are read), and the history is
+   * scanned again only when a run went away (its models may have gone with it) or the change named no runs (a bulk
+   * delete, a sweep, a reset). Starting or finishing a run, the common change, never rescans the history.
+   */
+  private async updateModels(): Promise<void> {
+    const ids = this.changedRuns;
+    this.changedRuns = new Set();
+    if (ids === null || this.knownModels === null) return this.scanModels();
+    if (ids.size === 0) return;
+    const mine = this.modelScan;
+    let runs: (RunRecord | undefined)[];
+    try {
+      runs = await Promise.all([...ids].map((id) => this.core.history.get(id)));
+    } catch {
+      return; // The filter keeps what it had.
+    }
+    if (mine !== this.modelScan) return; // a newer full scan covers these runs
+    const present = runs.filter((run): run is RunRecord => run !== undefined);
+    if (present.length < runs.length) return this.scanModels();
+    for (const model of modelsOf(present)) {
+      this.knownModels?.add(model);
+      this.modelsDuringScan.add(model);
+    }
+    this.paintModels([...(this.knownModels ?? [])].sort());
   }
 
   private paintModels(models: string[]): void {
