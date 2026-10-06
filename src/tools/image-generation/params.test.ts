@@ -190,6 +190,24 @@ describe('buildRequests', () => {
     expect(approxDimensions(value)).toEqual({ width: 1536, height: 1024 });
     expect(effective(form({ size: 'big' }), controls).size).toBeNull();
   });
+
+  it('matches a size in the model’s list however it is spaced, and says when it is not offered', () => {
+    const listed = { ...modelControls(MING), sizes: ['1024x1024', '1536x1024'] };
+    expect(effective(form({ size: '1024 x 1024' }), listed)).toMatchObject({ size: '1024x1024' });
+    expect(effective(form({ size: '1536×1024' }), listed)).toMatchObject({ size: '1536x1024' });
+    const other = effective(form({ size: '800x600', aspectRatio: '16:9' }), listed);
+    expect(other.size).toBeNull();
+    expect(other.notes).toEqual([
+      '800x600 is not one of this model’s sizes (1024x1024, 1536x1024), so the aspect ratio and resolution are used.',
+    ]);
+    const none = effective(form({ size: '800x600' }), { ...listed, sizes: null });
+    expect(none.notes).toEqual([
+      'This model takes no exact size, so the aspect ratio and resolution are used.',
+    ]);
+    // Nothing typed, nothing to say.
+    expect(effective(form({ size: '' }), listed).notes).toEqual([]);
+    expect(effective(form({ size: 'big' }), listed).notes).toEqual([]);
+  });
 });
 
 describe('transparency', () => {

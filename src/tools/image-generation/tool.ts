@@ -11,12 +11,14 @@
  * of one with a new seed), Use as reference and Edit (Send to Image editor). Reference images go through
  * `referencePicker` (each encoded once). History keeps the prompt and settings, never the images.
  */
+import { partialImageResult } from '../../core/api/client';
 import type { GeneratedImage, ImageRequest } from '../../core/api/types';
-import { userMessage } from '../../core/errors';
+import { createTicker } from '../../core/util';
 import { readImageSize } from '../../core/media/image';
 import { aspectValue, type ImageModelControls } from '../../core/models/image-params';
 import type { ImageControlsResult, RunHandle } from '../../core/types';
 import { emptyState } from '../../ui/components/empty-state';
+import { failureLine } from '../../ui/components/failure-line';
 import { mimeMatches } from '../../ui/components/file-types';
 import { imageResultCard } from '../../ui/components/image-result-card';
 import { referencePicker } from '../../ui/components/reference-picker';
@@ -24,9 +26,16 @@ import { progressBar } from '../../ui/components/progress-bar';
 import { switchField } from '../../ui/components/switch-field';
 import { h, replace } from '../../ui/dom';
 import { announce } from '../../ui/feedback/announce';
-import { isStop, markPresented, needsAction, presentError } from '../../ui/feedback/errors';
+import {
+  type FailureText,
+  failureText,
+  isStop,
+  markPresented,
+  needsAction,
+  presentError,
+} from '../../ui/feedback/errors';
 import { toast } from '../../ui/feedback/toast';
-import { formatBytes, formatDateTime, plural } from '../../ui/format';
+import { formatBytes, formatDateTime, plural, shorten, stemFrom } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { type ItemStatus, runItems } from '../../ui/tool/batch';
@@ -83,7 +92,10 @@ interface Item {
   /** Number of the first image in the group (1-based), for titles and file names. */
   first: number;
   status: ItemStatus;
-  error: string | null;
+  /** Why it failed, worded for its card (a request that may have been billed says so). */
+  failure: FailureText | null;
+  /** The error behind `failure`: its Retry asks first when the request may have been billed. */
+  cause: unknown;
   slot: HTMLElement;
   partialUrl: string | null;
 }
@@ -101,24 +113,9 @@ type RunArg = { retry: Item[] } | { variation: Generation };
 
 const randomSeed = (): number => (crypto.getRandomValues(new Uint32Array(1))[0] ?? 0) % MAX_SEED;
 
-/** A short file stem from the prompt: `lighthouse-on-a-rocky-coast`. */
-export function stemFrom(prompt: string): string {
-  const words = prompt
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 5);
-  return words.join('-').slice(0, 48) || 'image';
-}
-
 /** The picture's size from its header (no decode), or null when it cannot be read. */
 const dimensionsOf = (blob: Blob): Promise<{ width: number; height: number } | null> =>
   readImageSize(blob).catch(() => null);
-
-const shorten = (text: string, max: number): string =>
-  text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
 const isFinal = (status: ItemStatus): boolean =>
   status === 'done' || status === 'failed' || status === 'stopped';
@@ -693,13 +690,17 @@ export function setup(ctx: ToolContext): ToolInstance {
           'div',
           { class: 'card-body vstack gap-2' },
           h('h4', { class: 'h6 mb-0' }, title),
-          h(
-            'div',
-            { class: 'small text-danger-emphasis', role: 'note', 'data-testid': 'imagegen-error' },
-            item.status === 'stopped'
-              ? 'Stopped before it was ready.'
-              : (item.error ?? 'It failed.'),
-          ),
+          item.status === 'stopped' || !item.failure
+            ? h(
+                'div',
+                {
+                  class: 'small text-danger-emphasis',
+                  role: 'note',
+                  'data-testid': 'imagegen-error',
+                },
+                item.status === 'stopped' ? 'Stopped before it was ready.' : 'It failed.',
+              )
+            : h('div', { role: 'note' }, failureLine(item.failure, { testId: 'imagegen-error' })),
           h(
             'div',
             { class: 'd-flex flex-wrap gap-2 mt-auto' },
@@ -711,7 +712,13 @@ export function setup(ctx: ToolContext): ToolInstance {
                   class: 'btn btn-sm btn-outline-primary d-inline-flex align-items-center gap-1',
                   'aria-label': `Retry ${title.toLowerCase()}`,
                   'data-testid': 'imagegen-retry',
-                  onclick: () => gate.retry({ retry: [item] }, 'Generate cannot start now.'),
+                  // After a request that may have been billed, Retry asks first.
+                  onclick: () =>
+                    void gate.retryFailed(
+                      item.cause,
+                      { retry: [item] },
+                      'Generate cannot start now.',
+                    ),
                 },
                 icon('arrow-clockwise'),
                 'Retry',
@@ -790,7 +797,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           formats: raster ? ['png', 'jpg', 'webp'] : [],
           actions: [
             {
-              label: 'Variations',
+              label: 'Variation',
               icon: 'shuffle',
               ariaLabel: `Make a variation of ${title.toLowerCase()}`,
               testId: 'imagegen-vary',
@@ -835,7 +842,10 @@ export function setup(ctx: ToolContext): ToolInstance {
   const settle = (item: Item, status: ItemStatus, error?: unknown): void => {
     item.status = status;
     if (status === 'done') return; // its images replaced the card already
-    if (status === 'failed') item.error = userMessage(error);
+    if (status === 'failed') {
+      item.failure = failureText(error);
+      item.cause = error;
+    }
     if (status === 'queued' || status === 'running') {
       drawWaiting(item);
       return;
@@ -858,48 +868,86 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   /**
+   * Cards for the images a request did not deliver, as a failed (or, after a Stop, stopped) card of their own
+   * with Retry for just those, placed right after the delivered images.
+   */
+  const remainderOf = (
+    item: Item,
+    made: number,
+    status: 'failed' | 'stopped',
+    why: { failure: FailureText; cause: unknown } | null,
+  ): Item => {
+    const missing = Math.max(0, item.plan.images - made);
+    const body: ImageRequest = { ...item.plan.body };
+    if (body.n !== undefined && missing > 1) body.n = missing;
+    else delete body.n;
+    const remainder: Item = {
+      group: item.group,
+      plan: { body, images: missing },
+      first: item.first + made,
+      status,
+      failure: why?.failure ?? null,
+      cause: why?.cause ?? null,
+      slot: h('div', { class: 'col' }),
+      partialUrl: null,
+    };
+    item.group.remainders.push(remainder);
+    return remainder;
+  };
+
+  /**
    * One request: streamed partials go to the waiting card; the images replace it. Images asked for and not
    * delivered (fewer than `n`, or an error after some) get a failed card of their own, with Retry for just them.
+   * A Stop keeps the images that completed (paid for): they are shown, and the rest is a stopped card.
    */
   const generate = async (
     run: RunHandle,
     item: Item,
     signal: AbortSignal,
   ): Promise<{ made: number; missing: number }> => {
-    const result = await ctx.api.images(item.plan.body, {
-      run,
-      signal,
-      onPartial: (partial) => {
-        if (item.status !== 'running') return;
-        if (item.partialUrl) URL.revokeObjectURL(item.partialUrl);
-        item.partialUrl = URL.createObjectURL(partial.blob);
-        drawWaiting(item);
-      },
-    });
+    let result;
+    try {
+      result = await ctx.api.images(item.plan.body, {
+        run,
+        signal,
+        onPartial: (partial) => {
+          if (item.status !== 'running') return;
+          if (item.partialUrl) URL.revokeObjectURL(item.partialUrl);
+          item.partialUrl = URL.createObjectURL(partial.blob);
+          drawWaiting(item);
+        },
+      });
+    } catch (error) {
+      const kept = partialImageResult(error)?.images ?? [];
+      if (kept.length > 0) {
+        const rest =
+          item.plan.images > kept.length ? remainderOf(item, kept.length, 'stopped', null) : null;
+        await showImages(item, kept, rest?.slot ?? null);
+        if (rest) drawFailed(rest);
+        announce(`Stopped: ${plural(kept.length, 'image')} kept.`);
+      }
+      throw error;
+    }
     const made = result.images.length;
     const missing = Math.max(0, item.plan.images - made);
-    let remainder: Item | null = null;
-    if (missing > 0) {
-      const body: ImageRequest = { ...item.plan.body };
-      if (body.n !== undefined && missing > 1) body.n = missing;
-      else delete body.n;
-      remainder = {
-        group: item.group,
-        plan: { body, images: missing },
-        first: item.first + made,
-        status: 'failed',
-        error: result.error
-          ? userMessage(result.error)
-          : `The model returned ${made} of the ${plural(item.plan.images, 'image')} asked for.`,
-        slot: h('div', { class: 'col' }),
-        partialUrl: null,
-      };
-      item.group.remainders.push(remainder);
-    }
+    const remainder =
+      missing > 0
+        ? remainderOf(item, made, 'failed', {
+            failure: result.error
+              ? failureText(result.error)
+              : {
+                  text: `The model returned ${made} of the ${plural(item.plan.images, 'image')} asked for.`,
+                  outcomeUnknown: false,
+                  activityUrl: null,
+                  note: null,
+                },
+            cause: result.error ?? null,
+          })
+        : null;
     await showImages(item, result.images, remainder?.slot ?? null);
     if (remainder) drawFailed(remainder);
     else if (result.error) {
-      announce(`The images arrived, then an error: ${userMessage(result.error)}`);
+      announce(`The images arrived, then an error: ${failureText(result.error).text}`);
     }
     return { made, missing };
   };
@@ -924,7 +972,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       model,
       form: groupForm,
       references: sent,
-      stem: stemFrom(groupForm.prompt),
+      stem: stemFrom(groupForm.prompt, 'image'),
       section: h('section', { class: 'vstack gap-2', 'data-testid': 'imagegen-group' }),
       grid,
       bar,
@@ -938,7 +986,8 @@ export function setup(ctx: ToolContext): ToolInstance {
         plan,
         first,
         status: 'queued',
-        error: null,
+        failure: null,
+        cause: null,
         slot: h('div', { class: 'col' }),
         partialUrl: null,
       };
@@ -964,23 +1013,16 @@ export function setup(ctx: ToolContext): ToolInstance {
     return group;
   };
 
-  let ticker: ReturnType<typeof setInterval> | null = null;
-  const stopTicker = (): void => {
-    if (ticker) clearInterval(ticker);
-    ticker = null;
-  };
+  const ticker = createTicker();
 
   /** Runs `items` of `group` inside `handle`'s run, and ends the run. */
   const runGroup = async (handle: RunHandle, group: Group, items: Item[]): Promise<void> => {
     const started = Date.now();
     ui.status('Generating…');
-    stopTicker();
-    ticker = setInterval(() => {
+    ticker.start((seconds) => {
       const counter = requestProgress(items);
-      ui.progress(
-        `Generating… ${Math.round((Date.now() - started) / 1000)} s${counter ? ` · ${counter}` : ''}`,
-      );
-    }, 1000);
+      ui.progress(`Generating… ${seconds} s${counter ? ` · ${counter}` : ''}`);
+    }, started);
     updateBar(group, items);
     try {
       const outcome = await runItems({
@@ -1001,7 +1043,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           ? `${made} of ${plural(asked, 'image')} ready; ${failed} failed`
           : `${plural(made, 'image')} ready`;
       // The ticker stops first, or a tick during the History write would overwrite the summary.
-      stopTicker();
+      ticker.stop();
       ui.status(summary);
       const seeds = items
         .map((item) => item.plan.body.seed)
@@ -1011,7 +1053,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         meta: { images: made, failed, ...(seeds.length ? { seeds } : {}) },
       });
     } catch (error) {
-      stopTicker();
+      ticker.stop();
       for (const item of items) {
         if (item.status === 'queued' || item.status === 'running') settle(item, 'stopped');
       }
@@ -1020,7 +1062,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       await handle.fail(error);
       throw error;
     } finally {
-      stopTicker();
+      ticker.stop();
     }
   };
 
@@ -1094,7 +1136,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       },
       signal,
     );
-    for (const item of items) item.error = null;
+    for (const item of items) {
+      item.failure = null;
+      item.cause = null;
+    }
     try {
       await runGroup(handle, group, items);
     } catch (error) {
