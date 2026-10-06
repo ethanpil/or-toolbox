@@ -4,7 +4,7 @@ Oct 2, 2026 · @Ethan
 
 ## Status
 
-This is draft v0.2. The tool list is cut to 14 tools that each need real infrastructure, and the platform decisions (public site, Vite + TypeScript, IndexedDB + localStorage) are made. Anything marked **(proposed)** or listed under Open questions is a default we keep unless you say otherwise; the build order and test gates are in the Delivery plan.
+This is the plan as delivered in v1.0 (October 2026). All 14 tools and the platform pages are built and shipped. Where the build differs from the plan, [Delivered v1: deviations](#delivered-v1-deviations) says how and why; the text above that section is the original spec, kept as written. One launch task is still open: the Name item under Open questions.
 
 ## Vision and principles
 
@@ -157,7 +157,7 @@ The shell around the tools is what makes this a product rather than a folder of 
 
 - Every tool has a **Prompts** button next to its main input that opens a panel with two tabs: **Recent** (filled automatically from that tool's runs) and **Saved** (prompts the user chose to keep, with an optional name).
 - A saved prompt stores the text plus that tool's settings at the time (e.g. voice and format for text-to-speech, aspect ratio for images, the whole step list for a video sequence), so "Use" restores the form exactly.
-- Actions per prompt: Use, Save (from Recent), Rename, Copy, Delete. Per tool: Clear recent, Clear saved, Clear all for this tool. Every delete asks for confirmation and offers Undo in a toast for a few seconds.
+- Actions per prompt: Use, Save (from Recent), Rename, Copy, Delete. Per tool: Clear recent, Clear saved, Clear all for this tool. Every delete asks for confirmation and offers Undo in a toast that stays until the user dismisses it.
 - Saved prompts never expire; Recent follows the history retention setting. A **Record recent prompts** switch (on by default) lets privacy-minded users turn auto-saving off.
 - **Settings → Data** lists prompt counts per tool with a delete button on each row, plus **Delete all prompts and history** for the whole app (keys and settings untouched) and a separate **Reset everything** that also removes keys and settings. Both need a typed confirmation.
 - Saved prompts are included in backup/restore and sync live across open tabs.
@@ -194,7 +194,7 @@ Pages never talk to OpenRouter or storage directly; they go through the core, wh
 | localStorage | Settings, key aliases, defaults, favorites, UI state (< 100 KB) | Synchronous read at page start, shared by every page on the origin |
 | IndexedDB | Text-only run history, saved and recent prompts per tool, video job queue and sequence state, cached model list, stats rollups | Larger capacity than localStorage, async, survives reloads |
 | Memory only | Images, audio, video and uploaded files during a session | Never written to disk; leave-page warning protects undownloaded results |
-| sessionStorage | Unlocked key material when the passphrase lock is on | Cleared when the tab closes |
+| sessionStorage | Unlocked key material when the passphrase lock is on | Removed by auto-lock or Lock now; browsers may restore it with a closed tab (see Delivered v1: deviations) |
 
 **Cross-page and cross-tab sync.** A `BroadcastChannel('ortoolbox')` announces changes ("settings changed", "run finished") so open tabs update live; the `storage` event is the fallback. Schema has a `version` and migrations run at page start.
 
@@ -306,6 +306,40 @@ All 14 tools ship together as v1, built in nine stages; each stage ends at a tes
 | 7. Decision, Bot-to-bot, Model arena | Jev question builder and results, bot loop with moderation, parallel arena | Every bot stop condition triggers; arena runs 4 models at once; Decision handles each question type |
 | 8. Release | Performance budgets, cross-browser pass, security review (CSP, key handling, output sanitising), user docs and README | Lighthouse 90+ on Home and two tools; `/code-review max` on the whole repository; v1.0 tag |
 
+## Delivered v1: deviations
+
+What differs from the plan above, and why. Everything else in the plan was built as written.
+
+**Process**
+
+- **Gates ran locally, per stage.** Each stage ended at a local gate (unit tests, Playwright against the mocked OpenRouter, a review of the stage's changes) and was tagged `stage-0` to `stage-7` on its own branch. The live smoke test on Pages and the OAuth round trip against the real OpenRouter are done once, after the site is published, not at each stage.
+- **Browsers.** The automated suite runs in Chromium, Firefox and WebKit; WebKit stands in for Safari. The joined MP4 is decoded and played by the automated gate in Chromium only; playback in Firefox, Safari and VLC is a manual check.
+- **Lighthouse 90+.** Met on desktop and on mobile Home. Not met on mobile Chat, whose performance score stays under 90 on Lighthouse's throttled mobile profile.
+- **Whole-repository review.** Instead of one `/code-review max`, Stage 8 ran independent finders over the whole repository, each finding was verified separately, and the fixes shipped in rounds (see the changelog).
+- **XLSX.** The Data extractor's XLSX is checked by unzipping and parsing it in the e2e gate, and by a spreadsheet reader (openpyxl) in CI. It was not opened in Excel or Google Sheets.
+
+**Security and delivery**
+
+- **COEP is always `require-corp`**, not `credentialless` where supported. Nothing is hot-linked, so `credentialless` would buy nothing and needs per-browser negotiation.
+- **No `blob:` workers.** The CSP allows `worker-src 'self'` only: ffmpeg's ESM cores are self-hosted and the wasm is handed over as a `blob:` URL, but no worker or script is a `blob:`. There are no frames at all (`frame-src 'none'`), so the plan's sandboxed-iframe preview has no use.
+- **The CSP is also a response header.** The meta tag stays, and the service worker adds the same policy as a header on documents and workers, with `frame-ancestors 'none'` (a meta tag cannot set it). A small script in `theme-init.js` hides a framed page on the first visit, before the worker controls it.
+- **Isolation reload on two pages only.** Diagnostics and Video studio reload once on a first visit to become isolated; every other page only registers the worker. The reload never happens once the user has started using the page. The OAuth callback must never reload.
+- **The service worker verifies what it caches.** Every cached file is checked against a SHA-256 recorded at build time, because every project site on `github.io` shares one CacheStorage.
+- **Unlock state outlives the tab.** The unlocked key sits in `sessionStorage`, which browsers may restore with a closed tab, so it is not "cleared when the tab closes". Auto-lock (24 hours at most) and Lock now remove it, and the Privacy page says so.
+- **Connect does not request a credit limit.** The PKCE exchange creates a key without one. The Connect help, the key field and the Privacy page recommend setting a limit on OpenRouter afterwards.
+- **Sanitized output is an allowlist.** Markdown from models loses classes, `data-*`, ARIA attributes and the other attributes that could draw fake dialogs or drive page controls.
+- **Third-party notices** ship as `licenses.txt` on the site and `THIRD-PARTY-NOTICES.txt` in the repository, with the source of the GPL ffmpeg.wasm cores. The project's own license is not chosen yet.
+
+**Behavior**
+
+- **Leaving the page.** In-app links get the plan's dialog with Download all. Reloads, closing the tab and typed addresses get the browser's own prompt, which cannot carry custom text. Leaving during a run now asks too.
+- **Video notifications are opt-in** (a switch in the video drawer; permission is asked only when the user turns it on, and a notification shows only while the page is hidden), not on by default.
+- **No auto-join.** A finished sequence does not join its clips by itself; the user presses Join, which runs ffmpeg with its own Stop. Joins are capped at 1.5 GiB, the most the browser can allocate.
+- **Native extend and Previous job.** Native extend sends a public HTTPS link only to models priced with video input; every other model falls back to Continue. No model is confirmed to take `previous_job_id`, so it is not sent.
+- **Settings is one page of deep-linkable sections** (keys, default models, tools, budgets, appearance, security, data, backup), not tabs.
+- **Storage that cannot save.** A browser that blocks `localStorage` or IndexedDB gets a notice and a plain error, instead of settings that silently revert.
+- **Retries never pay twice.** A request that may have been billed (network loss after sending, a 5xx or 408 on a paid call) is never re-sent by itself, and its Retry asks first. The plan's "retry with fallback model" is the user's choice, not automatic.
+
 ## Open questions
 
 Your answers turn this draft into the v1 build plan; the first four matter most because they change the architecture.
@@ -322,4 +356,4 @@ Your answers turn this draft into the v1 build plan; the first four matter most 
 - [x] **Mobile:** desktop first, responsive.
 - [x] **Releases:** everything in v1, delivered in stages with test gates.
 - [x] **Look and feel:** plain Bootstrap 5.3 with light and dark modes.
-- [x] **Name:** ORtoolbox. Before launch, confirm the GitHub repo name is free and check OpenRouter's brand guidelines for using "OR" in a public product name.
+- [ ] **Name:** ORtoolbox. Open launch task: before launch, confirm the GitHub repo name is free and check OpenRouter's brand guidelines for using "OR" in a public product name.
