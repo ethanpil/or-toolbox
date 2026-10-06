@@ -723,7 +723,7 @@ export interface RunRecord {
   jobId: string | null;
   /**
    * Requests sent and not yet answered (`RunHandle.sending`), as last stored. An orphan with one in flight books an
-   * unknown cost. Absent on records stored before it existed.
+   * unknown cost. Only on running records (a final record drops it), and absent on ones stored before it existed.
    */
   inFlight?: number;
   meta: Record<string, unknown>;
