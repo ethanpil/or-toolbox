@@ -86,7 +86,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await t?.cleanup();
   t = null;
-  document.querySelectorAll('[data-testid="toast"]').forEach((node) => node.remove());
+  document.querySelectorAll('[data-testid="toasts"] > *').forEach((node) => node.remove());
 });
 
 async function mount(speech: ApiClient['speech']) {
