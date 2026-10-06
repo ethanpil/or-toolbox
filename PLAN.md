@@ -314,7 +314,7 @@ What differs from the plan above, and why. Everything else in the plan was built
 
 - **Gates ran locally, per stage.** Each stage ended at a local gate (unit tests, Playwright against the mocked OpenRouter, a review of the stage's changes) and was tagged `stage-0` to `stage-7` on its own branch. The live smoke test on Pages and the OAuth round trip against the real OpenRouter are done once, after the site is published, not at each stage.
 - **Browsers.** The automated suite runs in Chromium, Firefox and WebKit; WebKit stands in for Safari. The joined MP4 is decoded and played by the automated gate in Chromium only; playback in Firefox, Safari and VLC is a manual check.
-- **Lighthouse 90+.** Met on desktop and on mobile Home. Not met on mobile Chat, whose performance score stays under 90 on Lighthouse's throttled mobile profile.
+- **Lighthouse 90+.** Measured on the v1.0 build (Lighthouse 13.5, production preview): desktop Home 100, Chat 98, Decision 98; mobile Home 98, Chat 90, Decision 84–91 across runs (blocking time varies). Accessibility, best practices and SEO are 100 on all of them. Mobile Decision is the one score that can fall under 90 on the throttled mobile profile.
 - **Whole-repository review.** Instead of one `/code-review max`, Stage 8 ran independent finders over the whole repository, each finding was verified separately, and the fixes shipped in rounds (see the changelog).
 - **XLSX.** The Data extractor's XLSX is checked by unzipping and parsing it in the e2e gate, and by a spreadsheet reader (openpyxl) in CI. It was not opened in Excel or Google Sheets.
 
