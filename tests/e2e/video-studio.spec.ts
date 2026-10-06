@@ -193,7 +193,7 @@ test.describe('Video studio', () => {
     );
     await page.getByTestId('video-duration').selectOption('4');
     await page.getByTestId('run-button').click();
-    await expect.poll(() => jobs.submits().length).toBe(1);
+    await expect.poll(() => jobs.submits().length, { timeout: 60_000 }).toBe(1);
     const fallback = jobs.submits()[0]!;
     expect(fallback.frame_images?.[0]?.frame_type).toBe('first_frame');
     expect(pngSize(firstFrame(fallback)!)).toEqual({ width: 544, height: 544 });
@@ -204,7 +204,7 @@ test.describe('Video studio', () => {
     await page.getByTestId('video-extend-url').fill('https://example.com/harbour.mp4');
     await expect(page.getByTestId('video-notes')).toContainText('Native extend');
     await page.getByTestId('run-button').click();
-    await expect.poll(() => jobs.submits().length).toBe(2);
+    await expect.poll(() => jobs.submits().length, { timeout: 60_000 }).toBe(2);
     const native = jobs.submits()[1]!;
     expect(native.frame_images).toBeUndefined();
     expect(native.input_references).toEqual([

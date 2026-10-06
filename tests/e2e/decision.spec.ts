@@ -110,7 +110,9 @@ test('one run with all three question types: a request for each and a card for e
   await expect(page.getByTestId('dec-cost')).toHaveText('Cost <$0.0001');
   await expect(page.getByTestId('tool-status')).toContainText('Done');
 
-  // Readable in both themes, with the cards on screen.
+  // Readable in both themes, with the cards on screen. (From the top of the page: after a run the page has scrolled
+  // to the results, which leaves the library select under the sticky navbar, and axe reports it as overlapped.)
+  await page.evaluate(() => window.scrollTo(0, 0));
   await expectNoSeriousA11yViolations(page);
   await page.emulateMedia({ colorScheme: 'dark' });
   await expect(page.locator('html')).toHaveAttribute('data-bs-theme', 'dark');
