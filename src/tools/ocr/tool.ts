@@ -5,7 +5,7 @@
  * one Run press (its output is the combined text, checkpointed as pages finish).
  */
 import type { ChatRequest } from '../../core/api/types';
-import { InvalidInputError, userMessage } from '../../core/errors';
+import { FreeOnlyError, InvalidInputError, isOutcomeUnknown, userMessage } from '../../core/errors';
 import { readAsDataUrl } from '../../core/files';
 import {
   isPdfEngineId,
@@ -16,16 +16,19 @@ import {
 } from '../../core/models/pdf-engines';
 import type { RunAddon, RunHandle } from '../../core/types';
 import { documentInput, textImage, type PageRef } from '../../ui/components/document-input';
+import { failureLine } from '../../ui/components/failure-line';
 import { outputPanel } from '../../ui/components/output-panel';
 import { progressBar } from '../../ui/components/progress-bar';
 import { focusedKey, focusKey, h, replaceWith } from '../../ui/dom';
-import { isStop } from '../../ui/feedback/errors';
+import { isStop, markPresented } from '../../ui/feedback/errors';
+import { toast } from '../../ui/feedback/toast';
 import { plural } from '../../ui/format';
 import { icon } from '../../ui/icon';
 import { uid } from '../../ui/id';
 import { batchSummary, batchTitle, runItems } from '../../ui/tool/batch';
 import type { ToolContext, ToolInstance } from '../../ui/tool/index';
 import { retryGate } from '../../ui/tool/retry-gate';
+import { pendingOnly } from '../../ui/tool/runner';
 import {
   combineMarkdown,
   combinePlainText,
@@ -82,10 +85,17 @@ export function setup(ctx: ToolContext): ToolInstance {
     concurrency: uid('ocr-concurrency'),
   };
 
+  /**
+   * What the Read press that is going on began with: every setting and the instructions, read once. Nothing read
+   * per page may change what a page costs or whether it may run (the engine, the image size, the text hint), so the
+   * estimate, the add-ons, the free-only check and every request come from this, never from the form.
+   */
+  let active: { s: ReturnType<typeof settings>; instructions: string } | null = null;
+
   // --- input zone -----------------------------------------------------------------------------------------
   const docs = documentInput({
     accept: ctx.manifest.accepts,
-    maxSide: () => Number(size.value) || DEFAULT_SIZE,
+    maxSide: () => active?.s.maxSide ?? (Number(size.value) || DEFAULT_SIZE),
     onChange: () => void ui.refreshEstimate(),
   });
 
@@ -161,6 +171,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       id,
       type: 'checkbox',
       class: 'form-check-input',
+      role: 'switch',
       checked,
       'data-testid': testId,
       onchange: () => {
@@ -212,15 +223,10 @@ export function setup(ctx: ToolContext): ToolInstance {
     pdfEngine(engine.value as PdfEngineId).hint,
   );
 
-  const formCheck = (
-    input: HTMLInputElement,
-    label: string,
-    help: string,
-    isSwitch = false,
-  ): HTMLElement =>
+  const formSwitch = (input: HTMLInputElement, label: string, help: string): HTMLElement =>
     h(
       'div',
-      { class: ['form-check', isSwitch && 'form-switch'] },
+      { class: 'form-check form-switch' },
       input,
       h('label', { class: 'form-check-label', htmlFor: input.id }, label),
       h('div', { class: 'form-text mt-0' }, help),
@@ -238,12 +244,12 @@ export function setup(ctx: ToolContext): ToolInstance {
         'The main language of the pages, if you know it (for example German).',
       ),
     ),
-    formCheck(
+    formSwitch(
       separators,
       'Page separators',
       'Start every page with a line naming it in the combined text.',
     ),
-    formCheck(
+    formSwitch(
       textHint,
       "Send the PDF's own text along",
       'Where a PDF page carries text, the model gets it as a hint for spelling and numbers.',
@@ -252,11 +258,10 @@ export function setup(ctx: ToolContext): ToolInstance {
       'fieldset',
       { class: 'vstack gap-2' },
       h('legend', { class: 'form-label fs-6 mb-1' }, 'PDF parser'),
-      formCheck(
+      formSwitch(
         pdfParser,
         "Use OpenRouter's PDF parser instead",
         'Sends each PDF whole (the page selection is ignored) for a text PDF. Images still go page by page.',
-        true,
       ),
       h('label', { class: 'form-label mb-0', htmlFor: ids.engine }, 'Parser'),
       engine,
@@ -350,7 +355,8 @@ export function setup(ctx: ToolContext): ToolInstance {
         label: 'Plain text',
         extension: 'txt',
         icon: 'file-earmark-text',
-        build: () => new Blob([combinePlainText(results)], { type: 'text/plain' }),
+        build: () =>
+          new Blob([combinePlainText(results, separators.checked)], { type: 'text/plain' }),
       },
       {
         label: 'Word document',
@@ -482,8 +488,20 @@ export function setup(ctx: ToolContext): ToolInstance {
             )
           : null,
       ),
-      result.error
-        ? h('div', { class: 'small text-danger-emphasis', role: 'note' }, result.error)
+      result.failure || result.error
+        ? h(
+            'div',
+            { role: 'note' },
+            failureLine(
+              result.failure ?? {
+                text: result.error ?? '',
+                outcomeUnknown: false,
+                activityUrl: null,
+                note: null,
+              },
+              { testId: 'ocr-page-error' },
+            ),
+          )
         : null,
       result.truncated
         ? h(
@@ -573,11 +591,11 @@ export function setup(ctx: ToolContext): ToolInstance {
     concurrency: Number(concurrency.value),
   });
 
-  const planUnits = (): Unit[] => {
+  const planUnits = (parser: boolean): Unit[] => {
     const planned: Unit[] = [];
     const wholePdfs = new Set<string>();
     for (const ref of docs.selection()) {
-      if (pdfParser.checked && ref.kind === 'pdf') {
+      if (parser && ref.kind === 'pdf') {
         if (wholePdfs.has(ref.fileId)) continue;
         wholePdfs.add(ref.fileId);
         planned.push({ key: `${ref.fileId}:all`, kind: 'pdf', ref });
@@ -597,9 +615,12 @@ export function setup(ctx: ToolContext): ToolInstance {
     plan.reduce((sum, unit) => sum + (unit.kind === 'pdf' ? unit.ref.pageCount : 0), 0);
 
   /** The plan's model cost: page images at the chosen size (plus the PDF text hint) and parsed pages. */
-  const estimatePlan = async (plan: readonly Unit[], model: string): Promise<number | null> => {
+  const estimatePlan = async (
+    plan: readonly Unit[],
+    model: string,
+    s: ReturnType<typeof settings>,
+  ): Promise<number | null> => {
     if (plan.length === 0) return null;
-    const s = settings();
     let imagePages = 0;
     let hintPages = 0;
     for (const unit of plan) {
@@ -620,8 +641,8 @@ export function setup(ctx: ToolContext): ToolInstance {
   };
 
   /** The parser's own charge for a plan (Mistral OCR bills per page, even with a free model). */
-  const addonsFor = (plan: readonly Unit[]): RunAddon[] => {
-    const addon = pdfEngineAddon(settings().engine, parsedPagesIn(plan));
+  const addonsFor = (plan: readonly Unit[], s: ReturnType<typeof settings>): RunAddon[] => {
+    const addon = pdfEngineAddon(s.engine, parsedPagesIn(plan));
     return addon ? [addon] : [];
   };
 
@@ -630,9 +651,10 @@ export function setup(ctx: ToolContext): ToolInstance {
     unit: Unit,
     result: PageResult,
     signal: AbortSignal,
+    began: NonNullable<typeof active>,
+    maxCompletionTokens: number | null,
   ): Promise<void> => {
-    const s = settings();
-    const instructions = prompt.value;
+    const { s, instructions } = began;
     let body: ChatRequest;
     if (unit.kind === 'pdf') {
       const file = docs.file(unit.ref.fileId);
@@ -640,11 +662,11 @@ export function setup(ctx: ToolContext): ToolInstance {
       body = pdfRequest(
         run.model,
         { fileName: unit.ref.fileName, dataUrl: await readAsDataUrl(file) },
-        { ...s, instructions },
+        { ...s, instructions, maxCompletionTokens },
       );
     } else {
       const page = await docs.loadPage(unit.ref);
-      body = pageRequest(run.model, page, { ...s, instructions });
+      body = pageRequest(run.model, page, { ...s, instructions, maxCompletionTokens });
     }
     signal.throwIfAborted();
     result.text = '';
@@ -660,6 +682,12 @@ export function setup(ctx: ToolContext): ToolInstance {
         scheduleCombined();
       },
     });
+    if (answer.refusal) {
+      // The model declined (its words were streamed as text) or a filter blocked the reply: that is a failed page,
+      // not a page whose text is the refusal. Billed as usual; its Retry is the user's.
+      result.text = '';
+      throw new InvalidInputError(`The model did not answer: ${answer.refusal}`);
+    }
     result.text = answer.text;
     result.truncated = answer.finishReason === 'length';
   };
@@ -667,13 +695,43 @@ export function setup(ctx: ToolContext): ToolInstance {
   /** True while a run reads pages (the runner's own flag is still set while its `run` returns). */
   let reading = false;
 
+  /** The error each failed page ended with, for its Retry (a request that may have been billed asks first). */
+  const failures = new Map<string, unknown>();
+
   /** Reads `keys` again (a Retry); the runner's own Retry after a refusal repeats the same pages. */
   const retry = (keys: string[]): void => {
-    if (keys.length > 0) gate.retry(keys, 'Reading cannot start now.');
+    if (keys.length === 0) return;
+    const errors = keys.flatMap((key) => (failures.has(key) ? [failures.get(key)] : []));
+    void gate.retryFailed(
+      errors.find((error) => isOutcomeUnknown(error)) ?? errors[0],
+      keys,
+      'Reading cannot start now.',
+    );
   };
 
+  /** The plan of the Read press that is going or was last (null before beginRun accepted a press). */
+  let pressed: string[] | null = null;
+
   const run = async (signal: AbortSignal, keys?: string[]): Promise<void> => {
-    const plan = keys ? units.filter((unit) => keys.includes(unit.key)) : planUnits();
+    if (!keys) pressed = null;
+    // Everything the run uses is read here, once.
+    const began = { s: settings(), instructions: prompt.value };
+    active = began;
+    try {
+      await perform(signal, keys, began);
+    } finally {
+      active = null;
+    }
+  };
+
+  const perform = async (
+    signal: AbortSignal,
+    keys: string[] | undefined,
+    began: NonNullable<typeof active>,
+  ): Promise<void> => {
+    const plan = keys
+      ? units.filter((unit) => keys.includes(unit.key))
+      : planUnits(began.s.pdfParser);
     if (plan.length === 0) {
       if (!keys) {
         ui.status(
@@ -684,23 +742,40 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
 
     const model = ctx.model().model;
+    const info = model ? await ctx.models.get(model).catch(() => undefined) : undefined;
+    const maxCompletionTokens = info?.maxCompletionTokens ?? null;
     // Refused before anything was sent (no key, locked, free-only, budget, Cancel): every page stays as it was.
-    const runHandle = await ctx.beginRun(
-      {
-        title: batchTitle(
-          plan.map((unit) => unit.ref.fileName),
-          { retry: keys !== undefined },
-        ),
-        // A retry books only what it reads; a full run uses the header's estimate and add-ons.
-        ...(keys
-          ? {
-              estimateUsd: model ? await estimatePlan(plan, model) : null,
-              addons: addonsFor(plan),
-            }
-          : {}),
-      },
-      signal,
-    );
+    let runHandle: RunHandle;
+    try {
+      runHandle = await ctx.beginRun(
+        {
+          title: batchTitle(
+            plan.map((unit) => unit.ref.fileName),
+            { retry: keys !== undefined },
+          ),
+          // What this press reads, as it was when pressed (a retry books only its own pages).
+          estimateUsd: model ? await estimatePlan(plan, model, began.s) : null,
+          addons: addonsFor(plan, began.s),
+          prompt: began.instructions,
+          settings: began.s,
+        },
+        signal,
+      );
+    } catch (error) {
+      // Only the paid parser is refused: the model is free, so "pick a free model" would send the user astray.
+      if (error instanceof FreeOnlyError && error.models.length === 0) {
+        markPresented(error);
+        toast({
+          variant: 'warning',
+          title: 'Free-only mode is on',
+          message: `${userMessage(error)} Choose the free parser in Settings, or turn free-only mode off.`,
+          action: { label: 'Parser settings', onClick: ui.openDrawer, testId: 'toast-parser' },
+          testId: 'error-toast',
+        });
+      }
+      throw error;
+    }
+    if (!keys) pressed = plan.map((unit) => unit.key);
 
     // The run is on: only now replace (or reset) what it reads.
     if (keys) {
@@ -708,10 +783,13 @@ export function setup(ctx: ToolContext): ToolInstance {
         if (!keys.includes(result.key)) continue;
         result.status = 'queued';
         result.error = null;
+        result.failure = null;
         result.text = '';
         result.truncated = false;
+        failures.delete(result.key);
       }
     } else {
+      failures.clear();
       units = plan;
       openTexts.clear();
       results = plan.map((unit) => ({
@@ -723,6 +801,7 @@ export function setup(ctx: ToolContext): ToolInstance {
         status: 'queued',
         text: '',
         error: null,
+        failure: null,
         truncated: false,
       }));
     }
@@ -740,18 +819,28 @@ export function setup(ctx: ToolContext): ToolInstance {
     try {
       await runItems({
         items: plan,
-        concurrency: Number(concurrency.value) || DEFAULT_CONCURRENCY,
+        concurrency: began.s.concurrency || DEFAULT_CONCURRENCY,
         signal: runHandle.signal,
         work: async (unit, itemSignal) => {
           const result = resultOf(unit);
-          if (result) await readUnit(runHandle, unit, result, itemSignal);
+          if (result) {
+            await readUnit(runHandle, unit, result, itemSignal, began, maxCompletionTokens);
+          }
         },
         onItem: (outcome) => {
           const result = resultOf(outcome.item);
           if (!result) return;
           result.status = outcome.status;
-          if (outcome.status === 'running') result.error = null;
-          if (outcome.status === 'failed') result.error = userMessage(outcome.error);
+          if (outcome.status === 'running') {
+            result.error = null;
+            result.failure = null;
+            failures.delete(result.key);
+          }
+          if (outcome.status === 'failed') {
+            result.error = outcome.failure?.text ?? userMessage(outcome.error);
+            result.failure = outcome.failure ?? null;
+            failures.set(result.key, outcome.error);
+          }
           updatePage(result);
           updateProgress();
           if (outcome.status === 'running' || outcome.status === 'queued') return;
@@ -795,7 +884,17 @@ export function setup(ctx: ToolContext): ToolInstance {
     }
   };
 
-  const runner = ui.runner<string[]>({ label: 'Read', icon: 'file-earmark-text', run });
+  // A replay after an error covers only the pages without a result, so a fatal error part-way never pays twice;
+  // a press the run refused (nothing began) is replayed as the whole press.
+  const isDone = (key: string): boolean =>
+    results.some((result) => result.key === key && result.status === 'done');
+  const unfinished = pendingOnly<string>(isDone, () => pressed ?? []);
+  const runner = ui.runner<string[]>({
+    label: 'Read',
+    icon: 'file-earmark-text',
+    run,
+    replayArg: (arg) => (arg === undefined && pressed === null ? undefined : unfinished(arg)),
+  });
   // Retry buttons follow Run (busy, disabled by this tool or the framework).
   const gate = retryGate(runner);
   renderPages();
@@ -828,8 +927,8 @@ export function setup(ctx: ToolContext): ToolInstance {
   return {
     getState: () => ({ prompt: prompt.value, settings: settings() }),
     applyState,
-    estimate: (model) => estimatePlan(planUnits(), model),
-    addons: () => (pdfParser.checked ? addonsFor(planUnits()) : []),
+    estimate: (model) => estimatePlan(planUnits(pdfParser.checked), model, settings()),
+    addons: () => (pdfParser.checked ? addonsFor(planUnits(true), settings()) : []),
     onFiles: (files) => void docs.add(files),
     onReceive: (items) => {
       const files = items.flatMap((item) =>

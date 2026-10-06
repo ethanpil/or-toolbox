@@ -28,6 +28,28 @@ const result = (pageNumber: number, text: string, extra: Partial<PageResult> = {
 });
 
 describe('prompts and requests', () => {
+  it('never asks for more output than the model can give', () => {
+    const settings = { mode: 'printed' as const, language: '', instructions: '', textHint: false };
+    const page = { fileName: 'a.png', pageNumber: 1, pageCount: 1, imageDataUrl: 'data:x' };
+    expect(pageRequest('m', page, settings).max_tokens).toBe(4096);
+    expect(pageRequest('m', page, { ...settings, maxCompletionTokens: 2000 }).max_tokens).toBe(
+      2000,
+    );
+    expect(pageRequest('m', page, { ...settings, maxCompletionTokens: 64_000 }).max_tokens).toBe(
+      4096,
+    );
+    const file = { fileName: 'a.pdf', dataUrl: 'data:y' };
+    const parser = {
+      mode: 'printed' as const,
+      language: '',
+      instructions: '',
+      engine: 'cloudflare-ai' as const,
+    };
+    expect(pdfRequest('m', file, parser).max_tokens).toBe(32_000);
+    expect(pdfRequest('m', file, { ...parser, maxCompletionTokens: 8000 }).max_tokens).toBe(8000);
+    expect(pdfRequest('m', file, { ...parser, maxCompletionTokens: null }).max_tokens).toBe(32_000);
+  });
+
   it('has a rule per mode and adds the language hint', () => {
     expect(systemPrompt('math', '')).toMatch(/LaTeX/);
     expect(systemPrompt('handwriting', '')).toMatch(/\[illegible\]/);
@@ -201,6 +223,18 @@ describe('combined output', () => {
       'Three\n\n[report.pdf · page 3 of 3 is cut off: the answer reached the length limit]',
     );
     expect(combinePlainText([result(1, 'One'), result(2, 'Two')])).not.toContain('Not read');
+  });
+
+  it('leaves out the separator lines of plain text when Page separators is off', () => {
+    const pages = [result(1, 'One'), result(2, 'Two')];
+    expect(combinePlainText(pages, false)).toBe('One\n\nTwo');
+    // The missing-pages line stays: it is a warning, not a separator.
+    const missing = combinePlainText(
+      [result(1, 'One'), result(2, '', { status: 'failed' })],
+      false,
+    );
+    expect(missing.split('\n\n')[0]).toBe('[Not read in full: report.pdf · page 2 of 3]');
+    expect(missing).not.toContain('---');
   });
 
   it('unwraps only a fence around the whole answer', () => {
