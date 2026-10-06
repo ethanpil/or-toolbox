@@ -273,6 +273,16 @@ export function createKeysService(
     core.bus.on('keys-changed', () => {
       void reconcileSession().finally(notify);
     });
+    // Another tab's write reaches this tab's localStorage on its own schedule: Firefox and WebKit can deliver the
+    // bus message first, while this tab still reads the old file (measured in CI). The storage event says the new
+    // file is here. (key null: the other tab cleared the whole storage.)
+    if (typeof window !== 'undefined') {
+      window.addEventListener('storage', (event) => {
+        if (event.key === LS_KEYS.keys || event.key === null) {
+          void reconcileSession().finally(notify);
+        }
+      });
+    }
     core.bus.on('data-reset', () => {
       statusCache.clear();
       statusInflight.clear();

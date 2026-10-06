@@ -706,6 +706,24 @@ describe('other tabs', () => {
     expect(tabB.keys.list().map((k) => k.name)).toEqual(['A']);
   });
 
+  it("reads the file again when another tab's write arrives after its bus message", async () => {
+    const tab = harness();
+    await tab.keys.add({ name: 'A', secret: KEY_A });
+    const changes = vi.fn();
+    tab.keys.subscribe(changes);
+    // The other tab's rename lands here later than its keys-changed message (Firefox, WebKit): only the storage
+    // event says it arrived.
+    const file = storedFile();
+    localStorage.setItem(
+      LS_KEYS.keys,
+      JSON.stringify({ ...file, keys: file.keys.map((key) => ({ ...key, name: 'Renamed' })) }),
+    );
+    window.dispatchEvent(new StorageEvent('storage', { key: 'ortoolbox:something-else' }));
+    window.dispatchEvent(new StorageEvent('storage', { key: LS_KEYS.keys }));
+    await vi.waitFor(() => expect(changes).toHaveBeenCalledTimes(1));
+    expect(tab.keys.list().map((key) => key.name)).toEqual(['Renamed']);
+  });
+
   it('drops an unlocked session that no longer opens the file', async () => {
     const tabA = harness();
     const tabB = harness();
