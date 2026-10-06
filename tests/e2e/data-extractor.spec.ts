@@ -59,6 +59,10 @@ function fileOf(call: RecordedCall): string {
 
 /** Draws ten receipts and hands them to the drop zone's file input, as choosing them would. */
 async function addReceipts(page: Page): Promise<void> {
+  // The drop zone is drawn by the tool's setup, which can finish after the page's load event.
+  await page
+    .locator('[data-testid="doc-drop-zone"] input[type=file]')
+    .waitFor({ state: 'attached' });
   await page.evaluate(async () => {
     const input = document.querySelector<HTMLInputElement>(
       '[data-testid="doc-drop-zone"] input[type=file]',
@@ -484,7 +488,12 @@ test('one document that cannot be read is marked, the others arrive, and Retry f
   const calls = mock.calls('/api/v1/chat/completions');
   expect(calls).toHaveLength(11);
   expect(fileOf(calls[10]!)).toBe('receipt-02.png');
-  // Only the 400 this test asked for: the browser logs a failed request, and so does the page's own report.
-  expect(problems.filter((problem) => !/400/.test(problem))).toEqual([]);
-  expect(problems.filter((problem) => /400/.test(problem))).toHaveLength(2);
+  // Only the 400 this test asked for: one failed response, which Chromium and WebKit (not Firefox) also log to
+  // the console as a resource that failed to load.
+  expect(problems.filter((problem) => problem.startsWith('HTTP 400: '))).toHaveLength(1);
+  const others = problems.filter((problem) => !problem.startsWith('HTTP 400: '));
+  expect(others.length).toBeLessThanOrEqual(1);
+  for (const problem of others) {
+    expect(problem).toMatch(/^console\.error: Failed to load resource: .*\b400\b/);
+  }
 });

@@ -469,6 +469,7 @@ test('a moderator message reaches both bots; edit a turn and resume from there',
   await page.getByTestId('bots-step').click();
   await expect(turns(page)).toHaveCount(2);
   await expect(turns(page).nth(1)).toHaveAttribute('data-speaker', 'b');
+  await expect.poll(() => mock.calls(CHAT, 'POST').length).toBe(3);
   expect(messagesOf(mock.calls(CHAT, 'POST')[2]).slice(1)).toEqual([
     {
       role: 'user',

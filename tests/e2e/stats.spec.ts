@@ -774,6 +774,9 @@ test.describe('the ledger', () => {
     await openStats(page);
     await expect(kpi(page, 'spend')).toHaveText('$1.65');
     expect((await indexReads(page)).filter((index) => index === 'stats.day')).toHaveLength(1);
+    // Every page's boot sweep (runs in progress that nobody owns) reads once when the browser is idle, which is
+    // 2 s after load where there is no requestIdleCallback (WebKit): let it pass before counting.
+    await expect.poll(() => indexReads(page)).toContain('runs.status');
 
     await clearIndexReads(page);
     await page.getByTestId('stats-range-7d').click();

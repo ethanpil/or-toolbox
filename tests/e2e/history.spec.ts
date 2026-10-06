@@ -790,9 +790,14 @@ test.describe('runs in progress', () => {
       return record?.status;
     }, id);
 
-  // Written after the page started: at page start, the sweep finalizes runs that no live page owns.
+  // Written after the page started, and owned (its run lock held, as the tab running it would): the page's boot
+  // sweep finalizes runs that no live page owns, and it runs when the browser is idle, which is 2 s after load
+  // where there is no requestIdleCallback (WebKit).
   test.beforeEach(async ({ page }) => {
     await openHistory(page);
+    await page.evaluate((id) => {
+      void navigator.locks.request(`ortoolbox:run:${id}`, () => new Promise<void>(() => undefined));
+    }, live.id);
     await seedDb(page, { runs: [live] });
     await expect(row(page, 'run-live').getByTestId('run-status')).toHaveText('Running');
   });

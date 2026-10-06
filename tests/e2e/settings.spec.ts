@@ -159,11 +159,15 @@ test.describe('sections', () => {
     await expect(other.getByTestId('free-only-switch')).toBeChecked();
     await expect(other.getByTestId('free-only-impact')).toContainText('cannot run while');
 
+    // The other tab shows its keys first, so the rename has to reach a section already on screen. The rename is
+    // applied once its dialog has closed; check it in this tab before looking at the other one.
+    await other.getByTestId('settings-nav-keys').click();
+    await expect(other.getByTestId('key-name')).toHaveText('Test key');
     await page.getByTestId('settings-nav-keys').click();
     await page.getByTestId('key-rename').click();
     await page.getByTestId('prompt-input').fill('Renamed elsewhere');
     await page.getByTestId('rename-key-dialog').getByTestId('dialog-confirm').click();
-    await other.getByTestId('settings-nav-keys').click();
+    await expect(page.getByTestId('key-name')).toHaveText('Renamed elsewhere');
     await expect(other.getByTestId('key-name')).toHaveText('Renamed elsewhere');
   });
 });
