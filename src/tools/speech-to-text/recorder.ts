@@ -55,8 +55,12 @@ export interface Recorder {
 
 type State = 'idle' | 'starting' | 'recording' | 'paused' | 'stopping';
 
-/** Preferred containers, best first: Opus in WebM (Chromium, Firefox), then Ogg, then MP4 (Safari). */
-const MIME_TYPES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+/**
+ * Preferred containers, best first: Opus in Ogg (Firefox), then WebM (Chromium), then MP4 (Safari). Ogg first
+ * because Firefox's WebM recording has no length and no seek index, and Firefox will not seek it: the player's
+ * transcript times did nothing there (measured in CI). Its Ogg has both. Chromium cannot record Ogg.
+ */
+const MIME_TYPES = ['audio/ogg;codecs=opus', 'audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
 /** The warning before the length limit. */
 const WARN_SECONDS = 60;
 /** A level below this (about -66 dBFS) is no signal at all: a muted or dead microphone, not a quiet room. */
