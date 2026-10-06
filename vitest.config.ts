@@ -21,6 +21,8 @@ export default mergeConfig(
       // Vitest serves modules from '/', so give url() the site's real base.
       env: { BASE_URL: viteConfig.base ?? '/' },
       include: ['src/**/*.test.ts', 'tests/lint/**/*.test.ts', 'vite-plugins/**/*.test.ts'],
+      // Lets Bootstrap's late transition timers land before each file's jsdom is torn down.
+      setupFiles: ['src/vitest-setup.ts'],
     },
   }),
 );
