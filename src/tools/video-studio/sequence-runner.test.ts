@@ -245,7 +245,7 @@ describe('sequence runner', () => {
           fail: () => Promise.resolve({}),
         } as unknown as RunHandle);
       },
-      submit: (_handle, body, payload) =>
+      submit: (_handle, _body, payload) =>
         new Promise((resolve) => {
           release = () => resolve({ id: 'job-1', payload } as unknown as JobRecord);
         }),

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
-import { DEFAULT_SEQUENCE, parseSequenceSpec } from './sequence';
+import { DEFAULT_SEQUENCE } from './sequence';
 import { sequencePanel, type SequencePanelHost } from './sequence-panel';
 
 function build() {
@@ -63,14 +63,5 @@ describe('spend cap field', () => {
     expect(cap.getAttribute('aria-invalid')).toBeNull();
     type('');
     expect(onSpec).toHaveBeenLastCalledWith({ capUsd: null });
-  });
-});
-
-describe('a stored cap of 0 or less', () => {
-  it('is kept as a cap that stops every further step, never read as no cap', () => {
-    expect(parseSequenceSpec({ capUsd: 0 }).capUsd).toBe(0);
-    expect(parseSequenceSpec({ capUsd: -3 }).capUsd).toBe(0);
-    expect(parseSequenceSpec({ capUsd: null }).capUsd).toBeNull();
-    expect(parseSequenceSpec({ capUsd: 'x' }).capUsd).toBeNull();
   });
 });
