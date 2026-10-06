@@ -434,6 +434,8 @@ test('a moderator message reaches both bots; edit a turn and resume from there',
 
   await page.getByTestId('bots-step').click();
   await expect(turns(page)).toHaveCount(2);
+  // The turn is drawn as soon as it starts, a moment before its request is recorded.
+  await expect.poll(() => mock.calls(CHAT, 'POST').length).toBe(2);
   expect(messagesOf(mock.calls(CHAT, 'POST')[1]).at(-1)).toEqual({
     role: 'user',
     content:
