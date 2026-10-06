@@ -1,14 +1,33 @@
 # Building a tool
 
-How to build one of the 14 tools on the Stage 2 shell. Read [CLAUDE.md](../CLAUDE.md) first (architecture rules and conventions are binding) and [openrouter-api.md](openrouter-api.md) for the endpoint you call. Every tool page renders through `mountTool` with its own setup.
+How to build one of the 14 tools on the shared tool framework (`src/ui/tool/`). Read [CLAUDE.md](../CLAUDE.md) first (architecture rules and conventions are binding) and [openrouter-api.md](openrouter-api.md) for the endpoint you call. Every tool page renders through `mountTool` with its own setup.
 
 ## The contract in one screen
 
 ```text
-src/tools/<id>/manifest.json   static half: name, icon, category, capabilities (first = primary), accepts, produces, lazyLibs, defaults, ownModels?
+tools/<id>/index.html          the page: a <title> (US spelling), <div id="app"> and one module script (copy any tool's)
+src/tools/<id>/manifest.json   static half: the fields in the table below
 src/tools/<id>/main.ts         mountTool(getTool('<id>'), setup)          ← the only line that must stay
 src/tools/<id>/*.ts            your pipeline, UI pieces and *.test.ts (never import another tool's folder)
 ```
+
+A tool id is also the folder name and the URL segment, and it must be listed in `TOOL_IDS` (`src/tools/types.ts`). `src/tools/registry.ts` validates every manifest at page start (and in the unit tests): a missing field, a wrong type or an unknown field throws.
+
+| Manifest field | What it is |
+| --- | --- |
+| `id` | The tool id; must equal the folder name. |
+| `name`, `description` | Display name, and one line for the tool cards, the header and the command palette. |
+| `category` | Home page group: `documents`, `audio`, `images`, `video` or `reasoning`. |
+| `icon` | A Bootstrap Icons name without the `bi-` prefix. |
+| `capabilities` | The capabilities the tool uses (`text`, `vision`, `image`, `tts`, `stt`, `video`, `music`, `decisions`); **the first is the primary one**. Each has its own default model in Settings. |
+| `accepts` | MIME types the tool takes (wildcards such as `image/*` allowed): they filter drops, pastes and Send to… for this tool. Empty for a tool that takes no files (Bot-to-bot). |
+| `produces` | MIME types it can export (not empty). Descriptive, like `usesJobs`. |
+| `usesJobs` | True for a tool that runs long work through the job queue (Video studio). Descriptive: nothing reads it, but keep it true to what the tool does. |
+| `lazyLibs` | npm packages the tool loads with `import()` (a unit test checks that each is a dependency). |
+| `defaults` | The tool's default options: the bottom of the cascade run → tool → capability → global, and what `ctx.options.get()` starts from. |
+| `ownModels` | Optional, default false: the tool chooses its models itself (see below). |
+
+All manifest strings are UI text: use US spelling.
 
 ```ts
 mountTool(manifest: ToolManifest, setup: ToolSetup, options?: { isolation?: 'required' }): void
@@ -21,19 +40,20 @@ interface ToolInstance {
   addons?(): readonly RunAddon[];                // paid extras besides the model, e.g. a PDF parser (see Paid add-ons)
   onFiles?(files: File[]): void;                 // page-wide drop and paste, filtered by manifest.accepts
   onReceive?(items: SendItem[]): void;           // "Send to…" from another tool, filtered by manifest.accepts
+  promptless?: boolean;                          // no main text field (see Prompts, History and the form state)
   sample?(): void | Promise<void>;               // ?sample=1 and onboarding's "Try a sample"
 }
 ```
 
-All types live in `src/ui/tool/types.ts` and are re-exported from `src/ui/tool/index.ts`.
+All types live in `src/ui/tool/types.ts` and are re-exported from `src/ui/tool/index.ts`; `ToolManifest` is in `src/tools/types.ts`.
 
-`mountTool` installs the page-wide drop/paste guard first (so a file dropped while the page is still loading never makes the browser open it and leave), renders the page shell (navbar, palette, toasts, leave guard, budget confirmation), the tool header (icon, name, description, model chip, key chip when there are several keys, cost estimate, Prompts, Settings, History) and three empty zones, builds the context, awaits `setup`, then:
+`mountTool` installs the page-wide drop/paste guard first (so a file dropped while the page is still loading never makes the browser open it and leave; until `setup` has returned, such a drop is only refused with a toast), renders the page shell (navbar, palette, toasts, leave guard, budget confirmation), the tool header (icon, name, description, model chip, key chip when there are several keys, cost estimate, Prompts, Settings, History) and the input and output zones, builds the context and awaits `setup`. The zones keep their place but stay invisible until `setup` has returned, so nothing shifts when a tool that reads storage first fills them. Then:
 
-1. creates the Prompts panel around your `getState`/`applyState`;
-2. calls `ctx.jobs.resume()` (register job handlers **inside** `setup`);
-3. routes dropped and pasted files to `onFiles` (only accepted ones; see Files in and out);
-4. computes the first estimate (`estimate`, if you provide it);
-5. applies the URL: `?run=<id>` (History → `applyState`), `?prompt=<id>` (a saved or recent prompt), `?sample=1` (`sample()`), `?receive=<id>` (Send to… hand-over → `onReceive`); these are removed from the address bar afterwards. `?model=<id>` stays and overrides the primary model for this visit ("re-run with another model").
+1. the zones appear, and the first estimate is computed (`estimate`, if you provide it);
+2. the Prompts panel is created around your `getState`/`applyState`;
+3. `ctx.jobs.resume()` runs (register job handlers **inside** `setup`);
+4. dropped and pasted files reach `onFiles` (only accepted ones; see Files in and out);
+5. the URL is applied: `?run=<id>` (History → `applyState`), `?prompt=<id>` (a saved or recent prompt), `?sample=1` (`sample()`), then `?receive=<id>` (Send to… hand-over → `onReceive`); these are removed from the address bar afterwards. `?model=<id>` stays and overrides the primary model for this visit ("re-run with another model").
 
 Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No other tool does.
 
@@ -52,9 +72,9 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `state` | `ToolStateStore` for this tool (IndexedDB `kv`): JSON-safe, persistent, e.g. saved deciders or a video sequence. Never binaries. Every `set` and `delete` emits `{ type: 'tool-state-changed', tool, key }` on `ctx.bus`, in this tab and the others, and so do Reset everything, Delete all prompts and history and a backup import for every key they remove or write: a page showing stored values stays in step with `ctx.bus.on('tool-state-changed', (e) => e.tool === ctx.manifest.id && reread(e.key))` (your own writes arrive too). See Stored state below for `update` and resets. |
 | `options` | `{ get(), set(patch), reset() }`: `manifest.defaults` merged with the user's saved options (`settings.tools[id].options`). `set` stores only what you pass. |
 | `ui` | The zones and helpers below. |
-| `model(cap?)` | `ResolvedModel` for a capability (default: the primary one, `capabilities[0]`), with free-only applied. `model === null` means nothing may run; for the primary capability the framework already shows the notice and disables Run. See Models per capability. |
+| `model(cap?)` | `ResolvedModel` (`{ model, source, note }`) for a capability (default: the primary one, `capabilities[0]`), with free-only applied. `.model === null` means nothing may run; for the primary capability the framework already shows the notice and disables Run. See Models per capability. |
 | `modelOverride` | `?model=` or null. |
-| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (default `ctx.model().model`), `prompt` and `settings` (from your `getState()`), `estimateUsd` (default: the header's current estimate, recomputed first if the input changed since; for a `model` other than the header's, your `estimate(model)` hook for that model, so the per-run limit still applies), `addons` (default: your `addons()`), and aborts the run when `signal` aborts. Call it **before** changing any tool state (see Refused runs change nothing). |
+| `beginRun(spec, signal?)` | `runs.begin` for this tool: fills `tool`, `model` (default `ctx.model().model`; with none it throws `InvalidInputError`), `prompt` and `settings` (from your `getState()`), `estimateUsd` (default: your `estimate` hook for the current input, always computed afresh, unless you set one with `ui.setEstimate`; for a `model` other than the header's, the hook for that model, so the per-run limit still applies, and unknown without a hook), `addons` (default: your `addons()`), and aborts the run when `signal` aborts. Call it **before** changing any tool state (see Refused runs change nothing). |
 
 ### Models per capability
 
@@ -67,10 +87,10 @@ Video studio passes `{ isolation: 'required' }` (multi-threaded ffmpeg). No othe
 | `input`, `output` | The two zone bodies (`.card-body`). Input is left on wide screens, output right; they stack on narrow ones. |
 | `drawer` | Body of the Settings offcanvas. Put everyday options here. |
 | `advanced(title)` | Adds a collapsed accordion section at the end of the drawer and returns its body. |
-| `runner<A>({ label, icon, run(signal, arg?), hint, container, hideWhileBusy, replayArg, stopOnEscape })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter (Run, no argument) and Escape to stop (`stopOnEscape: false` opts out; `{ allowIn: [field] }` adds a field). While a run of the page is going (not one handed off to a job), reloading or closing the tab asks first. Returns `Runner<A>`: `trigger(arg?)` (see Runner arguments), `stop()`, `setDisabled(reason)`, `setLabel(text)`, `addAction(options)` (see A Run bar with more than Run), `busy`, `disabledReason`, `subscribe(fn)`. |
+| `runner<A>({ label, icon, run(signal, arg?), hint, container, hideWhileBusy, replayArg, safeAction, retryUnknownOutcome, stopOnEscape })` | The Run/Stop bar, appended to `input` (or `container`). The first runner gets Ctrl/Cmd+Enter (Run, no argument) and Escape to stop (`stopOnEscape: false` opts out; `{ allowIn: [field] }` adds a field). While a run of the page is going (not one handed off to a job), reloading or closing the tab asks first. `replayArg`, `safeAction` and `retryUnknownOutcome` shape the error toast's Retry (see Runner arguments and the error rule). Returns `Runner<A>`: `trigger(arg?)` (see Runner arguments), `stop()`, `setDisabled(reason)`, `setLabel(text)`, `addAction(options)` (see A Run bar with more than Run), `busy`, `disabledReason`, `subscribe(fn)`. |
 | `refreshEstimate()` | Recomputes the estimate through `ToolInstance.estimate` and shows it; resolves with the value. Call it when the input changes. |
 | `setEstimate(usd \| null, note?)` | Sets the badge directly (`≈ $0.0012`, `Free` for 0, `Unknown` for null), for tools without `estimate`. |
-| `status(text)` | A state change in the output header ("Reading 3 pages…", "Done"), announced politely. |
+| `status(text)` | A state change in the output header ("Reading 3 pages…", "Done"), announced politely; an empty string clears it. |
 | `progress(text)` | A ticking counter in the same line ("Composing… 12 s", "18 of 75 parts", "40%"): shown at once, announced at most once every 10 s. Use `status` for the start and end of a phase, `progress` for everything in between. |
 | `holdWork(description)` | Marks unsaved in-memory work that is not a downloadable result (a recording in progress, paid parts not joined yet): leaving asks first (in-app dialog and the browser's prompt), naming `description`. Returns the release; call it when the work is saved or discarded. |
 | `confirmDiscard({ what, isDirty?, title?, confirmLabel?, testId? })` | The one "replace unsaved work?" question (`src/ui/tool/discard.ts`): resolves true at once when `isDirty()` is false, else after the user chose Replace. Ask it before `beginRun` when a run, a load or a new file would throw away edits (an edited transcript, corrected grid values): `if (!(await ui.confirmDiscard({ what: 'your edited transcript', isDirty: () => edited }))) return;`. |
@@ -91,7 +111,7 @@ try {
   await run.finish({ output: result.choices[0]?.message.content ?? '' });     // text only, never binaries
 } catch (error) {
   output.fail(error);      // if you have an output panel (below)
-  await run.fail(error);   // AbortError → 'aborted', anything else → 'error'
+  await run.fail(error);   // AbortError → 'aborted', anything else → 'error' (an OrError's message is shown; any other Error reads "Something went wrong")
   throw error;             // the runner reports it, once
 }
 ```
@@ -100,7 +120,7 @@ try {
 
 - **Stop** (an `AbortError`, or Cancel in the budget confirmation, `RunCancelledError`) is not an error: nothing is shown but a neutral "Stopped" status; partial output stays.
 - An error the output panel already showed inline (`output.fail(error)` marks it) is not shown again.
-- Errors that need an action (no key → Connect / paste a key, locked → unlock, free-only, budget blocked, storage full, storage blocked by the browser) always go to `presentError`, which opens the right dialog and retries.
+- Errors that need an action (no key → Connect / paste a key, locked → unlock, free-only, budget blocked, storage full, storage blocked by the browser: `storage-unavailable`, which the shell also announces once at page start when `webStorageBlocked()` says so) always go to `presentError`, which opens the right dialog and retries.
 - Anything else is shown once: inline by the output panel, or by `presentError` (a toast with Retry) when there is no panel.
 - **Unknown outcome:** a paid request that may have gone through (`isOutcomeUnknown(error)`: connection lost after sending, 408, or a 5xx other than 503) never gets a plain Retry. Give the runner a `safeAction` (e.g. `{ label: 'Check status', onClick }`); without one the toast links to OpenRouter's activity page. Set `retryUnknownOutcome` only when sending again cannot pay twice.
 
@@ -122,7 +142,7 @@ ui.runner<string[]>({ run, replayArg: pendingOnly((key) => hasResult(key), () =>
 
 `beginRun` (via `runs.begin`) refuses before anything is sent: no key (`no-key`), locked keys (`locked`), free-only with a paid model (`free-only`), a hard budget (`budget-blocked`). In Warn mode, or above the per-run threshold, the shell's **budget confirmation** opens by itself; Cancel throws `RunCancelledError`. You never handle any of this yourself: throw, and the rule above applies. Runs that belong together (arena contenders, the steps of a sequence) ask ONE question for the group instead: see Groups of runs.
 
-Long runs: `run.checkpoint({ output })` persists partial text (bot transcripts, batches), throttled to one write per interval. Pass `output` as a function (`run.checkpoint({ output: () => combined() })`) when building the text is costly: it is called only when a write actually happens (and once more by `finish()` without an output). Parallel runs of one action share a `groupId` (arena contenders). A run that calls several models lists them in `models` so free-only checks them all.
+Long runs: `run.checkpoint({ output })` persists partial text (bot transcripts, batches), throttled to one write per interval. Pass `output` as a function (`run.checkpoint({ output: () => combined() })`) when building the text is costly: it is called only when a write actually happens (and once more by `finish()` without an output). Parallel runs of one action share a `groupId` (arena contenders). A run that calls several models lists them in `models` so free-only checks them all. The API client brackets every request with `run.sending()`, which stores that a request is in flight: a run whose page dies before the answer books its reservation as an unknown cost, never "nothing sent". Tools never call it, but a fake `RunHandle` in a test must implement it.
 
 A run stopped before it sent anything (Stop during the free-model wait, a step paused before its request) books nothing: History keeps it as stopped, Stats count no run. A run that failed with an error still counts as one error run.
 
@@ -130,7 +150,7 @@ A run stopped before it sent anything (Stop during the free-model wait, a step p
 
 Several runs that the user starts with one action are checked and confirmed once, for their **total**: the key and the lock once, free-only across all their models and paid add-ons, the budgets against the total estimate (add-ons included), and one dialog that names the group (your label, its models, the total, an optional note). Each run still reserves its own estimate when it begins, and a hard (monthly) block still refuses it.
 
-**Runs that start together** (Model arena's contenders): `ctx.runs.beginAll(specs, { label, signal })` approves them as one group and begins them all, or none. When one is refused (Cancel, a block, the signal), the ones already begun are withdrawn: no record, no reservation, nothing sent or booked, and the refusal is thrown as `beginRun` would. Fill each spec as `ctx.beginRun` would (`tool`, `model`, `estimateUsd`, `addons`, `prompt` and `settings` from `getState()`); they share `specs[0].groupId`, and the handles come back in the order of `specs`. A member whose estimate is unknown is left out of the total and counted (the dialog says "≈ $0.27 + 1 unknown"; budgets treat the total as a floor).
+**Runs that start together** (Model arena's contenders): `ctx.runs.beginAll(specs, { label, note?, signal })` approves them as one group (only with a `label`; without one each run asks for itself) and begins them all, or none. When one is refused (Cancel, a block, the signal), the ones already begun are withdrawn: no record, no reservation, nothing sent or booked, and the refusal is thrown as `beginRun` would. Fill each spec as `ctx.beginRun` would (`tool`, `model`, `estimateUsd`, `addons`, `prompt` and `settings` from `getState()`); they share `specs[0].groupId` (one is made when it has none), must be of one tool, and the handles come back in the order of `specs`. After they have begun, `signal` aborting aborts them, as `ctx.beginRun` does. A member whose estimate is unknown is left out of the total and counted (the dialog says "≈ $0.27 + 1 unknown"; budgets treat the total as a floor).
 
 ```ts
 const snapshot = getState();
@@ -235,7 +255,7 @@ pause.setLabel('Pausing…');
 pause.setDisabled('Pausing after this turn'); // a visible reason in the title; null turns it back on
 ```
 
-- `runner.addAction(options)` adds a button after Run and before Stop, in call order. `run: arg` makes it start a run like `trigger(arg)`: it is off exactly when Run is, with Run's reason as its title, and the error toast's Retry replays that argument. `onClick` is for anything else. `when: 'idle'` (default) shows it while no run is going, `'busy'` only while one is. `tone: 'primary'` outlines it in the accent colour. It returns `{ button, setLabel, setDisabled(reason) }`.
+- `runner.addAction(options)` adds a button after Run and before Stop, in call order. `run: arg` makes it start a run like `trigger(arg)`: it is off exactly when Run is, with Run's reason as its title, and the error toast's Retry replays that argument. `onClick` is for anything else. `when: 'idle'` (default) shows it while no run is going, `'busy'` only while one is. `tone: 'primary'` outlines it in the accent color. It returns `{ button, setLabel, setDisabled(reason) }`.
 - An action that is off keeps focus (`aria-disabled`, like Run). When the control that has focus hides (Run → Pause, Stop → Run), focus moves to the first visible control in the bar, for every runner.
 - Ctrl/Cmd+Enter always presses the first runner's Run with no argument, so make that the primary action ("Start or Resume"). The bar is one sticky element: its height (`--or-runner-height`) follows whatever it holds, so extra buttons need nothing more.
 - **Escape to stop:** the primary runner installs `stopOnEscape` itself (`src/ui/tool/stop-on-escape.ts`); pass `stopOnEscape: { allowIn: [field] }` for a field where Escape should stop too (Chat's composer), or `stopOnEscape: false` to opt out. Do not call `stopOnEscape(runner)` for the primary runner any more (a second runner can still use it). Escape stops the run that is going, but not with Ctrl/Cmd/Alt, while a dialog, drawer or dropdown is open, while an input method composes, or in a field or select (they use Escape themselves) unless the field is listed in `allowIn` (Chat's composer). It is built on `plainShortcutAllowed` (`src/ui/shell/shortcuts.ts`), as any plain-key shortcut should be, and `composing(event)` lives there too. Do not copy the handler.
@@ -291,7 +311,7 @@ output.start();                                    // skeleton until the first c
 await ctx.api.chatStream(body, {
   run,
   onEvent: (event) => {
-    if (event.type === 'text') output.append(event.text);   // sanitised Markdown, drawn progressively
+    if (event.type === 'text') output.append(event.text);   // sanitized Markdown, drawn progressively
   },
 });
 output.finish();                                   // final render, "Done · 245 words", Copy/Download/Send to… enabled
@@ -315,7 +335,7 @@ let sentAt = 0;
 await ctx.api.chatStream(body, { run, onSend: () => (sentAt = performance.now()), onEvent });
 ```
 
-**A Stop keeps what was paid for.** Both streaming calls reject with the abort, and attach what had arrived: `partialStreamResult(error)` (`src/core/api/chat-stream.ts`) for `chatStream`, `partialImageResult(error)` (`src/core/api/client.ts`) for an `images` stream, which holds the images that completed (and were billed) before the Stop. Show and keep those (as session results) before you end the run as stopped; their cost is already on the run, and the rest of the request is booked as unknown (a provider may finish images after the disconnect).
+**A Stop keeps what was paid for.** Both streaming calls reject with the abort, and attach what had arrived: `partialStreamResult(error)` (`src/core/api/chat-stream.ts`) for `chatStream`, `partialImageResult(error)` (`src/core/api/client.ts`) for an `images` stream, which holds the images that completed (and were billed) before the Stop. Show and keep those (as session results) before you end the run as stopped; their cost is already on the run, and the rest of the request is booked as unknown (a provider may finish images after the disconnect). A stream that fails for another reason after some images completed does not reject: the call resolves with those images and `result.error` set, so show both.
 
 ```ts
 } catch (error) {
@@ -355,7 +375,7 @@ body.max_tokens = fit.maxTokens ?? undefined;                    // null: Max to
 // estimate with completionTokens: fit.completionTokens
 ```
 
-`trimOldest(tokens, budget, startsAt?)` drops the oldest first and always keeps the last message (the one being answered); with `startsAt(index)`, once something went it drops on until the kept part starts where you allow (Chat passes `(i) => turns[i].role === 'user'`, so no reply is left without its question).
+`outputTokens(maxTokens, maxCompletionTokens)` is the output a request makes room for (Max tokens, else `DEFAULT_OUTPUT_TOKENS`, within the model's own cap), and `promptBudget` keeps 5% of the window back for the approximation. `trimOldest(tokens, budget, startsAt?)` drops the oldest first and always keeps the last message (the one being answered); with `startsAt(index)`, once something went it drops on until the kept part starts where you allow (Chat passes `(i) => turns[i].role === 'user'`, so no reply is left without its question).
 
 The framework asks again when the model changes (header chip, settings, free-only, a catalog refresh), shows only the newest answer (an older, slower one never overwrites it), and `ctx.beginRun` without `estimateUsd` always computes it afresh for the input as it is at that moment (so a paste followed by Ctrl+Enter, before your debounced `refreshEstimate`, books the right amount); only a value set with `ui.setEstimate` is booked as is. A run on another model than the header's (`beginRun({ model })`: "Another model…", an arena contender) books your hook's answer for that model; without a hook it is unknown. Pass `estimateUsd` yourself only when a run costs something else (one step of a sequence). The kinds (`src/core/types.ts`, `EstimateInput`): `tokens`, `speech`, `transcription`, `image`, `video`, `music`, `decision`. Estimates are deliberately high; null means unknown (shown as "Unknown"; the per-run threshold then does not apply). Free models estimate 0.
 
@@ -374,66 +394,85 @@ For text and table exports use `exportMenu({ filename, formats, resultIds })`, w
 
 ## Jobs (long remote work)
 
-Register handlers in `setup`, before it returns (the framework calls `jobs.resume()` right after):
+A job is persisted work that outlives the page (Video studio's clips): the run is handed off to it, a handler polls it, and whichever tab sees it end finishes the run. Three parts, as Video studio does them (`src/tools/video-studio/tool.ts`).
+
+**1. A handler that only polls.** Register it in `setup`, before it returns (the framework calls `jobs.resume()` right after). `poll` reads the remote status; a finished status carries `usage`, and the core books it on the job's run before the job turns final, so the cost counts even if a later download fails.
 
 ```ts
+type VideoPayload = { label: string }; // JSON-safe: what delivery needs later
+type VideoResult = { outputs: number; costUsd: number | null };
+
 ctx.jobs.register<VideoPayload, VideoResult>('video', {
+  intervalMs: (job) => Math.min(30_000, 2_000 + (Date.now() - job.createdAt) / 10), // optional; default 5 s
   poll: async (job, signal) => {
-    const status = await ctx.api.videos.status(job.remoteId!, { keyId: job.keyId, signal });
+    if (!job.remoteId) return { state: 'failed', error: 'The job has no OpenRouter id.' };
+    const status = await ctx.api.videos.status(job.remoteId, { keyId: job.keyId, signal });
     if (!status.done) return { state: 'running', progress: null, remoteStatus: status.status };
     if (status.status === 'completed') {
-      return { state: 'succeeded', result: { outputs: status.outputs, costUsd: status.costUsd } };
+      return {
+        state: 'succeeded',
+        result: { outputs: status.outputs, costUsd: status.costUsd },
+        usage: { costUsd: status.costUsd }, // null: unknown, the run books its reservation
+      };
     }
-    return { state: 'failed', error: status.error ?? 'The video job did not finish.' };
+    return { state: 'failed', error: status.error ?? `The video job ended as ${status.status}.` };
   },
 });
+```
 
-// starting one, inside run():
+**2. Starting one, inside `run()`.** A request that may have reached OpenRouter is never sent again by itself. If `submit` fails, the API client has already booked what it knows (and marked an error that may have been billed as an unknown outcome): end the run and rethrow. If OpenRouter accepted the request but the job cannot be stored, the work is probably being billed: book the reservation, end the run, and say so.
+
+```ts
 const run = await ctx.beginRun({}, signal);
+const submitted = await ctx.api.videos.submit(body, { run }).catch(async (error: unknown) => {
+  await run.fail(error);
+  throw error;
+});
 try {
-  const submitted = await ctx.api.videos.submit(body, { run });
   const job = await ctx.jobs.add<VideoPayload, VideoResult>({
     tool: ctx.manifest.id,
     type: 'video',
-    payload,
+    payload: { label },
     keyId: run.keyId,
     remoteId: submitted.id,
     runId: run.id,
   });
-  run.handOff(job.id); // from now on unload and Stop do not finalise the run, and leaving the page is safe
-} catch (error) {
-  await run.fail(error); // the submit (or storing the job) failed: the run ends here
-  throw error;
+  run.handOff(job.id); // from now on unload and Stop do not finalize the run, and leaving the page is safe
+} catch (cause) {
+  run.addUsage({ model: run.model, promptTokens: 0, completionTokens: 0, costUsd: 0, costEstimated: false, costUnknown: true, latencyMs: 0 });
+  await run.fail(cause);
+  throw new OrError(
+    'api',
+    'OpenRouter accepted the request, but this page could not keep track of it. It is probably being made and billed: check your OpenRouter activity before sending it again.',
+    { cause },
+  );
 }
+```
 
-// ending it, wherever you observe the outcome (also after a reload, or in another tab):
+**3. Ending the run, wherever the job turns final** (also after a reload, or in another tab). `jobs.subscribe` reports every tool's jobs, so filter; `runs.reattach` answers null when the run is already final, which makes this safe to run twice. The cost is already on the run: only finish or fail it. A handed-off run ignores aborts, so a failure is an `OrError` carrying the reason (a bare `Error` would read "Something went wrong" in History), and a deliberate "Stop waiting" (`ctx.jobs.cancel(job.id)`, state `cancelled`) is `run.cancel(reason)`: aborted, not an error, booking max(cost, reservation) because the job may still finish and bill.
+
+```ts
+const settle = async (job: JobRecord<VideoPayload, VideoResult>): Promise<void> => {
+  if (!job.runId) return;
+  const run = await ctx.runs.reattach(job.runId);
+  if (!run) return; // already final
+  if (job.state === 'succeeded') {
+    await run.finish({ output: `Video clip ready: ${job.payload.label}.`, meta: { videoJobIds: [job.remoteId] } });
+  } else if (job.state === 'cancelled') {
+    await run.cancel('Stopped waiting for the video job.');
+  } else {
+    await run.fail(new OrError('api', job.error ?? 'The video job failed.'));
+  }
+};
+
 ctx.jobs.subscribe((record) => {
-  const job = record as JobRecord<VideoPayload, VideoResult>;
-  if (!job.runId || job.removed) return;
-  if (job.state !== 'succeeded' && job.state !== 'failed' && job.state !== 'cancelled') return;
-  void ctx.runs.reattach(job.runId).then(async (run) => {
-    if (!run) return; // already final
-    if (job.state === 'succeeded' && job.result) {
-      // Video cost arrives only on the completed status read; the run books it.
-      run.addUsage({
-        model: run.model,
-        promptTokens: 0,
-        completionTokens: 0,
-        costUsd: job.result.costUsd ?? 0,
-        costEstimated: false,
-        costUnknown: job.result.costUsd === null,
-        latencyMs: job.updatedAt - job.createdAt,
-      });
-      await run.finish({ meta: { videoJobIds: [job.remoteId] } });
-    } else {
-      // A handed-off run ignores AbortErrors, so end it with a plain error carrying the reason.
-      await run.fail(new Error(job.state === 'cancelled' ? 'The video job was cancelled.' : (job.error ?? 'The video job failed.')));
-    }
-  });
+  if (record.tool !== ctx.manifest.id || record.type !== 'video' || record.removed) return;
+  if (record.state !== 'succeeded' && record.state !== 'failed' && record.state !== 'cancelled') return;
+  void settle(record as JobRecord<VideoPayload, VideoResult>).catch((error: unknown) => void presentError(error));
 });
 ```
 
-**Completion is not download.** Return `usage: { costUsd }` with `succeeded` (metadata and cost only): the core books it on the run before the job turns final, so a download that fails later still counts. Download the content separately, with its own retries; when it cannot happen any more (retention), mark the result expired: the cost is already booked. Read `failureKind` on a failed job: `'remote'` (the provider failed, usually free) or `'gave-up'` (the core stopped asking: poll failures, a 404 after retention, a missing key, or the job was still running 3 hours after it was added, `maxAgeMs` on the handler to change that; it may still be billed, and the reservation is booked). The core records on the run that it booked the job's cost, so a tab that takes the polling over never books it twice. Settings → Data never deletes a running run, an open job, a finished job whose run is still running, or the saved state of a tool that has one: a delivery may still need them. Notifications are opt-in: `jobs.add({ …, notify: true })`, or `'group'` for one per group. A deliberate "Stop waiting" ends the run with `run.cancel(reason)` (aborted, not an error).
+**Completion is not download.** Return metadata and cost only with `succeeded` (the `usage` above), never the content. Download the content separately, with its own retries; when it cannot happen any more (retention), mark the result expired: the cost is already booked. Without `usage` the tool would have to book the cost itself with `run.addUsage`. Read `failureKind` on a failed job: `'remote'` (the provider failed, usually free) or `'gave-up'` (the core stopped asking: poll failures, a 404 after retention, a missing key, or the job was still running 3 hours after it was added, `maxAgeMs` on the handler to change that; it may still be billed, and the reservation is booked). The core records on the run that it booked the job's cost, so a tab that takes the polling over never books it twice. Settings → Data never deletes a running run, an open job, a finished job whose run is still running, or the saved state of a tool that has one: a delivery may still need them. Notifications are opt-in: `jobs.add({ …, notify: true })`, or `'group'` for one per group.
 
 Show progress with `jobList()` + `bindJobList(ctx.jobs, list, { tool: ctx.manifest.id })`. Work that only lives in this page until a later step (a sequence being assembled, parts not yet joined) is protected with `ui.holdWork(description)`. Handed-off runs do not count for the leave guard: the job carries on without the page.
 
@@ -461,7 +500,7 @@ A tool that works on files and settings only, with no main text field, sets `pro
 ## Files in and out
 
 - **Drop and paste:** implement `onFiles(files)`. From the moment the page starts, every file drag over it is caught (a stray drop never opens the file and leaves the page). While your tool takes files (`onFiles` and a non-empty `accepts`), a page-wide overlay shows during the drag; only files matching `manifest.accepts` (wildcards and extension fallback) reach `onFiles`, and skipped ones are named in a toast. A tool without `onFiles` answers a drop with "<Tool> doesn't take files." A paste into a text field that carries text is left to the field.
-- **Handle files by type.** `accepts` can mix text, images and PDFs: branch on `file.type` (with the extension as fallback). `readAsText` only for text; images go to the model as data URLs (`readAsDataUrl`); PDFs through `openPdf` (dynamic import, see Media). Never read a binary file as text.
+- **Handle files by type.** `accepts` can mix text, images and PDFs: branch on `fileMime(file)` (`src/ui/components/file-types.ts`: the browser's type, else the extension's; browsers leave `.md` and some audio untyped, and the one text classifier is `classifyFile` in `src/core/attachments`), not on `file.type` alone. `readAsText` (`src/core/files`) only for text; images go to the model as data URLs (`readAsDataUrl`); PDFs through `openPdf` (dynamic import, see Media). Never read a binary file as text.
 - **Drop zone:** `dropZone({ accept, multiple, onFiles })` for an explicit target with a keyboard-reachable "Choose files" button.
 - **Send to…:** `ctx.ui.sendTo([{ kind: 'text', text, type: 'text/markdown' }, { kind: 'file', blob, name }])` lists tools whose `accepts` match and opens the chosen one in a new tab; the items travel in memory over a BroadcastChannel handshake (nothing is stored). The target receives them in `onReceive`. `outputPanel({ sendTo: ctx.ui.sendTo })` wires its own button.
 
@@ -472,7 +511,7 @@ A tool that works on files and settings only, with no main text field, sets `pro
 | `dropZone(options)` | File input target (drag, keyboard, accept filter); its Choose files button keeps focus across rebuilds (`focusKey`, default `drop-zone`). |
 | `attachmentChip({ ref, data?, missing?, remove? })` | One file sent with a chat request (thumbnail or kind icon, name, size, optional Remove). The files themselves: `src/core/attachments/` (`readAttachment`, `toContentPart`, `missingInput`, `parserAddons`, `keepParsed`), as Chat and Model arena use them. |
 | `attachmentIntake({ noun, files, setFiles, keep, field, changed })` | How a request takes files in: `addFiles(files)` for `onFiles`, `receive(items)` for `onReceive` (named text and files become attachments, other text goes into `field`), `attach(ref, data?)`. The count and size limits, one warning for everything refused and the wording (one `noun`: "message", "prompt") are shared; `changed()` is where the tool redraws its chips and refreshes its estimate. Chat's composer uses it. |
-| `createMarkdownCache({ size?, decorate? })` | Rendered, sanitised Markdown of finished messages, so a redraw parses nothing again: `fill(target, key, text)` (the cached render at once, else plain text until it is ready; a slow render never overwrites a newer text), `prerender(key, text)` when a message finishes, `render`, `cached`. `decorate(fragment)` runs once per fresh render (Chat adds code Copy buttons). One cache per tool; a message still arriving streams through `streamMarkdown`. |
+| `createMarkdownCache({ size?, decorate? })` | Rendered, sanitized Markdown of finished messages, so a redraw parses nothing again: `fill(target, key, text)` (the cached render at once, else plain text until it is ready; a slow render never overwrites a newer text), `prerender(key, text)` when a message finishes, `render`, `cached`. `decorate(fragment)` runs once per fresh render (Chat adds code Copy buttons). One cache per tool; a message still arriving streams through `streamMarkdown`. |
 | `referencePicker({ ui, min?, max, accepts?, label?, ... })` | Reference images for a request: drop zone, small thumbnails (`imageThumbnail`), remove with focus management, a limits note (`setLimits` when the model changes, `problem()`), `add(items)` for Send to, paste and "use as reference". `dataUrls({ maxSide, maxBytes })` encodes each reference once and caches it until the limits change. |
 | `compareSlider(...)` | A before/after wipe (keyboard and pointer). |
 | `documentInput(options)` | Images and PDFs with thumbnails and page choice (`1-3, 7`, tile toggles); `selection()` lists pages, `loadPage(ref)` renders one for upload (`{ fileName, pageNumber, imageDataUrl, text? }`), `pageImage`/`reveal` show the source. Pair with `runItems()` for per-page requests. |
@@ -483,19 +522,19 @@ A tool that works on files and settings only, with no main text field, sets `pro
 | `streamMarkdown(target, options)` | The output panel's streaming renderer without the panel, for custom layouts. |
 | `exportMenu({ filename, formats, resultIds })` | Lazily built downloads in several formats; `update(…)` changes it in place. |
 | `imageViewer({ src \| blob, alt })` | Fit/zoom, checkerboard behind transparency. |
-| `videoResultCard({ ui, blob, name, seconds?, meta, covers?, onRemove, beforeRemove?, focusFallback?, ... })` | One video result: player, Download (`covers` marks the results it includes as downloaded too), Send to…, Remove (asks while not downloaded) with the card focus contract, leave guard through `ui.addResult`. Returns `{ element, handle, player, remove() }`. |
+| `videoResultCard({ ui, blob, name, seconds?, meta, covers?, onRemove, beforeRemove?, focusFallback?, ... })` | One video result: player, Download (`covers` marks the results it includes as downloaded too), Send to…, Remove (asks while not downloaded; see `resultRemoval`) with the card focus contract, leave guard through `ui.addResult`. Returns `{ element, handle, player, remove() }`. |
 | `audioResultCard({ ui, blob, name, seconds?, peaks?, metaParts, formats, onRemove, ... })` | One audio result (a recording, joined speech, a song): player, downloads (the file as it is plus converted `formats`), Send to…, Remove (asks while not downloaded) with focus management, registered with the leave guard through `ui.addResult`. Returns `{ element, handle, player, remove() }`. |
-| `imageResultCard({ ui, blob, name, meta, formats, onRemove, actions?, viewer?, ... })` | One image result (a generated image, an edited version): viewer, downloads (the file as it is plus `formats` converted through a canvas: `png`, `jpg`, `webp`), Send to…, the tool's own `actions` (`{ label, icon, ariaLabel, onClick, testId }`), Remove (asks while not downloaded) with focus management, registered with the leave guard through `ui.addResult`. `viewer: false` for a page that already shows the image (an editor canvas). Returns `{ element, handle, viewer, remove() }`. `focusFallback` runs after `onRemove` has updated the page; a format the browser cannot encode (WebP in Safari) is left out of the menu; an SVG is offered as PNG and as a sanitized SVG (`sanitizeSvg`), never as the model sent it. |
-| `resultRemoval(options)`, `confirmUndownloaded(handle, title, noun, testId)` | The one Remove of the three result cards (`result-removal.ts`): `beforeRemove` (default `confirmUndownloaded`, a confirmation while not downloaded; `() => true` skips it), then drop, announce, `onRemove`, and only then focus (next card, previous card, `focusFallback()`). A tool with a check of its own composes: `beforeRemove: () => !busy() && confirmUndownloaded(card.handle, title, 'image', 'gen')`. |
+| `imageResultCard({ ui, blob, name, meta, formats, onRemove, actions?, viewer?, ... })` | One image result (a generated image, an edited version): viewer, downloads (the file as it is plus `formats` converted through a canvas: `png`, `jpg`, `webp`), Send to…, the tool's own `actions` (`{ label, icon, ariaLabel, onClick, testId }`), Remove (asks while not downloaded) with focus management, registered with the leave guard through `ui.addResult`. `viewer: false` for a page that already shows the image (an editor canvas). Returns `{ element, handle, viewer, remove() }`. `focusFallback` runs after `onRemove` has updated the page; a format the browser cannot encode (WebP in Safari) is left out of the menu; an SVG is offered as PNG and as a sanitized SVG (`sanitizeSvg(blob)`, `src/ui/components/sanitize-svg.ts`: no scripts, `foreignObject` or references that leave the file), never as the model sent it. |
+| `resultRemoval(options)`, `confirmUndownloaded(handle, title, noun, testId)` | The one Remove of the three result cards (`src/ui/components/result-removal.ts`): `beforeRemove` (default `confirmUndownloaded`, a confirmation while not downloaded; `() => true` skips it), then drop, announce, `onRemove`, and only then focus (next card, previous card, `focusFallback()`). A tool with a check of its own composes it after its own: `beforeRemove: () => !busy() && confirmUndownloaded(card.handle, title, 'image', 'gen')`. Call `resultRemoval` yourself only for a card of your own; the three cards above already do. |
 | `failureLine(failure, { testId? })` | An inline failure from `failureText(error)` or a `runItems` outcome's `failure`: text, note, and the OpenRouter activity link after an unknown outcome. |
-| `progressBar({ label, hidden?, class?, testId? })` | A labelled `role="progressbar"`; `update(done, total, text?)` (text becomes `aria-valuetext`). Pair it with `ui.progress`. |
+| `progressBar({ label, hidden?, class?, testId? })` | A labeled `role="progressbar"`; `update(done, total, text?)` (text becomes `aria-valuetext`). Pair it with `ui.progress`. |
 | `audioPlayer({ src \| blob, peaks?, label })` | Native controls plus a waveform (`peaks()` from `src/core/media/audio`, or decoded lazily at 8 kHz mono; none beyond 30 minutes). Pass `seconds` when you know the length (nothing is measured); recordings whose duration reads as Infinity are probed before seeking. |
 | `videoPlayer({ src \| blob, label })` | Native controls in a letterboxed frame. |
 | `jobList(options)` + `bindJobList(...)` | Persistent jobs with progress. |
 | `emptyState({ icon, title, text, action, compact, inline })` | Every "nothing yet" place. |
 | `connectKey(options)` | Connect with OpenRouter / paste a key (onboarding, the no-key dialog). |
 
-Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` (a toast with an action stays until dismissed), `confirmDialog`, `typedConfirm({ phrase })` (destructive data actions), `promptDialog`, `unlockDialog()`, `presentError(error, { retry })`, `announce(text)`, `setFieldError(input, feedback, message | null)` (field validation: `is-invalid`, `aria-invalid`, `aria-describedby`, announced), and `openModal(options)` for anything custom (one modal at a time, later ones queue; await `closed`). Formatting: `src/ui/format.ts` (`formatUsd`, `formatEstimate`, `formatTokens`, `formatMs`, `formatBytes`, `formatDuration`, `formatRelativeTime`, `formatModelPrice`, `plural`, and the cost wording below). Links: `src/ui/shell/links.ts` (`toolUrl`, `settingsUrl(section)`, `historyUrl`, `modelsUrl`).
+Feedback (`src/ui/feedback/`): `toast({ message, title?, variant, action, actions?, timeoutMs, testId? })` (a toast with an action stays until dismissed, and Alt+Shift+N moves keyboard focus to the newest one with an action, so keyboard users reach Undo and Retry without tabbing the whole page), `confirmDialog`, `typedConfirm({ phrase })` (destructive data actions), `promptDialog`, `unlockDialog()`, `presentError(error, { retry })`, `announce(text)`, `setFieldError(input, feedback, message | null)` (field validation: `is-invalid`, `aria-invalid`, `aria-describedby`, announced), and `openModal(options)` for anything custom (one modal at a time, later ones queue; await `closed`). Formatting: `src/ui/format.ts` (`formatUsd`, `formatEstimate`, `formatTokens`, `formatMs`, `formatBytes`, `formatDuration`, `formatRelativeTime`, `formatDate`, `formatModelPrice`, `plural`, `shorten`, `stemFrom`, `fileStamp`, and the cost wording below). A stored time goes into a `<time>` through `isoDateTime(time)`, which returns undefined for a time no `Date` can hold, never through `new Date(time).toISOString()`, which throws and would break the whole list. No `toLocaleString` or `toLocaleDateString` calls of your own. Links: `src/ui/shell/links.ts` (`toolUrl`, `settingsUrl(section)`, `historyUrl`, `modelsUrl`).
 
 **What a run cost** has one rule, `describeRunCost(cost, { free?, booked? })` in `src/ui/format.ts`: unknown first (never free, never zero, never `≈`; `{ kind: 'unknown', text: 'Unknown', counted: '≈ $0.0034' }` says what budgets counted for it, `booked` being the run's reservation), then free (a zero cost on a free model), then estimated (`≈ $0.012`), else the reported amount. `formatRunCost` is the same as one string (`Unknown (≈ $0.0034 counted)`), and `usageLine(usage, { free?, booked? })` is the line under a reply (`1.2K in · 340 out · cost unknown · 1.4 s`). Take `free` from `ctx.models.isFree(model)`; do not word costs yourself.
 
@@ -505,11 +544,11 @@ Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` 
 
 ## Media and heavy libraries
 
-- **Lazy only.** Anything heavy loads with `import()` when first needed, and the manifest lists it in `lazyLibs` (a unit test checks they are dependencies). Budget: each tool adds at most 80 KB gzipped JS to the shell's 150 KB; check the `npm run build` output.
+- **Lazy only.** Anything heavy loads with `import()` when first needed, and the manifest lists it in `lazyLibs` (a unit test checks they are dependencies). Budget: the shell (the JS every page loads before it runs) is at most 150 KB gzipped, and each tool page at most 80 KB more of eager JS; lazy chunks do not count. After `npm run build`, `npm run budgets` (`scripts/check-budgets.mjs`) checks every page and exits 1 over budget.
 - **PDF:** import `src/core/media/pdf.ts` dynamically only (`const { openPdf } = await import('../../core/media/pdf')`); it brings about 5 MB of pdf.js assets.
 - **Audio:** join TTS or audio segments with `stitchAudio(segments, 'mp3' | 'wav')` (`src/core/media/stitch.ts`: decode → PCM → encode once; a single segment already in the target format comes back as it is, without loading anything). Plain MP3 concatenation leaves gaps at the seams. Convert a file with `transcode(blob, 'mp3' | 'wav')` (`src/core/media/transcode.ts`, loads ffmpeg only when called).
-- **Images:** run heavy pixel work in the worker (`src/core/media/image-async.ts`: `isolateImage`, `maskOverlayAsync`, `maskToRasterAsync`, `featherInsideAsync`, `compositeMaskedAsync`, each with `{ signal, transfer }` and a page fallback), never pixel loops on the main thread. A failed worker is recreated on the next job; after three failures in a row the page does the work. Encode references that belong together (marked, plain, mask) with `toDataUrls(images, options)`, at one pixel size; `readImageSize(blob)` reads dimensions from the file header without decoding.
-- **Image models:** ask `ctx.models.imageControls(model)`: `ready` (send only the fields its `controls` list), `missing` (refuse before the run) or `unknown` (the list could not be read: send `controls`, the bare prompt-only set, and let the request try). Estimates with references pass `requests` (how many requests upload them).
+- **Images:** run heavy pixel work in the worker (`src/core/media/image-async.ts`: `isolateImage`, `maskOverlayAsync`, `maskToRasterAsync`, `featherInsideAsync`, `compositeMaskedAsync`, each with `{ signal, transfer }` and a page fallback), never pixel loops on the main thread. A failed worker is recreated on the next job; after three failures in a row the page does the work. Encode references that belong together (marked, plain, mask) with `toDataUrls(images, options)` (`src/core/media/image.ts`), at one pixel size; `readImageSize(blob)` (same file) reads dimensions from the file header without decoding.
+- **Image models:** ask `ctx.models.imageControls(model)`, which resolves `{ status, controls }`: `ready` (send only the fields its `controls` list; a field it does not list is never sent), `missing` (the list was read and does not have the model: refuse before the run) or `unknown` (the list could not be read: send `controls`, the bare prompt-only set, and let the request try; a failed read is tried again 30 s later and after a catalog refresh). A zero catalog image price is unknown, not free. Estimates with references pass `requests` (how many requests upload them).
 - **ZIP:** `zipFiles()` from `src/core/export`, or fflate's `zipSync`. Never fflate's async API (`zip`, `unzip`, `deflate`): it starts `blob:` workers that the CSP blocks, and then never settles.
 - **ffmpeg:** go through `src/core/media/ffmpeg-ops.ts` (`concatVideos` refuses a clip or a result over `MAX_JOIN_BYTES`, 1.5 GiB, before encoding); any `exec` of your own passes explicit `-threads` limits (multi-threaded ffmpeg crashes on H.264 encodes with the default count).
 
@@ -520,50 +559,60 @@ Feedback (`src/ui/feedback/`): `toast({ message, variant, action, timeoutMs })` 
 - DOM only through `h()`; model output only through `renderMarkdown()` (the output panel does it). No `innerHTML`, no inline styles in strings, no remote `src` (load remote media with `fetch` → Blob → object URL).
 - No `fetch` to OpenRouter and no storage access: go through `ctx`.
 - Element ids: generate them with `uid()` (`src/ui/id.ts`); a page can hold several instances.
+- **US spelling in everything a person can read or hear:** string and template-literal text in `src/**/*.ts`, HTML `<title>`s and the manifests ("Summarize", "color", "canceled", "organize"). `tests/lint/us-spelling.test.ts` fails on a British spelling and names the file and word; fix the text. A literal that is not UI text (a stored field, an error code) goes on `ALLOWED` in `tests/lint/us-spelling.ts` with its reason. Comments, identifiers and unit-test files are not read.
+- Errors the user can act on are `OrError` subclasses (`src/core/errors.ts`, each with a `code`), never a bare `Error`: a bare one reads "Something went wrong" in the toast and in History.
 - `hidden` is safe on any element (a global rule beats Bootstrap's display utilities).
 
 ## Accessibility
 
-Every control has a visible label (or `aria-label` for icon buttons), everything works with the keyboard (Tab order follows the layout; Ctrl/Cmd+Enter runs), focus is visible, status changes go through `ui.status()` / `announce()` rather than new live regions, field errors through `setFieldError`, and colours come from Bootstrap's variables so both themes and custom accents keep AA contrast. Do not move focus unexpectedly; dialogs return focus to their opener, and re-rendered controls keep it through `data-focus-key`.
+Every control has a visible label (or `aria-label` for icon buttons), everything works with the keyboard (Tab order follows the layout; Ctrl/Cmd+Enter runs), focus is visible, status changes go through `ui.status()` / `announce()` rather than new live regions, field errors through `setFieldError`, and colors come from Bootstrap's variables so both themes and custom accents keep AA contrast. Do not move focus unexpectedly; dialogs return focus to their opener, and re-rendered controls keep it through `data-focus-key`.
 
 ## Testing
 
 - **Convention:** the tool's main prompt field (the one `getState().prompt` reads) carries `data-testid="tool-prompt"`. Shared specs (Prompts, onboarding's sample) find it there. A tool without one declares `promptless: true` on its instance.
-- **Unit** (`src/tools/<id>/*.test.ts`, Vitest + jsdom): pipeline logic, request building, parsing, and the tool itself through `createToolTestContext` (`src/ui/tool/testing.ts`). It builds a real `ToolContext` (the same `createToolContext` as the page) over the fake core: real settings, runs, history and models services on fake IndexedDB, one fake key, and an API client whose calls throw unless you provide them.
+- **Unit** (`src/tools/<id>/*.test.ts`, Vitest + jsdom; `npm run test`, or `npx vitest run src/tools/<id>` while you work): pipeline logic, request building, parsing, and the tool itself through `createToolTestContext` (`src/ui/tool/testing.ts`). It builds a real `ToolContext` (the same `createToolContext` as the page) over the fake core: real settings, runs, history and models services on fake IndexedDB, one fake key, and an API client whose calls throw unless you provide them.
 
   ```ts
   import 'fake-indexeddb/auto';
+  import { afterEach, beforeEach, expect, it } from 'vitest';
   import { isolateChannels, resetDb } from '../../core/testing/state-fakes';
-  import { createToolTestContext } from '../../ui/tool/testing';
+  import { createToolTestContext, type ToolTestContext } from '../../ui/tool/testing';
 
+  let t: ToolTestContext | null = null;
   beforeEach(async () => {
     isolateChannels();
     await resetDb();
     localStorage.clear();
   });
+  afterEach(async () => {
+    await t?.cleanup();
+    t = null;
+  });
 
   it('round-trips its state and books its estimate', async () => {
-    const t = createToolTestContext(getTool('chat'), { catalog: [model], api: { chatStream } });
+    // `model` (a RawModel) and `chatStream` (a stub) are yours; the catalog must hold the model the tool resolves.
+    t = createToolTestContext(getTool('<id>'), { catalog: [model], api: { chatStream } });
     const tool = await t.mount(setup);
-    const state = { prompt: 'Summarise this', settings: { length: 'long', temperature: 0.3 } };
+    const state = { prompt: 'Summarize this', settings: { length: 'long', temperature: 0.3 } };
     tool.applyState(state);
     expect(tool.getState()).toEqual(state);
     await t.ctx.ui.refreshEstimate();
     expect(t.estimate()).toBeGreaterThan(0);
     await t.runners[0]!.trigger(); // runs through ctx.beginRun and your mocked chatStream
-    await t.cleanup();
   });
   ```
 
-  Options: `catalog` (models the models service serves), `api` (calls to mock), `modelOverride` (`?model=`), `noKey`. The result also exposes `core`, `keyState`, `zones`, `sent` (Send to… items) and `status()`. **`await t.cleanup()`** in `afterEach`: it stops every runner, waits for idle and for tool-state calls still in flight (a write queue's next write too), drops the bus listeners added through the context and the runners' Escape handlers, then removes the zones, so nothing of one test is written into the next test's fresh database. `await t.settle()` waits the same way without stopping anything (before checking what was stored, or opening a second "tab"); do not write your own settle loop.
-- **E2E** (`tests/e2e/<id>.spec.ts`): `watchForProblems(page, { allowAborted: ['/api/v1/…'] })` lists the paths whose aborts the app causes on purpose (Stop, a stream cancelled after `[DONE]`); `<audio>`/`<video>` aborts of `blob:` reads are ignored for every spec. import `test`/`expect` from `tests/mock/index.ts`; mock every OpenRouter call (`mock.json`, `mock.sse` for streams, `mock.file` for media, `mock.sequence` for polling), seed state with `seedApp(context, { key: true })` from `tests/e2e/app.ts`, and assert `watchForProblems(page)` is empty. Cover: a run end to end with the output, the error path (`mock.json(..., { status: 429 })`), Stop, drop/paste of an accepted file, and the prompts round trip (save current → Use restores the form). `tests/e2e/routes.spec.ts` already runs axe on your page in light and dark.
+  Options: `catalog` (models the models service serves), `api` (calls to mock), `modelOverride` (`?model=`), `noKey`. The result also exposes `ctx`, `core`, `keyState`, `zones`, `runners`, `sent` (Send to… items), `estimate()` and `status()`. **`await t.cleanup()`** (it is async) in `afterEach`: it stops every runner, waits for idle and for tool-state calls still in flight (a write queue's next write too), drops the bus listeners added through the context and the runners' Escape handlers, then removes the zones, so nothing of one test is written into the next test's fresh database. `await t.settle()` (also async) waits the same way without stopping anything (before checking what was stored, or opening a second "tab"); do not write your own settle loop. A fake `RunHandle` must implement `sending()`.
+- **E2E** (`tests/e2e/<id>.spec.ts`): `watchForProblems(page, { allowAborted: ['/api/v1/…'] })` lists the paths whose aborts the app causes on purpose (Stop, a stream canceled after `[DONE]`); `<audio>`/`<video>` aborts of `blob:` reads are ignored for every spec. Import `test`/`expect` from `tests/mock/index.ts` (never from `@playwright/test`); mock every OpenRouter call (`mock.json`, `mock.sse` for streams, `mock.file` for media, `mock.sequence` for polling, `mock.respond` to answer from the request body), seed state with `seedApp(context, { key: true })` from `tests/e2e/app.ts`, and call `const problems = await watchForProblems(page)` before the page loads, then assert `problems` is empty at the end (it collects console errors, failed requests, HTTP errors and CSP violations). Run your spec with `npm run e2e:dev -- tests/e2e/<id>.spec.ts` (dev server); `npm run e2e` is the full production-build gate. Cover: a run end to end with the output, the error path (`mock.json(..., { status: 429 })`), Stop, drop/paste of an accepted file, and the prompts round trip (save current → Use restores the form). `tests/e2e/routes.spec.ts` already runs axe on your page in light and dark.
 
 ## Worked example
 
-A complete small tool, type-checked and unit-tested against the framework while this guide was written (as `src/tools/chat/main.ts`). It summarises text: input, a drawer option and an advanced option, an estimate through the hook, streaming output, drop/paste by file type, Send to…, a sample and the prompts round trip.
+A complete small tool, compiled against the framework's real types when this guide was last updated (every snippet in this guide was checked the same way). It summarizes text: input, a drawer option and an advanced option, an estimate through the hook, streaming output, drop/paste by file type, Send to…, a sample and the prompts round trip. Use your own tool's id in `getTool()`; the example borrows `chat`.
 
 ```ts
 import { readAsText } from '../../core/files';
+import { approxTokens, MESSAGE_OVERHEAD } from '../../core/tokens';
+import { fileMime } from '../../ui/components/file-types';
 import { outputPanel } from '../../ui/components/output-panel';
 import { h } from '../../ui/dom';
 import { presentError } from '../../ui/feedback/errors';
@@ -576,8 +625,7 @@ type Length = 'short' | 'medium' | 'long';
 const MAX_TOKENS: Record<Length, number> = { short: 200, medium: 500, long: 1200 };
 const isLength = (value: unknown): value is Length =>
   value === 'short' || value === 'medium' || value === 'long';
-const isText = (file: File): boolean =>
-  file.type.startsWith('text/') || /\.(txt|md|markdown)$/i.test(file.name);
+const isText = (file: File): boolean => fileMime(file).startsWith('text/');
 
 export function setup(ctx: ToolContext): ToolInstance {
   const { ui } = ctx;
@@ -624,6 +672,7 @@ export function setup(ctx: ToolContext): ToolInstance {
     length: isLength(length.value) ? length.value : 'medium',
     temperature: Number(temperature.value),
   });
+  const instruction = () => `Summarize the user's text (${settings().length}), as Markdown.`;
 
   text.addEventListener('input', () => void ui.refreshEstimate());
   length.addEventListener('change', () => {
@@ -632,7 +681,7 @@ export function setup(ctx: ToolContext): ToolInstance {
   });
 
   ui.runner({
-    label: 'Summarise',
+    label: 'Summarize',
     icon: 'text-paragraph',
     run: async (signal) => {
       if (!text.value.trim()) {
@@ -647,7 +696,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           {
             model: run.model,
             messages: [
-              { role: 'system', content: `Summarise the user's text (${settings().length}), as Markdown.` },
+              { role: 'system', content: instruction() },
               { role: 'user', content: text.value },
             ],
             max_tokens: MAX_TOKENS[settings().length],
@@ -661,6 +710,7 @@ export function setup(ctx: ToolContext): ToolInstance {
           },
         );
         output.finish();
+        if (result.refusal) ui.status(result.refusal); // the model declined, or the reply was filtered
         await run.finish({ output: result.text });
       } catch (error) {
         output.fail(error); // Stop: "Stopped", partial kept; other errors inline, once
@@ -682,7 +732,7 @@ export function setup(ctx: ToolContext): ToolInstance {
       ctx.models.estimate({
         kind: 'tokens',
         model,
-        promptTokens: Math.ceil(text.value.length / 4) + 50,
+        promptTokens: approxTokens(instruction()) + approxTokens(text.value) + 2 * MESSAGE_OVERHEAD,
         completionTokens: MAX_TOKENS[settings().length],
       }),
     onFiles: (files) => {
@@ -712,9 +762,9 @@ mountTool(getTool('chat'), setup);
 
 ## Checklist
 
-1. Write `setup` in `src/tools/<id>/` (split into modules as it grows); keep `main.ts` to the `mountTool` call, and the manifest's `accepts`, `capabilities` (primary first) and `lazyLibs` true to what the tool does.
+1. Add `tools/<id>/index.html`, `src/tools/<id>/manifest.json` (every field of the table above, US spelling) and `main.ts`; write `setup` in `src/tools/<id>/` (split into modules as it grows). Keep `main.ts` to the `mountTool` call, and the manifest's `accepts`, `capabilities` (primary first) and `lazyLibs` true to what the tool does.
 2. Main prompt field: `data-testid="tool-prompt"`. Implement `getState`/`applyState` (exact round trip), `estimate` (and call `ui.refreshEstimate()` on input changes), `sample()` (onboarding offers it), and `onFiles`/`onReceive` if the manifest accepts anything.
-3. Follow the error rule: `output.fail(error)` / `run.fail(error)` / rethrow; `presentError` outside the runner. Call `beginRun` before touching tool state; batches go through `runItems`, per-item Retry through `runner.trigger(arg)`, paid extras (the PDF parser) through `addons()`.
-4. Media: lazy imports, `stitchAudio`, `isolateImage`, `zipFiles`/`zipSync`, explicit ffmpeg `-threads`; stay inside the 80 KB budget.
-5. Tests: unit tests for the pipeline and the tool through `createToolTestContext`, and an e2e spec against the mock (run, error, Stop, files, prompts round trip).
+3. Follow the error rule: `output.fail(error)` / `run.fail(error)` / rethrow; `presentError` outside the runner; `OrError`s, never bare `Error`s. Call `beginRun` before touching tool state, and `ui.confirmDiscard` before it when a run would replace edits; batches go through `runItems`, per-item Retry through `retryGate` and `runner.trigger(arg)` (with `replayArg: pendingOnly(…)` so a replay never pays twice), failures drawn with `failureLine`, paid extras (the PDF parser) through `addons()`.
+4. Media: lazy imports, `stitchAudio`, `isolateImage`, `zipFiles`/`zipSync`, explicit ffmpeg `-threads`; results through the result cards or `ui.addResult` (never stored); stay inside the 80 KB budget (`npm run build`, then `npm run budgets`).
+5. Tests: unit tests for the pipeline and the tool through `createToolTestContext`, and an e2e spec against the mock (run, error, Stop, files, prompts round trip). `npm run check` (typecheck, lint, unit tests, including the US-spelling and architecture lint tests) passes before the work is done.
 6. Check the page in both themes at 320 px and on a desktop, with the keyboard only.

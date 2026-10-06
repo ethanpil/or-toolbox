@@ -44,7 +44,7 @@ ORtoolbox is a toolbox of 14 AI tools that runs entirely in your browser, on you
 - **Costs in view.** An estimate before every run, the real cost after it, per-run records in History and a Stats dashboard by tool, model and key.
 - **History and prompts.** Text-only history you can search, reopen, re-run with another model and export. Each tool keeps Recent and Saved prompts that restore the tool's settings too.
 - **Your key, your way.** Connect with OpenRouter (OAuth) or paste a key. Several keys, per-tool key and model pinning, and an optional passphrase lock that encrypts keys at rest.
-- **Backup and restore.** One `.ortoolbox.json` file, keys left out unless you add them, encrypted with a passphrase. Restore shows a preview and merges or replaces.
+- **Backup and restore.** One `.ortoolbox.json` file. Keys are left out unless you add them, and then they are encrypted with a passphrase. Restore shows a preview and merges (newer data wins) or replaces (work in progress is kept).
 - **Light and dark themes**, an accent color, density and reduced-motion settings.
 - **Keyboard and accessibility care.** Everything is reachable by keyboard, with visible focus, live status announcements and contrast checked in both themes. A command palette (Ctrl/Cmd+K) jumps to any tool, page, setting, run or model.
 - **Offline shell.** A service worker keeps the app shell, so pages open without a network; the tools themselves need one.
@@ -52,13 +52,13 @@ ORtoolbox is a toolbox of 14 AI tools that runs entirely in your browser, on you
 
 ## Privacy and security
 
-- **Nothing is stored remotely.** There is no ORtoolbox server, no analytics and no cookies. Keys and settings live in your browser's local storage, history, prompts and stats in IndexedDB. Images, audio, video and uploaded files stay in memory and are never written to disk; the page warns before you leave with results you have not downloaded.
+- **Nothing is stored remotely.** There is no ORtoolbox server, no analytics and no cookies. Keys and settings live in your browser's local storage, history, prompts and stats in IndexedDB. Images, audio, video and uploaded files stay in memory and are never written to disk (Chat is the one exception: it keeps the text of attached text files and PDFs with the conversation); the page warns before you leave with results you have not downloaded or a run in progress.
 - **Requests go only to openrouter.ai** (plus the site's own files from the static host). When you run a tool, your prompt and files go to OpenRouter and on to the model provider you chose. Free models are often served by providers that log or train on prompts, so keep private data off them. A per-key switch asks OpenRouter to prefer providers that do not retain data.
-- **No third-party origins at runtime.** All scripts, fonts and the ffmpeg cores are bundled and self-hosted. The Content Security Policy (`script-src 'self'`, `connect-src` limited to the site and `https://openrouter.ai`, no inline scripts, no frames) makes everything else impossible, and model output rendered as Markdown is sanitized.
+- **No third-party origins at runtime.** All scripts, fonts and the ffmpeg cores are bundled and self-hosted. The Content Security Policy (`script-src 'self'`, `connect-src` limited to the site and `https://openrouter.ai`, no inline scripts, no frames, sent as a response header as well as in the page) makes everything else impossible, and model output rendered as Markdown is sanitized with an attribute allowlist. The service worker checks every cached file against a hash from the build, so another site on the same host cannot swap in code.
 - **Keys are handled with care:** masked in the UI, never logged, never in a URL, never in History, excluded from backups unless you opt in. The optional passphrase lock encrypts them at rest (AES-GCM, key derived with PBKDF2). Use a key with a credit limit, so a leak can only spend that much.
-- **Shared github.io origin.** On `ethanpil.github.io` every project site shares one origin, so another page on that address could read what ORtoolbox stores in your browser. Turn on the passphrase lock (it encrypts keys only, not history or settings), use a key with a small credit limit, or serve ORtoolbox from a custom domain, where this risk does not exist.
+- **Shared github.io origin.** On `ethanpil.github.io` every project site shares one origin, so another page on that address could read what ORtoolbox stores in your browser. Turn on the passphrase lock (it encrypts keys only, not history or settings, and a page on that address could still read a key while it is unlocked), use a key with a small credit limit, or serve ORtoolbox from a custom domain, where this risk does not exist.
 
-The in-app [Privacy page](https://ethanpil.github.io/or-toolbox/privacy/) says the same in more detail.
+The in-app [Privacy page](https://ethanpil.github.io/or-toolbox/privacy/) says the same in more detail. Third-party licenses, including the source of the GPL-licensed ffmpeg.wasm cores, are in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) and, on the site, `licenses.txt`.
 
 ## Getting started
 
@@ -79,7 +79,7 @@ npm install
 npx playwright install chromium firefox webkit   # for the end-to-end tests
 npm run dev                                      # http://localhost:5273/or-toolbox/
 npm run check                                    # typecheck, lint, unit tests
-npm run e2e                                      # build, then end-to-end tests
+npm run e2e                                      # build, then the end-to-end gate (see below)
 ```
 
 | Command | What it does |
@@ -88,9 +88,12 @@ npm run e2e                                      # build, then end-to-end tests
 | `npm run build` / `npm run preview` | Typecheck and build to `dist/`; serve it on port 4273 with the service worker and CSP active. |
 | `npm run check` | Typecheck, lint and unit tests. Run it before sending a change. |
 | `npm run e2e:dev -- <spec>` | Playwright against the dev server, for day-to-day work. |
-| `npm run e2e` | Build, then the full Playwright suite against `preview` (the gate). |
+| `npm run e2e` | Build, then the Playwright gate against `preview`: the default and service-worker suites. The specs that import the page's own code (`tests/e2e/media`, `tests/e2e/dev`) run only on the dev server: `npm run e2e:dev -- tests/e2e/media tests/e2e/dev`. |
+| `npm run budgets` | Check the built JavaScript against the size budgets (shell at most 150 KB gzipped, each tool at most 80 KB more). Run it after `npm run build`; CI does. |
+| `npm run icons` | Regenerate the app icons and favicon from `public/icons/logo.svg`. |
+| `npm run icon-subset` | Regenerate the cut-down icon font and stylesheet after adding or removing an icon. Needs Python with `fonttools` and `brotli` (`pip install fonttools brotli`); the outputs are committed. |
 
-The e2e tests talk only to a mocked OpenRouter; no test reaches the real API. CI (`.github/workflows/ci.yml`) runs the checks and the suite on Chromium, Firefox and WebKit, and deploys `main` to GitHub Pages.
+The e2e tests talk only to a mocked OpenRouter; no test reaches the real API. CI (`.github/workflows/ci.yml`) runs the checks, the size budgets, the gate suites and the dev-server specs on Chromium, Firefox and WebKit, and deploys `main` to GitHub Pages.
 
 Where to read next:
 
@@ -102,4 +105,4 @@ Where to read next:
 
 ## License
 
-To be decided. There is no `LICENSE` file yet, so no permission to copy or reuse the code is granted until one is added.
+To be decided. There is no `LICENSE` file yet, so no permission to copy or reuse the code is granted until one is added. Third-party components keep their own licenses: see [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
