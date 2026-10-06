@@ -1,6 +1,6 @@
 {
   "name": "or-toolbox",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "ORtoolbox - a browser-only toolbox of AI tools on top of OpenRouter.",
   "type": "module",

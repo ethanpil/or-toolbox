@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-06
+
+### Fixed
+
+- Another tab's key change now shows in Settings and the key chip in Firefox and Safari (69c0ec3).
+- Continue from last frame no longer sends a blank frame where the browser draws video as transparent; it reads the frame through VideoFrame (5f67b83).
+- Firefox recordings no longer wait 10 s at "Reading the file…" (8bee079), and transcript times seek in them: Firefox now records Ogg (9bbb7ce).
+- The end-to-end suite runs green in Firefox and WebKit as well as Chromium (0cfac94, f76f84d, e98ede9, fe75ed8, 2386410), and CI gives Firefox an audio output (f3a5692).
+- Unit tests no longer fail on a late Bootstrap transition timer or a prompts-panel refresh after their page is gone (1c6e573, 0baec30).
+
+### Changed
+
+- CI can be run by hand on any branch; only a push to main deploys (4657c15). Dependabot skips TypeScript major versions until typescript-eslint supports 7 (4f6784d).
+
 ## [1.0.0] - 2026-10-05
 
 ### Added
