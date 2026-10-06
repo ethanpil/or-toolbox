@@ -96,6 +96,16 @@ jobs:
       - name: Install ${{ matrix.browser }} for Playwright
         run: npx playwright install --with-deps ${{ matrix.browser }}
 
+      # Without an audio output, Firefox never starts an AudioContext (it stays "suspended"), so the stubbed
+      # microphone makes no sound and the recorder's level meter never moves. A null sink is an output.
+      - name: Audio output for Firefox
+        if: matrix.browser == 'firefox'
+        run: |
+          sudo apt-get install -y --no-install-recommends pulseaudio
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=ci
+          pactl set-default-sink ci
+
       # The default suite (service workers blocked) and the service-worker
       # suite (isolation, offline shell, multi-threaded ffmpeg), against
       # `vite preview` of the build.

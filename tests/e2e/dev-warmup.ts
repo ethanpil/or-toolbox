@@ -5,7 +5,7 @@
  * Visiting one page of each kind first lets Vite settle before any test starts. Playwright starts the
  * webServer before global setup, so the server is up here.
  */
-import { chromium, type FullConfig } from '@playwright/test';
+import { type Browser, chromium, firefox, type FullConfig, webkit } from '@playwright/test';
 
 const PAGES = [
   '',
@@ -20,7 +20,13 @@ const PAGES = [
 export default async function warmUp(config: FullConfig): Promise<void> {
   const baseURL = config.projects.find((project) => project.use.baseURL)?.use.baseURL;
   if (!baseURL) return;
-  const browser = await chromium.launch();
+  // Whichever browser this machine has (a CI job installs only the one it tests).
+  let browser: Browser | null = null;
+  for (const type of [chromium, firefox, webkit]) {
+    browser = await type.launch().catch(() => null);
+    if (browser) break;
+  }
+  if (!browser) return;
   try {
     const page = await browser.newPage();
     for (const path of PAGES) {
