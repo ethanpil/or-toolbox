@@ -236,7 +236,6 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
   await page.goto('tools/data-extractor/');
   await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
   const runner = page.getByTestId('runner');
-  await page.getByTestId('tool-prompt').focus();
 
   /**
    * Whether a bar covers the focused control of the input zone, or null when focus is elsewhere. The browser
@@ -259,9 +258,23 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
         : a.top < b.bottom - 1 && a.bottom > b.top;
     }, bar);
 
+  const inInput = (): Promise<boolean> =>
+    page.evaluate(
+      () =>
+        document.querySelector('[data-testid="tool-input"]')?.contains(document.activeElement) ??
+        false,
+    );
+
+  // Tab through the input zone from the control before it (the model chip), until focus leaves it. (Explicit
+  // ends: only Chromium wraps Tab from the end of the page back to its top.)
+  await page.getByTestId('model-chip').focus();
   let checked = 0;
+  let entered = false;
   for (let step = 0; step < 40; step++) {
     await page.keyboard.press('Tab');
+    const inside = await inInput();
+    if (entered && !inside) break;
+    entered ||= inside;
     if ((await covered('runner')()) === null) continue;
     checked++;
     await expect.poll(covered('runner'), { message: `Tab ${step}` }).toBe(false);
@@ -269,10 +282,12 @@ test('the sticky Run bar never covers the control that has focus (WCAG 2.4.11)',
   expect(checked).toBeGreaterThan(3);
   await expect(runner).toBeVisible();
 
-  // Back up with Shift+Tab: the sticky navbar never covers the focused control either.
+  // Back up with Shift+Tab from Run: the sticky navbar never covers the focused control either.
+  await page.getByTestId('run-button').focus();
   let above = 0;
   for (let step = 0; step < 30; step++) {
     await page.keyboard.press('Shift+Tab');
+    if (!(await inInput())) break;
     if ((await covered('navbar')()) === null) continue;
     above++;
     await expect.poll(covered('navbar'), { message: `Shift+Tab ${step}` }).toBe(false);
@@ -288,8 +303,14 @@ test('pressing blank space on a tool page does not scroll it (a drag that starts
   await page.setViewportSize({ width: 1000, height: 720 });
   await page.goto('tools/data-extractor/');
   await expect(page.getByTestId('page-title')).toHaveText('Data extractor');
+  // The chips and the estimate arrive after setup: the page has its final height once they are there.
+  await expect(page.getByTestId('model-chip-name')).not.toBeEmpty();
+  await expect(page.getByTestId('cost-estimate-value')).not.toBeEmpty();
   // At the end of the page <main> ends above the window's bottom edge, which is where the scroll once happened.
-  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  // Instantly: the page scrolls smoothly unless motion is reduced, and Firefox and WebKit animate that scroll.
+  await page.evaluate(() =>
+    window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' }),
+  );
   const scrolled = (): Promise<number> => page.evaluate(() => scrollY);
   const before = await scrolled();
   expect(before).toBeGreaterThan(0);

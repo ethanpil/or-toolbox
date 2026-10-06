@@ -108,6 +108,14 @@ test('a poisoned cache entry is never served, and is repaired from the network',
     await page.goto(`${online.baseURL}settings/`);
     await expect(page.getByTestId('page-title')).toHaveText('Settings');
     expect(await page.title()).not.toContain('pwned');
+    // Asked for directly, the file is the real one. (WebKit runs a module script it loaded on the first visit from
+    // its memory cache without asking the worker, so in WebKit the navigation alone never reaches the entry.)
+    expect(
+      await page.evaluate(
+        async (url) => (await (await fetch(url, { cache: 'no-store' })).text()).includes('pwned'),
+        poisoned,
+      ),
+    ).toBe(false);
     await expect
       .poll(() =>
         page.evaluate(async (url) => {

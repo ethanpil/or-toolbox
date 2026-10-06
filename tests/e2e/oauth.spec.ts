@@ -4,27 +4,42 @@
  * (POST /auth/keys) and the user lands where they started, with the key stored.
  */
 import { createHash } from 'node:crypto';
-import { expect, test } from '../mock/index.ts';
+import { expect, type SequenceResponse, test } from '../mock/index.ts';
 import { seedApp } from './app.ts';
 import { watchForProblems } from './support.ts';
 
 const MINTED_KEY =
   'sk-or-v1-minted-1111111111111111111111111111111111111111111111111111111111111111';
 
+/**
+ * OpenRouter's answer once the user has decided: a redirect to `location`. Playwright's WebKit does not follow a
+ * redirect that `route.fulfill()` answers for a navigation (the page is left on an empty URL), so there the mock
+ * sign-in page sends the browser on with a meta refresh; Chromium and Firefox get the 302 OpenRouter sends.
+ */
+function redirectTo(location: string, browserName: string): SequenceResponse {
+  if (browserName !== 'webkit') return { status: 302, headers: { location } };
+  const href = location.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+  return {
+    body: `<!doctype html><meta http-equiv="refresh" content="0;url=${href}">`,
+    headers: { 'content-type': 'text/html; charset=utf-8' },
+  };
+}
+
 test('Connect with OpenRouter: sign in, exchange the code, come back to Settings with the key', async ({
   page,
   context,
   mock,
+  browserName,
 }) => {
   await seedApp(context);
   const problems = await watchForProblems(page);
   // OpenRouter's sign-in page, reduced to what it does after the user agrees: redirect to the callback with a code.
-  mock.respond('GET', '/auth', (call) => ({
-    status: 302,
-    headers: {
-      location: `${call.query['callback_url']}?code=abc123&state=${call.query['state']}`,
-    },
-  }));
+  mock.respond('GET', '/auth', (call) =>
+    redirectTo(
+      `${call.query['callback_url']}?code=abc123&state=${call.query['state']}`,
+      browserName,
+    ),
+  );
   mock.json('POST', '/api/v1/auth/keys', { key: MINTED_KEY, user_id: 'user_1' });
   mock.json('GET', '/api/v1/key', {
     data: { label: 'sk-or-v1-min...111', limit: null, limit_remaining: null, usage: 0.25 },
@@ -72,14 +87,15 @@ test('a sign-in the user refuses ends on a clear message and stores nothing', as
   page,
   context,
   mock,
+  browserName,
 }) => {
   await seedApp(context);
-  mock.respond('GET', '/auth', (call) => ({
-    status: 302,
-    headers: {
-      location: `${call.query['callback_url']}?error=access_denied&state=${call.query['state']}`,
-    },
-  }));
+  mock.respond('GET', '/auth', (call) =>
+    redirectTo(
+      `${call.query['callback_url']}?error=access_denied&state=${call.query['state']}`,
+      browserName,
+    ),
+  );
 
   await page.goto('settings/#keys');
   await page.getByTestId('connect-openrouter').click();

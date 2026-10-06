@@ -224,8 +224,10 @@ test('a short upload goes as it is: transcript, exports, Send to, light and dark
   await page.emulateMedia({ colorScheme: 'dark' });
   await expect(page.locator('html')).toHaveAttribute('data-bs-theme', 'dark');
   await expectNoSeriousA11yViolations(page);
-  await page.screenshot({ path: test.info().outputPath('stt-dark.png'), fullPage: true });
+  // Before the screenshot: in WebKit, Playwright's screenshot adds a <style> element to the page, which the CSP
+  // refuses and reports.
   expect(problems).toEqual([]);
+  await page.screenshot({ path: test.info().outputPath('stt-dark.png'), fullPage: true });
 });
 
 /**
@@ -738,9 +740,19 @@ test('Stage 4 gate: a 60-minute recording is cut into parts and merged with cont
   page,
   context,
   mock,
+  browserName,
 }) => {
   test.setTimeout(15 * 60_000);
-  await seedApp(context, { key: true });
+  // The mock reads each part's audio from the request body, and Playwright's Firefox does not report request
+  // bodies over 10 MB: a 5-minute part is about 13 MB of base64. Firefox cuts 2-minute parts (about 5 MB);
+  // Chromium and WebKit keep the default 5 minutes.
+  const partMinutes = browserName === 'firefox' ? 2 : 5;
+  await seedApp(context, {
+    key: true,
+    ...(partMinutes === 5
+      ? {}
+      : { settings: { tools: { 'speech-to-text': { options: { partMinutes } } } } }),
+  });
   mock.json('GET', '/api/v1/models', CATALOG);
   // Each part's answer is what a model would say about the audio it got: one segment per tone burst, timed
   // from the part's own start (0), never from the recording's.
@@ -770,17 +782,19 @@ test('Stage 4 gate: a 60-minute recording is cut into parts and merged with cont
   await page.goto('tools/speech-to-text/');
   await addSynthesisedWav(page, 3600, 'meeting-60-minutes.wav');
   await expect(page.getByTestId('stt-source-meta')).toHaveText('1:00:00 · 109.9 MB');
-  await expect(page.getByTestId('stt-source-plan')).toContainText('parts of up to 5:00');
+  await expect(page.getByTestId('stt-source-plan')).toContainText(
+    `parts of up to ${partMinutes}:00`,
+  );
   await page.getByTestId('run-button').click();
   await expect(page.getByTestId('tool-status')).toHaveText(/^Done · \d+ parts$/, {
     timeout: 12 * 60_000,
   });
 
-  // Cut into parts no longer than 5 minutes that add up to the hour.
+  // Cut into parts no longer than the part length that add up to the hour.
   const parts = await page.getByTestId('stt-part').count();
-  expect(parts).toBeGreaterThanOrEqual(12);
+  expect(parts).toBeGreaterThanOrEqual(60 / partMinutes);
   expect(mock.calls(PATH)).toHaveLength(parts);
-  for (const seconds of partSeconds) expect(seconds).toBeLessThanOrEqual(300);
+  for (const seconds of partSeconds) expect(seconds).toBeLessThanOrEqual(partMinutes * 60);
   expect(partSeconds.reduce((sum, seconds) => sum + seconds, 0)).toBeCloseTo(3600, 3);
 
   // One segment per burst, each where the burst is in the recording: offsets added, continuous, monotonic.

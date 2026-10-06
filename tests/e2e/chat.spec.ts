@@ -295,9 +295,12 @@ test('a pasted PDF is read once; later messages send the parser text', async ({ 
     const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
     const data = new DataTransfer();
     data.items.add(new File([bytes], 'invoice.pdf', { type: 'application/pdf' }));
-    document.body.dispatchEvent(
-      new ClipboardEvent('paste', { clipboardData: data, bubbles: true }),
-    );
+    const paste = new ClipboardEvent('paste', { clipboardData: data, bubbles: true });
+    // Firefox's constructor ignores `clipboardData` (a script-made paste carries only text there): attach it.
+    if (paste.clipboardData?.files.length !== 1) {
+      Object.defineProperty(paste, 'clipboardData', { value: data });
+    }
+    document.body.dispatchEvent(paste);
   }, pdf);
   await expect(page.getByTestId('composer-attachment')).toContainText('invoice.pdf');
   await send(page, 'Invoice number and total?');

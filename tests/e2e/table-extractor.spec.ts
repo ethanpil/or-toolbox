@@ -64,9 +64,22 @@ test('two tables on a page: edit, export XLSX, a ZIP of CSVs, one CSV, and copy 
   page,
   context,
   mock,
+  browserName,
 }) => {
   test.slow();
-  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  // Only Chromium can grant reading the clipboard back (Firefox knows no `clipboard-read`, WebKit no
+  // `clipboard-write`); every browser records what the page writes, so the copied text is checked everywhere.
+  if (browserName === 'chromium') {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  }
+  await context.addInitScript(() => {
+    const written: string[] = [];
+    (window as unknown as { __copied: string[] }).__copied = written;
+    const clipboard = navigator.clipboard as Clipboard | undefined;
+    if (!clipboard) return;
+    const writeText = clipboard.writeText.bind(clipboard);
+    clipboard.writeText = (text: string) => writeText(text).then(() => void written.push(text));
+  });
   await seedApp(context, {
     key: true,
     settings: { tools: { 'table-extractor': { model: 'test/vision' } } },
@@ -173,14 +186,20 @@ test('two tables on a page: edit, export XLSX, a ZIP of CSVs, one CSV, and copy 
   // Copy as TSV for a spreadsheet.
   await first.getByTestId('te-copy').click();
   await expect(page.getByTestId('toast').filter({ hasText: 'Copied' })).toBeVisible();
-  const tsv = await page.evaluate(() => navigator.clipboard.readText());
-  // The system clipboard may turn line feeds into CRLF (Windows).
-  expect(tsv.split(/\r?\n/)).toEqual([
+  const expectedTsv = [
     'Area\tQ1\tQ2',
     'North\t1,200\t1,350',
     `"'=HYPERLINK(""http://evil"")"\t98\t102`,
     'South\t75\t80',
-  ]);
+  ];
+  const copied = await page.evaluate(() => (window as unknown as { __copied: string[] }).__copied);
+  expect(copied).toHaveLength(1);
+  expect(copied[0]!.split(/\r?\n/)).toEqual(expectedTsv);
+  if (browserName === 'chromium') {
+    // The system clipboard may turn line feeds into CRLF (Windows).
+    const tsv = await page.evaluate(() => navigator.clipboard.readText());
+    expect(tsv.split(/\r?\n/)).toEqual(expectedTsv);
+  }
 
   // Delete the chart table (Undo brings it back), then delete it for good: one table exports as one CSV.
   await second.getByTestId('te-delete').click();
